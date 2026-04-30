@@ -1,0 +1,18 @@
+[package]
+name = "hello-world-plugin"
+version = "0.1.0"
+description = "Minimal tau plugin used to verify plugin loading, slash commands, tools, and event hooks."
+
+[plugin]
+api_version = "1"
+tool_prefix = "hello_"
+
+[run]
+command = "./hello-world"
+
+[failure]
+max_retries = 1
+init_timeout = 5
+exec_timeout = 5
+on_cmd_timeout = 5
+on_event_timeout = 2

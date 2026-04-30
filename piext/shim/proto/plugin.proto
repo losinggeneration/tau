@@ -1,0 +1,407 @@
+syntax = "proto3";
+
+package plugins;
+
+option go_package = "github.com/losinggeneration/tau/agent/plugins/proto";
+
+// Plugin service: implemented by plugins, called by tau (the host).
+service Plugin {
+    // Handshake: tau passes session metadata, plugin returns its declared api_version.
+    rpc Initialize(InitRequest) returns (InitResponse);
+
+    // Returns the tools, commands, event subscriptions, and CLI flags this plugin registers.
+    rpc ListRegistrations(ListRegistrationsRequest) returns (Registrations);
+
+    // Invoked for any event the plugin subscribed to.
+    // The response may include a block verdict for tool_call events.
+    rpc OnEvent(Event) returns (EventResponse);
+
+    // Invoked when the model calls a tool registered by this plugin.
+    // Tool progress (onUpdate) is pushed via Host.ToolProgress from inside the handler.
+    rpc ExecuteTool(ToolCall) returns (ToolResult);
+
+    // Invoked when the user runs a slash command registered by this plugin.
+    rpc ExecuteCommand(CommandInvocation) returns (CommandResult);
+
+    // Raw terminal input observed by the host TUI.
+    rpc OnTerminalInput(TerminalInput) returns (TerminalInputResponse);
+
+    // Cooperative shutdown: plugin drains in-flight work.
+    rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+// Host service: implemented by tau (the host), called by plugins.
+service Host {
+    // UI prompts (headless via runtime's UI interface).
+    rpc UIConfirm(UIConfirmRequest) returns (UIConfirmResponse);
+    rpc UISelect(UISelectRequest) returns (UISelectResponse);
+    rpc UIInput(UIInputRequest) returns (UIInputResponse);
+    rpc UINotify(UINotifyRequest) returns (UINotifyResponse);
+    rpc UISetStatus(UISetStatusRequest) returns (UISetStatusResponse);
+    rpc UISetWidget(UISetWidgetRequest) returns (UISetWidgetResponse);
+    rpc UISetTitle(UISetTitleRequest) returns (UISetTitleResponse);
+    rpc UISetEditorText(UISetEditorTextRequest) returns (UISetEditorTextResponse);
+    rpc UISetToolsExpanded(UISetToolsExpandedRequest) returns (UISetToolsExpandedResponse);
+
+    // Logging.
+    rpc Log(LogRequest) returns (LogResponse);
+
+    // Configuration access.
+    rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+    // Tool progress streaming.
+    rpc ToolProgress(ToolProgressEvent) returns (ToolProgressResponse);
+
+    // Per-plugin state (namespaced, persisted under ~/.tau/agent/plugin-state/<name>/).
+    rpc StateGet(StateGetRequest) returns (StateGetResponse);
+    rpc StateSet(StateSetRequest) returns (StateSetResponse);
+    rpc StateAppend(StateAppendRequest) returns (StateAppendResponse);
+    rpc StateDelete(StateDeleteRequest) returns (StateDeleteResponse);
+
+    // Session-scoped operations (active session only).
+    rpc SessionAppend(SessionAppendRequest) returns (SessionAppendResponse);
+    rpc SessionScan(SessionScanRequest) returns (SessionScanResponse);
+    rpc SessionSetLabel(SessionSetLabelRequest) returns (SessionSetLabelResponse);
+    rpc SessionGetLabel(SessionGetLabelRequest) returns (SessionGetLabelResponse);
+    // Send a user message to the active session.
+    // deliver_as: "" → normal send (queued as next turn),
+    //             "steer" → injected mid-stream (RPC steer),
+    //             "followUp" → queued after the current turn finishes.
+    // Mirrors pi's pi.sendUserMessage semantics.
+    rpc SessionSendUserMessage(SessionSendUserMessageRequest) returns (SessionSendUserMessageResponse);
+}
+
+// --- Plugin service messages ---
+
+message InitRequest {
+    // The tau version (e.g. "0.1.0" or git commit hash).
+    string version = 1;
+    // The session ID this plugin is being initialized for.
+    string session_id = 2;
+    // The current working directory.
+    string cwd = 3;
+    // The plugin's manifest path (for reference).
+    string manifest_path = 4;
+}
+
+message InitResponse {
+    // The plugin's supported API version (e.g. "1").
+    string api_version = 1;
+    // Error message if initialization failed.
+    string error = 2;
+}
+
+message ListRegistrationsRequest {}
+
+message Registrations {
+    repeated ToolRegistration tools = 1;
+    repeated CommandRegistration commands = 2;
+    repeated string event_subscriptions = 3;
+    repeated CLIFlag cli_flags = 4;
+    // Optional tool prefix prepended to all tool names from this plugin.
+    string tool_prefix = 5;
+}
+
+message ToolRegistration {
+    string name = 1;
+    string description = 2;
+    map<string, string> parameters = 3;  // JSON schema as string map
+}
+
+message CommandRegistration {
+    string name = 1;
+    string description = 2;
+    string argument_hint = 3;
+}
+
+message CLIFlag {
+    string name = 1;
+    string description = 2;
+    bool required = 3;
+    string default_value = 4;
+}
+
+message Event {
+    // Event name (e.g. "tool_call", "agent_start", "message_user").
+    string name = 1;
+    // Event payload as JSON string.
+    string payload = 2;
+    // Session ID this event belongs to.
+    string session_id = 3;
+    // Timestamp (RFC 3339).
+    string timestamp = 4;
+}
+
+message EventResponse {
+    // Whether to block the event (currently only valid for tool_call events).
+    bool block = 1;
+    // Reason for blocking (if block is true).
+    string block_reason = 2;
+    // Optional response data (e.g. modified tool call args).
+    string response_data = 3;
+    // Compaction summary from plugins subscribed to compaction_request.
+    // When set, tau writes a compaction entry with this summary instead of
+    // running built-in summarization.
+    CompactionResponse compaction = 4;
+}
+
+message CompactionRequest {
+    // Transcript entries (up to but not including the preservation window)
+    // as JSON string.
+    string transcript = 1;
+    // Token count of the transcript before compaction.
+    int64 tokens_before = 2;
+    // Session ID.
+    string session_id = 3;
+}
+
+message CompactionResponse {
+    // Summary of the compacted context.
+    string summary = 1;
+    // ID of the first entry to keep after compaction.
+    string first_kept_entry_id = 2;
+    // Error message if the plugin failed to produce a summary.
+    string error = 3;
+}
+
+message ToolCall {
+    string tool_name = 1;
+    string tool_call_id = 2;
+    // Tool arguments as JSON string.
+    string arguments = 3;
+    // Session ID.
+    string session_id = 4;
+}
+
+message ToolResult {
+    // Tool output as JSON string.
+    string output = 1;
+    bool is_error = 2;
+    string error_message = 3;
+}
+
+message CommandInvocation {
+    string command_name = 1;
+    string arguments = 2;
+    // Session ID.
+    string session_id = 3;
+}
+
+message CommandResult {
+    string output = 1;
+    bool is_error = 2;
+    string error_message = 3;
+}
+
+message TerminalInput {
+    string key = 1;
+    string text = 2;
+    string mod = 3;
+}
+
+message TerminalInputResponse {
+    bool consume = 1;
+}
+
+message ShutdownRequest {
+    // Requested drain timeout in seconds.
+    int32 drain_timeout_seconds = 1;
+}
+
+message ShutdownResponse {
+    bool graceful = 1;
+    string error = 2;
+}
+
+// --- Host service messages ---
+
+message UIConfirmRequest {
+    string title = 1;
+    string message = 2;
+    string id = 3;  // correlation ID
+}
+
+message UIConfirmResponse {
+    bool confirmed = 1;
+    string error = 2;
+}
+
+message UISelectRequest {
+    string title = 1;
+    repeated string options = 2;
+    string id = 3;
+}
+
+message UISelectResponse {
+    int32 selected_index = 1;
+    string error = 2;
+}
+
+message UIInputRequest {
+    string title = 1;
+    string placeholder = 2;
+    string id = 3;
+}
+
+message UIInputResponse {
+    string value = 1;
+    string error = 2;
+}
+
+message UINotifyRequest {
+    string message = 1;
+    int32 level = 2;  // 0=info, 1=success, 2=warn, 3=error
+}
+
+message UINotifyResponse {}
+
+message UISetStatusRequest {
+    string key = 1;
+    string message = 2;
+}
+
+message UISetStatusResponse {}
+
+message UISetWidgetRequest {
+    string key = 1;
+    repeated string lines = 2;
+}
+
+message UISetWidgetResponse {}
+
+message UISetTitleRequest {
+    string title = 1;
+}
+
+message UISetTitleResponse {}
+
+message UISetEditorTextRequest {
+    string text = 1;
+}
+
+message UISetEditorTextResponse {}
+
+message UISetToolsExpandedRequest {
+    bool expanded = 1;
+}
+
+message UISetToolsExpandedResponse {}
+
+message LogRequest {
+    string message = 1;
+    int32 level = 2;  // 0=debug, 1=info, 2=warn, 3=error
+}
+
+message LogResponse {}
+
+message GetConfigRequest {
+    string key = 1;
+}
+
+message GetConfigResponse {
+    string value = 1;
+    bool exists = 2;
+}
+
+message ToolProgressEvent {
+    string tool_call_id = 1;
+    string content = 2;
+    bool is_error = 3;
+}
+
+message ToolProgressResponse {}
+
+message StateGetRequest {
+    string key = 1;
+}
+
+message StateGetResponse {
+    string value = 1;
+    bool exists = 2;
+}
+
+message StateSetRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message StateSetResponse {}
+
+message StateAppendRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message StateAppendResponse {}
+
+message StateDeleteRequest {
+    string key = 1;
+}
+
+message StateDeleteResponse {}
+
+message SessionAppendRequest {
+    // Entry type: "custom" or "custom_message".
+    string entry_type = 1;
+    // Entry payload as JSON string.
+    string payload = 2;
+    // Parent entry ID (optional).
+    string parent_id = 3;
+}
+
+message SessionAppendResponse {
+    string entry_id = 1;
+    string error = 2;
+}
+
+message SessionScanRequest {
+    // Filter by entry type (optional, empty = all types).
+    string entry_type_filter = 1;
+    // Filter by custom_type (optional).
+    string custom_type_filter = 2;
+}
+
+message SessionScanResponse {
+    repeated SessionEntry entries = 1;
+    string error = 2;
+}
+
+message SessionEntry {
+    string id = 1;
+    string entry_type = 2;
+    string custom_type = 3;
+    string payload = 4;
+    string parent_id = 5;
+    string timestamp = 6;
+    string label = 7;  // Resolved label for this entry, if any
+}
+
+message SessionSetLabelRequest {
+    string entry_id = 1;
+    string label = 2;  // Empty string to clear the label
+}
+
+message SessionSetLabelResponse {
+    string entry_id = 1;  // ID of the new label entry
+    string error = 2;
+}
+
+message SessionGetLabelRequest {
+    string entry_id = 1;
+}
+
+message SessionGetLabelResponse {
+    string label = 1;  // The label, or empty if none
+    string error = 2;
+}
+
+message SessionSendUserMessageRequest {
+    string text = 1;
+    // "", "steer", or "followUp"
+    string deliver_as = 2;
+}
+
+message SessionSendUserMessageResponse {
+    bool ok = 1;
+    string error = 2;
+}

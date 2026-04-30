@@ -1,0 +1,49 @@
+# Build artifacts
+/tau
+/tau-test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.txt
+coverage.html
+
+# Dependency directories (remove the comment below to not commit vendored code)
+/vendor/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor / OS scratch files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local working files
+Untitled
+Untitled.*
+next_steps.txt
+app-spec-review.txt
+imp-v-spec
+*.scratch
+*.scratch.*
+*.working
+*.working.*
+
+# Generated / proto
+**/gen/*.pb.go
+**/*.pb.gw.go
+
+# Local environment
+.env
+.env.local

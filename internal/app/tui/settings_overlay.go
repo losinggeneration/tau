@@ -1,0 +1,372 @@
+package tui
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/losinggeneration/tau/ai"
+	tauui "github.com/losinggeneration/tau/tui"
+
+	"github.com/losinggeneration/tau/tui/settingslist"
+)
+
+// settingsOverlay hosts a settingslist rendered as the dialog picker.
+// The picker hosts the same settings model, theme, thinking level,
+// auto-compaction, and queue display settings the TUI supports; the
+// per-row value is sourced from the App's runtime state and the change
+// callback writes back to whichever subsystem owns the setting.
+//
+// Wiring the existing settingslist package into the App was the gap
+// the parity checklist flagged: the package existed and was tested,
+// but it had no consumer. The overlay below gives it one and exposes
+// the App's settings in a single searchable/fuzzy menu.
+type settingsOverlay struct {
+	list  *settingslist.List
+	items []settingslist.Item
+}
+
+// newSettingsOverlay constructs a settingsOverlay whose value list is
+// sourced from app state. The returned overlay is ready to be hosted
+// by the dialog picker; the search field is enabled so the user can
+// fuzzy-filter settings as they type.
+func newSettingsOverlay(app *App) *settingsOverlay {
+	items := buildSettingsItems(app)
+	o := &settingsOverlay{items: items}
+	o.list = settingslist.New(
+		items,
+		12,
+		settingslist.DefaultTheme(),
+		func(id, newValue string) {
+			if app == nil {
+				return
+			}
+			applySettingsChange(app, id, newValue)
+		},
+		func() {
+			if app != nil {
+				app.dismissDialog()
+			}
+		},
+		settingslist.Options{EnableSearch: true},
+	)
+	return o
+}
+
+// HandleInput accepts simple test input and forwards it as normalized key
+// events. Production picker input uses HandleKey.
+func (o *settingsOverlay) HandleInput(data string) {
+	if o == nil || o.list == nil {
+		return
+	}
+	o.list.HandleInput(data)
+}
+
+func (o *settingsOverlay) HandleKey(ke tauui.KeyEvent) {
+	if o == nil || o.list == nil {
+		return
+	}
+	o.list.HandleKey(ke)
+}
+
+// Render implements the settingslist.Component contract so it can be
+// hosted by the overlay picker.
+func (o *settingsOverlay) Render(width int) []string {
+	if o == nil || o.list == nil {
+		return nil
+	}
+	return o.list.Render(width)
+}
+
+// SearchEnabled reports whether the search input is active. The
+// dialog picker uses this to size itself.
+func (o *settingsOverlay) SearchEnabled() bool {
+	return true
+}
+
+func buildSettingsItems(app *App) []settingslist.Item {
+	if app == nil {
+		return nil
+	}
+	// Several rows read their current value from the footer's data record.
+	// Reading it unguarded means /settings panics whenever the footer is not
+	// yet wired, which is a crash for a menu that only needed to show a blank.
+	data := app.footer.dataOrEmpty()
+	items := []settingslist.Item{
+		{
+			ID:           "settings.model",
+			Label:        "Model",
+			Description:  "Active model id (provider/id).",
+			CurrentValue: app.currentModel,
+			Values:       app.switchableModelIDs(),
+		},
+		{
+			ID:           "settings.thinkingLevel",
+			Label:        "Thinking level",
+			Description:  "Reasoning effort for the session.",
+			CurrentValue: data.thinkingLevel,
+			Values:       ai.ThinkingLevels,
+		},
+		{
+			ID:           "settings.autoCompaction",
+			Label:        "Auto-compact",
+			Description:  "Trigger automatic compaction when context is full.",
+			CurrentValue: boolOnOff(data.autoCompaction),
+			Values:       []string{"off", "on"},
+		},
+		{
+			ID:           "settings.theme",
+			Label:        "Theme",
+			Description:  "Color theme for the terminal UI.",
+			CurrentValue: data.theme,
+			Submenu:      app.themeSubmenuFactory(),
+		},
+		{
+			ID:           "settings.layout",
+			Label:        "Layout",
+			Description:  "fixed: pinned header/editor, chat scrolls alone. document: one scrolling document.",
+			CurrentValue: string(app.LayoutMode()),
+			Values:       []string{string(LayoutFixed), string(LayoutDocument)},
+		},
+		{
+			ID:           "settings.streamingFooter",
+			Label:        "Footer notice",
+			Description:  "Right-side notice when an action is in progress.",
+			CurrentValue: data.notice,
+		},
+	}
+	return items
+}
+
+// themeSubmenuFactory returns a Submenu factory that builds a
+// nested settings list of the available themes. The user can
+// pick one (Enter/Space) and the chosen theme is committed back
+// to the parent setting via the done callback. This is also the
+// "settings.theme" submenu the Pi settings list exposes for
+// theme selection.
+func (a *App) themeSubmenuFactory() func(current string, done func(selected string, ok bool)) settingslist.KeyComponent {
+	return func(current string, done func(selected string, ok bool)) settingslist.KeyComponent {
+		themes := a.availableThemes()
+		items := make([]settingslist.Item, 0, len(themes))
+		for _, name := range themes {
+			items = append(items, settingslist.Item{
+				ID:           "settings.theme." + name,
+				Label:        name,
+				Description:  "Switch to the " + name + " theme.",
+				CurrentValue: name,
+				Values:       []string{name},
+			})
+		}
+		return settingslist.New(
+			items,
+			8,
+			settingslist.DefaultTheme(),
+			func(id, newValue string) {
+				if a != nil {
+					applySettingsChange(a, "settings.theme", newValue)
+				}
+				done(newValue, true)
+			},
+			func() { done("", false) },
+			settingslist.Options{},
+		)
+	}
+}
+
+// availableThemes returns the list of theme names the App can
+// switch to. The default theme is always present; theme plugins
+// can extend this list by registering themes via the extensions
+// API. Used by the settings submenu and the /theme command.
+func (a *App) availableThemes() []string {
+	if a == nil {
+		return nil
+	}
+	names := []string{"default", "tau", "dark", "light"}
+	if a.extensions != nil {
+		th := a.extensions.Theme()
+		if th.Name != "" {
+			// Replace the default with the configured theme name
+			// so the user sees the current theme reflected.
+			names = append(names, th.Name)
+		}
+	}
+	return names
+}
+
+// applySettingsChange writes a confirmed new value back into the App
+// state. The dispatch picks the subsystem that owns the setting
+// (model switch, thinking level toggle, auto-compaction flag, footer
+// notice) and pushes the value through it. Unknown ids no-op.
+func applySettingsChange(app *App, id, value string) {
+	if app == nil || id == "" {
+		return
+	}
+	switch id {
+	case "settings.model":
+		if value == "" || value == app.currentModel {
+			return
+		}
+		app.applyModelFromArgs(stripProviderPrefix(value))
+		if app.footer != nil && app.footer.data != nil {
+			app.footer.data.model = app.sess.State().Model()
+		}
+		app.refreshFooterStats(app.loopContext())
+	case "settings.thinkingLevel":
+		if app.sess == nil {
+			return
+		}
+		if err := app.sess.SetThinkingLevel(value); err != nil {
+			app.conv.AddError("settings.thinkingLevel: " + err.Error())
+			app.refreshChat()
+			return
+		}
+		if app.footer != nil && app.footer.data != nil {
+			app.footer.data.thinkingLevel = value
+		}
+		// Remember the effort the user was working at, so app.thinking.toggle
+		// can come back to it. Recorded here rather than in the toggle handler
+		// so every way of choosing a level feeds the same memory.
+		app.rememberThinkingLevel(value)
+		// The editor's rules are the standing thinking-level indicator.
+		app.refreshEditorChrome()
+	case "settings.autoCompaction":
+		enabled := strings.EqualFold(value, "on") || value == "true"
+		if app.footer != nil && app.footer.data != nil {
+			app.footer.data.autoCompaction = enabled
+		}
+	case "settings.layout":
+		mode, ok := ParseLayoutMode(value)
+		if !ok {
+			app.conv.AddError("settings.layout: unknown mode " + value)
+			app.refreshChat()
+			return
+		}
+		app.SetLayoutMode(mode)
+		if err := app.persistLayoutSetting(mode); err != nil && app.conv != nil {
+			app.conv.AddError("settings.layout: selected " + value + " but failed to save setting: " + err.Error())
+			app.refreshChat()
+		}
+	case "settings.theme":
+		if app.footer != nil && app.footer.data != nil {
+			app.footer.data.theme = value
+		}
+		// applyTheme resolves the theme's colours and pushes them to both the
+		// chat log and the extensions registry, so nothing extra is needed
+		// here — forwarding the bare name first would briefly repaint plugin
+		// widgets against an empty palette.
+		app.applyTheme(value)
+		if err := app.persistThemeSetting(value); err != nil && app.conv != nil {
+			app.conv.AddError("settings.theme: selected " + value + " but failed to save setting: " + err.Error())
+		}
+	case "settings.streamingFooter":
+		if app.footer != nil && app.footer.data != nil {
+			app.footer.data.notice = value
+		}
+	}
+	if ctx := app.loopContext(); ctx != nil {
+		if ctx.InvalidateLayout != nil {
+			ctx.InvalidateLayout()
+		}
+		if ctx.InvalidateAll != nil {
+			ctx.InvalidateAll()
+		}
+		if ctx.Invalidate != nil {
+			if f := app.footer; f != nil {
+				if r := f.Rect(); r.W > 0 && r.H > 0 {
+					ctx.Invalidate(r)
+				}
+			}
+		}
+	}
+	app.refreshChat()
+}
+
+func (a *App) persistThemeSetting(value string) error {
+	if a == nil || a.settingsPath == "" {
+		return nil
+	}
+	settings, err := ai.LoadSettings(a.settingsPath)
+	if err != nil {
+		return fmt.Errorf("load settings: %w", err)
+	}
+	settings.Theme = value
+	if err := ai.SaveSettings(a.settingsPath, settings); err != nil {
+		return fmt.Errorf("write settings: %w", err)
+	}
+	return nil
+}
+
+// persistLayoutSetting writes the chosen layout back to settings.json so the
+// choice survives a restart. Without this the setting would be readable but
+// only ever writable by hand, and a switch made in the UI would silently
+// revert on the next launch.
+func (a *App) persistLayoutSetting(mode LayoutMode) error {
+	if a == nil || a.settingsPath == "" {
+		return nil
+	}
+	settings, err := ai.LoadSettings(a.settingsPath)
+	if err != nil {
+		return fmt.Errorf("load settings: %w", err)
+	}
+	settings.LayoutMode = string(mode)
+	if err := ai.SaveSettings(a.settingsPath, settings); err != nil {
+		return fmt.Errorf("write settings: %w", err)
+	}
+	return nil
+}
+
+// switchableModelIDs returns the list of bare model ids the user can
+// switch to via the settings menu. Used as the Values cycle list for
+// the model setting.
+func (a *App) switchableModelIDs() []string {
+	if a == nil {
+		return nil
+	}
+	models := a.availableModels()
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		if m == nil || m.ID == "" {
+			continue
+		}
+		ids = append(ids, m.ID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func stripProviderPrefix(value string) string {
+	if idx := strings.Index(value, "/"); idx > 0 {
+		return value[idx+1:]
+	}
+	return value
+}
+
+func boolOnOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
+}
+
+// cmdSettingsOverlay is the /settings command handler. It opens
+// the dialog picker with the settings overlay as the hosted
+// component so the user gets a searchable/fuzzy settings menu
+// wired to the runtime config (model, thinking level,
+// auto-compaction, footer notice).
+func cmdSettingsOverlay(app *App, _ string) {
+	if app == nil {
+		return
+	}
+	if app.dialogPicker == nil {
+		return
+	}
+	app.closeDialogComponent()
+	overlay := newSettingsOverlay(app)
+	app.dialogPicker.SetComponent(overlay)
+	app.dialogPicker.SetHeader("/settings")
+	app.dialogPicker.Reset()
+	app.dialogPicker.SetShown(true)
+	if ctx := app.loopContext(); ctx != nil && ctx.InvalidateLayout != nil {
+		ctx.InvalidateLayout()
+	}
+}

@@ -1,0 +1,218 @@
+body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    max-width: 960px;
+    margin: 2em auto;
+    padding: 0 1em;
+    background: #fff;
+    color: #222;
+    line-height: 1.6;
+}
+
+h1 {
+    border-bottom: 2px solid #eee;
+    padding-bottom: .5em;
+    margin-bottom: 1em;
+}
+
+.message {
+    margin: 1em 0;
+    padding: 1em;
+    border-radius: 8px;
+    border-left: 4px solid #ccc;
+}
+
+.message.user {
+    background: #f0f7ff;
+    border-color: #3b82f6;
+}
+
+.message.assistant {
+    background: #f0fdf4;
+    border-color: #22c55e;
+}
+
+.message.system {
+    background: #fefce8;
+    border-color: #eab308;
+}
+
+.role {
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: .85em;
+    margin-bottom: .5em;
+    color: #555;
+}
+
+.content {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.content code {
+    background: #f3f4f6;
+    padding: .2em .4em;
+    border-radius: 3px;
+    font-size: .9em;
+}
+
+.content pre {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 1em;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: .9em;
+}
+
+.content pre code {
+    background: transparent;
+    padding: 0;
+    color: inherit;
+}
+
+details {
+    margin: 1em 0;
+    padding: .5em;
+    background: #f9fafb;
+    border-radius: 4px;
+    border: 1px solid #e5e7eb;
+}
+
+details summary {
+    cursor: pointer;
+    font-weight: 600;
+    padding: .5em;
+}
+
+details[open] summary {
+    border-bottom: 1px solid #e5e7eb;
+    margin-bottom: .5em;
+}
+
+pre {
+    overflow-x: auto;
+}
+
+.metadata {
+    color: #666;
+    font-size: .9em;
+    margin-bottom: 2em;
+    padding: .5em;
+    background: #f9fafb;
+    border-radius: 4px;
+}
+
+.abandoned {
+    opacity: 0.7;
+    border-left-style: dashed;
+}
+
+.branch-summary {
+    background: #fffbeb;
+    border-color: #f59e0b;
+    font-style: italic;
+}
+
+.branch-summary .content {
+    color: #92400e;
+}
+
+/* Syntax highlighting with chroma */
+.chroma .hll { background-color: #ffffcc }
+.chroma .c { color: #6a9955; font-style: italic } /* Comment */
+.chroma .k { color: #569cd6; font-weight: bold } /* Keyword */
+.chroma .o { color: #d4d4d4 } /* Operator */
+.chroma .cm { color: #6a9955; font-style: italic } /* Comment.Multiline */
+.chroma .cp { color: #569cd6 } /* Comment.Preproc */
+.chroma .c1 { color: #6a9955; font-style: italic } /* Comment.Single */
+.chroma .cs { color: #6a9955; font-style: italic } /* Comment.Special */
+.chroma .gd { color: #ce9178 } /* Generic.Deleted */
+.chroma .ge { font-style: italic } /* Generic.Emph */
+.chroma .gr { color: #d19a66 } /* Generic.Error */
+.chroma .gh { color: #9cdcfe; font-weight: bold } /* Generic.Heading */
+.chroma .gi { color: #6a9955 } /* Generic.Inserted */
+.chroma .go { color: #808080 } /* Generic.Output */
+.chroma .gp { color: #dcdcaa; font-weight: bold } /* Generic.Prompt */
+.chroma .gs { font-weight: bold } /* Generic.Strong */
+.gu { color: #9cdcfe; text-decoration: underline } /* Generic.Subheading */
+.chroma .gt { color: #d19a66 } /* Generic.Traceback */
+.chroma .kc { color: #569cd6 } /* Keyword.Constant */
+.chroma .kd { color: #569cd6 } /* Keyword.Declaration */
+.chroma .kn { color: #4ec9b0 } /* Keyword.Namespace */
+.chroma .kp { color: #569cd6 } /* Keyword.Pseudo */
+.chroma .kr { color: #569cd6 } /* Keyword.Reserved */
+.chroma .kt { color: #4ec9b0 } /* Keyword.Type */
+.chroma .l { color: #b5cea8 } /* Literal */
+.chroma .ld { color: #ce9178 } /* Literal.Date */
+.chroma .m { color: #b5cea8 } /* Literal.Number */
+.chroma .s { color: #ce9178 } /* Literal.String */
+.chroma .na { color: #9cdcfe } /* Name.Attribute */
+.chroma .nb { color: #4ec9b0 } /* Name.Builtin */
+.chroma .nc { color: #4ec9b0; font-weight: bold } /* Name.Class */
+.chroma .no { color: #d16969 } /* Name.Constant */
+.chroma .nd { color: #dcdcaa } /* Name.Decorator */
+.chroma .ni { color: #d7ba7d } /* Name.Entity */
+.chroma .ne { color: #569cd6; font-weight: bold } /* Name.Exception */
+.chroma .nf { color: #dcdcaa } /* Name.Function */
+.chroma .nl { color: #d7ba7d } /* Name.Label */
+.chroma .nn { color: #b5cea8 } /* Name.Namespace */
+.chroma .nx { color: #9cdcfe } /* Name.Other */
+.chroma .py { color: #4ec9b0 } /* Name.Property */
+.chroma .nt { color: #569cd6 } /* Name.Tag */
+.chroma .nv { color: #9cdcfe } /* Name.Variable */
+.chroma .ow { color: #569cd6; font-weight: bold } /* Operator.Word */
+.chroma .w { color: #d4d4d4 } /* Text.Whitespace */
+.chroma .mf { color: #b5cea8 } /* Literal.Number.Float */
+.chroma .mh { color: #b5cea8 } /* Literal.Number.Hex */
+.chroma .mi { color: #b5cea8 } /* Literal.Number.Integer */
+.chroma .mo { color: #b5cea8 } /* Literal.Number.Oct */
+.chroma .sb { color: #ce9178 } /* Literal.String.Backtick */
+.chroma .sc { color: #ce9178 } /* Literal.String.Char */
+.chroma .sd { color: #ce9178 } /* Literal.String.Doc */
+.chroma .s2 { color: #ce9178 } /* Literal.String.Double */
+.chroma .se { color: #d7ba7d } /* Literal.String.Escape */
+.chroma .sh { color: #ce9178 } /* Literal.String.Heredoc */
+.chroma .si { color: #ce9178 } /* Literal.String.Interpol */
+.chroma .sx { color: #ce9178 } /* Literal.String.Other */
+.chroma .sr { color: #d7ba7d } /* Literal.String.Regex */
+.chroma .s1 { color: #ce9178 } /* Literal.String.Single */
+.chroma .ss { color: #569cd6 } /* Literal.String.Symbol */
+.chroma .bp { color: #4ec9b0 } /* Name.Builtin.Pseudo */
+.chroma .vc { color: #9cdcfe } /* Name.Variable.Class */
+.chroma .vg { color: #9cdcfe } /* Name.Variable.Global */
+.chroma .vi { color: #9cdcfe } /* Name.Variable.Instance */
+.chroma .il { color: #b5cea8 } /* Literal.Number.Integer.Long */
+/* Session metadata entries (rendered by the Go HTML exporter). */
+.session-info,
+.model-change,
+.thinking-change {
+    margin: 0.75em 0;
+    padding: 0.4em 0.75em;
+    background: #f3f4f6;
+    border-left: 3px solid #9ca3af;
+    color: #4b5563;
+    font-size: 0.9em;
+    border-radius: 3px;
+}
+
+.model-change {
+    border-left-color: #6366f1;
+}
+
+.thinking-change {
+    border-left-color: #ec4899;
+}
+
+.compaction {
+    margin: 1em 0;
+    padding: 0.5em;
+    background: #fef9c3;
+    border-left: 4px solid #ca8a04;
+    border-radius: 4px;
+}
+
+.compaction summary {
+    cursor: pointer;
+    font-weight: 600;
+}

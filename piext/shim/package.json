@@ -1,0 +1,27 @@
+{
+  "name": "@losinggeneration/pi-ext-shim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pi extension compatibility shim for tau plugins",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "proto:types": "proto-loader-gen-types --grpcLib=@grpc/grpc-js --outDir=src/generated --targetFileExtension=.ts --importFileExtension=.ts proto/plugin.proto"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.10.10",
+    "@grpc/proto-loader": "^0.7.13",
+    "jiti": "^2.6.2",
+    "node-forge": "^1.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/node-forge": "^1.3.0",
+    "typescript": "^5.6.0"
+  }
+}

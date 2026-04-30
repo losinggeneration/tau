@@ -1,0 +1,18 @@
+[package]
+name = "hello-python-plugin"
+version = "0.1.0"
+description = "Minimal tau plugin written in Python to verify cross-language go-plugin gRPC loading."
+
+[plugin]
+api_version = "1"
+tool_prefix = ""
+
+[run]
+command = "./hello-python"
+
+[failure]
+max_retries = 1
+init_timeout = 5
+exec_timeout = 5
+on_cmd_timeout = 5
+on_event_timeout = 2

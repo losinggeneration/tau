@@ -1,0 +1,606 @@
+package plugins
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"sync"
+
+	"github.com/losinggeneration/tau/agent/plugins/proto"
+	"github.com/losinggeneration/tau/agent/plugins/state"
+	"github.com/losinggeneration/tau/ai"
+	"github.com/xeipuuv/gojsonschema"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+// HostService implements the Host service that plugins call.
+type HostService struct {
+	proto.UnimplementedHostServer
+	manager *Manager
+	stateMu sync.Map // plugin name -> *state.Store
+}
+
+// NewHostService creates a new Host service.
+func NewHostService(m *Manager) *HostService {
+	return &HostService{manager: m}
+}
+
+// getStateStore returns the state store for a plugin, creating it if needed.
+func (h *HostService) getStateStore(pluginName string) (*state.Store, error) {
+	if store, ok := h.stateMu.Load(pluginName); ok {
+		return store.(*state.Store), nil
+	}
+
+	store, err := state.NewStore(h.manager.stateDir, pluginName)
+	if err != nil {
+		return nil, err
+	}
+	h.stateMu.Store(pluginName, store)
+	return store, nil
+}
+
+// getPluginName extracts the plugin name from gRPC metadata.
+// The plugin should set metadata with key "tau-plugin-name" in each request.
+func getPluginName(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if names := md.Get("tau-plugin-name"); len(names) > 0 {
+			return names[0]
+		}
+	}
+	return ""
+}
+
+// UIConfirm implements Host.UIConfirm.
+func (h *HostService) UIConfirm(ctx context.Context, req *proto.UIConfirmRequest) (*proto.UIConfirmResponse, error) {
+	if h.manager.ui == nil {
+		return &proto.UIConfirmResponse{Confirmed: false, Error: "no UI available"}, nil
+	}
+	confirmed, err := h.manager.ui.Confirm(ctx, req.Title, req.Message)
+	return &proto.UIConfirmResponse{
+		Confirmed: confirmed,
+		Error:     errToString(err),
+	}, nil
+}
+
+// UISelect implements Host.UISelect.
+func (h *HostService) UISelect(ctx context.Context, req *proto.UISelectRequest) (*proto.UISelectResponse, error) {
+	if h.manager.ui == nil {
+		return &proto.UISelectResponse{SelectedIndex: -1, Error: "no UI available"}, nil
+	}
+	idx, err := h.manager.ui.Select(ctx, req.Title, req.Options)
+	return &proto.UISelectResponse{
+		SelectedIndex: int32(idx),
+		Error:         errToString(err),
+	}, nil
+}
+
+// UIInput implements Host.UIInput.
+func (h *HostService) UIInput(ctx context.Context, req *proto.UIInputRequest) (*proto.UIInputResponse, error) {
+	if h.manager.ui == nil {
+		return &proto.UIInputResponse{Value: "", Error: "no UI available"}, nil
+	}
+	value, err := h.manager.ui.Input(ctx, req.Title, req.Placeholder)
+	return &proto.UIInputResponse{
+		Value: value,
+		Error: errToString(err),
+	}, nil
+}
+
+// UINotify implements Host.UINotify.
+func (h *HostService) UINotify(ctx context.Context, req *proto.UINotifyRequest) (*proto.UINotifyResponse, error) {
+	if h.manager.ui != nil {
+		h.manager.ui.Notify(int(req.Level), req.Message)
+	}
+	return &proto.UINotifyResponse{}, nil
+}
+
+// UISetStatus implements Host.UISetStatus.
+func (h *HostService) UISetStatus(ctx context.Context, req *proto.UISetStatusRequest) (*proto.UISetStatusResponse, error) {
+	if h.manager.ui != nil {
+		h.manager.ui.SetStatus(req.Key, req.Message)
+	}
+	return &proto.UISetStatusResponse{}, nil
+}
+
+// UISetWidget implements Host.UISetWidget.
+func (h *HostService) UISetWidget(ctx context.Context, req *proto.UISetWidgetRequest) (*proto.UISetWidgetResponse, error) {
+	if h.manager.ui != nil {
+		h.manager.ui.SetWidget(req.Key, req.Lines)
+	}
+	return &proto.UISetWidgetResponse{}, nil
+}
+
+func (h *HostService) UISetTitle(ctx context.Context, req *proto.UISetTitleRequest) (*proto.UISetTitleResponse, error) {
+	if h.manager.ui != nil {
+		h.manager.ui.SetTitle(req.Title)
+	}
+	return &proto.UISetTitleResponse{}, nil
+}
+
+func (h *HostService) UISetEditorText(ctx context.Context, req *proto.UISetEditorTextRequest) (*proto.UISetEditorTextResponse, error) {
+	if h.manager.ui != nil {
+		h.manager.ui.SetEditorText(req.Text)
+	}
+	return &proto.UISetEditorTextResponse{}, nil
+}
+
+func (h *HostService) UISetToolsExpanded(ctx context.Context, req *proto.UISetToolsExpandedRequest) (*proto.UISetToolsExpandedResponse, error) {
+	if h.manager.ui != nil {
+		h.manager.ui.SetToolsExpanded(req.Expanded)
+	}
+	return &proto.UISetToolsExpandedResponse{}, nil
+}
+
+// Log implements Host.Log.
+func (h *HostService) Log(ctx context.Context, req *proto.LogRequest) (*proto.LogResponse, error) {
+	level := slog.LevelInfo
+	switch req.Level {
+	case 0:
+		level = slog.LevelDebug
+	case 2:
+		level = slog.LevelWarn
+	case 3:
+		level = slog.LevelError
+	}
+	h.manager.logger.Log(ctx, level, "plugin log", "plugin", getPluginName(ctx), "message", req.Message)
+	return &proto.LogResponse{}, nil
+}
+
+// GetConfig implements Host.GetConfig.
+// It returns CLI flag values (if resolved) before settings.json values.
+func (h *HostService) GetConfig(ctx context.Context, req *proto.GetConfigRequest) (*proto.GetConfigResponse, error) {
+	pluginName := getPluginName(ctx)
+	if pluginName == "" {
+		return &proto.GetConfigResponse{Exists: false}, fmt.Errorf("plugin name not found in metadata")
+	}
+
+	// Priority order: CLI flags > settings.json > defaults
+	// 1. Check CLI flags first (highest priority).
+	if req.Key != "" {
+		if cliVal := h.manager.getCLIFlag(pluginName, req.Key); cliVal != "" {
+			// Wrap as JSON string for consistency.
+			val, _ := json.Marshal(cliVal)
+			return &proto.GetConfigResponse{
+				Value:  string(val),
+				Exists: true,
+			}, nil
+		}
+	} else {
+		// Return all CLI flags as a map.
+		h.manager.mu.RLock()
+		if flags, ok := h.manager.cliFlags[pluginName]; ok && len(flags) > 0 {
+			h.manager.mu.RUnlock()
+			val, _ := json.Marshal(flags)
+			return &proto.GetConfigResponse{
+				Value:  string(val),
+				Exists: true,
+			}, nil
+		}
+		h.manager.mu.RUnlock()
+	}
+
+	// 2. Check settings.json (plugins.<name>.<key>).
+	settings := h.manager.getSettings()
+	if settings == nil || settings.Plugins == nil {
+		return &proto.GetConfigResponse{Exists: false}, nil
+	}
+
+	pluginConfig, ok := settings.Plugins[pluginName]
+	if !ok {
+		return &proto.GetConfigResponse{Exists: false}, nil
+	}
+
+	// Look for the specific key within the plugin's config.
+	if req.Key != "" {
+		var config map[string]json.RawMessage
+		if err := json.Unmarshal(pluginConfig, &config); err != nil {
+			return &proto.GetConfigResponse{Exists: false}, fmt.Errorf("parse plugin config: %w", err)
+		}
+		val, ok := config[req.Key]
+		if !ok {
+			return &proto.GetConfigResponse{Exists: false}, nil
+		}
+		return &proto.GetConfigResponse{
+			Value:  string(val),
+			Exists: true,
+		}, nil
+	}
+
+	// If no key specified, return the entire plugin config as JSON.
+	return &proto.GetConfigResponse{
+		Value:  string(pluginConfig),
+		Exists: true,
+	}, nil
+}
+
+// ToolProgress implements Host.ToolProgress.
+// It forwards the event to the manager's progress channel if configured.
+func (h *HostService) ToolProgress(ctx context.Context, req *proto.ToolProgressEvent) (*proto.ToolProgressResponse, error) {
+	h.manager.broadcastToolProgress(ToolProgressEvent{
+		ToolCallID: req.ToolCallId,
+		Content:    req.Content,
+		IsError:    req.IsError,
+	})
+	return &proto.ToolProgressResponse{}, nil
+}
+
+// StateGet implements Host.StateGet.
+func (h *HostService) StateGet(ctx context.Context, req *proto.StateGetRequest) (*proto.StateGetResponse, error) {
+	pluginName := getPluginName(ctx)
+	if pluginName == "" {
+		return &proto.StateGetResponse{Exists: false}, fmt.Errorf("plugin name not found in metadata")
+	}
+	store, err := h.getStateStore(pluginName)
+	if err != nil {
+		return &proto.StateGetResponse{Exists: false}, fmt.Errorf("get state store: %w", err)
+	}
+
+	value, ok := store.Get(req.Key)
+	return &proto.StateGetResponse{
+		Value:  value,
+		Exists: ok,
+	}, nil
+}
+
+// StateSet implements Host.StateSet.
+func (h *HostService) StateSet(ctx context.Context, req *proto.StateSetRequest) (*proto.StateSetResponse, error) {
+	pluginName := getPluginName(ctx)
+	if pluginName == "" {
+		return &proto.StateSetResponse{}, fmt.Errorf("plugin name not found in metadata")
+	}
+	store, err := h.getStateStore(pluginName)
+	if err != nil {
+		return &proto.StateSetResponse{}, fmt.Errorf("get state store: %w", err)
+	}
+
+	if err := store.Set(req.Key, req.Value); err != nil {
+		return &proto.StateSetResponse{}, err
+	}
+	return &proto.StateSetResponse{}, nil
+}
+
+// StateAppend implements Host.StateAppend.
+func (h *HostService) StateAppend(ctx context.Context, req *proto.StateAppendRequest) (*proto.StateAppendResponse, error) {
+	pluginName := getPluginName(ctx)
+	if pluginName == "" {
+		return &proto.StateAppendResponse{}, fmt.Errorf("plugin name not found in metadata")
+	}
+	store, err := h.getStateStore(pluginName)
+	if err != nil {
+		return &proto.StateAppendResponse{}, fmt.Errorf("get state store: %w", err)
+	}
+
+	if err := store.Append(req.Key, req.Value); err != nil {
+		return &proto.StateAppendResponse{}, err
+	}
+	return &proto.StateAppendResponse{}, nil
+}
+
+// StateDelete implements Host.StateDelete.
+func (h *HostService) StateDelete(ctx context.Context, req *proto.StateDeleteRequest) (*proto.StateDeleteResponse, error) {
+	pluginName := getPluginName(ctx)
+	if pluginName == "" {
+		return &proto.StateDeleteResponse{}, fmt.Errorf("plugin name not found in metadata")
+	}
+	store, err := h.getStateStore(pluginName)
+	if err != nil {
+		return &proto.StateDeleteResponse{}, fmt.Errorf("get state store: %w", err)
+	}
+
+	if err := store.Delete(req.Key); err != nil {
+		return &proto.StateDeleteResponse{}, err
+	}
+	return &proto.StateDeleteResponse{}, nil
+}
+
+func (h *HostService) activeSession() (SessionAccessor, string, error) {
+	if h.manager.sessionAccessor == nil {
+		return nil, "", status.Error(codes.FailedPrecondition, "session accessor not configured")
+	}
+
+	sessionID := ""
+	if h.manager.sessionIDProvider != nil {
+		sessionID = h.manager.sessionIDProvider()
+	}
+	if sessionID == "" {
+		return nil, "", status.Error(codes.FailedPrecondition, "no active session")
+	}
+	return h.manager.sessionAccessor, sessionID, nil
+}
+
+func statusMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	return status.Convert(err).Message()
+}
+
+// SessionAppend implements Host.SessionAppend.
+func (h *HostService) SessionAppend(ctx context.Context, req *proto.SessionAppendRequest) (*proto.SessionAppendResponse, error) {
+	accessor, sessionID, err := h.activeSession()
+	if err != nil {
+		return &proto.SessionAppendResponse{Error: statusMessage(err)}, err
+	}
+
+	var parentID *string
+	if req.ParentId != "" {
+		parentID = &req.ParentId
+	}
+
+	entryID, err := accessor.AppendEntry(ctx, sessionID, req.EntryType, []byte(req.Payload), parentID)
+	if err != nil {
+		return &proto.SessionAppendResponse{Error: err.Error()}, status.Errorf(codes.Internal, "append entry: %v", err)
+	}
+	return &proto.SessionAppendResponse{EntryId: entryID}, nil
+}
+
+// SessionScan implements Host.SessionScan.
+func (h *HostService) SessionScan(ctx context.Context, req *proto.SessionScanRequest) (*proto.SessionScanResponse, error) {
+	accessor, sessionID, err := h.activeSession()
+	if err != nil {
+		return &proto.SessionScanResponse{Error: statusMessage(err)}, err
+	}
+
+	entries, err := accessor.ScanEntries(ctx, sessionID, req.EntryTypeFilter, req.CustomTypeFilter)
+	if err != nil {
+		return &proto.SessionScanResponse{Error: err.Error()}, status.Errorf(codes.Internal, "scan entries: %v", err)
+	}
+
+	protoEntries := make([]*proto.SessionEntry, len(entries))
+	for i, e := range entries {
+		parentID := ""
+		if e.ParentID != nil {
+			parentID = *e.ParentID
+		}
+		protoEntries[i] = &proto.SessionEntry{
+			Id:         e.ID,
+			EntryType:  e.EntryType,
+			CustomType: e.CustomType,
+			Payload:    string(e.Payload),
+			ParentId:   parentID,
+		}
+	}
+	return &proto.SessionScanResponse{Entries: protoEntries}, nil
+}
+
+// SessionSetLabel implements Host.SessionSetLabel.
+func (h *HostService) SessionSetLabel(ctx context.Context, req *proto.SessionSetLabelRequest) (*proto.SessionSetLabelResponse, error) {
+	accessor, sessionID, err := h.activeSession()
+	if err != nil {
+		return &proto.SessionSetLabelResponse{Error: statusMessage(err)}, err
+	}
+
+	entryID, err := accessor.SetLabel(ctx, sessionID, req.EntryId, req.Label)
+	if err != nil {
+		return &proto.SessionSetLabelResponse{Error: err.Error()}, status.Errorf(codes.Internal, "set label: %v", err)
+	}
+	return &proto.SessionSetLabelResponse{EntryId: entryID}, nil
+}
+
+// SessionGetLabel implements Host.SessionGetLabel.
+func (h *HostService) SessionGetLabel(ctx context.Context, req *proto.SessionGetLabelRequest) (*proto.SessionGetLabelResponse, error) {
+	accessor, sessionID, err := h.activeSession()
+	if err != nil {
+		return &proto.SessionGetLabelResponse{Error: statusMessage(err)}, err
+	}
+
+	label, err := accessor.GetLabel(ctx, sessionID, req.EntryId)
+	if err != nil {
+		return &proto.SessionGetLabelResponse{Error: err.Error()}, status.Errorf(codes.Internal, "get label: %v", err)
+	}
+	return &proto.SessionGetLabelResponse{Label: label}, nil
+}
+
+// SessionSendUserMessage implements Host.SessionSendUserMessage. Routes a
+// user message to the active session via the manager's configured sender
+// (Send/Steer/FollowUp), matching pi's pi.sendUserMessage semantics.
+func (h *HostService) SessionSendUserMessage(ctx context.Context, req *proto.SessionSendUserMessageRequest) (*proto.SessionSendUserMessageResponse, error) {
+	h.manager.mu.RLock()
+	sender := h.manager.messageSender
+	h.manager.mu.RUnlock()
+
+	if sender == nil {
+		return &proto.SessionSendUserMessageResponse{
+			Error: "message sender not configured",
+		}, status.Errorf(codes.Unavailable, "message sender not configured")
+	}
+
+	deliverAs := req.DeliverAs
+	switch deliverAs {
+	case "", "steer", "followUp":
+		// valid
+	default:
+		return &proto.SessionSendUserMessageResponse{
+			Error: "invalid deliver_as: must be \"\", \"steer\", or \"followUp\"",
+		}, status.Errorf(codes.InvalidArgument, "invalid deliver_as")
+	}
+
+	if err := sender(req.Text, deliverAs); err != nil {
+		return &proto.SessionSendUserMessageResponse{
+			Ok:    false,
+			Error: err.Error(),
+		}, status.Errorf(codes.Internal, "send user message: %v", err)
+	}
+	return &proto.SessionSendUserMessageResponse{Ok: true}, nil
+}
+
+// errToString converts an error to a string, or empty string if nil.
+func errToString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// getSettings returns the current plugin settings.
+func (m *Manager) getSettings() *ai.Settings {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.settings
+}
+
+// SetSettings updates the plugin settings (e.g., from merged settings.json).
+func (m *Manager) SetSettings(s *ai.Settings) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s == nil {
+		m.settings = &ai.Settings{}
+	} else {
+		m.settings = s
+	}
+}
+
+// ResolveCLIFlags merges parsed CLI flag values into the per-plugin config namespace.
+// After this is called, Host.GetConfig returns CLI-provided values over defaults.
+func (m *Manager) ResolveCLIFlags(pluginName string, flags map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if flags == nil {
+		return
+	}
+	// Initialize if not exists.
+	if _, ok := m.cliFlags[pluginName]; !ok {
+		m.cliFlags[pluginName] = make(map[string]string)
+	}
+	// Merge CLI values (CLI overrides defaults).
+	for k, v := range flags {
+		m.cliFlags[pluginName][k] = v
+	}
+}
+
+// RegisteredCLIFlags returns the currently registered CLI flags by plugin.
+func (m *Manager) RegisteredCLIFlags() map[string][]CLIFlag {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string][]CLIFlag, len(m.plugins))
+	for name, info := range m.plugins {
+		result[name] = append([]CLIFlag(nil), info.Registrations.CLIFlags...)
+	}
+	return result
+}
+
+// SetSessionAccessor configures the session accessor for Host service RPCs.
+// This should be called before plugins are loaded.
+func (m *Manager) SetSessionAccessor(accessor SessionAccessor) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionAccessor = accessor
+}
+
+// SetSessionIDProvider configures the session ID provider for Host service RPCs.
+// This should be called during runtime setup with a function that returns the
+// current active session ID.
+func (m *Manager) SetSessionIDProvider(provider func() string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionIDProvider = provider
+}
+
+// SetSessionCWDProvider configures the session CWD provider used during plugin
+// initialization and Host RPC handling.
+func (m *Manager) SetSessionCWDProvider(provider func() string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionCWDProvider = provider
+}
+
+// SetMessageSender wires the active session's message-sending methods for the
+// SessionSendUserMessage Host RPC. deliverAs must be one of "", "steer",
+// "followUp".
+func (m *Manager) SetMessageSender(sender func(text, deliverAs string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.messageSender = sender
+}
+
+func (m *Manager) currentCWD() string {
+	m.mu.RLock()
+	provider := m.sessionCWDProvider
+	m.mu.RUnlock()
+
+	if provider != nil {
+		if cwd := provider(); cwd != "" {
+			return cwd
+		}
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+
+	return cwd
+}
+
+// getCLIFlag returns a CLI flag value for the given plugin, or "" if not set.
+func (m *Manager) getCLIFlag(pluginName, key string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if flags, ok := m.cliFlags[pluginName]; ok {
+		return flags[key]
+	}
+	return ""
+}
+
+// validatePluginConfig validates the plugin's settings.json config against its JSON Schema.
+// If validation fails, the plugin load is rejected with a clear error.
+func (m *Manager) validatePluginConfig(pluginName, schemaStr string) error {
+	settings := m.getSettings()
+	if settings == nil || settings.Plugins == nil {
+		// No settings means nothing to validate.
+		return nil
+	}
+
+	pluginConfig, ok := settings.Plugins[pluginName]
+	if !ok || pluginConfig == nil {
+		// No plugin config means nothing to validate.
+		return nil
+	}
+
+	// Load the schema.
+	schemaLoader := gojsonschema.NewStringLoader(schemaStr)
+
+	// Load the plugin config as a JSON document.
+	// pluginConfig is already json.RawMessage, so we can use it directly.
+	configDoc := gojsonschema.NewBytesLoader(pluginConfig)
+
+	// Validate.
+	result, err := gojsonschema.Validate(schemaLoader, configDoc)
+	if err != nil {
+		return fmt.Errorf("schema validation error: %w", err)
+	}
+
+	if !result.Valid() {
+		var errMsg string
+		for _, desc := range result.Errors() {
+			errMsg += fmt.Sprintf("\n  - %s", desc)
+		}
+		return fmt.Errorf("config validation failed for plugin %q:%s", pluginName, errMsg)
+	}
+
+	return nil
+}
+
+// splitLines splits content into lines.
+func splitLines(content string) []string {
+	return strings.Split(content, "\n")
+}
+
+// trimSpace returns s with leading and trailing whitespace removed.
+func trimSpace(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}

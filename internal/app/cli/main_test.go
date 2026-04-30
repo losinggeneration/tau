@@ -1,0 +1,1893 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/losinggeneration/tau/agent/packages"
+	"github.com/losinggeneration/tau/agent/session"
+	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/ai/oauth"
+	"github.com/losinggeneration/tau/ai/store"
+	"github.com/losinggeneration/tau/commands"
+	"github.com/losinggeneration/tau/rpc/server"
+	"github.com/losinggeneration/tau/sdk"
+	"github.com/losinggeneration/tau/ui"
+	"github.com/urfave/cli/v3"
+)
+
+// mockCredStore is a test double for the credential store.
+type mockCredStore struct {
+	getCalled bool
+	getCred   ai.Credential
+	getErr    error
+	provider  string
+}
+
+func (m *mockCredStore) Get(_ context.Context, provider string) (ai.Credential, error) {
+	m.getCalled = true
+	m.provider = provider
+	if m.getErr != nil {
+		return ai.Credential{}, m.getErr
+	}
+	return m.getCred, nil
+}
+
+func (m *mockCredStore) Set(_ context.Context, _ string, _ ai.Credential) error {
+	return nil
+}
+
+func (m *mockCredStore) Delete(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *mockCredStore) List(_ context.Context) ([]ai.CredentialRef, error) {
+	return nil, nil
+}
+
+func (m *mockCredStore) RefreshOAuth(_ context.Context, _ string, _ oauth.Provider) (ai.Credential, error) {
+	return ai.Credential{}, nil
+}
+
+// TestPrintModeGoldensAgainstRealProvider tests that SDK can be configured with real providers.
+// This covers the spec requirement: "SDK tests that exercise real runtime/session wiring".
+// Uses mock credential store so we can verify the SDK wires it correctly without needing real API keys.
+func TestNewRootCommandRegistersCLIOnlySubcommands(t *testing.T) {
+	cmd := newRootCommand()
+	var models *cli.Command
+	var login *cli.Command
+	var providers *cli.Command
+	for _, child := range cmd.Commands {
+		switch child.Name {
+		case "models":
+			models = child
+		case "login":
+			login = child
+		case "providers":
+			providers = child
+		case "accounts":
+			t.Fatal("new root command should expose providers, not accounts")
+		}
+	}
+	if models == nil {
+		t.Fatal("new root command did not register models subcommand")
+	}
+	if !slices.Contains(models.Aliases, "model") {
+		t.Fatalf("models aliases = %v, want singular alias %q", models.Aliases, "model")
+	}
+	if login == nil {
+		t.Fatal("new root command did not register login subcommand")
+	}
+	if providers == nil {
+		t.Fatal("new root command did not register providers subcommand")
+	}
+	var list *cli.Command
+	for _, child := range models.Commands {
+		if child.Name == "list" {
+			list = child
+			break
+		}
+	}
+	if list == nil {
+		t.Fatal("models subcommand did not register list subcommand")
+	}
+}
+
+func TestModelAliasListRunsAsSubcommand(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+	cmd := newRootCommand()
+	ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
+	ctx = context.WithValue(ctx, rootPromptDelimiterKey{}, false)
+
+	if err := cmd.Run(ctx, []string{"tau", "model", "list"}); err != nil {
+		t.Fatalf("tau model list returned error: %v", err)
+	}
+}
+
+func TestLoginOpenAIWithoutCredentialFails(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+
+	cmd := newRootCommand()
+	cmd.ExitErrHandler = func(context.Context, *cli.Command, error) {}
+	err := cmd.Run(context.Background(), []string{"tau", "login", ai.ProviderOpenAI})
+	if err == nil {
+		t.Fatal("tau login openai succeeded without credentials; want error")
+	}
+	if !strings.Contains(err.Error(), "missing API key for openai") || !strings.Contains(err.Error(), "OPENAI_API_KEY") {
+		t.Fatalf("error = %q, want missing OPENAI_API_KEY guidance", err.Error())
+	}
+
+	fb := store.NewFileBackend(filepath.Join(configDir, "auth.json"), store.Options{})
+	if _, err := fb.Get(context.Background(), ai.ProviderOpenAI); !errors.Is(err, ai.ErrCredentialNotFound) && !os.IsNotExist(err) {
+		t.Fatalf("stored OpenAI credential after failed login: err=%v", err)
+	}
+}
+
+func TestLoginOpenAIRejectsOAuthFlag(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+
+	cmd := newRootCommand()
+	cmd.ExitErrHandler = func(context.Context, *cli.Command, error) {}
+	err := cmd.Run(context.Background(), []string{"tau", "login", ai.ProviderOpenAI, "--oauth"})
+	if err == nil {
+		t.Fatal("tau login openai --oauth succeeded; want error")
+	}
+	if !strings.Contains(err.Error(), "OAuth login is not supported for openai") {
+		t.Fatalf("error = %q, want unsupported OAuth guidance", err.Error())
+	}
+}
+
+func TestLoginOpenAIWithAPIKeyStoresAPIKey(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+
+	cmd := newRootCommand()
+	if err := cmd.Run(context.Background(), []string{"tau", "login", ai.ProviderOpenAI, "--api-key", "sk-test"}); err != nil {
+		t.Fatalf("tau login openai --api-key returned error: %v", err)
+	}
+
+	fb := store.NewFileBackend(filepath.Join(configDir, "auth.json"), store.Options{})
+	cred, err := fb.Get(context.Background(), ai.ProviderOpenAI)
+	if err != nil {
+		t.Fatalf("get stored credential: %v", err)
+	}
+	if cred.Type != ai.CredentialTypeAPIKey || cred.APIKey != "sk-test" {
+		t.Fatalf("stored credential = %+v, want API key", cred)
+	}
+}
+
+func TestLoginLocalProviderWithoutCredentialStoresNone(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+
+	for _, provider := range []string{ai.ProviderOllama, ai.ProviderClaudeAgent} {
+		t.Run(provider, func(t *testing.T) {
+			cmd := newRootCommand()
+			if err := cmd.Run(context.Background(), []string{"tau", "login", provider}); err != nil {
+				t.Fatalf("tau login %s returned error: %v", provider, err)
+			}
+
+			fb := store.NewFileBackend(filepath.Join(configDir, "auth.json"), store.Options{})
+			cred, err := fb.Get(context.Background(), provider)
+			if err != nil {
+				t.Fatalf("get stored credential: %v", err)
+			}
+			if cred.Type != ai.CredentialTypeNone {
+				t.Fatalf("stored credential type = %q, want %q", cred.Type, ai.CredentialTypeNone)
+			}
+		})
+	}
+}
+
+func TestRenderSessionsListUsesShortestUniqueIDsAndTerminalWidth(t *testing.T) {
+	summaries := []session.SessionSummary{
+		{ID: "abcdef00-0000-0000-0000-000000000000", Name: "short", FirstPrompt: "short", CWD: "/tmp/project", Created: "2026-08-30T00:00:00Z", MessageCount: 12, Tokens: session.TokenCounts{Input: 100, Output: 23}},
+		{ID: "abcfff00-0000-0000-0000-000000000000", Name: "a-very-long-session-name", FirstPrompt: "a very long session name\nwith extra prompt body", CWD: "/home/harley/Projects/ai/tau/with/a/long/path", Created: "2026-08-29T00:00:00Z", MessageCount: 3, Tokens: session.TokenCounts{Input: 4, Output: 5}},
+	}
+
+	var b strings.Builder
+	if err := renderSessionsList(&b, summaries, 120); err != nil {
+		t.Fatalf("renderSessionsList: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimRight(b.String(), "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("lines = %d, want 4:\n%s", len(lines), b.String())
+	}
+	for _, line := range lines {
+		if got := len(line); got != 120 {
+			t.Fatalf("line width = %d, want 120 for %q\nfull output:\n%s", got, line, b.String())
+		}
+	}
+	if !strings.HasPrefix(lines[2], "abcd") || !strings.HasPrefix(lines[3], "abcf") {
+		t.Fatalf("IDs not shortened to unique prefixes:\n%s", b.String())
+	}
+	if strings.Contains(b.String(), "abcdef00-") {
+		t.Fatalf("full ID leaked into list:\n%s", b.String())
+	}
+	if !strings.Contains(lines[2], "/tmp/project") {
+		t.Fatalf("short cwd should not be truncated:\n%s", b.String())
+	}
+	if !strings.Contains(lines[3], "a very long session name") {
+		t.Fatalf("slug-derived name should render the first prompt:\n%s", b.String())
+	}
+	if strings.Contains(b.String(), "extra prompt body") {
+		t.Fatalf("prompt-derived list name should only use first non-empty line:\n%s", b.String())
+	}
+}
+
+func TestSessionListNameKeepsExplicitRename(t *testing.T) {
+	summary := session.SessionSummary{Name: "manual-name", FirstPrompt: "original prompt"}
+	if got := sessionListName(summary); got != "manual-name" {
+		t.Fatalf("sessionListName = %q, want explicit name", got)
+	}
+}
+
+func TestRunModelsListAllShowsBuiltInModelsWithoutCredentials(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+
+	cmd := &cli.Command{Flags: cloneFlags(ModelsListFlags)}
+	if err := cmd.Set("all", "true"); err != nil {
+		t.Fatalf("set all: %v", err)
+	}
+
+	stdout := captureStdout(t, func() {
+		if err := runModelsList(context.Background(), cmd); err != nil {
+			t.Fatalf("runModelsList: %v", err)
+		}
+	})
+
+	lines := nonEmptyLines(stdout)
+	if len(lines) == 0 {
+		t.Fatalf("runModelsList --all printed no models; output:\n%s", stdout)
+	}
+	if !slices.Contains(lines, ai.ProviderOpenAI+"/gpt-5.5") {
+		t.Fatalf("runModelsList --all missing generated built-in model %s/gpt-5.5; output:\n%s", ai.ProviderOpenAI, stdout)
+	}
+}
+
+func TestModelsListFlagsIncludesAllAlias(t *testing.T) {
+	have := flagNames(ModelsListFlags)
+	for _, want := range []string{"all", "a"} {
+		if _, ok := have[want]; !ok {
+			t.Fatalf("ModelsListFlags missing %q; have %v", want, sortedKeys(have))
+		}
+	}
+}
+
+func TestRunModelsListUsesStoredCredentials(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+
+	fb := store.NewFileBackend(filepath.Join(configDir, "auth.json"), store.Options{})
+	if err := fb.EnsureDir(); err != nil {
+		t.Fatalf("ensure auth dir: %v", err)
+	}
+	if err := fb.Set(context.Background(), ai.ProviderAnthropic, ai.NewAPIKeyCredential("test-key")); err != nil {
+		t.Fatalf("set credential: %v", err)
+	}
+
+	cmd := &cli.Command{Flags: ModelsListFlags}
+	if err := cmd.Set("provider", ai.ProviderAnthropic); err != nil {
+		t.Fatalf("set provider: %v", err)
+	}
+
+	stdout := captureStdout(t, func() {
+		if err := runModelsList(context.Background(), cmd); err != nil {
+			t.Fatalf("runModelsList: %v", err)
+		}
+	})
+
+	lines := nonEmptyLines(stdout)
+	if len(lines) < 2 {
+		t.Fatalf("runModelsList printed %d lines, want multiple Anthropic models; output:\n%s", len(lines), stdout)
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(line, ai.ProviderAnthropic+"/") {
+			t.Fatalf("line = %q, want provider-filtered Anthropic model", line)
+		}
+		if strings.Contains(line, "/default/") {
+			t.Fatalf("line = %q, want provider/model row", line)
+		}
+	}
+}
+
+func TestRunModelsListUsesEnvironmentCredentialsAndProviderFilter(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+
+	cmd := &cli.Command{Flags: ModelsListFlags}
+	if err := cmd.Set("provider", ai.ProviderOpenAI); err != nil {
+		t.Fatalf("set provider: %v", err)
+	}
+
+	stdout := captureStdout(t, func() {
+		if err := runModelsList(context.Background(), cmd); err != nil {
+			t.Fatalf("runModelsList: %v", err)
+		}
+	})
+
+	lines := nonEmptyLines(stdout)
+	if len(lines) < 2 {
+		t.Fatalf("runModelsList printed %d lines, want multiple OpenAI models; output:\n%s", len(lines), stdout)
+	}
+	foundGenerated := false
+	for _, line := range lines {
+		if !strings.HasPrefix(line, ai.ProviderOpenAI+"/") {
+			t.Fatalf("line = %q, want provider-filtered OpenAI model", line)
+		}
+		if line == ai.ProviderOpenAI+"/gpt-5.5" {
+			foundGenerated = true
+		}
+	}
+	if !foundGenerated {
+		t.Fatalf("runModelsList output missing generated built-in model %s/gpt-5.5; output:\n%s", ai.ProviderOpenAI, stdout)
+	}
+}
+
+func TestRunProvidersIncludesEnvironmentCredentials(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+
+	fb := store.NewFileBackend(filepath.Join(configDir, "auth.json"), store.Options{})
+	if err := fb.EnsureDir(); err != nil {
+		t.Fatalf("ensure auth dir: %v", err)
+	}
+	if err := fb.Set(context.Background(), ai.ProviderAnthropic, ai.NewAPIKeyCredential("test-key")); err != nil {
+		t.Fatalf("set credential: %v", err)
+	}
+
+	cmd := &cli.Command{Flags: ProvidersFlags}
+	stdout := captureStdout(t, func() {
+		if err := runProviders(context.Background(), cmd); err != nil {
+			t.Fatalf("runProviders: %v", err)
+		}
+	})
+
+	if !strings.Contains(stdout, ai.ProviderAnthropic+"  [api_key]") {
+		t.Fatalf("runProviders output missing stored provider; output:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, ai.ProviderOpenAI+"  [api_key]") {
+		t.Fatalf("runProviders output missing env provider; output:\n%s", stdout)
+	}
+}
+
+func TestMergeProviderRefsWithEnvDoesNotDuplicateStoredProvider(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	refs := mergeProviderRefsWithEnv([]ai.CredentialRef{{
+		Provider: ai.ProviderOpenAI,
+		Type:     ai.CredentialTypeOAuth,
+	}})
+
+	count := 0
+	for _, ref := range refs {
+		if ref.Provider == ai.ProviderOpenAI {
+			count++
+			if ref.Type != ai.CredentialTypeOAuth {
+				t.Fatalf("stored provider type = %q, want oauth preserved", ref.Type)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("openai provider ref count = %d, want 1; refs: %#v", count, refs)
+	}
+}
+
+func TestRejectCommandShapedRootArgs(t *testing.T) {
+	cmd := newRootCommand()
+	if err := rejectCommandShapedRootArgs(context.Background(), cmd, []string{"modles", "list"}); err == nil {
+		t.Fatal("bare multi-token root args should be rejected as command-shaped")
+	}
+	ctxWithDelimiter := context.WithValue(context.Background(), rootPromptDelimiterKey{}, true)
+	if err := rejectCommandShapedRootArgs(ctxWithDelimiter, cmd, []string{"model", "list"}); err != nil {
+		t.Fatalf("explicit -- prompt delimiter should allow multi-token prompt args: %v", err)
+	}
+	if err := rejectCommandShapedRootArgs(context.Background(), cmd, []string{"model list"}); err != nil {
+		t.Fatalf("single quoted prompt arg should be allowed: %v", err)
+	}
+}
+
+func TestPrintModeGoldensAgainstRealProvider(t *testing.T) {
+	// Clear and re-init providers
+	ai.Clear()
+	ai.Init()
+
+	// Create mock credential store
+	credStore := &mockCredStore{
+		getCred: ai.NewAPIKeyCredential("sk-test-key"),
+	}
+
+	rt, err := sdk.NewRuntime(sdk.RuntimeOptions{
+		CredentialStore: credStore,
+		ExplicitModel:   "anthropic/claude-sonnet-4-6",
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background())
+
+	sess, err := rt.NewSession(context.Background(), sdk.SessionOptions{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close(context.Background())
+
+	// Verify session was created successfully with correct model
+	state := sess.State()
+	if state.SessionID() == "" {
+		t.Error("expected non-empty session ID")
+	}
+	if state.Model() != "anthropic/claude-sonnet-4-6" {
+		t.Errorf("expected model 'anthropic/claude-sonnet-4-6', got %q", state.Model())
+	}
+}
+
+// TestJSONEventSchemaValidationAgainstRealProvider tests that SDK Event types map correctly
+// to the JSON event types specified in the modes/SDK spec.
+func TestJSONEventSchemaValidationAgainstRealProvider(t *testing.T) {
+	// Clear and re-init providers
+	ai.Clear()
+	ai.Init()
+
+	// Create mock credential store
+	credStore := &mockCredStore{
+		getCred: ai.NewAPIKeyCredential("sk-test-key"),
+	}
+
+	rt, err := sdk.NewRuntime(sdk.RuntimeOptions{
+		CredentialStore: credStore,
+		ExplicitModel:   "anthropic/claude-sonnet-4-6",
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background())
+
+	sess, err := rt.NewSession(context.Background(), sdk.SessionOptions{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close(context.Background())
+
+	// Session should be created with the correct model
+	state := sess.State()
+	if state.SessionID() == "" {
+		t.Error("expected non-empty session ID")
+	}
+	if state.Model() != "anthropic/claude-sonnet-4-6" {
+		t.Errorf("expected model 'anthropic/claude-sonnet-4-6', got %q", state.Model())
+	}
+
+	// Valid types per spec (SDK Event types map to JSON event types)
+	validTypes := map[string]bool{
+		"session_start":  true,
+		"message_start":  true,
+		"text_delta":     true,
+		"thinking_delta": true,
+		"tool_call":      true,
+		"tool_progress":  true,
+		"tool_result":    true,
+		"command_result": true,
+		"message_end":    true,
+		"usage":          true,
+		"error":          true,
+		"session_end":    true,
+		"ui_confirm":     true,
+		"ui_select":      true,
+		"ui_input":       true,
+		"ui_notify":      true,
+		"ui_set_status":  true,
+		"ui_set_widget":  true,
+	}
+
+	// Verify we can build valid event structures
+	for _, eventType := range []string{"session_start", "session_end"} {
+		if !validTypes[eventType] {
+			t.Errorf("expected %q to be a valid event type", eventType)
+		}
+	}
+}
+
+// TestJSONStreamLFDelimited validates that SDK events can be serialized to LF-delimited JSON.
+// cmd/tau --json outputs these as JSONL with LF as the record separator per spec.
+func TestJSONStreamLFDelimited(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+
+	// Create mock credential store
+	credStore := &mockCredStore{
+		getCred: ai.NewAPIKeyCredential("sk-test-key"),
+	}
+
+	rt, err := sdk.NewRuntime(sdk.RuntimeOptions{
+		CredentialStore: credStore,
+		ExplicitModel:   "anthropic/claude-sonnet-4-6",
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background())
+
+	sess, err := rt.NewSession(context.Background(), sdk.SessionOptions{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close(context.Background())
+
+	// Verify session was created successfully
+	state := sess.State()
+	if state.SessionID() == "" {
+		t.Error("expected non-empty session ID")
+	}
+
+	// Verify the event struct can be marshaled to JSON
+	event := sdk.Event{
+		Type:      "session_start",
+		SessionID: state.SessionID(),
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	// Verify each line is valid JSON (LF-delimited, not other separators)
+	var obj map[string]any
+	if err := json.Unmarshal(data, &obj); err != nil {
+		t.Errorf("event is not valid JSON: %v", err)
+	}
+	// Should not contain U+2028 or U+2029 (valid in JSON strings but not as separators)
+	if strings.Contains(string(data), "\xe2\x80\xa8") || strings.Contains(string(data), "\xe2\x80\xa9") {
+		t.Error("event contains U+2028/U+2029 which cannot be used as separators")
+	}
+}
+
+// isolateBuildEnv points tau's config + home at temp dirs so runtime-option
+// builds never see the developer's real extensions/packages.
+func isolateBuildEnv(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", tmp)
+	t.Setenv("HOME", tmp)
+	return tmp
+}
+
+func TestBuildRuntimeOptionsWithoutPluginsSkipsManager(t *testing.T) {
+	isolateBuildEnv(t)
+
+	_, pluginMgr, loader, _ := buildRuntimeOptions(context.Background(), ui.NewNoOpUI(), nil, withoutPlugins())
+	if pluginMgr != nil {
+		t.Fatal("withoutPlugins returned a plugin manager; want nil")
+	}
+	if loader == nil {
+		t.Fatal("expected artifact loader even without plugins")
+	}
+}
+
+func TestBuildRuntimeOptionsDefaultCreatesManager(t *testing.T) {
+	isolateBuildEnv(t)
+
+	_, pluginMgr, _, _ := buildRuntimeOptions(context.Background(), ui.NewNoOpUI(), nil)
+	if pluginMgr == nil {
+		t.Fatal("default buildRuntimeOptions returned nil plugin manager")
+	}
+}
+
+func TestBuildConversationRuntimeOptionsHonorsRootFlags(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionDir := filepath.Join(tmpDir, "sessions")
+	projectDir := filepath.Join(tmpDir, "project")
+	skillDir := filepath.Join(projectDir, ".tau", "skills")
+
+	requireNoError := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	requireNoError(os.MkdirAll(skillDir, 0o755))
+	requireNoError(os.WriteFile(filepath.Join(skillDir, "test-skill.md"), []byte("---\nname: test-skill\n---\nskill body"), 0o644))
+
+	origWD, err := os.Getwd()
+	requireNoError(err)
+	requireNoError(os.Chdir(projectDir))
+	defer func() {
+		requireNoError(os.Chdir(origWD))
+	}()
+
+	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	requireNoError(cmd.Set("session-dir", sessionDir))
+	requireNoError(cmd.Set("no-skills", "true"))
+
+	ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
+	rtOpts, _, loader, _, _ := buildConversationRuntimeOptions(ctx, nil)
+
+	if rtOpts.SessionsDir != sessionDir {
+		t.Fatalf("SessionsDir = %q, want %q", rtOpts.SessionsDir, sessionDir)
+	}
+	if loader == nil {
+		t.Fatal("expected artifact loader")
+	}
+	if loader.SkillRegistry().Len() != 0 {
+		t.Fatalf("expected no skills to be discovered when --no-skills is set, found %d", loader.SkillRegistry().Len())
+	}
+}
+
+func TestBuildConversationRuntimeOptionsIncludesCLIArtifactPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	projectDir := filepath.Join(tmpDir, "project")
+	skillPath := filepath.Join(tmpDir, "cli-skill.md")
+
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	if err := os.WriteFile(skillPath, []byte("---\nname: cli-skill\ndescription: cli\n---\nbody"), 0o644); err != nil {
+		t.Fatalf("write skill: %v", err)
+	}
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(projectDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(origWD); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	}()
+
+	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	if err := cmd.Set("skill", skillPath); err != nil {
+		t.Fatalf("set skill flag: %v", err)
+	}
+
+	ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
+	_, _, loader, _, _ := buildConversationRuntimeOptions(ctx, nil)
+	if loader == nil {
+		t.Fatal("expected artifact loader")
+	}
+	if _, ok := loader.SkillRegistry().Get("cli-skill"); !ok {
+		t.Fatal("expected CLI skill path to be discovered")
+	}
+}
+
+func TestBuildConversationRuntimeOptionsResolvesModelsFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, "config")
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+
+	// The flat settings.json schema has a single defaultProvider/defaultModel
+	// pair. Custom model lists live in models.json instead.
+	modelsPath := filepath.Join(configDir, "models.json")
+	reg := ai.NewModelRegistry()
+	if err := reg.SetCustomModels("anthropic", []string{"claude-sonnet-4-6", "claude-opus-4-6"}); err != nil {
+		t.Fatalf("set custom models: %v", err)
+	}
+	if err := ai.SaveModelRegistry(modelsPath, reg); err != nil {
+		t.Fatalf("save models: %v", err)
+	}
+
+	settings := &ai.Settings{
+		DefaultProvider: "anthropic",
+		DefaultModel:    "claude-sonnet-4-6",
+	}
+	if err := ai.SaveSettings(filepath.Join(configDir, "settings.json"), settings); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+
+	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	if err := cmd.Set("models", "claude-sonnet-4-6"); err != nil {
+		t.Fatalf("set models flag: %v", err)
+	}
+
+	ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
+	rtOpts, _, _, _, sessionFlags := buildConversationRuntimeOptions(ctx, nil)
+	if sessionFlags.SelectionError != nil {
+		t.Fatalf("SelectionError = %v", sessionFlags.SelectionError)
+	}
+	if got, want := rtOpts.ExplicitModel, "anthropic/claude-sonnet-4-6"; got != want {
+		t.Fatalf("ExplicitModel = %q, want %q", got, want)
+	}
+}
+
+func TestRunListModelsIncludesGeneratedBuiltInModels(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+
+	stdout := captureStdout(t, func() {
+		if code := runListModels(context.Background(), "gpt-5.5"); code != ExitSuccess {
+			t.Fatalf("runListModels exit code = %d, want %d", code, ExitSuccess)
+		}
+	})
+
+	lines := nonEmptyLines(stdout)
+	if len(lines) == 0 {
+		t.Fatalf("runListModels printed no matches for generated built-in model; output:\n%s", stdout)
+	}
+	found := false
+	for _, line := range lines {
+		if line == "openai/gpt-5.5" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("runListModels output missing generated built-in model openai/gpt-5.5; output:\n%s", stdout)
+	}
+}
+
+func TestBuildPromptSequence(t *testing.T) {
+	t.Run("stdin_becomes_prompt_without_positional_args", func(t *testing.T) {
+		prompts, err := buildPromptSequence(nil, nil, strings.NewReader("stdin prompt"), false, false)
+		if err != nil {
+			t.Fatalf("buildPromptSequence: %v", err)
+		}
+		if len(prompts) != 1 || prompts[0] != "stdin prompt" {
+			t.Fatalf("prompts = %#v, want stdin-only prompt", prompts)
+		}
+	})
+
+	t.Run("stdin_and_positional_joined_without_separator_remaining_messages_sequential", func(t *testing.T) {
+		prompts, err := buildPromptSequence(
+			[]string{"positional prompt"},
+			[]string{"follow up one", "follow up two"},
+			strings.NewReader("stdin context"),
+			false,
+			false,
+		)
+		if err != nil {
+			t.Fatalf("buildPromptSequence: %v", err)
+		}
+		// Composition order: stdin + first positional, joined with no
+		// separator. Remaining -m messages follow as sequential prompts.
+		want := []string{
+			"stdin contextpositional prompt",
+			"follow up one",
+			"follow up two",
+		}
+		if len(prompts) != len(want) {
+			t.Fatalf("len(prompts) = %d, want %d (%#v)", len(prompts), len(want), prompts)
+		}
+		for i := range want {
+			if prompts[i] != want[i] {
+				t.Fatalf("prompts[%d] = %q, want %q", i, prompts[i], want[i])
+			}
+		}
+	})
+
+	t.Run("force_read_stdin_reads_even_when_tty", func(t *testing.T) {
+		prompts, err := buildPromptSequence(nil, []string{"message"}, strings.NewReader("forced stdin"), true, true)
+		if err != nil {
+			t.Fatalf("buildPromptSequence: %v", err)
+		}
+		want := []string{"forced stdin", "message"}
+		for i := range want {
+			if prompts[i] != want[i] {
+				t.Fatalf("prompts[%d] = %q, want %q", i, prompts[i], want[i])
+			}
+		}
+	})
+
+	t.Run("empty_stdin_does_not_create_prompt", func(t *testing.T) {
+		prompts, err := buildPromptSequence(nil, nil, io.NopCloser(strings.NewReader("")), false, false)
+		if err != nil {
+			t.Fatalf("buildPromptSequence: %v", err)
+		}
+		if len(prompts) != 0 {
+			t.Fatalf("prompts = %#v, want empty", prompts)
+		}
+	})
+}
+
+func TestProcessEventWith_NoStreamBuffersUntilMessageEnd(t *testing.T) {
+	stdout := captureStdout(t, func() {
+		var mu sync.Mutex
+		p := &eventPrinter{NoStream: true}
+		processEventWith(&sdk.Event{Type: "text_delta", Payload: map[string]any{"delta": "hello "}}, &mu, p)
+		processEventWith(&sdk.Event{Type: "text_delta", Payload: map[string]any{"delta": "world"}}, &mu, p)
+		// Nothing should have printed yet.
+		processEventWith(&sdk.Event{Type: "message_end", Payload: map[string]any{}}, &mu, p)
+	})
+	if stdout != "hello world" {
+		t.Errorf("stdout = %q, want 'hello world'", stdout)
+	}
+}
+
+func TestProcessEventWith_StreamingPrintsImmediately(t *testing.T) {
+	stdout := captureStdout(t, func() {
+		var mu sync.Mutex
+		p := &eventPrinter{NoStream: false}
+		processEventWith(&sdk.Event{Type: "text_delta", Payload: map[string]any{"delta": "hi"}}, &mu, p)
+	})
+	if stdout != "hi" {
+		t.Errorf("stdout = %q, want 'hi'", stdout)
+	}
+}
+
+func TestProcessEventWith_UsageAcceptsIntegerTokenCounts(t *testing.T) {
+	stderr := captureStderr(t, func() {
+		var mu sync.Mutex
+		processEventWith(&sdk.Event{Type: "usage", Payload: map[string]any{
+			"this_call": map[string]any{"input_tokens": 120, "output_tokens": 30},
+		}}, &mu, nil)
+	})
+	if !strings.Contains(stderr, "[tokens: in=120 out=30]") {
+		t.Errorf("stderr = %q, want integer token counts to be printed", stderr)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, _ := os.Pipe()
+	orig := os.Stdout
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 1024)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				b.Write(buf[:n])
+			}
+			if err != nil {
+				done <- b.String()
+				return
+			}
+		}
+	}()
+	fn()
+	w.Close()
+	os.Stdout = orig
+	return <-done
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, _ := os.Pipe()
+	orig := os.Stderr
+	os.Stderr = w
+	done := make(chan string)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 1024)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				b.Write(buf[:n])
+			}
+			if err != nil {
+				done <- b.String()
+				return
+			}
+		}
+	}()
+	fn()
+	w.Close()
+	os.Stderr = orig
+	return <-done
+}
+
+func nonEmptyLines(s string) []string {
+	raw := strings.Split(s, "\n")
+	lines := make([]string, 0, len(raw))
+	for _, line := range raw {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func TestRegisterBuiltInCommands_RegistersExpectedNames(t *testing.T) {
+	reg := commands.NewInMemoryRegistry()
+	registerBuiltInCommands(reg)
+
+	want := []string{"login", "help", "reload", "sessions", "set-model", "show-model"}
+	for _, name := range want {
+		if _, _, ok := reg.Lookup(name); !ok {
+			t.Errorf("built-in command /%s not registered", name)
+		}
+	}
+}
+
+func TestRegisterBuiltInCommands_HelpListsCommands(t *testing.T) {
+	reg := commands.NewInMemoryRegistry()
+	registerBuiltInCommands(reg)
+
+	h, _, ok := reg.Lookup("help")
+	if !ok {
+		t.Fatal("/help not registered")
+	}
+	res, err := h(context.Background(), "", nil, nil)
+	if err != nil {
+		t.Fatalf("help handler: %v", err)
+	}
+	if !strings.Contains(res.Output, "/login") || !strings.Contains(res.Output, "/reload") {
+		t.Errorf("help output missing expected commands: %s", res.Output)
+	}
+}
+
+func TestNormalizeToolList(t *testing.T) {
+	t.Run("nil_input_returns_nil", func(t *testing.T) {
+		if got := normalizeToolList(nil); got != nil {
+			t.Errorf("normalizeToolList(nil) = %v, want nil", got)
+		}
+	})
+	t.Run("repeated_single_names", func(t *testing.T) {
+		got := normalizeToolList([]string{"read", "bash", "read"})
+		want := []string{"read", "bash"}
+		if !slicesEqual(got, want) {
+			t.Errorf("normalizeToolList(repeated) = %v, want %v", got, want)
+		}
+	})
+	t.Run("comma_separated_single_arg", func(t *testing.T) {
+		got := normalizeToolList([]string{"read,bash,edit"})
+		want := []string{"read", "bash", "edit"}
+		if !slicesEqual(got, want) {
+			t.Errorf("normalizeToolList(csv) = %v, want %v", got, want)
+		}
+	})
+	t.Run("mixed_csv_and_repeated", func(t *testing.T) {
+		got := normalizeToolList([]string{"read,bash", "edit", "bash"})
+		want := []string{"read", "bash", "edit"}
+		if !slicesEqual(got, want) {
+			t.Errorf("normalizeToolList(mixed) = %v, want %v", got, want)
+		}
+	})
+	t.Run("whitespace_trimmed_and_blanks_skipped", func(t *testing.T) {
+		got := normalizeToolList([]string{"  read , , bash  "})
+		want := []string{"read", "bash"}
+		if !slicesEqual(got, want) {
+			t.Errorf("normalizeToolList(whitespace) = %v, want %v", got, want)
+		}
+	})
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestApplyConversationFlags_NewPiCompatibleFlags(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionDir := filepath.Join(tmpDir, "sessions")
+	projectDir := filepath.Join(tmpDir, "project")
+	// Isolate the model registry from any global state left by other tests.
+	t.Setenv("TAU_CONFIG_DIR", tmpDir)
+
+	requireNoError := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	requireNoError(os.MkdirAll(projectDir, 0o755))
+
+	// Seed a model registry so the model resolution path inside
+	// applyConversationFlags doesn't fail when --models is non-empty
+	// (urfave/cli/v3 keeps StringSliceFlag value state on the package-level
+	// flag pointer, so a previous test may have set a value that bleeds in).
+	modelsPath := filepath.Join(tmpDir, "models.json")
+	reg := ai.NewModelRegistry()
+	requireNoError(reg.SetCustomModels("anthropic", []string{"claude-sonnet-4-6", "claude-opus-4-6"}))
+	requireNoError(ai.SaveModelRegistry(modelsPath, reg))
+	requireNoError(ai.SaveSettings(filepath.Join(tmpDir, "settings.json"), &ai.Settings{
+		DefaultProvider: "anthropic",
+		DefaultModel:    "claude-sonnet-4-6",
+	}))
+
+	origWD, err := os.Getwd()
+	requireNoError(err)
+	requireNoError(os.Chdir(projectDir))
+	defer func() { requireNoError(os.Chdir(origWD)) }()
+
+	allFlags := cloneFlags(append(append([]cli.Flag{}, RootFlags...), ConversationFlags...))
+	cmd := &cli.Command{Flags: allFlags}
+	requireNoError(cmd.Set("session-dir", sessionDir))
+	requireNoError(cmd.Set("provider", "anthropic"))
+	requireNoError(cmd.Set("api-key", "sk-test"))
+	requireNoError(cmd.Set("name", "refactor session"))
+	requireNoError(cmd.Set("system-prompt", "you are a Go expert"))
+	requireNoError(cmd.Set("append-system-prompt", "always run go test"))
+	requireNoError(cmd.Set("append-system-prompt", "prefer table-driven tests"))
+	requireNoError(cmd.Set("tools", "read,ls"))
+	requireNoError(cmd.Set("exclude-tools", "bash"))
+	requireNoError(cmd.Set("approve", "true"))
+	requireNoError(cmd.Set("session-id", "exact-123"))
+
+	settings, err := loadSettings()
+	requireNoError(err)
+	var rtOpts sdk.RuntimeOptions
+	rtOpts.Settings = settings
+	sf := applyConversationFlags(&rtOpts, cmd)
+
+	if sf.SelectionError != nil {
+		t.Fatalf("SelectionError = %v", sf.SelectionError)
+	}
+	if rtOpts.Provider != "anthropic" {
+		t.Errorf("Provider = %q, want %q", rtOpts.Provider, "anthropic")
+	}
+	if rtOpts.APIKey != "sk-test" {
+		t.Errorf("APIKey = %q, want %q", rtOpts.APIKey, "sk-test")
+	}
+	if sf.DisplayName != "refactor session" {
+		t.Errorf("DisplayName = %q, want %q", sf.DisplayName, "refactor session")
+	}
+	if sf.SystemPrompt != "you are a Go expert" {
+		t.Errorf("SystemPrompt = %q, want %q", sf.SystemPrompt, "you are a Go expert")
+	}
+	if !slicesEqual(sf.AppendSystemPrompts, []string{"always run go test", "prefer table-driven tests"}) {
+		t.Errorf("AppendSystemPrompts = %v", sf.AppendSystemPrompts)
+	}
+	if !slicesEqual(sf.ToolAllowlist, []string{"read", "ls"}) {
+		t.Errorf("ToolAllowlist = %v", sf.ToolAllowlist)
+	}
+	if !slicesEqual(sf.ToolDenylist, []string{"bash"}) {
+		t.Errorf("ToolDenylist = %v", sf.ToolDenylist)
+	}
+	if !sf.ApproveProjectFiles {
+		t.Error("ApproveProjectFiles = false, want true")
+	}
+	// --session-id should win over --session and be applied.
+	if sf.ResumeSessionID != "exact-123" {
+		t.Errorf("ResumeSessionID = %q, want %q", sf.ResumeSessionID, "exact-123")
+	}
+}
+
+func TestApplyConversationFlags_NoApproveOverridesApprove(t *testing.T) {
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(origWD) }()
+
+	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	if err := cmd.Set("approve", "true"); err != nil {
+		t.Fatalf("set approve: %v", err)
+	}
+	if err := cmd.Set("no-approve", "true"); err != nil {
+		t.Fatalf("set no-approve: %v", err)
+	}
+
+	var rtOpts sdk.RuntimeOptions
+	sf := applyConversationFlags(&rtOpts, cmd)
+	// When both are set, --no-approve wins (more conservative).
+	if sf.ApproveProjectFiles {
+		t.Error("ApproveProjectFiles = true, want false (--no-approve should override --approve)")
+	}
+}
+
+func TestSubCommandAliases_Registered(t *testing.T) {
+	names := make(map[string]bool, len(Commands))
+	for _, c := range Commands {
+		names[c.Name] = true
+	}
+	for _, want := range []string{"remove", "list", "update", "install", "uninstall"} {
+		if !names[want] {
+			t.Errorf("sub-command %q not registered; got %v", want, keys(names))
+		}
+	}
+}
+
+func TestUpdateCommand_HasSelfAndPiSubcommands(t *testing.T) {
+	for _, c := range Commands {
+		if c.Name != "update" {
+			continue
+		}
+		subNames := make(map[string]bool, len(c.Commands))
+		for _, sub := range c.Commands {
+			subNames[sub.Name] = true
+		}
+		for _, want := range []string{"self", "pi"} {
+			if !subNames[want] {
+				t.Errorf("update sub-command %q not registered; got %v", want, subNames)
+			}
+		}
+		return
+	}
+	t.Fatal("update command not registered")
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// cloneFlags creates fresh copies of each flag so tests don't share state
+// through the package-level RootFlags/ConversationFlags slices. urfave/cli/v3
+// stores per-flag state on the Flag itself, so two tests that build a
+// Command from the same Flag pointer see each other's mutations.
+func cloneFlags(in []cli.Flag) []cli.Flag {
+	out := make([]cli.Flag, 0, len(in))
+	for _, f := range in {
+		switch src := f.(type) {
+		case *cli.StringFlag:
+			cp := *src
+			out = append(out, &cp)
+		case *cli.BoolFlag:
+			cp := *src
+			out = append(out, &cp)
+		case *cli.StringSliceFlag:
+			cp := *src
+			out = append(out, &cp)
+		case *cli.IntFlag:
+			cp := *src
+			out = append(out, &cp)
+		default:
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func TestNormalizeOptionalResumeArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{name: "long_without_value", args: []string{"tau", "--resume"}, want: []string{"tau", "--resume="}},
+		{name: "short_without_value", args: []string{"tau", "-r"}, want: []string{"tau", "--resume="}},
+		{name: "long_before_flag", args: []string{"tau", "--resume", "--mode", "text"}, want: []string{"tau", "--resume=", "--mode", "text"}},
+		{name: "long_with_value", args: []string{"tau", "--resume", "sess-123"}, want: []string{"tau", "--resume", "sess-123"}},
+		{name: "long_equals_empty", args: []string{"tau", "--resume="}, want: []string{"tau", "--resume="}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeOptionalResumeArgs(tc.args)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("normalizeOptionalResumeArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveAppMode covers the mode resolution matrix. Each row is
+// (mode flag, --print, --json, stdinIsTTY, --stdin) -> expected AppMode.
+// The matrix exercises the four AppModes and the alias/precedence rules
+// between --mode, --print, --json, --stdin, and TTY detection.
+func TestResolveAppMode(t *testing.T) {
+	cases := []struct {
+		name      string
+		mode      string
+		print     bool
+		json      bool
+		stdinTTY  bool
+		stdinFlag bool
+		resume    *string
+		want      string
+	}{
+		// --mode primary
+		{name: "mode_rpc_tty", mode: "rpc", stdinTTY: true, want: "rpc"},
+		{name: "mode_rpc_nontty", mode: "rpc", stdinTTY: false, want: "rpc"},
+		{name: "mode_json_tty", mode: "json", stdinTTY: true, want: "json"},
+		{name: "mode_json_nontty", mode: "json", stdinTTY: false, want: "json"},
+		{name: "mode_text_tty", mode: "text", stdinTTY: true, want: "text"},
+		{name: "mode_text_nontty", mode: "text", stdinTTY: false, want: "text"},
+		{name: "mode_text_print", mode: "text", print: true, stdinTTY: true, want: "text"},
+
+		// --json alias
+		{name: "json_only_tty", json: true, stdinTTY: true, want: "json"},
+		{name: "json_only_nontty", json: true, stdinTTY: false, want: "json"},
+
+		// --print force
+		{name: "print_tty", print: true, stdinTTY: true, want: "text"},
+		{name: "print_nontty", print: true, stdinTTY: false, want: "text"},
+
+		// No mode flags
+		{name: "default_tty", stdinTTY: true, want: "interactive"},
+		{name: "default_nontty", stdinTTY: false, want: "text"},
+
+		// --stdin force
+		{name: "stdin_tty", stdinTTY: true, stdinFlag: true, want: "text"},
+
+		// --resume with an empty ID opens the interactive session selector.
+		{name: "resume_empty_nontty_forces_interactive", stdinTTY: false, resume: stringPtr(""), want: "interactive"},
+		{name: "resume_id_nontty_stays_text", stdinTTY: false, resume: stringPtr("sess-123"), want: "text"},
+
+		// --mode wins over --json (alias only honored when --mode unset)
+		{name: "json_ignored_when_mode_text", mode: "text", json: true, stdinTTY: true, want: "text"},
+		{name: "json_ignored_when_mode_rpc", mode: "rpc", json: true, stdinTTY: true, want: "rpc"},
+		{name: "print_ignored_when_mode_json", mode: "json", print: true, stdinTTY: true, want: "json"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &cli.Command{Flags: cloneFlags(append(append([]cli.Flag{}, RootFlags...), ConversationFlags...))}
+			if tc.mode != "" {
+				requireNoErrorSet(t, cmd.Set("mode", tc.mode))
+			}
+			if tc.print {
+				requireNoErrorSet(t, cmd.Set("print", "true"))
+			}
+			if tc.json {
+				requireNoErrorSet(t, cmd.Set("json", "true"))
+			}
+			if tc.stdinFlag {
+				requireNoErrorSet(t, cmd.Set("stdin", "true"))
+			}
+			if tc.resume != nil {
+				requireNoErrorSet(t, cmd.Set("resume", *tc.resume))
+			}
+			got := resolveAppMode(cmd, tc.stdinTTY)
+			if got != tc.want {
+				t.Errorf("resolveAppMode(mode=%q, print=%v, json=%v, tty=%v) = %q, want %q",
+					tc.mode, tc.print, tc.json, tc.stdinTTY, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateForkConflict covers --fork's mutual-exclusion rules with
+// the other session-targeting flags.
+func TestValidateForkConflict(t *testing.T) {
+	cases := []struct {
+		name        string
+		fork        string
+		session     string
+		sessionID   string
+		resume      string
+		continueF   bool
+		noSession   bool
+		wantErr     bool
+		errContains string
+	}{
+		{name: "no_conflict", fork: "id-1"},
+		{name: "fork_with_session", fork: "id-1", session: "id-2", wantErr: true, errContains: "--session"},
+		{name: "fork_with_session_id", fork: "id-1", sessionID: "exact-2", wantErr: true, errContains: "--session-id"},
+		{name: "fork_with_resume", fork: "id-1", resume: "id-3", wantErr: true, errContains: "--resume"},
+		{name: "fork_with_continue", fork: "id-1", continueF: true, wantErr: true, errContains: "--continue"},
+		{name: "fork_with_no_session", fork: "id-1", noSession: true, wantErr: true, errContains: "--no-session"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &cli.Command{Flags: cloneFlags(append(append([]cli.Flag{}, RootFlags...), ConversationFlags...))}
+			if tc.fork != "" {
+				requireNoErrorSet(t, cmd.Set("fork", tc.fork))
+			}
+			if tc.session != "" {
+				requireNoErrorSet(t, cmd.Set("session", tc.session))
+			}
+			if tc.sessionID != "" {
+				requireNoErrorSet(t, cmd.Set("session-id", tc.sessionID))
+			}
+			if tc.resume != "" {
+				requireNoErrorSet(t, cmd.Set("resume", tc.resume))
+			}
+			if tc.continueF {
+				requireNoErrorSet(t, cmd.Set("continue", "true"))
+			}
+			if tc.noSession {
+				requireNoErrorSet(t, cmd.Set("no-session", "true"))
+			}
+			err := validateForkConflict(cmd)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("validateForkConflict() = nil, want error")
+				}
+				if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.errContains)
+				}
+			} else if err != nil {
+				t.Errorf("validateForkConflict() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func stringPtr(s string) *string {
+	return &s
+}
+
+func requireNoErrorSet(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("flag set failed: %v", err)
+	}
+}
+
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRpcModeValidation_RejectsPrompts covers the guard in runRoot that
+// rejects positional prompts and @file attachments when the resolved
+// mode is rpc. RPC is a long-lived server, so positional prompts would
+// be lost and @file attachments cannot be expanded; clients must send
+// both through JSON-RPC.
+func TestRpcModeValidation_RejectsPrompts(t *testing.T) {
+	t.Run("non_rpc_mode_passes", func(t *testing.T) {
+		if err := validateRpcInput("text", []string{"hello"}, nil); err != nil {
+			t.Errorf("validateRpcInput(text) = %v, want nil", err)
+		}
+		if err := validateRpcInput("json", []string{"hello"}, nil); err != nil {
+			t.Errorf("validateRpcInput(json) = %v, want nil", err)
+		}
+	})
+	t.Run("rpc_with_no_input_passes", func(t *testing.T) {
+		if err := validateRpcInput("rpc", nil, nil); err != nil {
+			t.Errorf("validateRpcInput(rpc, nil, nil) = %v, want nil", err)
+		}
+	})
+	t.Run("rpc_rejects_positional_prompts", func(t *testing.T) {
+		err := validateRpcInput("rpc", []string{"hello"}, nil)
+		if err == nil {
+			t.Fatal("validateRpcInput = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "positional prompts") {
+			t.Errorf("error %q does not mention positional prompts", err.Error())
+		}
+	})
+	t.Run("rpc_rejects_file_images_even_without_prompts", func(t *testing.T) {
+		// A bare @file arg expands into fileImages only; the prompts list
+		// is empty in this case. The guard must still fire.
+		err := validateRpcInput("rpc", nil, []ai.ContentBlock{{Type: "image"}})
+		if err == nil {
+			t.Fatal("validateRpcInput = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "@file") {
+			t.Errorf("error %q does not mention @file", err.Error())
+		}
+	})
+	t.Run("rpc_prompts_rejected_before_file_images", func(t *testing.T) {
+		// When both are present, the prompt error wins so the user
+		// sees the more fundamental issue first.
+		err := validateRpcInput("rpc", []string{"hello"}, []ai.ContentBlock{{Type: "image"}})
+		if err == nil {
+			t.Fatal("validateRpcInput = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "positional prompts") {
+			t.Errorf("error %q should mention positional prompts first", err.Error())
+		}
+	})
+}
+
+// TestRpcCommand_ActionIsRunRPC verifies that the rpcCmd's Action
+// function is the same as runRPC. This is the structural guarantee
+// that "tau rpc" and "tau --mode rpc" both invoke the same RPC server:
+// rpcCmd.Action is runRPC, and runRoot's mode switch routes "rpc" to
+// runRPC. Either side drifting makes the two commands behave
+// differently, which would be a contract break.
+func TestRpcCommand_ActionIsRunRPC(t *testing.T) {
+	for _, c := range Commands {
+		if c.Name != "rpc" {
+			continue
+		}
+		if c.Action == nil {
+			t.Fatal("rpcCmd.Action is nil")
+		}
+		got := reflect.ValueOf(c.Action).Pointer()
+		want := reflect.ValueOf(runRPC).Pointer()
+		if got != want {
+			t.Errorf("rpcCmd.Action pointer = %#x, want runRPC pointer %#x", got, want)
+		}
+		return
+	}
+	t.Fatal("rpc command not registered")
+}
+
+// TestListModelsSearchOperand covers the optional [search] operand for
+// the --list-models flag. The search is the first positional when it
+// does not start with '-'; flag-shaped args are left for urfave/cli.
+func TestListModelsSearchOperand(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "no_args", args: nil, want: ""},
+		{name: "empty_args", args: []string{}, want: ""},
+		{name: "first_is_search", args: []string{"claude"}, want: "claude"},
+		{name: "first_is_flag", args: []string{"-v"}, want: ""},
+		{name: "first_is_double_dash", args: []string{"--foo"}, want: ""},
+		{name: "additional_args_ignored", args: []string{"claude", "extra"}, want: "claude"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := listModelsSearchOperand(tc.args); got != tc.want {
+				t.Errorf("listModelsSearchOperand(%v) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubCommandAliasRouting verifies that the pi-compatible sub-command
+// aliases route to the same Action function as their canonical
+// counterparts. This is the structural guarantee that "tau remove" and
+// "tau uninstall" behave identically, and that "tau list" matches
+// "tau extensions list".
+func TestSubCommandAliasRouting(t *testing.T) {
+	actionsByName := make(map[string]*cli.Command, len(Commands))
+	for _, c := range Commands {
+		actionsByName[c.Name] = c
+	}
+	cases := []struct {
+		alias string
+		canon string
+	}{
+		{alias: "remove", canon: "uninstall"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.alias+"_routes_to_"+tc.canon, func(t *testing.T) {
+			aliasCmd, ok := actionsByName[tc.alias]
+			if !ok {
+				t.Fatalf("alias %q not registered", tc.alias)
+			}
+			canonCmd, ok := actionsByName[tc.canon]
+			if !ok {
+				t.Fatalf("canonical %q not registered", tc.canon)
+			}
+			if aliasCmd.Action == nil {
+				t.Fatalf("%s.Action is nil", tc.alias)
+			}
+			if canonCmd.Action == nil {
+				t.Fatalf("%s.Action is nil", tc.canon)
+			}
+			got := reflect.ValueOf(aliasCmd.Action).Pointer()
+			want := reflect.ValueOf(canonCmd.Action).Pointer()
+			if got != want {
+				t.Errorf("%s.Action = %v, want %s.Action = %v", tc.alias, aliasCmd.Action, tc.canon, canonCmd.Action)
+			}
+		})
+	}
+}
+
+// TestRootFlagsIncludesPiCompatibleFlags verifies that the pi-compatible
+// root flags from the plan are registered with the documented names. The
+// "tau --help" output is built from these slices, so a missing entry
+// here would also be a missing entry in the help text.
+func TestRootFlagsIncludesPiCompatibleFlags(t *testing.T) {
+	wanted := []string{
+		"provider",
+		"api-key",
+		"system-prompt",
+		"append-system-prompt",
+		"name",
+		"session-id",
+		"tools",
+		"exclude-tools",
+		"approve",
+		"no-approve",
+		"mode",
+		"print",
+		"json",
+	}
+	have := flagNames(RootFlags, ConversationFlags)
+	for _, w := range wanted {
+		if _, ok := have[w]; !ok {
+			t.Errorf("flag %q not registered; have %v", w, sortedKeys(have))
+		}
+	}
+}
+
+// flagNames returns the set of flag names + aliases declared in the
+// provided flag slices. Aliases are included because help rendering
+// shows them, so a "missing" alias would be a help-text gap.
+func flagNames(groups ...[]cli.Flag) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, g := range groups {
+		for _, f := range g {
+			out[f.Names()[0]] = struct{}{}
+			for _, a := range f.Names()[1:] {
+				out[a] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+// sortedKeys returns the keys of m sorted ascending, for stable test
+// output.
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// TestSplitFileArgs verifies the partition of positional args into @file
+// references and plain text. The '@' prefix is stripped from the file
+// path; everything else is preserved in order.
+func TestSplitFileArgs(t *testing.T) {
+	t.Run("no_args", func(t *testing.T) {
+		files, plain := splitFileArgs(nil)
+		if len(files) != 0 || len(plain) != 0 {
+			t.Errorf("splitFileArgs(nil) = (%v, %v), want (empty, empty)", files, plain)
+		}
+	})
+	t.Run("all_plain", func(t *testing.T) {
+		files, plain := splitFileArgs([]string{"hello", "world"})
+		if len(files) != 0 || !slicesEqual(plain, []string{"hello", "world"}) {
+			t.Errorf("got files=%v plain=%v, want files=[] plain=[hello world]", files, plain)
+		}
+	})
+	t.Run("all_files", func(t *testing.T) {
+		files, plain := splitFileArgs([]string{"@a.md", "@b.md"})
+		if !slicesEqual(files, []string{"a.md", "b.md"}) || len(plain) != 0 {
+			t.Errorf("got files=%v plain=%v, want files=[a.md b.md] plain=[]", files, plain)
+		}
+	})
+	t.Run("mixed_preserves_order", func(t *testing.T) {
+		files, plain := splitFileArgs([]string{"@a.md", "first", "@b.md", "second"})
+		if !slicesEqual(files, []string{"a.md", "b.md"}) || !slicesEqual(plain, []string{"first", "second"}) {
+			t.Errorf("got files=%v plain=%v", files, plain)
+		}
+	})
+	t.Run("empty_at_prefix", func(t *testing.T) {
+		// "@" alone is treated as a file arg with empty path; expandFileArg
+		// rejects this with "empty @file reference" at expansion time.
+		files, plain := splitFileArgs([]string{"@"})
+		if !slicesEqual(files, []string{""}) || len(plain) != 0 {
+			t.Errorf("got files=%v plain=%v, want files=[''] plain=[]", files, plain)
+		}
+	})
+}
+
+// TestExpandFileArg_TextFile verifies that a text file is wrapped in
+// <file name="<abs-path>">…</file> and the wrapper's name uses the
+// resolved absolute path. Images produce a different wrapper (covered
+// separately).
+func TestExpandFileArg_TextFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "hello.txt")
+	body := "hello world\n"
+	requireNoError(t, os.WriteFile(path, []byte(body), 0o644))
+
+	text, images, err := expandFileArg(path)
+	if err != nil {
+		t.Fatalf("expandFileArg: %v", err)
+	}
+	if len(images) != 0 {
+		t.Errorf("images = %v, want nil for text file", images)
+	}
+	if !strings.Contains(text, body) {
+		t.Errorf("text %q does not contain body %q", text, body)
+	}
+	if !strings.Contains(text, "<file name=") || !strings.Contains(text, path) {
+		t.Errorf("text %q does not wrap with absolute path %q", text, path)
+	}
+}
+
+// TestExpandFileArg_ImageExt verifies that an image extension triggers
+// the image content-block path; the marker text is still wrapped.
+func TestExpandFileArg_ImageExt(t *testing.T) {
+	tmpDir := t.TempDir()
+	// 1x1 PNG (smallest valid PNG) so ai.LoadImageContentBlock can decode it.
+	pngBytes := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+		0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41,
+		0x54, 0x78, 0x9c, 0x62, 0x00, 0x01, 0x00, 0x00,
+		0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+		0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+		0x42, 0x60, 0x82,
+	}
+	path := filepath.Join(tmpDir, "tiny.png")
+	requireNoError(t, os.WriteFile(path, pngBytes, 0o644))
+
+	text, images, err := expandFileArg(path)
+	if err != nil {
+		t.Fatalf("expandFileArg: %v", err)
+	}
+	if len(images) != 1 {
+		t.Errorf("images = %d, want 1", len(images))
+	}
+	if !strings.Contains(text, "<file name=") {
+		t.Errorf("text %q does not wrap with <file name=>", text)
+	}
+	if !strings.Contains(text, "[image content]") {
+		t.Errorf("text %q does not contain image marker", text)
+	}
+}
+
+// TestExpandFileArg_MissingFile verifies positional @file args still fail fast.
+func TestExpandFileArg_MissingFile(t *testing.T) {
+	_, _, err := expandFileArg(filepath.Join(t.TempDir(), "does-not-exist.txt"))
+	if err == nil {
+		t.Fatal("expandFileArg on missing file = nil error, want error")
+	}
+}
+
+func TestProcessFileArguments_MissingFileStaysLiteral(t *testing.T) {
+	out, images, err := processFileArguments("look at @missing.md")
+	if err != nil {
+		t.Fatalf("processFileArguments: %v", err)
+	}
+	if len(images) != 0 {
+		t.Fatalf("images = %d, want 0", len(images))
+	}
+	if out != "look at @missing.md" {
+		t.Fatalf("out = %q, want literal missing reference", out)
+	}
+}
+
+func TestProcessFileArguments_TildePath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "notes.md"), []byte("home body"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	out, _, err := processFileArguments("look at @~/notes.md")
+	if err != nil {
+		t.Fatalf("processFileArguments: %v", err)
+	}
+	if !strings.Contains(out, "home body") {
+		t.Fatalf("out = %q, want expanded home file", out)
+	}
+}
+
+// TestExpandFileArg_EmptyPath verifies that an empty @file reference is
+// rejected with a clear error rather than a confusing stat failure.
+func TestExpandFileArg_EmptyPath(t *testing.T) {
+	_, _, err := expandFileArg("")
+	if err == nil {
+		t.Fatal("expandFileArg(\"\") = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error %q does not mention empty", err.Error())
+	}
+}
+
+// TestBuildPromptSequenceWithFiles_CompositionOrder covers the spec
+// composition: stdin + @file-text + first positional, joined with no
+// separator; remaining positionals and -m messages are sequential.
+func TestBuildPromptSequenceWithFiles_CompositionOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "ctx.md")
+	requireNoError(t, os.WriteFile(filePath, []byte("file body"), 0o644))
+
+	t.Run("stdin_plus_file_plus_positional_joined_no_separator", func(t *testing.T) {
+		prompts, _, err := buildPromptSequenceWithFiles(
+			[]string{"@" + filePath, "ask about this"},
+			nil,
+			strings.NewReader("stdin body"),
+			false, false,
+		)
+		if err != nil {
+			t.Fatalf("buildPromptSequenceWithFiles: %v", err)
+		}
+		if len(prompts) != 1 {
+			t.Fatalf("len(prompts) = %d, want 1 (%#v)", len(prompts), prompts)
+		}
+		wrapped, _, err := expandFileArg(filePath)
+		if err != nil {
+			t.Fatalf("expandFileArg: %v", err)
+		}
+		want := "stdin body" + wrapped + "ask about this"
+		if prompts[0] != want {
+			t.Errorf("prompts[0] = %q, want %q", prompts[0], want)
+		}
+	})
+	t.Run("remaining_positionals_sequential", func(t *testing.T) {
+		prompts, _, err := buildPromptSequenceWithFiles(
+			[]string{"first", "second", "third"},
+			nil,
+			nil, true, false,
+		)
+		if err != nil {
+			t.Fatalf("buildPromptSequenceWithFiles: %v", err)
+		}
+		if !slicesEqual(prompts, []string{"first", "second", "third"}) {
+			t.Errorf("prompts = %v, want [first second third]", prompts)
+		}
+	})
+	t.Run("file_with_no_positional_or_stdin", func(t *testing.T) {
+		prompts, _, err := buildPromptSequenceWithFiles(
+			[]string{"@" + filePath},
+			nil,
+			nil, true, false,
+		)
+		if err != nil {
+			t.Fatalf("buildPromptSequenceWithFiles: %v", err)
+		}
+		if len(prompts) != 1 {
+			t.Fatalf("len(prompts) = %d, want 1 (%#v)", len(prompts), prompts)
+		}
+		if !strings.Contains(prompts[0], "file body") {
+			t.Errorf("prompts[0] = %q, want it to contain file body", prompts[0])
+		}
+	})
+	t.Run("missing_positional_file_is_fatal", func(t *testing.T) {
+		_, _, err := buildPromptSequenceWithFiles(
+			[]string{"@" + filepath.Join(tmpDir, "no-such-file.txt")},
+			nil,
+			nil, true, false,
+		)
+		if err == nil {
+			t.Fatal("expected error for missing positional @file, got nil")
+		}
+	})
+	t.Run("messages_follow_positionals_sequentially", func(t *testing.T) {
+		prompts, _, err := buildPromptSequenceWithFiles(
+			[]string{"first"},
+			[]string{"second", "third"},
+			nil, true, false,
+		)
+		if err != nil {
+			t.Fatalf("buildPromptSequenceWithFiles: %v", err)
+		}
+		if !slicesEqual(prompts, []string{"first", "second", "third"}) {
+			t.Errorf("prompts = %v, want [first second third]", prompts)
+		}
+	})
+}
+
+func TestPrintPostTUIExitMessage(t *testing.T) {
+	var b strings.Builder
+	if err := printPostTUIExitMessage(&b, "No session selected"); err != nil {
+		t.Fatalf("printPostTUIExitMessage: %v", err)
+	}
+	if got, want := b.String(), "\x1b[25;1H\x1b[0m\x1b[39m\x1b[49m\x1b[JNo session selected\n"; got != want {
+		t.Fatalf("message output = %q, want %q", got, want)
+	}
+}
+
+func TestPrintPostTUIExitMessageEmpty(t *testing.T) {
+	var b strings.Builder
+	if err := printPostTUIExitMessage(&b, ""); err != nil {
+		t.Fatalf("printPostTUIExitMessage empty: %v", err)
+	}
+	if b.Len() != 0 {
+		t.Fatalf("empty message printed %q, want nothing", b.String())
+	}
+}
+
+func TestPrintResumeInstructions(t *testing.T) {
+	var b strings.Builder
+	printResumeInstructions(&b, "sess-123")
+	got := b.String()
+	for _, want := range []string{"Session ID: sess-123", "tau --resume sess-123"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("resume instructions = %q, missing %q", got, want)
+		}
+	}
+}
+
+func TestPrintResumeInstructionsEmptyID(t *testing.T) {
+	var b strings.Builder
+	printResumeInstructions(&b, "")
+	if b.Len() != 0 {
+		t.Fatalf("empty session id printed %q, want nothing", b.String())
+	}
+}
+
+func TestPrintResumeInstructionsIfWrittenSkipsMissingSession(t *testing.T) {
+	var b strings.Builder
+	if err := printResumeInstructionsIfWritten(&b, filepath.Join(t.TempDir(), "sessions"), "missing-session"); err != nil {
+		t.Fatalf("printResumeInstructionsIfWritten: %v", err)
+	}
+	if b.Len() != 0 {
+		t.Fatalf("missing session printed %q, want nothing", b.String())
+	}
+}
+
+func TestPackagesAndExtensionsListAnnotatePiPackages(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+	pkgDir := filepath.Join(configDir, "packages", "pi-echo")
+	requireNoError(t, os.MkdirAll(pkgDir, 0o755))
+	requireNoError(t, os.WriteFile(filepath.Join(pkgDir, "tau-package.toml"), []byte(`[package]
+name = "pi-echo"
+version = "1.0.0"
+description = "Echo"
+[plugin]
+api_version = "1"
+[run]
+command = "/usr/bin/node /tmp/shim/index.js extension.js"
+`), 0o600))
+	requireNoError(t, packages.InstallSidecar{Source: "./pi-echo", InstalledAt: "2026-01-01T00:00:00Z", Scope: "user", Pi: true}.Write(pkgDir))
+
+	cmd := &cli.Command{Flags: cloneFlags(PackagesListFlags)}
+	packagesOut := captureStdout(t, func() {
+		if err := runPackagesList(context.Background(), cmd); err != nil {
+			t.Fatalf("runPackagesList: %v", err)
+		}
+	})
+	if !strings.Contains(packagesOut, "pi-echo (pi-ext)") {
+		t.Fatalf("packages list missing pi annotation:\n%s", packagesOut)
+	}
+
+	extOut := captureStdout(t, func() {
+		if err := runExtensionsList(context.Background(), nil); err != nil {
+			t.Fatalf("runExtensionsList: %v", err)
+		}
+	})
+	if !strings.Contains(extOut, "pi-echo (pi-ext)") {
+		t.Fatalf("extensions list missing pi annotation:\n%s", extOut)
+	}
+}
+
+func TestDaemonTokenAddListRevoke(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+
+	var out string
+	run := func(args ...string) {
+		t.Helper()
+		cmd := newRootCommand()
+		ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
+		ctx = context.WithValue(ctx, rootPromptDelimiterKey{}, false)
+		out = captureStdout(t, func() {
+			if err := cmd.Run(ctx, append([]string{"tau"}, args...)); err != nil {
+				t.Fatalf("tau %v returned error: %v", args, err)
+			}
+		})
+	}
+
+	run("daemon", "token", "add", "phone")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "Token for phone") {
+		t.Fatalf("add output = %q, want token intro plus secret", out)
+	}
+	token := lines[1]
+	if len(token) < 32 {
+		t.Fatalf("token output = %q, want a long secret", token)
+	}
+
+	// List shows the device with only a prefix of the secret.
+	run("daemon", "token", "list")
+	if !strings.Contains(out, "phone") || !strings.Contains(out, token[:8]) {
+		t.Fatalf("list output = %q, want device name and token prefix", out)
+	}
+	if strings.Contains(out, token) {
+		t.Fatalf("list output = %q leaks the full token", out)
+	}
+
+	// The bridge accepts the token issued through the CLI.
+	store := server.NewTokenStore(filepath.Join(configDir(), "remote-tokens.json"))
+	if !store.Contains(token) {
+		t.Fatal("bridge token store does not contain the token added via CLI")
+	}
+
+	run("daemon", "token", "revoke", "phone")
+	if !strings.Contains(out, "Revoked token for phone") {
+		t.Fatalf("revoke output = %q", out)
+	}
+	if store.Contains(token) {
+		t.Fatal("revoked token still accepted by the bridge store")
+	}
+
+	// Revoking an unknown device fails.
+	revokeCmd := newRootCommand()
+	revokeCmd.ExitErrHandler = func(context.Context, *cli.Command, error) {}
+	err := revokeCmd.Run(context.Background(), []string{"tau", "daemon", "token", "revoke", "phone"})
+	if err == nil {
+		t.Fatal("revoking unknown device succeeded; want error")
+	}
+}

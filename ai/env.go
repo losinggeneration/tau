@@ -1,0 +1,344 @@
+package ai // import "github.com/losinggeneration/tau/ai"
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+func init() {
+	// Register transport for API key detection
+}
+
+// TelemetryEnabled returns true if telemetry is enabled.
+// It checks the TAU_TELEMETRY environment variable:
+// - "1", "true", "yes" (case-insensitive) -> enabled
+// - "0", "false", "no" (case-insensitive) -> disabled
+// - Empty or unset -> enabled (default)
+func TelemetryEnabled() bool {
+	val := os.Getenv("TAU_TELEMETRY")
+	if val == "" {
+		return true // Default to enabled
+	}
+	switch strings.ToLower(val) {
+	case "1", "true", "yes":
+		return true
+	case "0", "false", "no":
+		return false
+	default:
+		return true // Default to enabled for unknown values
+	}
+}
+
+var cachedVertexAdcExists *bool
+
+// HasVertexADC checks if Google Application Default Credentials are available.
+// This checks for the credentials file path in GOOGLE_APPLICATION_CREDENTIALS,
+// or the default ADC path (~/.config/gcloud/application_default_credentials.json).
+// The result is cached to handle the module-load race at startup.
+func HasVertexADC() bool {
+	if cachedVertexAdcExists != nil {
+		return *cachedVertexAdcExists
+	}
+
+	// Check GOOGLE_APPLICATION_CREDENTIALS first (standard way)
+	if gacPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); gacPath != "" {
+		exists := fileExists(gacPath)
+		cachedVertexAdcExists = &exists
+		return exists
+	}
+
+	// Fall back to default ADC path
+	defaultPath := filepath.Join(userHomeDir(), ".config", "gcloud", "application_default_credentials.json")
+	exists := fileExists(defaultPath)
+	cachedVertexAdcExists = &exists
+	return exists
+}
+
+// HasVertexProject checks if the required Google Cloud project is set.
+// Checks GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT.
+func HasVertexProject() bool {
+	return os.Getenv("GOOGLE_CLOUD_PROJECT") != "" || os.Getenv("GCLOUD_PROJECT") != ""
+}
+
+// HasVertexLocation checks if the required Google Cloud location is set.
+func HasVertexLocation() bool {
+	return os.Getenv("GOOGLE_CLOUD_LOCATION") != ""
+}
+
+// HasBedrockCredentials checks if AWS credentials are available from any source.
+// This checks all AWS credential sources: explicit credentials, profiles,
+// ECS task roles, IRSA, and Bedrock bearer tokens.
+func HasBedrockCredentials() bool {
+	// Check explicit credentials
+	if os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "" {
+		return true
+	}
+	// Check for profile (credentials come from shared AWS config chain)
+	if os.Getenv("AWS_PROFILE") != "" {
+		return true
+	}
+	// Check Bedrock bearer token
+	if os.Getenv("AWS_BEARER_TOKEN_BEDROCK") != "" {
+		return true
+	}
+	// Check ECS task role credentials
+	if os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != "" {
+		return true
+	}
+	if os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "" {
+		return true
+	}
+	// Check IRSA (IAM Roles for Service Accounts)
+	if os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
+		return true
+	}
+	return false
+}
+
+// EnvTransport is a transport that uses environment variables for authentication.
+type EnvTransport struct{}
+
+// transportKey is used to store/retrieve transport from context.
+type transportKey struct{}
+
+// WithTransportContext adds a custom transport to the context.
+func WithTransportContext(ctx context.Context, t *Transport) context.Context {
+	return context.WithValue(ctx, transportKey{}, t)
+}
+
+// TransportFromContext retrieves a transport from the context.
+func TransportFromContext(ctx context.Context) (*Transport, bool) {
+	t, ok := ctx.Value(transportKey{}).(*Transport)
+
+	return t, ok
+}
+
+// HTTPClient returns an HTTP client configured for the given provider.
+func HTTPClient(provider string) *http.Client {
+	return &http.Client{}
+}
+
+// fileExists checks if a file exists and is not a directory.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// userHomeDir returns the user's home directory.
+func userHomeDir() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return home
+	}
+	return ""
+}
+
+// envGet returns an environment variable, checking multiple common names.
+func envGet(names ...string) string {
+	for _, name := range names {
+		if val := os.Getenv(name); val != "" {
+			return val
+		}
+	}
+
+	return ""
+}
+
+// envVarNames returns the environment variables consulted for the given
+// provider. For plain API-key providers this is the single entry from
+// EnvVarRegistry. Special-cased providers (Anthropic OAuth precedence,
+// Copilot/Codex token chain, Google Vertex ADC, Amazon Bedrock credential
+// sources, Cloudflare AI Gateway account/gateway) return the full ordered
+// list consulted during resolution.
+func envVarNames(provider string) []string {
+	// Special-cased providers first — their resolution logic consults
+	// more than the single registry entry.
+	switch provider {
+	case ProviderAnthropic:
+		return []string{"ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+	case ProviderGitHubCopilot, ProviderOpenAICodex:
+		return []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}
+	case ProviderGoogleVertex:
+		return []string{
+			"GOOGLE_CLOUD_API_KEY",
+			"GOOGLE_APPLICATION_CREDENTIALS",
+			"GOOGLE_CLOUD_PROJECT",
+			"GCLOUD_PROJECT",
+			"GOOGLE_CLOUD_LOCATION",
+		}
+	case ProviderAmazonBedrock:
+		return []string{
+			"AWS_PROFILE",
+			"AWS_ACCESS_KEY_ID",
+			"AWS_SECRET_ACCESS_KEY",
+			"AWS_BEARER_TOKEN_BEDROCK",
+			"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+			"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+			"AWS_WEB_IDENTITY_TOKEN_FILE",
+		}
+	case ProviderCloudflareAIGateway:
+		return []string{"CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"}
+	}
+	if v, ok := EnvVarRegistry[provider]; ok {
+		return []string{v}
+	}
+	return nil
+}
+
+func envVarNameForProvider(provider string) string {
+	if envVar := EnvVarForProvider(provider); envVar != "" {
+		return envVar
+	}
+	names := envVarNames(provider)
+	if len(names) > 0 {
+		return strings.Join(names, " or ")
+	}
+	return "API_KEY"
+}
+
+// tooling to enumerate all env vars that may carry credentials; for
+// authoritative per-provider resolution, use GetEnvAPIKey.
+var EnvAPIKeys = buildEnvAPIKeys()
+
+func buildEnvAPIKeys() map[string]string {
+	m := make(map[string]string)
+	// Forward registry: provider -> env var. For shared env vars, the first
+	// provider encountered wins; this is a representative mapping, not a
+	// disambiguator.
+	for _, provider := range registryProviderOrder() {
+		envVar := EnvVarRegistry[provider]
+		if _, exists := m[envVar]; !exists {
+			m[envVar] = provider
+		}
+	}
+	// Special-case providers' additional env vars.
+	m["ANTHROPIC_OAUTH_TOKEN"] = ProviderAnthropic
+	m["ANTHROPIC_API_KEY"] = ProviderAnthropic
+	m["COPILOT_GITHUB_TOKEN"] = ProviderGitHubCopilot
+	m["GH_TOKEN"] = ProviderGitHubCopilot
+	m["GITHUB_TOKEN"] = ProviderGitHubCopilot
+	// AWS Bedrock credential sources
+	m["AWS_PROFILE"] = ProviderAmazonBedrock
+	m["AWS_ACCESS_KEY_ID"] = ProviderAmazonBedrock
+	m["AWS_SECRET_ACCESS_KEY"] = ProviderAmazonBedrock
+	m["AWS_BEARER_TOKEN_BEDROCK"] = ProviderAmazonBedrock
+	m["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] = ProviderAmazonBedrock
+	m["AWS_CONTAINER_CREDENTIALS_FULL_URI"] = ProviderAmazonBedrock
+	m["AWS_WEB_IDENTITY_TOKEN_FILE"] = ProviderAmazonBedrock
+	// Google Vertex ADC supplementary variables
+	m["GOOGLE_APPLICATION_CREDENTIALS"] = ProviderGoogleVertex
+	m["GOOGLE_CLOUD_PROJECT"] = ProviderGoogleVertex
+	m["GCLOUD_PROJECT"] = ProviderGoogleVertex
+	m["GOOGLE_CLOUD_LOCATION"] = ProviderGoogleVertex
+	// Cloudflare AI Gateway supplementary variables
+	m["CLOUDFLARE_ACCOUNT_ID"] = ProviderCloudflareAIGateway
+	m["CLOUDFLARE_GATEWAY_ID"] = ProviderCloudflareAIGateway
+	return m
+}
+
+// registryProviderOrder returns provider IDs in a stable, sorted order so
+// the reverse-map construction is deterministic.
+func registryProviderOrder() []string {
+	ids := make([]string, 0, len(EnvVarRegistry))
+	for id := range EnvVarRegistry {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// GetEnvAPIKey returns the API key for a provider by consulting the
+// environment. For plain API-key providers, it reads the single registered
+// env var from EnvVarRegistry. For special-cased providers, it follows the
+// documented precedence chain.
+//
+// Returns empty string when no credential is configured in the environment.
+// Returns "<authenticated>" for providers whose environment configuration
+// is sufficient to authenticate without an explicit key (Vertex ADC, any
+// Bedrock source).
+//
+// Per the package's precedence rules, an explicit request API key supplied
+// at call time wins over this environment-fallback helper; callers should
+// always check an explicit key first.
+func GetEnvAPIKey(provider string) string {
+	// Special-cased providers consult more than the single registry entry.
+	switch provider {
+	case ProviderAnthropic:
+		// OAuth token takes priority over the regular API key.
+		if key := os.Getenv("ANTHROPIC_OAUTH_TOKEN"); key != "" {
+			return key
+		}
+		return os.Getenv("ANTHROPIC_API_KEY")
+
+	case ProviderGitHubCopilot, ProviderOpenAICodex:
+		if key := os.Getenv("COPILOT_GITHUB_TOKEN"); key != "" {
+			return key
+		}
+		if key := os.Getenv("GH_TOKEN"); key != "" {
+			return key
+		}
+		return os.Getenv("GITHUB_TOKEN")
+
+	case ProviderGoogleVertex:
+		// GOOGLE_CLOUD_API_KEY takes priority.
+		if key := os.Getenv("GOOGLE_CLOUD_API_KEY"); key != "" {
+			return key
+		}
+		// ADC auth requires credentials + project + location.
+		if HasVertexADC() && HasVertexProject() && HasVertexLocation() {
+			return "<authenticated>"
+		}
+		return ""
+
+	case ProviderAmazonBedrock:
+		// Multiple credential sources: profile, IAM keys, bearer token,
+		// ECS task role, IRSA. Any of them authenticates the client.
+		if os.Getenv("AWS_PROFILE") != "" {
+			return "<authenticated>"
+		}
+		if os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "" {
+			return "<authenticated>"
+		}
+		if os.Getenv("AWS_BEARER_TOKEN_BEDROCK") != "" {
+			return "<authenticated>"
+		}
+		if os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != "" {
+			return "<authenticated>"
+		}
+		if os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "" {
+			return "<authenticated>"
+		}
+		if os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
+			return "<authenticated>"
+		}
+		return ""
+
+	case ProviderHuggingFace:
+		// HF_TOKEN is the primary var; HUGGINGFACE_HUB_TOKEN is a widely-used
+		// alias that the public helper also recognizes.
+		if key := os.Getenv("HF_TOKEN"); key != "" {
+			return key
+		}
+		return os.Getenv("HUGGINGFACE_HUB_TOKEN")
+	}
+
+	// Plain API-key providers: read the single entry from EnvVarRegistry.
+	if envVar, ok := EnvVarRegistry[provider]; ok {
+		return os.Getenv(envVar)
+	}
+	return ""
+}
+
+// getEnv is exported for internal use by providers.
+func getEnv(name string) string {
+	return os.Getenv(name)
+}
+
+// ShareViewerURL returns the share viewer URL override from TAU_SHARE_VIEWER_URL.
+// Returns empty string if not set (defaults to https://pi.dev/session/).
+func ShareViewerURL() string {
+	return os.Getenv("TAU_SHARE_VIEWER_URL")
+}
