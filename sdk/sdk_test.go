@@ -4232,3 +4232,72 @@ func TestSessionAttachmentsSurviveResume(t *testing.T) {
 	require.NotNil(t, lastPrompt)
 	assert.Contains(t, strings.Join(aiPromptTexts(lastPrompt), "\n"), "body")
 }
+
+// TestNewSession_PerModelThinkingLevel verifies the thinking-level precedence
+// for fresh sessions: explicit session option > per-model settings entry >
+// hardcoded medium default. Resumed sessions keep the level recorded in the
+// session file (covered by the restore path).
+func TestNewSession_PerModelThinkingLevel(t *testing.T) {
+	// registerRecordingProvider installs an isolated provider+model pair so the
+	// test does not depend on the generated registry, which other tests mutate
+	// via ai.RegisterModel overrides.
+	_, explicitModel := registerRecordingProvider(t, "test response")
+	ai.RegisterModel(&ai.Model{ID: "test-model-2", Provider: "test-provider", API: "test-api-sdk", ContextWindow: 128000})
+	credStore := &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")}
+	settings := &ai.Settings{
+		Models: map[string]ai.ModelSettings{
+			"test-provider/test-model": {ThinkingLevel: "high"},
+		},
+	}
+
+	t.Run("settings per-model level applies", func(t *testing.T) {
+		rt, err := NewRuntime(RuntimeOptions{
+			CredentialStore: credStore,
+			ExplicitModel:   explicitModel,
+			Settings:        settings,
+		})
+		require.NoError(t, err)
+
+		sess, err := rt.NewSession(testContext(t), SessionOptions{})
+		require.NoError(t, err)
+		defer func() { _ = sess.Close(testContext(t)) }()
+
+		statser, ok := sess.(Statser)
+		require.True(t, ok, "session must implement Statser")
+		assert.Equal(t, "high", statser.Stats().ThinkingLevel)
+	})
+
+	t.Run("session option outranks settings", func(t *testing.T) {
+		rt, err := NewRuntime(RuntimeOptions{
+			CredentialStore: credStore,
+			ExplicitModel:   explicitModel,
+			Settings:        settings,
+		})
+		require.NoError(t, err)
+
+		sess, err := rt.NewSession(testContext(t), SessionOptions{ThinkingLevel: "low"})
+		require.NoError(t, err)
+		defer func() { _ = sess.Close(testContext(t)) }()
+
+		statser, ok := sess.(Statser)
+		require.True(t, ok, "session must implement Statser")
+		assert.Equal(t, "low", statser.Stats().ThinkingLevel)
+	})
+
+	t.Run("unconfigured model falls back to medium", func(t *testing.T) {
+		rt, err := NewRuntime(RuntimeOptions{
+			CredentialStore: credStore,
+			ExplicitModel:   "test-provider/test-model-2",
+			Settings:        settings,
+		})
+		require.NoError(t, err)
+
+		sess, err := rt.NewSession(testContext(t), SessionOptions{})
+		require.NoError(t, err)
+		defer func() { _ = sess.Close(testContext(t)) }()
+
+		statser, ok := sess.(Statser)
+		require.True(t, ok, "session must implement Statser")
+		assert.Equal(t, "medium", statser.Stats().ThinkingLevel)
+	})
+}

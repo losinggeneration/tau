@@ -439,3 +439,128 @@ func TestDismissSettingsOverlayReleasesComponent(t *testing.T) {
 		t.Fatalf("dismissDialogCtx retained dialog component %T; want nil", got)
 	}
 }
+
+// TestApplySettingsChange_ThinkingLevelPersistsPerModel verifies changing the
+// thinking level records it against the active model in settings.json, so the
+// level follows the model across sessions and model switches.
+func TestApplySettingsChange_ThinkingLevelPersistsPerModel(t *testing.T) {
+	app := withTestFooter(newAppWithSelector(t))
+	app.extensions = nil
+	app.settingsPath = filepath.Join(t.TempDir(), "settings.json")
+	app.currentModel = "anthropic/claude-opus-4-6"
+
+	applySettingsChange(app, "settings.thinkingLevel", "high")
+
+	settings, err := ai.LoadSettings(app.settingsPath)
+	if err != nil {
+		t.Fatalf("load saved settings: %v", err)
+	}
+	if got := settings.Models["anthropic/claude-opus-4-6"].ThinkingLevel; got != "high" {
+		t.Fatalf("saved per-model level = %q, want high", got)
+	}
+	sess := app.sess.(*fakeSession)
+	seen := sess.thinkingLevelsSeen()
+	if len(seen) != 1 || seen[0] != "high" {
+		t.Fatalf("session levels = %v, want [high]", seen)
+	}
+}
+
+// TestApplySettingsChange_ThinkingLevelWithoutModelSkipsPersist verifies no
+// per-model entry is written when no model is active yet; the level stays a
+// session-only change rather than polluting settings.json.
+func TestApplySettingsChange_ThinkingLevelWithoutModelSkipsPersist(t *testing.T) {
+	app := withTestFooter(newAppWithSelector(t))
+	app.extensions = nil
+	app.settingsPath = filepath.Join(t.TempDir(), "settings.json")
+
+	applySettingsChange(app, "settings.thinkingLevel", "low")
+
+	settings, err := ai.LoadSettings(app.settingsPath)
+	if err != nil {
+		t.Fatalf("load saved settings: %v", err)
+	}
+	if len(settings.Models) != 0 {
+		t.Fatalf("models map = %v, want empty", settings.Models)
+	}
+}
+
+// TestApplyModelFromKey_AppliesSavedThinkingLevel verifies switching to a
+// model with a saved per-model thinking level applies it to the session
+// rather than inheriting the previous model's level.
+func TestApplyModelFromKey_AppliesSavedThinkingLevel(t *testing.T) {
+	app := withTestFooter(newAppWithSelector(t))
+	app.extensions = nil
+	app.settingsPath = filepath.Join(t.TempDir(), "settings.json")
+	settings := &ai.Settings{Models: map[string]ai.ModelSettings{
+		"anthropic/claude-opus-4-6": {ThinkingLevel: "high"},
+	}}
+	if err := ai.SaveSettings(app.settingsPath, settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	app.footer.data.thinkingLevel = "medium"
+	app.currentModel = "anthropic/claude-sonnet-4-6"
+
+	app.applyModelFromKey("anthropic/claude-opus-4-6")
+
+	sess := app.sess.(*fakeSession)
+	seen := sess.thinkingLevelsSeen()
+	if len(seen) != 1 || seen[0] != "high" {
+		t.Fatalf("session levels after switch = %v, want [high]", seen)
+	}
+	foundSystem := false
+	for _, msg := range app.conv.Messages() {
+		if msg.Role == RoleSystem && strings.Contains(msg.Text, "thinking level: high") {
+			foundSystem = true
+		}
+	}
+	if !foundSystem {
+		t.Fatalf("missing 'thinking level: high' system row in conversation")
+	}
+}
+
+// TestApplyModelFromKey_NoSavedLevelKeepsCurrent verifies a model without a
+// saved per-model level inherits the current session level unchanged.
+func TestApplyModelFromKey_NoSavedLevelKeepsCurrent(t *testing.T) {
+	app := withTestFooter(newAppWithSelector(t))
+	app.extensions = nil
+	app.settingsPath = filepath.Join(t.TempDir(), "settings.json")
+	if err := ai.SaveSettings(app.settingsPath, &ai.Settings{}); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	app.footer.data.thinkingLevel = "medium"
+	app.currentModel = "anthropic/claude-sonnet-4-6"
+
+	app.applyModelFromKey("anthropic/claude-opus-4-6")
+
+	sess := app.sess.(*fakeSession)
+	if seen := sess.thinkingLevelsSeen(); len(seen) != 0 {
+		t.Fatalf("session levels after switch = %v, want none", seen)
+	}
+}
+
+// TestApplySettingsChange_ThinkingLevelReportsPersistError verifies a failed
+// settings write surfaces an error row while the level still applies to the
+// session — matching the theme-persist-error behavior.
+func TestApplySettingsChange_ThinkingLevelReportsPersistError(t *testing.T) {
+	app := withTestFooter(newAppWithSelector(t))
+	app.extensions = nil
+	fileAsDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(fileAsDir, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	app.settingsPath = filepath.Join(fileAsDir, "settings.json")
+	app.currentModel = "anthropic/claude-opus-4-6"
+
+	applySettingsChange(app, "settings.thinkingLevel", "high")
+
+	sess := app.sess.(*fakeSession)
+	if seen := sess.thinkingLevelsSeen(); len(seen) != 1 || seen[0] != "high" {
+		t.Fatalf("session levels = %v, want [high] despite save error", seen)
+	}
+	for _, msg := range app.conv.Messages() {
+		if msg.Role == RoleError && strings.Contains(msg.Text, "settings.thinkingLevel") {
+			return
+		}
+	}
+	t.Fatalf("missing persist error in conversation: %#v", app.conv.Messages())
+}

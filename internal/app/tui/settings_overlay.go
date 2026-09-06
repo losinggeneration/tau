@@ -103,7 +103,7 @@ func buildSettingsItems(app *App) []settingslist.Item {
 		{
 			ID:           "settings.thinkingLevel",
 			Label:        "Thinking level",
-			Description:  "Reasoning effort for the session.",
+			Description:  "Reasoning effort; saved per active model.",
 			CurrentValue: data.thinkingLevel,
 			Values:       ai.ThinkingLevels,
 		},
@@ -227,6 +227,11 @@ func applySettingsChange(app *App, id, value string) {
 		// can come back to it. Recorded here rather than in the toggle handler
 		// so every way of choosing a level feeds the same memory.
 		app.rememberThinkingLevel(value)
+		// Persist the level against the active model so starting or switching
+		// back to it restores the effort.
+		if err := app.persistModelThinkingSetting(app.currentModel, value); err != nil {
+			app.conv.AddError("settings.thinkingLevel: " + err.Error())
+		}
 		// The editor's rules are the standing thinking-level indicator.
 		app.refreshEditorChrome()
 	case "settings.autoCompaction":
@@ -313,6 +318,58 @@ func (a *App) persistLayoutSetting(mode LayoutMode) error {
 		return fmt.Errorf("write settings: %w", err)
 	}
 	return nil
+}
+
+// persistModelThinkingSetting records the session's thinking level against the
+// active model in settings.json, so the level follows the model across
+// sessions and model switches instead of being one global knob.
+func (a *App) persistModelThinkingSetting(modelKey, level string) error {
+	if a == nil || a.settingsPath == "" || modelKey == "" {
+		return nil
+	}
+	settings, err := ai.LoadSettings(a.settingsPath)
+	if err != nil {
+		return fmt.Errorf("load settings: %w", err)
+	}
+	if settings.Models == nil {
+		settings.Models = make(map[string]ai.ModelSettings)
+	}
+	ms := settings.Models[modelKey]
+	ms.ThinkingLevel = level
+	settings.Models[modelKey] = ms
+	if err := ai.SaveSettings(a.settingsPath, settings); err != nil {
+		return fmt.Errorf("write settings: %w", err)
+	}
+	return nil
+}
+
+// applySavedThinkingLevel applies the per-model thinking level configured in
+// settings for key, if any. Model switches otherwise inherit the previous
+// model's level, which silently mismatches models configured for different
+// efforts. Returns whether a level was applied.
+func (a *App) applySavedThinkingLevel(key string) bool {
+	if a == nil || a.sess == nil || a.settingsPath == "" {
+		return false
+	}
+	settings, err := ai.LoadSettings(a.settingsPath)
+	if err != nil {
+		a.conv.AddError("thinking level: load settings: " + err.Error())
+		return false
+	}
+	level := settings.ThinkingLevelFor(key)
+	if level == "" || level == a.currentThinkingLevel() {
+		return false
+	}
+	if err := a.sess.SetThinkingLevel(level); err != nil {
+		a.conv.AddError("thinking level: " + err.Error())
+		return false
+	}
+	if a.footer != nil && a.footer.data != nil {
+		a.footer.data.thinkingLevel = level
+	}
+	a.refreshEditorChrome()
+	a.conv.AddSystem("thinking level: " + level)
+	return true
 }
 
 // switchableModelIDs returns the list of bare model ids the user can

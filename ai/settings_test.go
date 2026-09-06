@@ -197,3 +197,112 @@ func TestSettings_RoundTripFullFields(t *testing.T) {
 		t.Errorf("markdown.codeBlockIndent roundtrip: %q", loaded.Markdown.CodeBlockIndent)
 	}
 }
+
+// TestSettings_ModelsRoundTrip verifies the per-model settings map parses
+// from and saves back to settings.json, keyed by "provider/model-id".
+func TestSettings_ModelsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+
+	if err := os.WriteFile(path, []byte(`{
+  "defaultThinkingLevel": "medium",
+  "models": {
+    "anthropic/claude-opus-4-6": {"thinkingLevel": "high"},
+    "openai/gpt-5.4": {"thinkingLevel": "off"}
+  }
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Models["anthropic/claude-opus-4-6"].ThinkingLevel; got != "high" {
+		t.Errorf("anthropic per-model level = %q, want high", got)
+	}
+	if got := loaded.Models["openai/gpt-5.4"].ThinkingLevel; got != "off" {
+		t.Errorf("openai per-model level = %q, want off", got)
+	}
+
+	if err := SaveSettings(path, loaded); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Models["anthropic/claude-opus-4-6"].ThinkingLevel; got != "high" {
+		t.Errorf("anthropic per-model level after save = %q, want high", got)
+	}
+	if len(reloaded.Models) != 2 {
+		t.Errorf("models map size after save = %d, want 2", len(reloaded.Models))
+	}
+}
+
+// TestMergeSettings_ModelsPerKey verifies project settings merge per model
+// key: project overrides the same key and adds new keys without dropping
+// user-configured ones.
+func TestMergeSettings_ModelsPerKey(t *testing.T) {
+	user := &Settings{Models: map[string]ModelSettings{
+		"anthropic/claude-opus-4-6": {ThinkingLevel: "high"},
+		"google/gemini-2.5-pro":     {ThinkingLevel: "off"},
+	}}
+	project := &Settings{Models: map[string]ModelSettings{
+		"anthropic/claude-opus-4-6": {ThinkingLevel: "low"},
+		"openai/gpt-5.4":            {ThinkingLevel: "minimal"},
+	}}
+
+	merged := MergeSettings(user, project)
+
+	if got := merged.Models["anthropic/claude-opus-4-6"].ThinkingLevel; got != "low" {
+		t.Errorf("project override = %q, want low", got)
+	}
+	if got := merged.Models["google/gemini-2.5-pro"].ThinkingLevel; got != "off" {
+		t.Errorf("user-only key = %q, want off (must survive merge)", got)
+	}
+	if got := merged.Models["openai/gpt-5.4"].ThinkingLevel; got != "minimal" {
+		t.Errorf("project-added key = %q, want minimal", got)
+	}
+}
+
+// TestSettings_ThinkingLevelFor verifies the per-model lookup precedence:
+// per-model override, then global defaultThinkingLevel, then "".
+func TestSettings_ThinkingLevelFor(t *testing.T) {
+	s := &Settings{
+		DefaultThinkingLevel: "medium",
+		Models: map[string]ModelSettings{
+			"anthropic/claude-opus-4-6": {ThinkingLevel: "high"},
+			"broken/typo-model":         {ThinkingLevel: "hight"},
+		},
+	}
+
+	if got := s.ThinkingLevelFor("anthropic/claude-opus-4-6"); got != "high" {
+		t.Errorf("per-model = %q, want high", got)
+	}
+	if got := s.ThinkingLevelFor("unknown/model"); got != "medium" {
+		t.Errorf("fallback to default = %q, want medium", got)
+	}
+	// An invalid per-model value must not reach the request path; fall through
+	// to the global default instead.
+	if got := s.ThinkingLevelFor("broken/typo-model"); got != "medium" {
+		t.Errorf("invalid per-model = %q, want medium (global default)", got)
+	}
+	// Hand-edited values can carry case; the request path compares exactly, so
+	// the lookup normalizes to the lowercase ladder form.
+	casey := &Settings{Models: map[string]ModelSettings{
+		"anthropic/claude-opus-4-6": {ThinkingLevel: "High"},
+	}}
+	if got := casey.ThinkingLevelFor("anthropic/claude-opus-4-6"); got != "high" {
+		t.Errorf("normalized = %q, want high", got)
+	}
+
+	// No per-model and an invalid global default leave nothing configured.
+	empty := &Settings{DefaultThinkingLevel: "sometimes"}
+	if got := empty.ThinkingLevelFor("any/model"); got != "" {
+		t.Errorf("invalid global = %q, want empty", got)
+	}
+	var nilSettings *Settings
+	if got := nilSettings.ThinkingLevelFor("any/model"); got != "" {
+		t.Errorf("nil settings = %q, want empty", got)
+	}
+}

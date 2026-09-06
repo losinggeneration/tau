@@ -3384,6 +3384,11 @@ func (a *App) applyModelFromKey(key string) {
 		}
 	}
 	a.conv.AddSystem("model: " + key)
+	// A saved per-model thinking level follows the model switch; without this
+	// the session keeps the previous model's level. Runs after the model system
+	// row so the transcript reads model-first, and after refreshFooterStats so
+	// its footer/editor-chrome update is the last word on the displayed level.
+	a.applySavedThinkingLevel(key)
 	a.refreshChat()
 }
 

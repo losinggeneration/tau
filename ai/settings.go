@@ -106,6 +106,17 @@ type ThinkingBudgetsSettings struct {
 	High    int `json:"high,omitempty"`
 }
 
+// ModelSettings holds per-model overrides from settings.json. Entries live in
+// the top-level `models` map keyed by "provider/model-id" — the same key shape
+// enabledModels uses. A nested providers shape is not an option: the settings
+// parser rejects a top-level `providers` key (deprecated schema).
+type ModelSettings struct {
+	// ThinkingLevel overrides the reasoning/thinking effort used with this
+	// model. Valid values match ai.ThinkingLevels ("off" through "xhigh").
+	// Empty means no override — the defaultThinkingLevel applies.
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
+}
+
 // BranchSummarySettings controls branch-summary behavior.
 type BranchSummarySettings struct {
 	// ReserveTokens is the token budget for branch summaries. Defaults to 16384.
@@ -188,15 +199,16 @@ type Settings struct {
 
 	// === Nested groups ===
 
-	Compaction      CompactionSettings      `json:"compaction,omitempty"`
-	BranchSummary   BranchSummarySettings   `json:"branchSummary,omitempty"`
-	Retry           RetrySettings           `json:"retry,omitempty"`
-	ThinkingBudgets ThinkingBudgetsSettings `json:"thinkingBudgets,omitempty"`
-	Terminal        TerminalSettings        `json:"terminal,omitempty"`
-	Images          ImageSettings           `json:"images,omitempty"`
-	Markdown        MarkdownSettings        `json:"markdown,omitempty"`
-	Bash            BashSettings            `json:"bash,omitempty"`
-	Read            ReadSettings            `json:"read,omitempty"`
+	Compaction      CompactionSettings       `json:"compaction,omitempty"`
+	BranchSummary   BranchSummarySettings    `json:"branchSummary,omitempty"`
+	Retry           RetrySettings            `json:"retry,omitempty"`
+	ThinkingBudgets ThinkingBudgetsSettings  `json:"thinkingBudgets,omitempty"`
+	Terminal        TerminalSettings         `json:"terminal,omitempty"`
+	Images          ImageSettings            `json:"images,omitempty"`
+	Markdown        MarkdownSettings         `json:"markdown,omitempty"`
+	Bash            BashSettings             `json:"bash,omitempty"`
+	Read            ReadSettings             `json:"read,omitempty"`
+	Models          map[string]ModelSettings `json:"models,omitempty"`
 
 	// === Resource lists ===
 
@@ -502,6 +514,7 @@ func MergeSettings(user, project *Settings) *Settings {
 	out.Bash = mergeBash(user.Bash, project.Bash)
 	out.Read = mergeRead(user.Read, project.Read)
 	out.BranchSummary = mergeBranchSummary(user.BranchSummary, project.BranchSummary)
+	out.Models = mergeModelSettingsMap(user.Models, project.Models)
 
 	// Plugins: project shadows user per-key. nil raw value = explicit removal.
 	out.Plugins = make(map[string]json.RawMessage, len(user.Plugins)+len(project.Plugins))
@@ -656,6 +669,45 @@ func mergeBranchSummary(u, p BranchSummarySettings) BranchSummarySettings {
 		u.SkipPrompt = true
 	}
 	return u
+}
+
+// mergeModelSettingsMap merges project per-model settings over user settings,
+// per key and per field. Keys are "provider/model-id" strings.
+func mergeModelSettingsMap(u, p map[string]ModelSettings) map[string]ModelSettings {
+	if len(p) == 0 {
+		return u
+	}
+	if u == nil {
+		u = make(map[string]ModelSettings)
+	}
+	for key, ps := range p {
+		us := u[key]
+		if ps.ThinkingLevel != "" {
+			us.ThinkingLevel = ps.ThinkingLevel
+		}
+		u[key] = us
+	}
+	return u
+}
+
+// ThinkingLevelFor returns the thinking level configured for the
+// "provider/model-id" key, falling back to the global defaultThinkingLevel.
+// Returns "" when neither is set to a valid level, so callers can apply their
+// own default. Values are normalized to the lowercase ladder form (validation
+// is case-insensitive, but the provider request path compares exactly), and
+// invalid values are treated as unset rather than passed through: a typo in
+// settings.json must not reach the request path.
+func (s *Settings) ThinkingLevelFor(modelKey string) string {
+	if s == nil {
+		return ""
+	}
+	if m, ok := s.Models[modelKey]; ok && IsValidThinkingLevel(m.ThinkingLevel) {
+		return strings.ToLower(m.ThinkingLevel)
+	}
+	if IsValidThinkingLevel(s.DefaultThinkingLevel) {
+		return strings.ToLower(s.DefaultThinkingLevel)
+	}
+	return ""
 }
 
 // prettyJSON reformats compact JSON with 2-space indentation.

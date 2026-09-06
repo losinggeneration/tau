@@ -3202,6 +3202,12 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		sessionThinkingLevel = r.thinkingLevel
 	}
 	if sessionThinkingLevel == "" {
+		// Per-model override from settings, then the global defaultThinkingLevel.
+		// Only fresh sessions reach here: opts/explicit/CLI overrides won above,
+		// and resumes keep the level recorded in the session file.
+		sessionThinkingLevel = r.settings.ThinkingLevelFor(activeModelSpec.String())
+	}
+	if sessionThinkingLevel == "" {
 		sessionThinkingLevel = string(agent.ThinkingMedium)
 	}
 	agentCfg.ThinkingLevel = agent.ThinkingLevel(sessionThinkingLevel)
