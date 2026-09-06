@@ -868,6 +868,17 @@ func parseSlashCommand(line string) (name, args string) {
 	return name, args
 }
 
+// providerTriggerTokens returns provider-specific token caps for
+// auto-compaction. OpenAI's codex models bill at 2x rate above ~270K tokens
+// even though the advertised window is larger, so compaction is capped below
+// that line.
+func providerTriggerTokens(provider string) int {
+	if provider == ai.ProviderOpenAICodex {
+		return 250_000
+	}
+	return 0
+}
+
 func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Message) (<-chan Event, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelFn = cancel
@@ -917,7 +928,11 @@ func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Messag
 			state := s.agent.State()
 			estimatedTokens := s.estimateSessionTokens(state)
 			contextWindow := s.model.ContextWindow
-			if compaction.ShouldCompact(estimatedTokens, contextWindow, s.compactionConfig) {
+			cfg := s.compactionConfig
+			if t := providerTriggerTokens(s.model.Provider); t > 0 {
+				cfg.TriggerTokens = t
+			}
+			if compaction.ShouldCompact(estimatedTokens, contextWindow, cfg) {
 				// Compact before prompting.
 				if err := s.Compact(ctx); err != nil {
 					s.logger.Warn("auto-compaction failed", "error", err)
@@ -2774,7 +2789,7 @@ func (r *runtime) setupDefaultsForRuntime() {
 func (r *runtime) buildCompactionConfig(opts *CompactionSettings) compaction.Config {
 	cfg := compaction.DefaultConfig()
 
-	// Runtime options override settings.
+	// Runtime options override defaults.
 	if opts != nil {
 		if opts.Disabled {
 			cfg.TriggerPct = 0

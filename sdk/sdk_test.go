@@ -18,6 +18,7 @@ import (
 
 	"github.com/losinggeneration/tau/agent"
 	"github.com/losinggeneration/tau/agent/artifacts"
+	"github.com/losinggeneration/tau/agent/compaction"
 	agentplugins "github.com/losinggeneration/tau/agent/plugins"
 	"github.com/losinggeneration/tau/agent/plugins/proto"
 	sessionpkg "github.com/losinggeneration/tau/agent/session"
@@ -3543,6 +3544,46 @@ func TestBuildCompactionConfigDisabled(t *testing.T) {
 	cfg = r.buildCompactionConfig(&CompactionSettings{Disabled: true})
 	if cfg.TriggerPct != 0 {
 		t.Fatalf("runtime disabled TriggerPct = %d, want 0", cfg.TriggerPct)
+	}
+}
+
+func TestProviderTriggerTokens(t *testing.T) {
+	if got := providerTriggerTokens(ai.ProviderOpenAICodex); got != 250_000 {
+		t.Fatalf("openai-codex trigger = %d, want 250000", got)
+	}
+	for _, provider := range []string{"openai", "anthropic", ""} {
+		if got := providerTriggerTokens(provider); got != 0 {
+			t.Fatalf("provider %q trigger = %d, want 0", provider, got)
+		}
+	}
+
+	// Composed behavior at the auto-compact call site. On a 372K window the
+	// 75% default (279K) would cross OpenAI's ~270K 2x-billing line; capped it
+	// fires at 250K.
+	cfg := compaction.DefaultConfig()
+	if t := providerTriggerTokens(ai.ProviderOpenAICodex); t > 0 {
+		cfg.TriggerTokens = t
+	}
+	if !compaction.ShouldCompact(250_000, 372_000, cfg) {
+		t.Error("ShouldCompact(250k, 372k) with codex cap = false, want true")
+	}
+	if compaction.ShouldCompact(249_999, 372_000, cfg) {
+		t.Error("ShouldCompact(249999, 372k) with codex cap = true, want false")
+	}
+
+	// The percentage still governs smaller windows (min semantics):
+	// 75% of 128k = 96k, below the 250k cap.
+	if !compaction.ShouldCompact(100_000, 128_000, cfg) {
+		t.Error("ShouldCompact(100k, 128k) with codex cap = false, want true (96k pct threshold governs)")
+	}
+	if compaction.ShouldCompact(95_999, 128_000, cfg) {
+		t.Error("ShouldCompact(95999, 128k) with codex cap = true, want false")
+	}
+
+	// Disabling auto-compaction wins over the provider cap.
+	cfg.TriggerPct = 0
+	if compaction.ShouldCompact(900_000, 1_000_000, cfg) {
+		t.Error("ShouldCompact with TriggerPct=0 = true, want false (disabled)")
 	}
 }
 

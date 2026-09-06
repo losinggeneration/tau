@@ -7,9 +7,9 @@ import (
 
 // TestGitHubCopilotModelMetadata verifies Copilot models have correct metadata.
 func TestGitHubCopilotModelMetadata(t *testing.T) {
-	model, err := GetAvailableModel("github-copilot", "claude-sonnet-4")
+	model, err := GetAvailableModel("github-copilot", "claude-sonnet-4.6")
 	if err != nil {
-		t.Fatalf("GetAvailableModel(github-copilot, claude-sonnet-4): %v", err)
+		t.Fatalf("GetAvailableModel(github-copilot, claude-sonnet-4.6): %v", err)
 	}
 
 	if model.Provider != "github-copilot" {
@@ -47,8 +47,8 @@ func TestGitHubCopilotModelLookup(t *testing.T) {
 		id       string
 		wantErr  bool
 	}{
-		{"github-copilot", "claude-sonnet-4", false},
-		{"github-copilot", "claude-opus-4.5", false},
+		{"github-copilot", "claude-sonnet-4.6", false},
+		{"github-copilot", "claude-opus-4.7", false},
 		{"github-copilot", "claude-haiku-4.5", false},
 		{"github-copilot", "gpt-5-mini", false},
 		{"github-copilot", "nonexistent", true},
@@ -124,7 +124,7 @@ func TestGitHubCopilotProviderSupport(t *testing.T) {
 
 // TestGitHubCopilotCanGetClient verifies we can construct a client for Copilot models.
 func TestGitHubCopilotCanGetClient(t *testing.T) {
-	model, err := GetAvailableModel("github-copilot", "claude-sonnet-4")
+	model, err := GetAvailableModel("github-copilot", "claude-sonnet-4.6")
 	if err != nil {
 		t.Fatalf("GetAvailableModel: %v", err)
 	}

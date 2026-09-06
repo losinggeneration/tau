@@ -53,6 +53,12 @@ type Config struct {
 	// auto-compaction. A value <= 0 disables auto-compaction.
 	TriggerPct int
 
+	// TriggerTokens caps the trigger at an absolute token count. When > 0,
+	// auto-compaction fires at min(TriggerPct% of the context window,
+	// TriggerTokens). This lets large-context models (e.g. 1M-token windows)
+	// compact well before the percentage threshold would fire.
+	TriggerTokens int
+
 	// PreserveRecent is the number of recent entries to keep uncompacted.
 	PreserveRecent int
 }
@@ -73,6 +79,9 @@ func ShouldCompact(contextTokens, contextWindow int, cfg Config) bool {
 		return false
 	}
 	threshold := contextWindow * cfg.TriggerPct / 100
+	if cfg.TriggerTokens > 0 && cfg.TriggerTokens < threshold {
+		threshold = cfg.TriggerTokens
+	}
 	return contextTokens >= threshold
 }
 

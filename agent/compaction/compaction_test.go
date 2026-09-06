@@ -423,3 +423,57 @@ func TestPrepareCompaction_PreviousSummary(t *testing.T) {
 		t.Errorf("PreviousSummary = %q, want %q", prep.PreviousSummary, wantSummary)
 	}
 }
+
+func TestShouldCompact_TriggerTokens(t *testing.T) {
+	tests := []struct {
+		name          string
+		contextTokens int
+		contextWindow int
+		cfg           Config
+		want          bool
+	}{
+		{
+			name:          "token cap fires early on 1M window",
+			contextTokens: 250_000,
+			contextWindow: 1_000_000,
+			cfg:           Config{TriggerPct: 75, TriggerTokens: 250_000},
+			want:          true,
+		},
+		{
+			name:          "token cap not yet reached on 1M window",
+			contextTokens: 249_999,
+			contextWindow: 1_000_000,
+			cfg:           Config{TriggerPct: 75, TriggerTokens: 250_000},
+			want:          false,
+		},
+		{
+			name:          "pct threshold still applies to smaller windows",
+			contextTokens: 200_000,
+			contextWindow: 300_000,
+			cfg:           Config{TriggerPct: 75, TriggerTokens: 250_000},
+			want:          false, // 75% of 300k = 225k < 250k cap, so pct governs
+		},
+		{
+			name:          "cap ignored when zero",
+			contextTokens: 250_000,
+			contextWindow: 1_000_000,
+			cfg:           Config{TriggerPct: 75},
+			want:          false, // 75% of 1M = 750k
+		},
+		{
+			name:          "disabled overrides cap",
+			contextTokens: 900_000,
+			contextWindow: 1_000_000,
+			cfg:           Config{TriggerTokens: 250_000},
+			want:          false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ShouldCompact(tt.contextTokens, tt.contextWindow, tt.cfg); got != tt.want {
+				t.Errorf("ShouldCompact() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
