@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -155,6 +156,15 @@ type Manager struct {
 
 	// UI interface for headless routing.
 	ui UI
+	// uiStatus and uiWidgets hold the latest value a plugin pushed for each
+	// status/widget key. They exist because the UI is attached late: plugins
+	// load (and receive session_start) before the interactive TUI exists, so
+	// a plugin that renders an indicator from an early event would push it
+	// into a placeholder no-op UI and lose it permanently. Status and widgets
+	// are keyed state rather than transient events, so SetUI replays the
+	// current values into a newly attached UI. Both are guarded by mu.
+	uiStatus  []keyedStatus
+	uiWidgets []keyedWidget
 
 	// failureConfig holds retry configuration per plugin path.
 	failureConfig map[string]FailureConfig
@@ -727,15 +737,92 @@ func NewManager(configDir string, ui ui.UI, commandRegistry *commands.InMemoryRe
 	return m
 }
 
-// SetUI updates the UI implementation used for Host.UI* RPCs.
+// keyedStatus and keyedWidget are the retained UI state, kept in the order the
+// keys were first set so a replay renders deterministically.
+type (
+	keyedStatus struct {
+		key     string
+		message string
+	}
+	keyedWidget struct {
+		key   string
+		lines []string
+	}
+)
+
+// SetUI updates the UI implementation used for Host.UI* RPCs and replays the
+// status and widget state plugins pushed before this UI was attached.
+//
+// The replay is what makes a late-attached UI correct: the interactive TUI
+// installs itself only after the session exists, while session_start reaches
+// plugins during session creation. Without it, an indicator rendered from an
+// early event stays invisible until the plugin happens to redraw it.
 func (m *Manager) SetUI(impl ui.UI) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if impl == nil {
 		m.ui = nil
+		m.mu.Unlock()
 		return
 	}
-	m.ui = &uiAdapter{ui: impl}
+	adapted := &uiAdapter{ui: impl}
+	m.ui = adapted
+	statuses := append([]keyedStatus(nil), m.uiStatus...)
+	widgets := append([]keyedWidget(nil), m.uiWidgets...)
+	m.mu.Unlock()
+
+	// Replayed outside the lock: a UI implementation may call back into the
+	// manager while handling these.
+	for _, status := range statuses {
+		adapted.SetStatus(status.key, status.message)
+	}
+	for _, widget := range widgets {
+		adapted.SetWidget(widget.key, widget.lines)
+	}
+}
+
+// uiSetStatus retains the status for key and forwards it to the attached UI.
+// An empty message is how a plugin clears its indicator, so the key is dropped
+// rather than retained as an empty replay.
+func (m *Manager) uiSetStatus(key, message string) {
+	m.mu.Lock()
+	idx := slices.IndexFunc(m.uiStatus, func(s keyedStatus) bool { return s.key == key })
+	switch {
+	case message == "" && idx >= 0:
+		m.uiStatus = slices.Delete(m.uiStatus, idx, idx+1)
+	case message == "":
+	case idx >= 0:
+		m.uiStatus[idx].message = message
+	default:
+		m.uiStatus = append(m.uiStatus, keyedStatus{key: key, message: message})
+	}
+	impl := m.ui
+	m.mu.Unlock()
+
+	if impl != nil {
+		impl.SetStatus(key, message)
+	}
+}
+
+// uiSetWidget retains the lines for key and forwards them to the attached UI.
+// No lines means the plugin removed its widget, so nothing is retained.
+func (m *Manager) uiSetWidget(key string, lines []string) {
+	m.mu.Lock()
+	idx := slices.IndexFunc(m.uiWidgets, func(w keyedWidget) bool { return w.key == key })
+	switch {
+	case len(lines) == 0 && idx >= 0:
+		m.uiWidgets = slices.Delete(m.uiWidgets, idx, idx+1)
+	case len(lines) == 0:
+	case idx >= 0:
+		m.uiWidgets[idx].lines = slices.Clone(lines)
+	default:
+		m.uiWidgets = append(m.uiWidgets, keyedWidget{key: key, lines: slices.Clone(lines)})
+	}
+	impl := m.ui
+	m.mu.Unlock()
+
+	if impl != nil {
+		impl.SetWidget(key, lines)
+	}
 }
 
 // Discover scans for plugins in the configured directories and loads them.

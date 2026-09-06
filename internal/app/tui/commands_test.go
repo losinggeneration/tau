@@ -20,7 +20,7 @@ type sdkSlashInfo = sdkpkg.SlashCommandInfo
 func TestCommandsBuiltins(t *testing.T) {
 	c := NewCommands()
 
-	// NewCommands seeds 23 builtins: the original interactive commands,
+	// NewCommands seeds 22 builtins: the original interactive commands,
 	// show-model, /layout, plus the interactive stubs. The ordering is
 	// significant (it controls completion popup order) so
 	// we list every entry.
@@ -28,7 +28,7 @@ func TestCommandsBuiltins(t *testing.T) {
 		"help", "model", "show-model", "quit",
 		"settings", "scoped-models", "export", "import", "share",
 		"copy", "name", "session", "changelog", "hotkeys", "layout", "fork",
-		"tree", "login", "logout", "new", "compact", "resume", "reload",
+		"tree", "login", "logout", "new", "compact", "resume",
 	}
 	got := make([]string, 0, len(c.All()))
 	for _, cmd := range c.All() {
@@ -68,14 +68,14 @@ func TestCommandsFilter(t *testing.T) {
 		prefix string
 		want   []string
 	}{
-		// Empty prefix returns all 23 builtins. We list them
+		// Empty prefix returns all 22 builtins. We list them
 		// explicitly so any change to NewCommands is caught here
 		// (this is the canonical command list for the TUI).
 		{"", []string{
 			"help", "model", "show-model", "quit",
 			"settings", "scoped-models", "export", "import", "share",
 			"copy", "name", "session", "changelog", "hotkeys", "layout", "fork",
-			"tree", "login", "logout", "new", "compact", "resume", "reload",
+			"tree", "login", "logout", "new", "compact", "resume",
 		}},
 		{"h", []string{"help", "hotkeys"}},
 		{"c", []string{"changelog", "compact", "copy"}},
@@ -225,6 +225,60 @@ func TestTrySubmitForwardsNonLocalCommand(t *testing.T) {
 	}
 	if fs.sentTexts[0] != "/skill:my-skill arg1 arg2" {
 		t.Errorf("forwarded text = %q, want %q", fs.sentTexts[0], "/skill:my-skill arg1 arg2")
+	}
+}
+
+// TestTrySubmitForwardsReloadToSession verifies /reload reaches the session's
+// command pipeline rather than being intercepted by a TUI-local stub. The
+// session's builtin reload re-discovers artifacts (skills, prompts, themes)
+// and reloads plugins; /reload <plugin> force-restarts the named plugin.
+func TestTrySubmitForwardsReloadToSession(t *testing.T) {
+	app := newTestApp(t)
+	fs := app.sess.(*fakeSession)
+	fs.mu.Lock()
+	fs.slashInfos = []sdkSlashInfo{{
+		Name:         "reload",
+		Description:  "Re-discover artifacts (skills, prompts, themes) and plugins",
+		ArgumentHint: "<plugin>",
+		Source:       "builtin",
+	}}
+	fs.mu.Unlock()
+	editor := newPromptEditorForTest()
+	app.editor = editor
+	app.footer = newFooterForTest()
+	editor.SetText(testCtx(), "/reload my-plugin")
+	ctx := testCtx()
+	ctx.FocusedID = editor.ID()
+	if !app.trySubmit(ctx) {
+		t.Fatal("trySubmit did not consume a /command")
+	}
+	if editor.Text() != "" {
+		t.Errorf("editor text after submit = %q, want empty", editor.Text())
+	}
+	// The session call lands on a background goroutine; yield briefly so the
+	// recording fake sees it before we assert.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		fs.mu.Lock()
+		n := len(fs.sentTexts)
+		fs.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if len(fs.sentTexts) != 1 {
+		t.Fatalf("session.Send calls = %d, want 1", len(fs.sentTexts))
+	}
+	if fs.sentTexts[0] != "/reload my-plugin" {
+		t.Errorf("forwarded text = %q, want %q", fs.sentTexts[0], "/reload my-plugin")
+	}
+	// No local stub may claim the command: a "coming soon" system row would
+	// mean the TUI shadowed the session handler again.
+	if _, found := app.cmds.Lookup("reload"); found {
+		t.Error("reload registered as a TUI-local command; the session owns it")
 	}
 }
 
@@ -415,11 +469,11 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 
 	items := app.completionItems("")
 	// The local registry has 22 entries (4 originals + 18 stubs).
-	// Plus 2 from the session = 25. We don't assert the exact list
+	// Plus 2 from the session = 24. We don't assert the exact list
 	// ordering beyond the first five (the originals) so
 	// future stub additions don't break this test.
-	if len(items) != 25 {
-		t.Fatalf("completionItems = %d items, want 25 (23 local + 2 external)", len(items))
+	if len(items) != 24 {
+		t.Fatalf("completionItems = %d items, want 24 (22 local + 2 external)", len(items))
 	}
 	wantLocal := []string{"help", "model", "show-model", "quit", "settings"}
 	for i, name := range wantLocal {
@@ -469,13 +523,14 @@ func TestRegisterUnregisterAtRuntime(t *testing.T) {
 	if _, ok := c.Lookup("plugin-cmd"); !ok {
 		t.Fatal("plugin-cmd not present after register")
 	}
-	// NewCommands seeds 23 builtins: 4 originals (help, model,
+	// NewCommands seeds 22 builtins: 4 originals (help, model,
 	// show-model, quit) plus 18 interactive stubs/commands (settings,
 	// scoped-models, export, import, share, copy, name, session,
 	// changelog, hotkeys, fork, tree, login, logout, new, compact,
-	// resume, reload). With 1 plugin registered, All() returns 23.
-	if got := len(c.All()); got != 24 {
-		t.Errorf("All() length = %d, want 24 (23 builtins + 1 plugin)", got)
+	// resume). /reload is not a TUI local — the session owns it.
+	// With 1 plugin registered, All() returns 23.
+	if got := len(c.All()); got != 23 {
+		t.Errorf("All() length = %d, want 23 (22 builtins + 1 plugin)", got)
 	}
 	if !c.Unregister("plugin-cmd") {
 		t.Error("Unregister(plugin-cmd) returned false")
@@ -511,7 +566,6 @@ func TestStubCommandsSurfaceComingSoon(t *testing.T) {
 		{"share", "Share the session (coming soon)"},
 		{"copy", "Copy the last assistant reply to the clipboard (coming soon)"},
 		{"changelog", "Show the changelog (coming soon)"},
-		{"reload", "Reload extensions, skills, and prompt templates (coming soon)"},
 	}
 	for _, tc := range stubs {
 		t.Run(tc.name, func(t *testing.T) {

@@ -18,9 +18,10 @@ import (
 // interactive command Pi documents (/help, /model, /show-model, /quit,
 // /settings, /scoped-models, /export, /import, /share, /copy, /name,
 // /session, /changelog, /hotkeys, /fork, /tree, /login, /logout, /new,
-// /compact, /resume, /reload) is registered in the app's command
-// registry. Missing entries surface here so the inventory stays
-// authoritative.
+// /compact, /resume) is registered in the app's command registry.
+// Missing entries surface here so the inventory stays authoritative.
+// /reload is not local: the session's command pipeline owns it, so its
+// coverage lives in TestTrySubmitForwardsReloadToSession.
 func TestParityAudit_CommandsRegistered(t *testing.T) {
 	app := newTestApp(t)
 	required := []string{
@@ -28,7 +29,7 @@ func TestParityAudit_CommandsRegistered(t *testing.T) {
 		"settings", "scoped-models", "export", "import",
 		"share", "copy", "name", "session", "changelog",
 		"hotkeys", "fork", "tree", "login", "logout",
-		"new", "compact", "resume", "reload",
+		"new", "compact", "resume",
 	}
 	registered := map[string]bool{}
 	for _, c := range app.cmds.All() {

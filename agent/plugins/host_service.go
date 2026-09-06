@@ -101,17 +101,15 @@ func (h *HostService) UINotify(ctx context.Context, req *proto.UINotifyRequest) 
 
 // UISetStatus implements Host.UISetStatus.
 func (h *HostService) UISetStatus(ctx context.Context, req *proto.UISetStatusRequest) (*proto.UISetStatusResponse, error) {
-	if h.manager.ui != nil {
-		h.manager.ui.SetStatus(req.Key, req.Message)
-	}
+	// Routed through the manager so the value is retained for a UI that has
+	// not attached yet (see Manager.SetUI).
+	h.manager.uiSetStatus(req.Key, req.Message)
 	return &proto.UISetStatusResponse{}, nil
 }
 
 // UISetWidget implements Host.UISetWidget.
 func (h *HostService) UISetWidget(ctx context.Context, req *proto.UISetWidgetRequest) (*proto.UISetWidgetResponse, error) {
-	if h.manager.ui != nil {
-		h.manager.ui.SetWidget(req.Key, req.Lines)
-	}
+	h.manager.uiSetWidget(req.Key, req.Lines)
 	return &proto.UISetWidgetResponse{}, nil
 }
 

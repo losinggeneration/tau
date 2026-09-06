@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
+	baseui "github.com/losinggeneration/tau/ui"
 )
 
 // TestDispatchEventCollect_RegistrationOrder ensures handlers receive events
@@ -130,8 +132,9 @@ func TestPrepareHostSocket_PrefersXDGRuntimeDir(t *testing.T) {
 }
 
 // TestBuildPluginCmd_ManifestRunCommand: simple launcher lines exec the
-// interpreter directly (no shell) so signals reach the plugin process, with
-// cwd = manifest dir and TAU_HOST_SOCKET injected.
+// interpreter directly through the stdin-isolating wrapper (no shell
+// forking) so signals reach the plugin process, with cwd = manifest dir and
+// TAU_HOST_SOCKET injected.
 func TestBuildPluginCmd_ManifestRunCommand(t *testing.T) {
 	manifest := &Manifest{
 		Run: &RunSection{Command: "node /opt/shim/index.js pi-extension/index.js"},
@@ -143,8 +146,15 @@ func TestBuildPluginCmd_ManifestRunCommand(t *testing.T) {
 	if cmd.Dir != "/pkg/dir" {
 		t.Errorf("cmd.Dir = %q, want /pkg/dir", cmd.Dir)
 	}
-	// Direct exec: argv is exactly the run command's fields.
-	want := []string{"node", "/opt/shim/index.js", "pi-extension/index.js"}
+	// Direct exec through the wrapper: sh -c <script> node args..., where the
+	// script execs "$0" "$@" so the argv below is the real plugin argv. A bare
+	// interpreter name is PATH-resolved so a missing binary fails at launch
+	// construction instead of as a handshake timeout.
+	nodeBin, err := resolveLaunchBinary("node")
+	if err != nil {
+		t.Fatalf("resolve node: %v", err)
+	}
+	want := []string{"sh", "-c", pluginDirectScript, nodeBin, "/opt/shim/index.js", "pi-extension/index.js"}
 	if !slices.Equal(cmd.Args, want) {
 		t.Errorf("cmd.Args = %v, want %v", cmd.Args, want)
 	}
@@ -177,21 +187,28 @@ func TestBuildPluginCmd_QuotedPathsSplit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildPluginCmd: %v", err)
 	}
-	want := []string{"node", "/opt/my shim/index.js", "entry file.js"}
+	// Quoted fields survive as single $0/$@ parameters — the wrapper never
+	// re-splits them.
+	nodeBin, err := resolveLaunchBinary("node")
+	if err != nil {
+		t.Fatalf("resolve node: %v", err)
+	}
+	want := []string{"sh", "-c", pluginDirectScript, nodeBin, "/opt/my shim/index.js", "entry file.js"}
 	if !slices.Equal(cmd.Args, want) {
 		t.Errorf("cmd.Args = %v, want %v", cmd.Args, want)
 	}
 }
 
-// TestBuildPluginCmd_NoManifest uses exec.Command(path) and still injects
-// the host socket env.
+// TestBuildPluginCmd_NoManifest wraps the bare binary through the same
+// stdin-isolating exec wrapper and still injects the host socket env.
 func TestBuildPluginCmd_NoManifest(t *testing.T) {
 	cmd, err := buildPluginCmd("/abs/plugin-binary", nil, "", "/tmp/sock2")
 	if err != nil {
 		t.Fatalf("buildPluginCmd: %v", err)
 	}
-	if cmd.Path != "/abs/plugin-binary" {
-		t.Errorf("cmd.Path = %q, want /abs/plugin-binary", cmd.Path)
+	want := []string{"sh", "-c", pluginDirectScript, "/abs/plugin-binary"}
+	if !slices.Equal(cmd.Args, want) {
+		t.Errorf("cmd.Args = %v, want %v", cmd.Args, want)
 	}
 	if cmd.Dir != filepath.Dir("/abs/plugin-binary") {
 		t.Errorf("cmd.Dir = %q, want %q", cmd.Dir, filepath.Dir("/abs/plugin-binary"))
@@ -210,13 +227,62 @@ func TestBuildPluginCmd_HandshakeMatchesLoadLocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildPluginCmd: %v", err)
 	}
-	// Direct exec — argv matches the manifest's command fields exactly.
-	want := []string{"node", "shim.js", "--port=8080"}
+	// Direct exec through the wrapper — argv matches the manifest's command
+	// fields exactly as $0/$@.
+	nodeBin, err := resolveLaunchBinary("node")
+	if err != nil {
+		t.Fatalf("resolve node: %v", err)
+	}
+	want := []string{"sh", "-c", pluginDirectScript, nodeBin, "shim.js", "--port=8080"}
 	if !slices.Equal(cmd.Args, want) {
 		t.Errorf("cmd.Args = %v, want %v (Handshake must match loadLocked)", cmd.Args, want)
 	}
 	if cmd.Dir != "/p" {
 		t.Errorf("cmd.Dir = %q, want /p", cmd.Dir)
+	}
+}
+
+// TestBuildPluginCmd_IsolatesTerminalStdin pins the launcher hygiene that
+// keeps plugin subprocesses off tau's terminal: go-plugin unconditionally
+// assigns the host's stdin to the plugin process (cmd.Stdin = os.Stdin), and
+// inside the TUI that fd IS the terminal. A plugin — or any process an
+// extension spawns from it — that reads or reconfigures that fd steals
+// keystrokes from the UI and can leave the tty in a cooked/echoing state
+// (observed as a wedged TUI after /reload killed a plugin tree still holding
+// the terminal). Every launch shape must therefore exec through a wrapper
+// script that redirects stdin to /dev/null, and must use exec so signal
+// delivery to the plugin stays direct.
+func TestBuildPluginCmd_IsolatesTerminalStdin(t *testing.T) {
+	runManifest := &Manifest{Run: &RunSection{Command: "node /opt/shim/index.js entry.js"}}
+	complexManifest := &Manifest{Run: &RunSection{Command: "node shim.js --port=8080 && echo ready"}}
+
+	cases := []struct {
+		name         string
+		path         string
+		manifest     *Manifest
+		manifestPath string
+	}{
+		{"direct run command", "/pkg/dir/extension", runManifest, "/pkg/dir/tau-package.toml"},
+		{"shell run command", "/p/x", complexManifest, "/p/tau-package.toml"},
+		{"bare binary", "/abs/plugin-binary", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, err := buildPluginCmd(tc.path, tc.manifest, tc.manifestPath, "")
+			if err != nil {
+				t.Fatalf("buildPluginCmd: %v", err)
+			}
+			if len(cmd.Args) < 3 || cmd.Args[0] != "sh" || cmd.Args[1] != "-c" {
+				t.Fatalf("cmd.Args = %v, want an sh -c <script> wrapper", cmd.Args)
+			}
+			script := cmd.Args[2]
+			if !strings.Contains(script, "exec") {
+				t.Errorf("script %q must exec so signals reach the plugin directly", script)
+			}
+			if !strings.Contains(script, "< /dev/null") {
+				t.Errorf("script %q must redirect stdin to /dev/null so the plugin tree cannot hold tau's terminal", script)
+			}
+		})
 	}
 }
 
@@ -637,5 +703,130 @@ func TestDispatchTerminalInputForwardsToLoadedPlugins(t *testing.T) {
 	got := client.seen[0]
 	if got.Key != "rune" || got.Text != "x" || got.Mod != "ctrl" {
 		t.Fatalf("terminal input = %#v, want key/text/mod forwarded", got)
+	}
+}
+
+// recordingUI records the keyed UI state pushed through the Host service so
+// tests can assert on what a freshly attached UI receives.
+type recordingUI struct {
+	mu      sync.Mutex
+	status  map[string]string
+	widgets map[string][]string
+}
+
+func newRecordingUI() *recordingUI {
+	return &recordingUI{status: map[string]string{}, widgets: map[string][]string{}}
+}
+
+func (r *recordingUI) Confirm(context.Context, string, string) (bool, error) { return false, nil }
+func (r *recordingUI) Select(context.Context, string, []string) (int, error) { return -1, nil }
+func (r *recordingUI) Input(context.Context, string, string) (string, error) { return "", nil }
+func (r *recordingUI) Notify(baseui.NotifyLevel, string)                     {}
+func (r *recordingUI) SetTitle(string)                                       {}
+func (r *recordingUI) SetEditorText(string)                                  {}
+func (r *recordingUI) SetToolsExpanded(bool)                                 {}
+
+func (r *recordingUI) SetStatus(key, message string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.status[key] = message
+}
+
+func (r *recordingUI) SetWidget(key string, lines []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.widgets[key] = append([]string(nil), lines...)
+}
+
+func (r *recordingUI) statusFor(key string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value, ok := r.status[key]
+	return value, ok
+}
+
+func (r *recordingUI) widgetFor(key string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.widgets[key]
+}
+
+// TestSetUIReplaysStateSetBeforeUIAttached pins the startup ordering hole.
+//
+// The interactive TUI attaches its UI (pluginMgr.SetUI(app)) only after the
+// session exists, but session_start is dispatched to plugins *during* session
+// creation. A plugin that renders its indicator from that event — ponytail's
+// "ponytail: ULTRA" status — pushed it into the placeholder no-op UI, where it
+// was dropped for good: the indicator then appeared only once some later event
+// (agent_start on the first prompt) happened to fire after the real UI landed.
+// Status and widgets are keyed state, not transient events, so attaching a UI
+// must replay the current values.
+func TestSetUIReplaysStateSetBeforeUIAttached(t *testing.T) {
+	mgr := NewManager(t.TempDir(), baseui.NewNoOpUI(), nil)
+	ctx := context.Background()
+
+	if _, err := mgr.host.UISetStatus(ctx, &proto.UISetStatusRequest{Key: "ponytail", Message: "ponytail: ULTRA"}); err != nil {
+		t.Fatalf("UISetStatus: %v", err)
+	}
+	if _, err := mgr.host.UISetWidget(ctx, &proto.UISetWidgetRequest{Key: "ponytail", Lines: []string{"row"}}); err != nil {
+		t.Fatalf("UISetWidget: %v", err)
+	}
+
+	rec := newRecordingUI()
+	mgr.SetUI(rec)
+
+	if got, ok := rec.statusFor("ponytail"); !ok || got != "ponytail: ULTRA" {
+		t.Errorf("status after SetUI = %q (present=%v), want it replayed as %q", got, ok, "ponytail: ULTRA")
+	}
+	if got := rec.widgetFor("ponytail"); !slices.Equal(got, []string{"row"}) {
+		t.Errorf("widget after SetUI = %v, want [row] replayed", got)
+	}
+}
+
+// Only the newest value per key is replayed, and a key the plugin cleared must
+// not come back to life when a UI attaches.
+func TestSetUIReplaysLatestStateAndSkipsCleared(t *testing.T) {
+	mgr := NewManager(t.TempDir(), baseui.NewNoOpUI(), nil)
+	ctx := context.Background()
+
+	for _, message := range []string{"ponytail: LITE", "ponytail: ULTRA"} {
+		if _, err := mgr.host.UISetStatus(ctx, &proto.UISetStatusRequest{Key: "ponytail", Message: message}); err != nil {
+			t.Fatalf("UISetStatus: %v", err)
+		}
+	}
+	if _, err := mgr.host.UISetStatus(ctx, &proto.UISetStatusRequest{Key: "gone", Message: "transient"}); err != nil {
+		t.Fatalf("UISetStatus: %v", err)
+	}
+	// An empty message is how a plugin clears its indicator (ponytail does this
+	// for mode "off"); there is nothing to restore for that key afterwards.
+	if _, err := mgr.host.UISetStatus(ctx, &proto.UISetStatusRequest{Key: "gone", Message: ""}); err != nil {
+		t.Fatalf("UISetStatus: %v", err)
+	}
+
+	rec := newRecordingUI()
+	mgr.SetUI(rec)
+
+	if got, _ := rec.statusFor("ponytail"); got != "ponytail: ULTRA" {
+		t.Errorf("status = %q, want only the newest value %q", got, "ponytail: ULTRA")
+	}
+	if got, ok := rec.statusFor("gone"); ok {
+		t.Errorf("cleared key replayed as %q, want it left unset", got)
+	}
+}
+
+// Attaching a UI must not turn the manager into a replay-only sink: updates
+// after SetUI still go straight through to the live UI.
+func TestUIStateForwardsLiveAfterSetUI(t *testing.T) {
+	mgr := NewManager(t.TempDir(), baseui.NewNoOpUI(), nil)
+	ctx := context.Background()
+
+	rec := newRecordingUI()
+	mgr.SetUI(rec)
+
+	if _, err := mgr.host.UISetStatus(ctx, &proto.UISetStatusRequest{Key: "ponytail", Message: "ponytail: FULL"}); err != nil {
+		t.Fatalf("UISetStatus: %v", err)
+	}
+	if got, _ := rec.statusFor("ponytail"); got != "ponytail: FULL" {
+		t.Errorf("live status = %q, want %q", got, "ponytail: FULL")
 	}
 }

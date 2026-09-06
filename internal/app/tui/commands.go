@@ -80,10 +80,13 @@ type Commands struct {
 //
 // plus the convenience /help (standard across interactive CLIs).
 //
-// Commands still stubbed: /import, /share, /changelog, and /reload.
-// /export, /copy, /fork, /tree, /login, /logout, /hotkeys,
-// /compact, /resume, /settings, /scoped-models, /layout, /new, /model,
-// /name, /session, /show-model, and /quit have live handlers.
+// Commands still stubbed: /import, /share, and /changelog.
+// /reload is owned by the session's command pipeline (it re-discovers
+// skills/prompts/themes and reloads plugins); the TUI forwards the line
+// when the session advertises it. /export, /copy, /fork, /tree, /login,
+// /logout, /hotkeys, /compact, /resume, /settings, /scoped-models,
+// /layout, /new, /model, /name, /session, /show-model, and /quit have
+// live handlers.
 func NewCommands() *Commands {
 	c := &Commands{byName: map[string]Command{}}
 	c.Register(Command{
@@ -131,7 +134,9 @@ func NewCommands() *Commands {
 	c.Register(Command{Name: "new", Description: "Start a new session", Handler: cmdNew})
 	c.Register(Command{Name: "compact", Description: "Compact session history", Handler: cmdCompact})
 	c.Register(Command{Name: "resume", Description: "Resume a saved session", Handler: cmdResume})
-	c.Register(Command{Name: "reload", Description: "Reload resources", Handler: cmdStub("reload", "Reload extensions, skills, and prompt templates (coming soon)")})
+	// /reload is deliberately not registered here: the session's command
+	// pipeline owns it (artifact + plugin reload), and a local entry — even a
+	// stub — would shadow that handler.
 	return c
 }
 

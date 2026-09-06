@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,15 +76,43 @@ func splitCommand(line string) []string {
 	return fields
 }
 
+// Launch wrapper scripts. go-plugin unconditionally assigns the host's
+// stdin to the plugin process (cmd.Stdin = os.Stdin), and inside the TUI that
+// fd is the terminal. A plugin — or any process an extension spawns from it —
+// that reads or reconfigures that fd steals keystrokes from the UI and can
+// leave the tty cooked and echoing (a wedged TUI after /reload killed a
+// plugin tree that still held the terminal). Both scripts redirect stdin to
+// /dev/null and use exec so the wrapper shell replaces itself rather than
+// forking, keeping signal delivery to the plugin direct.
+const (
+	pluginDirectScript = `exec "$0" "$@" < /dev/null`
+	pluginShellScript  = `exec sh -c "$1" "$2" < /dev/null`
+)
+
+// resolveLaunchBinary resolves a bare interpreter name via PATH so a missing
+// binary fails at launch construction instead of as a handshake timeout.
+// Paths containing a slash are returned unchanged; sh resolves them against
+// the command's working directory.
+func resolveLaunchBinary(bin string) (string, error) {
+	if strings.ContainsRune(bin, '/') {
+		return bin, nil
+	}
+	resolved, err := exec.LookPath(bin)
+	if err != nil {
+		return "", fmt.Errorf("plugin run command %q: %w", bin, err)
+	}
+	return resolved, nil
+}
+
 // buildPluginCmd constructs the exec.Cmd used to launch a plugin, honoring
 // the manifest's [run].command when present and injecting TAU_HOST_SOCKET so
 // the plugin can dial the Host service. Used by both the discovery-time
 // loadLocked path and the CLI-driven Handshake path so they share launch
 // semantics (plugin path as $1, cwd = manifest dir).
 //
-// Simple launcher lines (e.g. "node /abs/shim/index.js entry.js") exec the
-// interpreter directly so signals reach the plugin process. Lines with shell
-// metacharacters fall back to sh -c.
+// Every shape launches through an sh -c wrapper that redirects stdin to
+// /dev/null (see the script constants above) while exec'ing the real command
+// so signals still reach the plugin process.
 //
 // hostSocket is the path to the Host service unix socket; empty means no
 // Host service is available (the env var is not set).
@@ -105,15 +134,18 @@ func buildPluginCmd(path string, manifest *Manifest, manifestPath, hostSocket st
 		runCmd := manifest.Run.Command
 		if !strings.ContainsAny(runCmd, shellMetachars) {
 			if fields := splitCommand(runCmd); len(fields) > 0 {
+				bin, err := resolveLaunchBinary(fields[0])
+				if err != nil {
+					return nil, err
+				}
 				// Direct exec: the plugin process gets signals directly.
-				return withEnv(exec.Command(fields[0], fields[1:]...)), nil
+				wrapperArgs := append([]string{"-c", pluginDirectScript, bin}, fields[1:]...)
+				return withEnv(exec.Command("sh", wrapperArgs...)), nil
 			}
 		}
 		// Shell fallback for complex commands. The plugin package dir is
-		// passed as $1 for scripts that want it.
-		cmd := exec.Command("sh", "-c", runCmd)
-		cmd.Args = append(cmd.Args, path)
-		return withEnv(cmd), nil
+		// passed as $0 for scripts that want it.
+		return withEnv(exec.Command("sh", "-c", pluginShellScript, "sh", runCmd, path)), nil
 	}
-	return withEnv(exec.Command(path)), nil
+	return withEnv(exec.Command("sh", "-c", pluginDirectScript, path)), nil
 }
