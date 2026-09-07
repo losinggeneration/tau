@@ -345,7 +345,7 @@ func SupportsXhigh(model *Model) bool {
 	}
 	id := model.ID
 	if strings.Contains(id, "gpt-5.2") || strings.Contains(id, "gpt-5.3") || strings.Contains(id, "gpt-5.4") ||
-		strings.Contains(id, "gpt-5.5") || strings.Contains(id, "gpt-5.6") {
+		strings.Contains(id, "gpt-5.5") || strings.Contains(id, "gpt-5.6") || strings.Contains(id, "gpt-6") {
 		return true
 	}
 	if strings.Contains(id, "opus-4-6") || strings.Contains(id, "opus-4.6") ||

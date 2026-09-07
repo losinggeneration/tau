@@ -40,7 +40,7 @@ func TestSupportsXhighNonOpusAnthropic(t *testing.T) {
 
 // TestSupportsXhighOpenAICodexCurrent verifies current OpenAI Codex models support xhigh reasoning.
 func TestSupportsXhighOpenAICodexCurrent(t *testing.T) {
-	for _, modelID := range []string{"gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"} {
+	for _, modelID := range []string{"gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"} {
 		t.Run(modelID, func(t *testing.T) {
 			model, err := GetAvailableModel(ProviderOpenAICodex, modelID)
 			if err != nil {

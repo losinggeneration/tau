@@ -522,17 +522,24 @@ func addStaticModels(models *[]*tauai.Model) {
 		appendIfMissing(cloneWithIDAndName(copilotBaseModel, "gpt-5.3-codex", "GPT-5.3 Codex"))
 	}
 
-	codexModels := []*tauai.Model{
-		newModel("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", tauai.APIOpenAICodexResponses, "openai-codex", codexBaseURL, true, []string{"text"}, costProfile(1.75, 14, 0.175, 0), 128000, codexMaxTokens),
-		newModel("gpt-5.4", "GPT-5.4", tauai.APIOpenAICodexResponses, "openai-codex", codexBaseURL, true, []string{"text", "image"}, costProfile(2.5, 15, 0.25, 0), codexContext, codexMaxTokens),
-		newModel("gpt-5.4-mini", "GPT-5.4 mini", tauai.APIOpenAICodexResponses, "openai-codex", codexBaseURL, true, []string{"text", "image"}, costProfile(0.75, 4.5, 0.075, 0), codexContext, codexMaxTokens),
-		newModel("gpt-5.5", "GPT-5.5", tauai.APIOpenAICodexResponses, "openai-codex", codexBaseURL, true, []string{"text", "image"}, costProfile(5, 30, 0.5, 0), codexContext, codexMaxTokens),
-		newModel("gpt-5.6-luna", "GPT-5.6 Luna", tauai.APIOpenAICodexResponses, "openai-codex", codexBaseURL, true, []string{"text", "image"}, costProfile(1, 6, 0.1, 1.25), 372000, codexMaxTokens),
-		newModel("gpt-5.6-sol", "GPT-5.6 Sol", tauai.APIOpenAICodexResponses, "openai-codex", codexBaseURL, true, []string{"text", "image"}, costProfile(5, 30, 0.5, 6.25), 372000, codexMaxTokens),
-		newModel("gpt-5.6-terra", "GPT-5.6 Terra", tauai.APIOpenAICodexResponses, "openai-codex", codexBaseURL, true, []string{"text", "image"}, costProfile(2.5, 15, 0.25, 3.125), 372000, codexMaxTokens),
-	}
-	for _, model := range codexModels {
-		appendIfMissing(model)
+	// OpenAI Codex (ChatGPT OAuth) serves a subset of the openai lineup. Clone
+	// those models from the openai provider entries collected above; codex
+	// responses are enforced to a ~272k context by the backend regardless of
+	// the model's marketing window. codexModelIDs mirrors the models reported
+	// by GET chatgpt.com/backend-api/codex/models (visible ones only).
+	codexModelIDs := []string{"gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"}
+	for _, id := range codexModelIDs {
+		base := findModel(*models, "openai", id)
+		if base == nil {
+			continue
+		}
+		codex := cloneWithIDAndName(base, base.ID, base.Name)
+		codex.API = tauai.APIOpenAICodexResponses
+		codex.Provider = "openai-codex"
+		codex.BaseURL = codexBaseURL
+		codex.ContextWindow = codexContext
+		codex.MaxTokens = codexMaxTokens
+		appendIfMissing(codex)
 	}
 
 	appendIfMissing(newModel("grok-code-fast-1", "Grok Code Fast 1", tauai.APIOpenAICompletions, "xai", "https://api.x.ai/v1", false, []string{"text"}, costProfile(0.2, 1.5, 0.02, 0), 32768, 8192))
