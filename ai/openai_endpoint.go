@@ -2,11 +2,13 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Endpoint resolution and transport shared by the two clients that speak the
@@ -16,6 +18,16 @@ import (
 
 // chatCompletionsPath is the endpoint both clients POST to.
 const chatCompletionsPath = "/chat/completions"
+
+var (
+	// chatCompletionsMaxRetries bounds 5xx retries. With the doubling base
+	// delay below the full schedule runs ~128s, so a hard-down provider
+	// still fails in about two minutes.
+	chatCompletionsMaxRetries = 10
+	// chatCompletionsRetryBase is the first backoff delay; each retry doubles
+	// it (125ms, 250ms, ... 64s).
+	chatCompletionsRetryBase = 125 * time.Millisecond
+)
 
 // resolveOpenAIBaseURL returns the base URL for a model's chat/completions
 // endpoint, preferring an explicit Model.BaseURL over the provider default.
@@ -106,25 +118,42 @@ func (t *HTTPTransport) withRequestOptions(model *Model, o *options) *HTTPTransp
 	return t.withAPIKey(apiKey).withHeaders(headers)
 }
 
+// chatCompletionsRetryDelay returns the backoff before retry attempt+1.
+func chatCompletionsRetryDelay(attempt int) time.Duration {
+	return chatCompletionsRetryBase * time.Duration(1<<attempt)
+}
+
 // doOpenAIChatCompletions posts a chat/completions request and returns the
-// response for streaming. On success the caller owns closing the body; on any
+// response for streaming. Transient server failures (HTTP 5xx) are retried
+// with exponential backoff for roughly two minutes before giving up; anything
+// else fails immediately. On success the caller owns closing the body; on any
 // error the body is already closed.
 func doOpenAIChatCompletions(ctx context.Context, model *Model, o *options, transport *HTTPTransport, body string) (*http.Response, error) {
-	resp, err := transport.Do(ctx, http.MethodPost, chatCompletionsPath, body)
-	if err != nil {
-		return nil, fmt.Errorf("%s: request: %w", model.Provider, err)
-	}
+	for attempt := 0; ; attempt++ {
+		resp, err := transport.Do(ctx, http.MethodPost, chatCompletionsPath, body)
+		if err != nil {
+			return nil, fmt.Errorf("%s: request: %w", model.Provider, err)
+		}
 
-	if hasResponseCallback(o) {
-		invokeResponseCallback(o, model, responseMetadata(resp))
-	}
+		if hasResponseCallback(o) {
+			invokeResponseCallback(o, model, responseMetadata(resp))
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
 
 		respBody, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("%s: status %d", model.Provider, resp.StatusCode)
+			err := fmt.Errorf("read error response body: %w", readErr)
+			if closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close error response body: %w", closeErr))
+			}
+			return nil, fmt.Errorf("%s: status %d: %w", model.Provider, resp.StatusCode, err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("%s: close error response body: %w", model.Provider, closeErr)
 		}
 
 		// z.ai reports an exhausted usage window as a 429 whose message
@@ -133,8 +162,14 @@ func doOpenAIChatCompletions(ctx context.Context, model *Model, o *options, tran
 			return nil, usageErr
 		}
 
+		if attempt < chatCompletionsMaxRetries && resp.StatusCode >= http.StatusInternalServerError {
+			if sleepErr := sleepWithContext(ctx, chatCompletionsRetryDelay(attempt)); sleepErr == nil {
+				continue
+			} else {
+				return nil, fmt.Errorf("%s: request: %w", model.Provider, sleepErr)
+			}
+		}
+
 		return nil, fmt.Errorf("%s: status %d: %s", model.Provider, resp.StatusCode, string(respBody))
 	}
-
-	return resp, nil
 }
