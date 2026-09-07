@@ -37,7 +37,7 @@ func TestListSearchFiltersAndResetsSelection(t *testing.T) {
 	lines := l.Render(80)
 	found := false
 	for _, line := range lines {
-		if line == "> g\x1b[7m \x1b[27m                                                                            " {
+		if line == "> g"+strings.Repeat(" ", 77) {
 			continue
 		}
 		if line == "> Gamma  " {
@@ -52,6 +52,47 @@ func TestListSearchFiltersAndResetsSelection(t *testing.T) {
 	}
 	if l.Search() != "g" || l.SelectedIndex() != 0 {
 		t.Fatalf("search=%q selected=%d", l.Search(), l.SelectedIndex())
+	}
+}
+
+// The settings rows render through cell-based drawing where a zero-width
+// ESC rune is overwritten by the next cell, leaving literal "[7m" text on
+// screen. The search input must therefore not embed ANSI escapes.
+func TestListRenderSearchInputHasNoANSIEscapes(t *testing.T) {
+	l := New([]Item{{ID: "a", Label: "Alpha"}}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	l.HandleInput("g")
+	rows := l.Render(80)
+	if !strings.HasPrefix(rows[0], "> g") {
+		t.Fatalf("search row = %q", rows[0])
+	}
+	if strings.ContainsRune(rows[0], '\x1b') {
+		t.Fatalf("search row embeds ANSI escapes: %q", rows[0])
+	}
+}
+
+func TestListRenderNoBlankLineAfterSearchRow(t *testing.T) {
+	l := New([]Item{{ID: "a", Label: "Alpha"}, {ID: "b", Label: "Beta"}}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	rows := l.Render(80)
+	if len(rows) < 2 || rows[1] == "" {
+		t.Fatalf("blank line after search row: %#v", rows)
+	}
+}
+
+func TestListValueChangeKeepsSelection(t *testing.T) {
+	l := New([]Item{
+		{ID: "a", Label: "A", Values: []string{"1", "2"}},
+		{ID: "b", Label: "B", CurrentValue: "x", Values: []string{"x", "y"}},
+	}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	l.HandleInput("\x1b[B") // down to B
+	if l.SelectedIndex() != 1 {
+		t.Fatalf("after down = %d, want 1", l.SelectedIndex())
+	}
+	l.HandleInput("\r") // cycle B's value
+	if l.SelectedIndex() != 1 {
+		t.Fatalf("selection reset to %d after value change, want 1", l.SelectedIndex())
+	}
+	if l.Items()[1].CurrentValue != "y" {
+		t.Fatalf("value not cycled: %q", l.Items()[1].CurrentValue)
 	}
 }
 

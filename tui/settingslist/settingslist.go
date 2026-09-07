@@ -52,6 +52,7 @@ type List struct {
 	onCancel      func()
 	searchEnabled bool
 	search        string
+	appliedQuery  string
 	submenu       KeyComponent
 	submenuIndex  int
 }
@@ -91,7 +92,7 @@ func (l *List) Render(width int) []string {
 func (l *List) renderMain(width int) []string {
 	var lines []string
 	if l.searchEnabled {
-		lines = append(lines, renderSearchInput(l.search, width), "")
+		lines = append(lines, renderSearchInput(l.search, width))
 	}
 	if len(l.items) == 0 {
 		lines = append(lines, l.theme.Hint("  No settings available"))
@@ -287,7 +288,17 @@ func (l *List) applyFilter(q string) {
 	} else {
 		l.filtered = fuzzy.Filter(l.items, q, func(i Item) string { return i.Label })
 	}
-	l.selected = 0
+	// A changed query changes the item set, so reset the cursor. A re-apply
+	// with the same query (a value change) must keep the cursor where it was,
+	// otherwise changing the second setting jumps to the top and the next
+	// keypress edits an unrelated row.
+	if q != l.appliedQuery {
+		l.selected = 0
+	}
+	l.appliedQuery = q
+	if l.selected >= len(l.filtered) {
+		l.selected = max(0, len(l.filtered)-1)
+	}
 }
 
 func (l *List) displayItems() []Item {
@@ -301,9 +312,13 @@ func (l *List) addHint(lines *[]string, width int) {
 	*lines = append(*lines, "", truncate(l.theme.Hint(map[bool]string{true: "  Type to search · Enter/Space to change · Esc to cancel", false: "  Enter/Space to change · Esc to cancel"}[l.searchEnabled]), width))
 }
 
+// renderSearchInput renders the search prompt row. It must not embed
+// ANSI escape sequences: the list renders through cell-based drawing
+// where a zero-width ESC rune is overwritten by the next cell, leaving
+// literal "[7m" text on screen.
 func renderSearchInput(value string, width int) string {
-	line := "> " + value + "\x1b[7m \x1b[27m"
-	return truncate(line+strings.Repeat(" ", max(0, width-visibleWidth("> "+value+" "))), width)
+	line := "> " + value
+	return truncate(line+strings.Repeat(" ", max(0, width-visibleWidth(line))), width)
 }
 
 func visibleWidth(s string) int { return text.Width(s) }
