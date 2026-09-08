@@ -591,6 +591,12 @@ func TestExpandPath(t *testing.T) {
 }
 
 // TestParseFrontmatter tests frontmatter parsing.
+func TestParseSimpleYAMLFoldedDescription(t *testing.T) {
+	fm, err := parseSimpleYAML([]byte("name: ponytail\ndescription: >\n  Forces the laziest solution\n  that actually works\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "Forces the laziest solution that actually works", fm["description"])
+}
+
 func TestParseFrontmatter(t *testing.T) {
 	t.Run("With frontmatter", func(t *testing.T) {
 		data := []byte(`---

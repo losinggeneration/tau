@@ -460,3 +460,34 @@ func TestDialogPickerPaintShowsDescriptionForLongName(t *testing.T) {
 		t.Fatalf("dialog picker should draw truncated name with ellipsis and metadata; drew %#v", rec.lines)
 	}
 }
+
+func TestSelectorPaintKeepsDescriptionNextToName(t *testing.T) {
+	sel := NewSelector()
+	sel.SetItems([]SelectorItem{
+		{Name: "/skill:odin", Description: strings.Repeat("very long description ", 20)},
+		{Name: "/skill:tdd", Description: "short"},
+	})
+	sel.SetShown(true)
+	sel.Layout(Rect{X: 0, Y: 0, W: 40, H: 2})
+
+	rec := &recordingDrawer{}
+	sel.Paint(rec, &Ctx{Theme: DefaultThemeModern()})
+
+	var names, descs int
+	for _, line := range rec.lines {
+		switch {
+		case strings.HasPrefix(line, "/skill:"):
+			names++
+		case strings.HasPrefix(line, "very long"):
+			descs++
+			if !strings.HasSuffix(line, "…") {
+				t.Fatalf("long description should be truncated with an ellipsis: %q", line)
+			}
+		case line == "short":
+			descs++
+		}
+	}
+	if names != 2 || descs != 2 {
+		t.Fatalf("expected both names and both descriptions drawn, drew %#v", rec.lines)
+	}
+}

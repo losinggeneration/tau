@@ -973,14 +973,27 @@ func slugify(s string) string {
 func parseSimpleYAML(data []byte) (map[string]any, error) {
 	result := make(map[string]any)
 	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if key, val, found := strings.Cut(line, ":"); found && key != "" {
-			result[strings.TrimSpace(key)] = strings.TrimSpace(val)
+		key, val, found := strings.Cut(line, ":")
+		if !found || key == "" {
+			continue
 		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if val == ">" || val == "|" {
+			var parts []string
+			for i+1 < len(lines) && strings.HasPrefix(lines[i+1], " ") {
+				i++
+				parts = append(parts, strings.TrimSpace(lines[i]))
+			}
+			result[key] = strings.Join(strings.Fields(strings.Join(parts, " ")), " ")
+			continue
+		}
+		result[key] = val
 	}
 	return result, nil
 }

@@ -252,6 +252,20 @@ func (s *Selector) Paint(d rovel.Drawer, ctx *rovel.Ctx) {
 			start = len(s.items) - s.Visible()
 		}
 	}
+	// Name column width: shared by every row so descriptions line up, but
+	// capped so a very long name can't crowd the descriptions off the row.
+	avail := r.W - 2
+	nameCol := min(s.maxNameW, avail)
+	if s.maxDescW > 0 {
+		descRoom := min(s.maxDescW, avail/2)
+		if nameCol+1+descRoom > avail {
+			nameCol = avail - 1 - descRoom
+		}
+	}
+	if nameCol < 0 {
+		nameCol = 0
+	}
+
 	rowsShown := 0
 	for i := 0; i < s.Visible(); i++ {
 		rowY := itemsY + i
@@ -280,30 +294,19 @@ func (s *Selector) Paint(d rovel.Drawer, ctx *rovel.Ctx) {
 			markerSt = accentSt
 		}
 		d.DrawText(rovel.Point{X: r.X, Y: rowY}, marker, markerSt)
-		// Name + right-aligned description columns.
+		// Name column, then the description immediately to its right so each
+		// description stays visually attached to its own name.
 		nameX := r.X + 2
+		d.DrawText(rovel.Point{X: nameX, Y: rowY}, fitText(item.Name, nameCol), rowSt)
 		desc := normalizeSelectorDescription(item.Description)
-		descW := text.Width(desc)
-		gap := 1
-		if desc == "" {
-			gap = 0
-		}
-		nameAvail := r.W - 2 - gap - descW
-		if nameAvail < 0 {
-			nameAvail = 0
-		}
-		d.DrawText(rovel.Point{X: nameX, Y: rowY}, text.Truncate(item.Name, nameAvail, true), rowSt)
-		if desc != "" && r.W > 2 {
-			descX := r.X + r.W - descW
-			if descX < nameX {
-				rowsShown++
-				continue
-			}
+		descX := nameX + nameCol + 1
+		descAvail := r.X + r.W - descX
+		if desc != "" && descAvail > 0 {
 			descStyle := rowSt
 			if idx != s.focused {
 				descStyle = mutedSt
 			}
-			d.DrawText(rovel.Point{X: descX, Y: rowY}, text.Truncate(desc, r.X+r.W-descX, false), descStyle)
+			d.DrawText(rovel.Point{X: descX, Y: rowY}, fitText(desc, descAvail), descStyle)
 		}
 		rowsShown++
 	}
@@ -346,6 +349,16 @@ func (s *Selector) moveFocusedBy(delta int, ctx *rovel.Ctx) bool {
 
 func (s *Selector) clipped() bool {
 	return len(s.items) > s.Visible()
+}
+
+// fitText returns s unchanged when it fits in w columns, otherwise a copy
+// truncated to w columns with a trailing ellipsis. text.Truncate always
+// reserves the ellipsis column, which would clip text that fits exactly.
+func fitText(s string, w int) string {
+	if text.Width(s) <= w {
+		return s
+	}
+	return text.Truncate(s, w, true)
 }
 
 func normalizeSelectorDescription(description string) string {
