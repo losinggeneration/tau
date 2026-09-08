@@ -2619,3 +2619,54 @@ func TestSkillRegistryLoadWithDiagnosticsReturnsAllDiagnostics(t *testing.T) {
 		t.Errorf("registry.Len() = %d, want 1 (only valid-skill)", registry.Len())
 	}
 }
+
+// TestPackageDiscoveryNestedSkillCategories reproduces manifest-less installs
+// like github.com/mattpocock/skills, where skills/ groups directory skills
+// under category subdirectories (skills/<category>/<name>/SKILL.md).
+// Discovery must recurse past the category dirs without loading their loose
+// .md files or walking VCS internals.
+func TestPackageDiscoveryNestedSkillCategories(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	packagesDir := filepath.Join(tmpDir, "packages")
+	pkgDir := filepath.Join(packagesDir, "grouped-skills")
+
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(pkgDir, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	}
+
+	write(filepath.Join("skills", "engineering", "tdd", "SKILL.md"),
+		"---\nname: tdd\ndescription: Test-driven development\n---\n# TDD")
+	write(filepath.Join("skills", "productivity", "handoff", "SKILL.md"),
+		"---\nname: handoff\ndescription: Hand off work in progress\n---\n# Handoff")
+	// Loose .md directly in a category dir (not a skill dir) must not load.
+	write(filepath.Join("skills", "engineering", "README.md"),
+		"---\nname: readme\ndescription: Not a skill\n---\n# README")
+	// VCS internals must never be walked.
+	write(filepath.Join("skills", "engineering", ".git", "objects", "pack", "SKILL.md"),
+		"---\nname: leaked\n.description: bogus\n---\n# Leaked")
+
+	entries, err := Walk(DiscoveryConfig{
+		HomeDir:      tmpDir,
+		PackagePaths: []string{packagesDir},
+	})
+	require.NoError(t, err)
+
+	found := make(map[string]bool)
+	for _, e := range entries {
+		if e.Tier == TierPackages && e.Kind == KindSkill {
+			found[e.SourcePath] = true
+		}
+	}
+
+	assert.True(t, found[filepath.Join(pkgDir, "skills", "engineering", "tdd", "SKILL.md")],
+		"should discover skill nested under a category dir, got: %v", found)
+	assert.True(t, found[filepath.Join(pkgDir, "skills", "productivity", "handoff", "SKILL.md")],
+		"should discover skill nested under a category dir, got: %v", found)
+	assert.False(t, found[filepath.Join(pkgDir, "skills", "engineering", "README.md")],
+		"category-dir .md must not load as a loose skill")
+	assert.Len(t, found, 2, "exactly the two directory skills, got: %v", found)
+}

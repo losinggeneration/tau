@@ -561,6 +561,19 @@ func discoverDir(dir string, kind ArtifactKind, tier SourceTier, skillDirMode bo
 			continue
 		}
 
+		// Whether this directory is itself a skill directory. Loose .md files
+		// only load from the skills-dir root and from skill directories;
+		// grouping dirs contribute SKILL.md dirs only.
+		var hasSkillMD bool
+		if kind == KindSkill && !skillDirMode {
+			for _, f := range files {
+				if f.Name() == "SKILL.md" && !f.IsDir() {
+					hasSkillMD = true
+					break
+				}
+			}
+		}
+
 		for _, entry := range files {
 			path := filepath.Join(currentDir, entry.Name())
 
@@ -624,8 +637,10 @@ func discoverDir(dir string, kind ArtifactKind, tier SourceTier, skillDirMode bo
 					continue
 				}
 
-				// For skill kind with skillDirMode=false (loose-skill dirs): continue
-				// recursing to find root-level .md files AND SKILL.md dirs.
+				// For skill kind with skillDirMode=false (loose-skill dirs): recurse
+				// into every subdir so grouped layouts
+				// (skills/<category>/<name>/SKILL.md) are discovered; loose .md
+				// files are gated per-directory in the file loop below.
 				// For skill kind with skillDirMode=true (agentskills.io dirs): only
 				// SKILL.md subdirs, skip everything else.
 				// For prompts/themes: no recursion into subdirs.
@@ -636,18 +651,15 @@ func discoverDir(dir string, kind ArtifactKind, tier SourceTier, skillDirMode bo
 						e, _ := discoverFile(skillMD, KindSkill, tier)
 						entries = append(entries, e...)
 					}
-				} else if kind == KindSkill && !skillDirMode {
-					// Loose-skill dirs: only recurse into subdirs that have SKILL.md.
-					// This enforces the spec rule: directory-skill discovery requires
-					// SKILL.md at the subdirectory root.
-					skillMD := filepath.Join(path, "SKILL.md")
-					if _, err := os.Stat(skillMD); os.IsNotExist(err) {
-						// No SKILL.md; don't recurse into this subdir.
-					} else {
-						// SKILL.md exists; recurse to find root-level .md files
-						// and nested SKILL.md dirs.
-						queue = append(queue, path)
+				} else if kind == KindSkill {
+					// Loose-skill dirs: recurse into every subdir to find grouped
+					// directory skills (skills/<category>/<name>/SKILL.md). VCS and
+					// vendored dirs are never walked; loose .md gating happens in
+					// the file loop below.
+					if isSkippedDirName(entry.Name()) {
+						continue
 					}
+					queue = append(queue, path)
 				}
 				continue
 			}
@@ -661,20 +673,15 @@ func discoverDir(dir string, kind ArtifactKind, tier SourceTier, skillDirMode bo
 				ext := strings.ToLower(filepath.Ext(path))
 				switch kind {
 				case KindSkill:
-					// For loose-skill mode: discover both SKILL.md files in skill subdirectories
-					// AND root-level .md files directly in any directory.
-					// Root-level .md files are those that are not SKILL.md and should be
-					// discovered in any directory (including subdirectories).
+					// Directory skills: SKILL.md anywhere in the walk. Loose
+					// skills: .md files only in the skills-dir root or in
+					// directories that are themselves skill dirs.
 					if ext == ".md" {
 						baseName := filepath.Base(path)
 						if baseName == "SKILL.md" && !skillDirMode {
-							// SKILL.md files inside skill subdirs (the subdir was checked
-							// to have SKILL.md at its root) are valid directory skills.
 							e, _ := discoverFile(path, kind, tier)
 							entries = append(entries, e...)
-						} else if baseName != "SKILL.md" {
-							// Root-level .md files (loose skills) - discovered in any directory
-							// during the regular file loop, not just at the top-level root.
+						} else if baseName != "SKILL.md" && (currentDir == dir || hasSkillMD) {
 							e, _ := discoverFile(path, kind, tier)
 							entries = append(entries, e...)
 						}
@@ -808,9 +815,6 @@ func discoverConventionFallback(pkgRoot string, cfg DiscoveryConfig, entries *[]
 	if !cfg.DisableSkills {
 		skillsPath := filepath.Join(pkgRoot, "skills")
 		if e, err := discoverDir(skillsPath, KindSkill, TierPackages, false, pkgRoot); err == nil && len(e) > 0 {
-			for i := range e {
-				e[i].SourcePath = filepath.Join(pkgRoot, "skills", filepath.Base(e[i].SourcePath))
-			}
 			*entries = append(*entries, e...)
 			found = true
 		}
@@ -835,6 +839,17 @@ func discoverConventionFallback(pkgRoot string, cfg DiscoveryConfig, entries *[]
 	}
 
 	return found
+}
+
+// isSkippedDirName reports directories that never contain artifacts and
+// may be expensive to walk (VCS internals, vendored dependency trees).
+func isSkippedDirName(name string) bool {
+	switch name {
+	case ".git", ".hg", ".svn", ".venv", "node_modules", "vendor", "__pycache__":
+		return true
+	default:
+		return false
+	}
 }
 
 // expandPath expands ~ and environment variables in a path.
