@@ -920,25 +920,18 @@ func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Messag
 
 		unsubscribe := s.agent.Subscribe(func(event agent.Event, signal <-chan struct{}) {
 			s.handleAgentEvent(events, event)
+			// Tool results can push a running turn past the context-window
+			// threshold between turns. Checking on message end lets compaction
+			// fire mid-turn, and the agent loop rebases onto the replacement
+			// summary before the next model call.
+			if e, ok := event.(agent.MessageEnd); ok && e.Message != nil && e.Message.Role != agent.RoleUser {
+				s.autoCompactIfDue(ctx)
+			}
 		})
 		defer unsubscribe()
 
 		// Auto-compaction check: trigger if context usage exceeds threshold.
-		if s.compactionConfig.TriggerPct > 0 && s.model != nil {
-			state := s.agent.State()
-			estimatedTokens := s.estimateSessionTokens(state)
-			contextWindow := s.model.ContextWindow
-			cfg := s.compactionConfig
-			if t := providerTriggerTokens(s.model.Provider); t > 0 {
-				cfg.TriggerTokens = t
-			}
-			if compaction.ShouldCompact(estimatedTokens, contextWindow, cfg) {
-				// Compact before prompting.
-				if err := s.Compact(ctx); err != nil {
-					s.logger.Warn("auto-compaction failed", "error", err)
-				}
-			}
-		}
+		s.autoCompactIfDue(ctx)
 
 		var promptErr error
 		if msg.SystemAddendum != "" {
@@ -1296,6 +1289,27 @@ func truncateText(text string, maxRunes int) string {
 		return text
 	}
 	return string(runes[:maxRunes]) + "..."
+}
+
+// autoCompactIfDue runs auto-compaction when the estimated context usage
+// crosses the configured threshold. Called between turns (before prompting)
+// and after mid-turn message events, because a tool result can push a
+// running turn past the window between turns.
+func (s *agentSession) autoCompactIfDue(ctx context.Context) {
+	if s.compactionConfig.TriggerPct <= 0 || s.model == nil {
+		return
+	}
+	cfg := s.compactionConfig
+	if t := providerTriggerTokens(s.model.Provider); t > 0 {
+		cfg.TriggerTokens = t
+	}
+	estimatedTokens := s.estimateSessionTokens(s.agent.State())
+	if !compaction.ShouldCompact(estimatedTokens, s.model.ContextWindow, cfg) {
+		return
+	}
+	if err := s.Compact(ctx); err != nil {
+		s.logger.Warn("auto-compaction failed", "error", err)
+	}
 }
 
 // estimateSessionTokens estimates the total token count from agent state.

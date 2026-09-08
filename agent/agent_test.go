@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1703,3 +1704,87 @@ func TestBuggyCallbackDoesNotAbortRun(t *testing.T) {
 }
 
 var errBuggyCallback = errors.New("buggy callback intentionally errors")
+
+// A /compact issued while a turn is still in flight must take effect for the
+// remaining model calls of that turn: the SDK swaps agent state via
+// ReplaceMessages mid-run, so the running loop has to notice and rebase its
+// working context onto the replacement instead of continuing from the stale
+// pre-compaction snapshot.
+func TestPromptMidRunReplaceMessagesRebasesContext(t *testing.T) {
+	toolCall, err := CreateToolCall("compact_now", map[string]any{})
+	if err != nil {
+		t.Fatalf("CreateToolCall: %v", err)
+	}
+
+	var streamCalls int
+	var secondPrompt *ai.Context
+	var a *Agent
+	a, err = New(NewConfig(
+		WithModel(&ai.Model{ID: "test", API: ai.APIOpenAICompletions, Provider: ai.ProviderOpenAI}),
+		WithTools(Tool{
+			Name:       "compact_now",
+			Parameters: map[string]any{"type": "object"},
+			Execute: func(ctx ToolContext) (*ToolResult, error) {
+				a.ReplaceMessages([]*Message{{
+					Role:      RoleSystem,
+					Content:   []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "Session Summary: compacted away"}},
+					Timestamp: time.Now(),
+				}})
+				return &ToolResult{Content: "compacted"}, nil
+			},
+		}),
+		WithClientFactory(func(model *ai.Model) (ai.Client, error) {
+			return stubClient{stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+				streamCalls++
+				partial := ai.AssistantMessage{Role: "assistant", Timestamp: time.Now().UnixMilli()}
+				switch streamCalls {
+				case 1:
+					handler(ctx, ai.Start{Partial: partial})
+					partial.Content = []ai.ContentBlock{{
+						Type:      ai.ContentBlockToolCall,
+						ID:        toolCall.ID,
+						Name:      toolCall.Name,
+						Arguments: toolCall.Arguments,
+					}}
+					final := partial
+					final.StopReason = ai.StopReasonToolUse
+					handler(ctx, ai.Done{Reason: ai.StopReasonToolUse, Message: final})
+					return nil
+				case 2:
+					secondPrompt = prompt
+					handler(ctx, ai.Start{Partial: partial})
+					partial.Content = []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "done"}}
+					final := partial
+					final.StopReason = ai.StopReasonStop
+					handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: final})
+					return nil
+				default:
+					t.Errorf("unexpected stream call %d", streamCalls)
+					return nil
+				}
+			}}, nil
+		}),
+	))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := a.Prompt(context.Background(), NewUserMessage("original user instructions")); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	if secondPrompt == nil {
+		t.Fatal("model was not called a second time")
+	}
+	if !strings.Contains(secondPrompt.SystemPrompt, "Session Summary: compacted away") {
+		t.Fatalf("second model call does not carry the compaction summary in its system prompt: %q", secondPrompt.SystemPrompt)
+	}
+	for _, m := range secondPrompt.Messages {
+		if m.Role == "toolResult" {
+			t.Fatalf("second model call received an orphan tool result: %#v", m)
+		}
+		if content, ok := m.ContentString(); ok && strings.Contains(content, "original user instructions") {
+			t.Fatalf("second model call still sees the pre-compaction user message: %#v", m)
+		}
+	}
+}

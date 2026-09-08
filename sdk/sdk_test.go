@@ -4301,3 +4301,166 @@ func TestNewSession_PerModelThinkingLevel(t *testing.T) {
 		assert.Equal(t, "medium", statser.Stats().ThinkingLevel)
 	})
 }
+
+// scriptedCompactionProvider serves a fixed tool-driven conversation: the
+// first stream call asks the builtin read tool for a large file, the Complete
+// path answers any compaction summarization request, and later stream calls
+// report what context the loop actually sent.
+type scriptedCompactionProvider struct {
+	api         string
+	caps        ai.Capabilities
+	bigFilePath string
+
+	mu            sync.Mutex
+	streamPrompts []*ai.Context
+	completeCalls int
+}
+
+func (p *scriptedCompactionProvider) API() string                   { return p.api }
+func (p *scriptedCompactionProvider) IsAlias() bool                 { return false }
+func (p *scriptedCompactionProvider) Capabilities() ai.Capabilities { return p.caps }
+
+func (p *scriptedCompactionProvider) NewClient(*ai.Model) (ai.Client, error) {
+	return &scriptedCompactionClient{provider: p}, nil
+}
+
+type scriptedCompactionClient struct {
+	provider *scriptedCompactionProvider
+}
+
+func (p *scriptedCompactionProvider) recordStream(prompt *ai.Context) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.streamPrompts = append(p.streamPrompts, prompt)
+}
+
+func (p *scriptedCompactionProvider) streamPrompt(i int) *ai.Context {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if i >= len(p.streamPrompts) {
+		return nil
+	}
+	return p.streamPrompts[i]
+}
+
+func (p *scriptedCompactionProvider) streamCalls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.streamPrompts)
+}
+
+func (p *scriptedCompactionProvider) completions() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.completeCalls
+}
+
+func (c *scriptedCompactionClient) Stream(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+	c.provider.recordStream(prompt)
+
+	partial := ai.AssistantMessage{Role: "assistant", Timestamp: 1234567890}
+	switch c.provider.streamCalls() {
+	case 1:
+		handler(ctx, ai.Start{Partial: partial})
+		toolCall, err := agent.CreateToolCall("read", map[string]any{"path": c.provider.bigFilePath})
+		if err != nil {
+			return err
+		}
+		partial.Content = []ai.ContentBlock{{
+			Type:      ai.ContentBlockToolCall,
+			ID:        toolCall.ID,
+			Name:      toolCall.Name,
+			Arguments: toolCall.Arguments,
+		}}
+		final := partial
+		final.StopReason = ai.StopReasonToolUse
+		handler(ctx, ai.Done{Reason: ai.StopReasonToolUse, Message: final})
+		return nil
+	default:
+		handler(ctx, ai.Start{Partial: partial})
+		partial.Content = []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "done"}}
+		final := partial
+		final.StopReason = ai.StopReasonStop
+		handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: final})
+		return nil
+	}
+}
+
+func (c *scriptedCompactionClient) Complete(ctx context.Context, model *ai.Model, prompt *ai.Context, opts ...ai.Option) (*ai.AssistantMessage, error) {
+	c.provider.mu.Lock()
+	c.provider.completeCalls++
+	c.provider.mu.Unlock()
+	return &ai.AssistantMessage{
+		Role:       "assistant",
+		Content:    []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "compaction summary of the session"}},
+		StopReason: ai.StopReasonStop,
+		Timestamp:  1234567890,
+	}, nil
+}
+
+// Auto-compaction must fire while a turn is still running: a tool result can
+// push the context past the trigger threshold, and the only check used to be
+// between turns, so the next model call failed with a context-window error and
+// the user had to /compact and Continue manually.
+func TestAutoCompactionFiresMidTurnWhenToolResultsGrowContext(t *testing.T) {
+	cwd := t.TempDir()
+	bigFile := filepath.Join(cwd, "big.txt")
+	bigContent := strings.Repeat("A", 200_000)
+	require.NoError(t, os.WriteFile(bigFile, []byte(bigContent), 0o644))
+
+	ai.Clear()
+	ai.Init()
+	provider := &scriptedCompactionProvider{
+		api:         "test-auto-compaction",
+		caps:        ai.Capabilities{Tools: true, Streaming: true},
+		bigFilePath: bigFile,
+	}
+	ai.Register("test-auto-compaction", provider)
+	ai.RegisterModel(&ai.Model{
+		ID:            "auto-compaction-model",
+		Provider:      "test-auto-compaction",
+		API:           "test-auto-compaction",
+		ContextWindow: 1_000,
+	})
+
+	rt, err := NewRuntime(RuntimeOptions{
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		SessionsDir:     t.TempDir(),
+		ExplicitModel:   "test-auto-compaction/default/auto-compaction-model",
+		Compaction:      &CompactionSettings{TriggerPct: 50},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+
+	sess, err := rt.NewSession(testContext(t), SessionOptions{CWD: cwd})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sess.Close(testContext(t)) })
+
+	var compactionEnds int
+	sess.(EventObserver).SetEventObserver(func(e Event) {
+		if e.Type == "compaction_end" {
+			compactionEnds++
+		}
+	})
+
+	events, err := sess.Send(testContext(t), Message{Text: "read the big file"})
+	require.NoError(t, err)
+	_ = collectSessionEvents(t, events)
+
+	require.Equal(t, 2, provider.streamCalls(), "tool call turn should make exactly two model calls")
+	require.Equal(t, 1, provider.completions(), "compaction should summarize exactly once")
+	assert.Equal(t, 1, compactionEnds, "compaction should run exactly once")
+
+	secondPrompt := provider.streamPrompt(1)
+	require.NotNil(t, secondPrompt)
+	assert.Contains(t, secondPrompt.SystemPrompt, "Session Summary: compaction summary of the session",
+		"second model call must start from the compacted summary")
+	for _, m := range secondPrompt.Messages {
+		content, ok := m.ContentString()
+		if !ok {
+			continue
+		}
+		assert.NotContains(t, content, bigContent[:100],
+			"second model call must not carry the pre-compaction tool result")
+	}
+}

@@ -465,6 +465,12 @@ type AgentContext struct {
 	SystemPrompt string
 	Messages     []*Message
 
+	// MessagesVersion identifies the transcript generation this snapshot was
+	// taken from. ReplaceMessages bumps it; a running loop compares its seen
+	// version against the agent's current one to pick up mid-run replacements
+	// (e.g. /compact issued while the turn is streaming).
+	MessagesVersion uint64
+
 	// SessionCWD is the session's current working directory.
 	// All tools that touch the filesystem resolve relative paths against this.
 	SessionCWD string
@@ -514,6 +520,13 @@ type AgentLoopConfig struct {
 	// - Context window management (pruning old messages)
 	// - Injecting context from external sources
 	TransformContext TransformContextFunc
+
+	// RebasedMessages returns the agent's current transcript when it has been
+	// externally replaced (via ReplaceMessages) since seenVersion. ok is false
+	// when no replacement happened. A running loop polls this before each
+	// model call so a mid-run /compact takes effect instead of the loop
+	// continuing from its stale pre-compaction snapshot.
+	RebasedMessages func(seenVersion uint64) (messages []*Message, version uint64, ok bool)
 
 	// Tool execution mode.
 	// - "sequential": execute tool calls one by one

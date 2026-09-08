@@ -19,6 +19,10 @@ type Agent struct {
 	handler StreamHandler
 	mu      sync.RWMutex
 
+	// messagesVersion increments on every external transcript replacement
+	// (ReplaceMessages/Reset) so a running loop can detect and rebase onto it.
+	messagesVersion uint64
+
 	// Event listeners
 	listeners      []eventListener
 	nextListenerID int
@@ -417,6 +421,7 @@ func (a *Agent) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.state.Messages = nil
+	a.messagesVersion++
 	a.state.IsStreaming = false
 	a.state.StreamingMessage = nil
 	a.state.PendingToolIDs = make(map[string]struct{})
@@ -580,12 +585,13 @@ func slicesClone[T any](s []T) []T {
 
 func (a *Agent) createContextSnapshot() *AgentContext {
 	return &AgentContext{
-		Model:        a.state.Model,
-		SystemPrompt: a.state.SystemPrompt,
-		Messages:     slicesClone(a.state.Messages),
-		Tools:        append([]Tool(nil), a.state.Tools...),
-		SessionCWD:   a.state.SessionCWD,
-		Capabilities: a.state.Capabilities,
+		Model:           a.state.Model,
+		SystemPrompt:    a.state.SystemPrompt,
+		Messages:        slicesClone(a.state.Messages),
+		MessagesVersion: a.messagesVersion,
+		Tools:           append([]Tool(nil), a.state.Tools...),
+		SessionCWD:      a.state.SessionCWD,
+		Capabilities:    a.state.Capabilities,
 	}
 }
 
@@ -643,6 +649,14 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform Transfo
 			defer a.mu.Unlock()
 			return a.drainFollowUp(), nil
 		}),
+		RebasedMessages: func(seenVersion uint64) ([]*Message, uint64, bool) {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if a.messagesVersion == seenVersion {
+				return nil, seenVersion, false
+			}
+			return slicesClone(a.state.Messages), a.messagesVersion, true
+		},
 		EventDispatcher: a.config.EventDispatcher,
 		Tools:           append([]Tool(nil), a.state.Tools...),
 		SessionCWD:      a.state.SessionCWD,
@@ -775,6 +789,7 @@ func (a *Agent) ReplaceMessages(messages []*Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.state.Messages = slicesClone(messages)
+	a.messagesVersion++
 }
 
 // Complete is a single-call helper that runs the agent with a prompt and waits

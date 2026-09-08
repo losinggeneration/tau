@@ -2480,3 +2480,129 @@ func TestBeforeAgentStart_InvalidResponseDataIgnored(t *testing.T) {
 		t.Errorf("captured prompt = %q, want %q", capturedPrompt, "kept")
 	}
 }
+
+// After a mid-run ReplaceMessages (compaction), the retained tail can begin
+// with tool results whose assistant tool-call message was summarized away.
+// Providers reject transcripts containing such orphan results, so the rebase
+// must drop them while keeping results whose tool call survived.
+func TestDropOrphanToolResultsRemovesResultsWithoutToolCall(t *testing.T) {
+	keptCall, err := CreateToolCall("kept_tool", map[string]any{})
+	if err != nil {
+		t.Fatalf("CreateToolCall(kept_tool): %v", err)
+	}
+	lostCall, err := CreateToolCall("lost_tool", map[string]any{})
+	if err != nil {
+		t.Fatalf("CreateToolCall(lost_tool): %v", err)
+	}
+
+	summary := &Message{
+		Role:      RoleSystem,
+		Content:   []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "Session Summary"}},
+		Timestamp: time.Now(),
+	}
+	assistantWithCall := &Message{
+		Role: RoleAssistant,
+		Content: []ai.ContentBlock{{
+			Type:      ai.ContentBlockToolCall,
+			ID:        keptCall.ID,
+			Name:      keptCall.Name,
+			Arguments: keptCall.Arguments,
+		}},
+		Timestamp: time.Now(),
+	}
+
+	messages := []*Message{
+		summary,
+		NewToolMessage(lostCall.ID, "lost_tool", "orphaned result", false),
+		assistantWithCall,
+		NewToolMessage(keptCall.ID, "kept_tool", "kept result", false),
+	}
+
+	got := dropOrphanToolResults(messages)
+
+	if len(got) != 3 {
+		t.Fatalf("len(got) = %d, want 3 (summary, assistant, kept result): %#v", len(got), got)
+	}
+	if got[0] != summary || got[1] != assistantWithCall {
+		t.Fatalf("got = %#v, want summary then assistant preserved in order", got)
+	}
+	if got[2].ToolCallID != keptCall.ID {
+		t.Fatalf("got[2].ToolCallID = %q, want %q", got[2].ToolCallID, keptCall.ID)
+	}
+}
+
+// Resuming a session whose compaction cut mid-turn loads a context that
+// starts with a tool result whose tool call was summarized away. The send
+// path must drop it: providers reject transcripts with orphan tool results.
+func TestStreamAssistantResponseDropsOrphanToolResultsFromInitialContext(t *testing.T) {
+	orphanCall, err := CreateToolCall("orphan_tool", map[string]any{})
+	if err != nil {
+		t.Fatalf("CreateToolCall: %v", err)
+	}
+	keptCall, err := CreateToolCall("kept_tool", map[string]any{})
+	if err != nil {
+		t.Fatalf("CreateToolCall: %v", err)
+	}
+
+	var got *ai.Context
+	client := stubClient{
+		stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+			got = prompt
+			partial := ai.AssistantMessage{Role: "assistant", Timestamp: time.Now().UnixMilli()}
+			handler(ctx, ai.Start{Partial: partial})
+			partial.Content = []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "done"}}
+			final := partial
+			final.StopReason = ai.StopReasonStop
+			handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: final})
+			return nil
+		},
+	}
+
+	assistantWithCall := &Message{
+		Role: RoleAssistant,
+		Content: []ai.ContentBlock{{
+			Type:      ai.ContentBlockToolCall,
+			ID:        keptCall.ID,
+			Name:      keptCall.Name,
+			Arguments: keptCall.Arguments,
+		}},
+		Timestamp: time.Now(),
+	}
+
+	_, err = RunAgentLoop(
+		context.Background(),
+		[]*Message{NewUserMessage("continue after resume")},
+		&AgentContext{
+			Model: &ai.Model{ID: "test", Provider: ai.ProviderOpenAI},
+			Messages: []*Message{
+				NewToolMessage(orphanCall.ID, "orphan_tool", "result before the cut", false),
+				assistantWithCall,
+				NewToolMessage(keptCall.ID, "kept_tool", "kept result", false),
+				NewUserMessage("continue after resume"),
+			},
+		},
+		AgentLoopConfig{
+			Model:         &ai.Model{ID: "test", Provider: ai.ProviderOpenAI},
+			ConvertToLlm:  DefaultConvertToLlm,
+			ClientFactory: func(model *ai.Model) (ai.Client, error) { return client, nil },
+		},
+		func(Event) {},
+	)
+	if err != nil {
+		t.Fatalf("RunAgentLoop: %v", err)
+	}
+	if got == nil {
+		t.Fatal("model was not called")
+	}
+
+	roles := make(map[string]bool)
+	for _, m := range got.Messages {
+		roles[m.Role] = true
+		if m.Role == "toolResult" && strings.Contains(fmt.Sprintf("%v", m.Content), "result before the cut") {
+			t.Fatalf("orphan tool result reached the provider: %#v", m)
+		}
+	}
+	if !roles["toolResult"] {
+		t.Fatal("kept tool result was dropped along with the orphan")
+	}
+}

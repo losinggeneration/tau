@@ -199,12 +199,13 @@ func prepareLoopContext(agentCtx *AgentContext, mode loopStartMode, prompts []*M
 	case loopStartWithPrompts:
 		newMessages := append([]*Message(nil), prompts...)
 		return &AgentContext{
-			Model:        agentCtx.Model,
-			Tools:        agentCtx.Tools,
-			SystemPrompt: agentCtx.SystemPrompt,
-			Messages:     append(append([]*Message(nil), agentCtx.Messages...), prompts...),
-			SessionCWD:   agentCtx.SessionCWD,
-			Capabilities: agentCtx.Capabilities,
+			Model:           agentCtx.Model,
+			Tools:           agentCtx.Tools,
+			SystemPrompt:    agentCtx.SystemPrompt,
+			Messages:        append(append([]*Message(nil), agentCtx.Messages...), prompts...),
+			MessagesVersion: agentCtx.MessagesVersion,
+			SessionCWD:      agentCtx.SessionCWD,
+			Capabilities:    agentCtx.Capabilities,
 		}, newMessages, nil
 	case loopStartContinue:
 		if len(agentCtx.Messages) == 0 {
@@ -509,6 +510,7 @@ func runLoop(
 
 	firstTurn := true
 	consecutiveEmptyResponses := 0
+	msgVersion := currentCtx.MessagesVersion
 
 	// Get pending messages from steering at start
 	pendingMessages, err := getSteeringMessages(ctx, config)
@@ -527,6 +529,17 @@ func runLoop(
 				dispatchEvent("turn_start", nil)
 			} else {
 				firstTurn = false
+			}
+
+			// A mid-run ReplaceMessages (e.g. /compact issued while this turn
+			// is streaming) swaps the agent's transcript. Rebase the working
+			// context onto the replacement so the next model call starts from
+			// it instead of continuing from the stale pre-replacement snapshot.
+			if config.RebasedMessages != nil {
+				if msgs, version, ok := config.RebasedMessages(msgVersion); ok {
+					currentCtx.Messages = msgs
+					msgVersion = version
+				}
 			}
 
 			// Process pending messages (inject before next assistant response)
@@ -756,7 +769,7 @@ func streamAssistantResponse(
 	// dedicated system prompt before conversion. This is especially important for
 	// compaction: after /compact the live history is a single "Session Summary:"
 	// system message, and the next provider request must receive that summary.
-	requestSystemPrompt, requestMessages := liftSystemMessagesIntoPrompt(systemPrompt, messages)
+	requestSystemPrompt, requestMessages := liftSystemMessagesIntoPrompt(systemPrompt, dropOrphanToolResults(messages))
 
 	// Convert to LLM-compatible messages
 	llmMessages, err := config.ConvertToLlm(ctx, requestMessages)
@@ -957,6 +970,32 @@ func streamAssistantResponse(
 	}
 
 	return nil, nil
+}
+
+// dropOrphanToolResults removes tool results whose tool call is not present
+// earlier in the list. After a mid-run ReplaceMessages (compaction), a result
+// can outlive the assistant tool-call message that produced it; providers
+// reject transcripts containing such orphan results.
+func dropOrphanToolResults(messages []*Message) []*Message {
+	toolCallIDs := make(map[string]bool)
+	kept := make([]*Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if msg.Role == RoleAssistant {
+			for _, block := range msg.Content {
+				if block.Type == ai.ContentBlockToolCall && block.ID != "" {
+					toolCallIDs[block.ID] = true
+				}
+			}
+		}
+		if msg.Role == RoleTool && !toolCallIDs[msg.ToolCallID] {
+			continue
+		}
+		kept = append(kept, msg)
+	}
+	return kept
 }
 
 func liftSystemMessagesIntoPrompt(systemPrompt string, messages []*Message) (string, []*Message) {
