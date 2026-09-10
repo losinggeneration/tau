@@ -2795,6 +2795,59 @@ func TestProcessResponsesStreamErrorEvent(t *testing.T) {
 	}
 }
 
+func TestProcessResponsesStreamEmptyErrorEventIncludesRawPayload(t *testing.T) {
+	sseData := `data: {"type":"error"}
+`
+
+	reader := newResponsesStreamReader(strings.NewReader(sseData))
+	model := &Model{ID: "gpt-5.5"}
+	output := &AssistantMessage{Role: "assistant", Content: []ContentBlock{}}
+
+	var streamErr StreamError
+	handler := func(ctx context.Context, event StreamEvent) {
+		if e, ok := event.(StreamError); ok {
+			streamErr = e
+		}
+	}
+
+	if err := ProcessResponsesStream(context.Background(), reader, output, handler, model, nil); err != nil {
+		t.Fatalf("ProcessResponsesStream failed: %v", err)
+	}
+
+	want := `error event with empty code/message: {"type":"error"}`
+	if streamErr.Msg.ErrorMessage != want {
+		t.Fatalf("errorMessage = %q, want %q", streamErr.Msg.ErrorMessage, want)
+	}
+	if !strings.Contains(streamErr.Error(), want) {
+		t.Fatalf("stream error = %q, want to contain %q", streamErr.Error(), want)
+	}
+}
+
+func TestProcessResponsesStreamNestedErrorEventMessage(t *testing.T) {
+	sseData := `data: {"type":"error","error":{"code":"server_error","message":"upstream reset"}}
+`
+
+	reader := newResponsesStreamReader(strings.NewReader(sseData))
+	model := &Model{ID: "gpt-5.5"}
+	output := &AssistantMessage{Role: "assistant", Content: []ContentBlock{}}
+
+	var streamErr StreamError
+	handler := func(ctx context.Context, event StreamEvent) {
+		if e, ok := event.(StreamError); ok {
+			streamErr = e
+		}
+	}
+
+	if err := ProcessResponsesStream(context.Background(), reader, output, handler, model, nil); err != nil {
+		t.Fatalf("ProcessResponsesStream failed: %v", err)
+	}
+
+	want := "error code server_error: upstream reset"
+	if streamErr.Msg.ErrorMessage != want {
+		t.Fatalf("errorMessage = %q, want %q", streamErr.Msg.ErrorMessage, want)
+	}
+}
+
 // TestProcessResponsesStreamFailedEvent tests that response.failed generates StreamError.
 func TestProcessResponsesStreamFailedEvent(t *testing.T) {
 	sseData := `data: {"type":"response.failed","response":{"id":"resp_abc123","status":"failed","error":{"code":"internal_error","message":"Internal server error"},"incomplete_details":{"reason":"Server overloaded"}}}

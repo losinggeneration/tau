@@ -42,6 +42,7 @@ type responsesEvent struct {
 	Type     string                `json:"type"`
 	Code     string                `json:"code,omitempty"`
 	Message  string                `json:"message,omitempty"`
+	Error    responsesError        `json:"error,omitempty"`
 	Delta    string                `json:"delta,omitempty"`
 	Response responsesResponseBody `json:"response,omitempty"`
 	Item     responsesItem         `json:"item,omitempty"`
@@ -391,8 +392,9 @@ func ProcessResponsesStream(
 			return nil
 
 		case "error":
-			streamErr := fmt.Errorf("responses: error code %s: %s", event.Code, event.Message)
-			output.ErrorMessage = event.Message
+			msg := buildResponsesErrorEventMessage(event, data)
+			streamErr := fmt.Errorf("responses: %s", msg)
+			output.ErrorMessage = msg
 			emitTerminalStreamError(ctx, handler, *output, streamErr, StopReasonError)
 			return nil
 		}
@@ -442,6 +444,31 @@ func buildResponseErrorMessage(resp responsesResponseBody) string {
 		return "incomplete: " + resp.Incomplete.Reason
 	}
 	return "unknown error"
+}
+
+func buildResponsesErrorEventMessage(event responsesEvent, raw string) string {
+	code := event.Code
+	message := event.Message
+	if code == "" {
+		code = event.Error.Code
+	}
+	if message == "" {
+		message = event.Error.Message
+	}
+
+	if code != "" && message != "" {
+		return "error code " + code + ": " + message
+	}
+	if code != "" {
+		return "error code " + code
+	}
+	if message != "" {
+		return message
+	}
+	if raw != "" {
+		return "error event with empty code/message: " + raw
+	}
+	return "error event with empty code/message"
 }
 
 // hasToolCalls returns true if the content has any tool call blocks.
