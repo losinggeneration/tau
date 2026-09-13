@@ -81,11 +81,11 @@ var AzureCapabilities = Capabilities{
 	ParallelToolCalls: true,
 }
 
-// CodexCapabilities is the baseline for GitHub Copilot Codex.
+// CodexCapabilities is the baseline for OpenAI Codex.
 var CodexCapabilities = Capabilities{
 	Tools:             true,
 	Streaming:         true,
-	Vision:            false,
-	Thinking:          false,
+	Vision:            true,
+	Thinking:          true,
 	ParallelToolCalls: true,
 }

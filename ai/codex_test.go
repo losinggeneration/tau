@@ -15,6 +15,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestCodexCapabilities(t *testing.T) {
+	if !CodexCapabilities.Vision {
+		t.Fatal("CodexCapabilities.Vision = false, want true")
+	}
+	if !CodexCapabilities.Thinking {
+		t.Fatal("CodexCapabilities.Thinking = false, want true")
+	}
+}
+
 func TestConvertMessageForCodexToolResultUsesMessageMetadata(t *testing.T) {
 	msg := Message{
 		Role:       "toolResult",

@@ -409,6 +409,13 @@ type App struct {
 	// so user rows in the chat log stay readable and retryable. Mutated on the app
 	// loop by routePrompt/submit and consumed by conversationEventAdapter.
 	pendingUserDisplays []submittedPromptDisplay
+	// pastedImages maps the bare @markers the TUI minted for pasted clipboard
+	// images ("pasted-image.png") to the saved file's absolute path. Pasted
+	// images live in the session data dir, outside the prompt root, so these
+	// markers resolve against the data dir first — otherwise a same-named
+	// working-tree file would silently shadow the image the user pasted.
+	// Mutated on the app loop by savePastedImage; read at expansion time.
+	pastedImages map[string]string
 	// nextImageDisplayNumber labels user-attached images as [Image #n]. It is UI
 	// state only; the model receives the original image blocks.
 	nextImageDisplayNumber int
@@ -2231,8 +2238,35 @@ func (a *App) expandTextAttachmentReferences(text, root string) (string, []ai.Co
 	return out.String(), images, attachmentIDs, nil
 }
 
-func (a *App) expandTextAttachmentReference(path, root string) (string, ai.ContentBlock, string, error) {
+// resolveAttachmentPath maps an @-reference token to a file on disk.
+// Markers minted by image pasting resolve straight to the saved file, so a
+// same-named working-tree file cannot shadow what the user pasted. Every
+// other token keeps the prompt-root-first order, with the session data dir
+// as a last resort so a recalled "@pasted-image.png" from editor history
+// still resolves after a restart into the same session.
+// Must be called on the app loop.
+func (a *App) resolveAttachmentPath(path, root string) string {
+	if abs, ok := a.pastedImages[path]; ok {
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
 	full := resolveAtReferencePath(path, root)
+	if _, err := os.Stat(full); err == nil {
+		return full
+	}
+	if dir := a.sessionState().DataDir(); dir != "" {
+		if alt := resolveAtReferencePath(path, dir); alt != full {
+			if _, err := os.Stat(alt); err == nil {
+				return alt
+			}
+		}
+	}
+	return full
+}
+
+func (a *App) expandTextAttachmentReference(path, root string) (string, ai.ContentBlock, string, error) {
+	full := a.resolveAttachmentPath(path, root)
 	info, err := os.Stat(full)
 	if err != nil {
 		if os.IsNotExist(err) {

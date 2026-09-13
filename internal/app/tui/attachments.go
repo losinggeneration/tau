@@ -20,7 +20,7 @@ func (a *App) updatePendingAttachments(text string, ctx *tauui.Ctx) {
 	if a == nil || a.widgetsAbove == nil {
 		return
 	}
-	records := pendingAttachments(text, a.fileSelectorRoot())
+	records := a.pendingAttachments(text)
 	if len(records) == 0 {
 		a.setWidget(pendingAttachmentsWidgetKey, nil, "above")
 		return
@@ -52,8 +52,11 @@ func attachmentKindIcon(kind string) string {
 	return "📎"
 }
 
-func pendingAttachments(text, root string) []pendingAttachment {
-	paths := pendingAtPaths(text, root)
+func (a *App) pendingAttachments(text string) []pendingAttachment {
+	root := a.fileSelectorRoot()
+	paths := pendingAtPaths(text, func(path string) string {
+		return a.resolveAttachmentPath(path, root)
+	})
 	out := make([]pendingAttachment, 0, len(paths))
 	for _, path := range paths {
 		kind := "document"
@@ -65,7 +68,7 @@ func pendingAttachments(text, root string) []pendingAttachment {
 	return out
 }
 
-func pendingAtPaths(text, root string) []string {
+func pendingAtPaths(text string, resolve func(string) string) []string {
 	var out []string
 	seen := map[string]struct{}{}
 	for i := 0; i < len(text); {
@@ -82,7 +85,7 @@ func pendingAtPaths(text, root string) []string {
 			i++
 			continue
 		}
-		full := resolveAtReferencePath(path, root)
+		full := resolve(path)
 		if info, err := os.Stat(full); err == nil && !info.IsDir() {
 			if abs, err := filepath.Abs(full); err == nil {
 				full = abs

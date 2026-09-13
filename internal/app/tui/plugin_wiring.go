@@ -95,17 +95,16 @@ func (a *App) savePastedImage(img clipboard.Image) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	root := a.fileSelectorRoot()
-	if root == "" {
-		root = "."
+	// The editor shows the bare filename — image pasting is a TUI-managed
+	// attachment and no other TUI makes users read an absolute path for it.
+	// savePastedImage remembers where that name really lives so expansion
+	// can map it back (see resolveAttachmentPath).
+	name := filepath.ToSlash(filepath.Base(path))
+	if a.pastedImages == nil {
+		a.pastedImages = map[string]string{}
 	}
-	if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
-		return filepath.ToSlash(rel), nil
-	}
-	if rel, err := filepath.Rel(dataDir, path); err == nil && !strings.HasPrefix(rel, "..") {
-		return filepath.ToSlash(rel), nil
-	}
-	return path, nil
+	a.pastedImages[name] = path
+	return name, nil
 }
 
 // applyEditorTextFromExtension pushes a plugin-supplied editor text
