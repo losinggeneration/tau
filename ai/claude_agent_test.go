@@ -13,25 +13,71 @@ import (
 	claude "github.com/losinggeneration/claude-agent-sdk-go"
 )
 
+func claudeAgentPromptString(t *testing.T, prompt any) string {
+	t.Helper()
+	s, ok := prompt.(string)
+	if !ok {
+		t.Fatalf("prompt = %T, want string", prompt)
+	}
+	return s
+}
+
 func TestClaudeAgentBuildPrompt(t *testing.T) {
 	prompt := &Context{
 		SystemPrompt: "stay terse",
 		Messages: []Message{
 			{Role: "user", Content: "hi"},
 			{Role: "assistant", Content: []ContentBlock{{Type: ContentBlockText, Text: "hello"}}},
-			{Role: "user", Content: []ContentBlock{{Type: ContentBlockImage, MimeType: "image/png", Data: "secret"}}},
+			{Role: "user", Content: []ContentBlock{{Type: ContentBlockText, Text: "with attachment"}}},
 			{Role: messageRoleToolResult, ToolName: "lookup", Content: []ContentBlock{{Type: ContentBlockToolResult, Text: "done"}}},
 			{Role: "user", Content: ""},
 		},
 	}
 
-	got := claudeAgentBuildPrompt(prompt)
-	want := "User: hi\n\nAssistant: hello\n\nUser: [image omitted: image/png]\n\nTool result lookup: done"
-	if got != want {
+	got := claudeAgentPromptContent(claudeAgentMessages(prompt))
+	want := "User: hi\n\nAssistant: hello\n\nUser: with attachment\n\nTool result lookup: done"
+	if claudeAgentPromptString(t, got) != want {
 		t.Fatalf("prompt mismatch\nwant: %q\n got: %q", want, got)
 	}
 	if prompt.SystemPrompt != "stay terse" {
 		t.Fatalf("system prompt mutated: %q", prompt.SystemPrompt)
+	}
+}
+
+func TestClaudeAgentBuildPromptWithImage(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: "look"},
+		{Role: "assistant", Content: "ok"},
+		{Role: "user", Content: []ContentBlock{
+			{Type: ContentBlockText, Text: "<file name=\"shot.png\">[image content]</file>"},
+			{Type: ContentBlockImage, MimeType: "image/png", Data: "c2hvdA=="},
+			{Type: ContentBlockText, Text: "what is it?"},
+		}},
+		{Role: messageRoleToolResult, ToolName: "read", Content: []ContentBlock{
+			{Type: ContentBlockImage, Data: ""},
+			{Type: ContentBlockImage, MimeType: "image/jpeg", Data: "anBn"},
+		}},
+	}
+
+	got, ok := claudeAgentPromptContent(messages).([]map[string]any)
+	if !ok {
+		t.Fatalf("prompt = %T, want content blocks", claudeAgentPromptContent(messages))
+	}
+	want := []map[string]any{
+		{"type": "text", "text": "User: look"},
+		{"type": "text", "text": "Assistant: ok"},
+		{"type": "text", "text": "User: <file name=\"shot.png\">[image content]</file>"},
+		{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "c2hvdA=="}},
+		{"type": "text", "text": "User: what is it?"},
+		{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": "anBn"}},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d blocks, want %d: %v", len(got), len(want), got)
+	}
+	for i, block := range got {
+		if fmt.Sprint(block) != fmt.Sprint(want[i]) {
+			t.Fatalf("block %d = %v, want %v", i, block, want[i])
+		}
 	}
 }
 
@@ -108,7 +154,7 @@ func TestClaudeAgentBuildOptionsSkipsInvalidTools(t *testing.T) {
 }
 
 func TestClaudeAgentStreamText(t *testing.T) {
-	client := &claudeAgentClient{runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+	client := &claudeAgentClient{runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 		messages := make(chan claude.Message, 2)
 		errs := make(chan error)
 		messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.TextBlock{Text: "ok"}}}
@@ -141,7 +187,7 @@ func TestClaudeAgentStreamText(t *testing.T) {
 }
 
 func TestClaudeAgentStreamToolCall(t *testing.T) {
-	client := &claudeAgentClient{runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+	client := &claudeAgentClient{runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 		messages := make(chan claude.Message, 2)
 		errs := make(chan error)
 		messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.ToolUseBlock{ID: "call_1", Name: "lookup", Input: map[string]any{"q": "go"}}}}
@@ -178,7 +224,7 @@ func TestClaudeAgentStreamToolCall(t *testing.T) {
 // come back with the mcp__tau__ prefix. tau's registry and transcript use the
 // plain tool name, so the provider strips it at the SDK boundary.
 func TestClaudeAgentStreamToolCallStripsMCPPrefix(t *testing.T) {
-	client := &claudeAgentClient{runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+	client := &claudeAgentClient{runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 		messages := make(chan claude.Message, 2)
 		errs := make(chan error)
 		messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.ToolUseBlock{ID: "call_1", Name: "mcp__tau__bash", Input: map[string]any{"command": "ls"}}}}
@@ -204,7 +250,7 @@ func TestClaudeAgentStreamToolCallStripsMCPPrefix(t *testing.T) {
 
 func TestClaudeAgentStreamError(t *testing.T) {
 	boom := errors.New("boom")
-	client := &claudeAgentClient{runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+	client := &claudeAgentClient{runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 		messages := make(chan claude.Message)
 		errs := make(chan error, 1)
 		errs <- boom
@@ -237,7 +283,7 @@ func TestClaudeAgentStreamError(t *testing.T) {
 func TestClaudeAgentStreamCancellationEmitsAborted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	client := &claudeAgentClient{runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+	client := &claudeAgentClient{runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 		return make(chan claude.Message), make(chan error)
 	}}
 
@@ -260,11 +306,11 @@ func TestClaudeAgentStreamCancellationEmitsAborted(t *testing.T) {
 
 func TestClaudeAgentSessionFirstTurnUsesNewSessionID(t *testing.T) {
 	tauSessionID := "f2df8aa3-20c8-4483-8f67-97604bd017de"
-	var gotPrompt string
+	var gotPrompt any
 	var gotOpts claude.Options
 	client := &claudeAgentClient{
 		state: &claudeAgentState{sessions: make(map[string]*ClaudeAgentSessionState)},
-		runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+		runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 			gotPrompt = prompt
 			gotOpts = opts
 			messages := make(chan claude.Message, 1)
@@ -292,18 +338,18 @@ func TestClaudeAgentSessionFirstTurnUsesNewSessionID(t *testing.T) {
 	if gotOpts.Resume != "" {
 		t.Fatalf("resume = %q, want empty", gotOpts.Resume)
 	}
-	if gotPrompt != "User: one" {
+	if claudeAgentPromptString(t, gotPrompt) != "User: one" {
 		t.Fatalf("prompt = %q", gotPrompt)
 	}
 }
 
 func TestClaudeAgentSessionResumeUsesResume(t *testing.T) {
 	state := &claudeAgentState{sessions: map[string]*ClaudeAgentSessionState{"tau-1": {SessionID: "claude-1", LastMessageCount: 2}}}
-	var gotPrompt string
+	var gotPrompt any
 	var gotOpts claude.Options
 	client := &claudeAgentClient{
 		state: state,
-		runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+		runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 			gotPrompt = prompt
 			gotOpts = opts
 			messages := make(chan claude.Message, 1)
@@ -330,7 +376,7 @@ func TestClaudeAgentSessionResumeUsesResume(t *testing.T) {
 	if gotOpts.SessionID != "" {
 		t.Fatalf("session id = %q, want empty", gotOpts.SessionID)
 	}
-	if gotPrompt != "User: new" {
+	if claudeAgentPromptString(t, gotPrompt) != "User: new" {
 		t.Fatalf("prompt = %q, want only new message", gotPrompt)
 	}
 }
@@ -339,7 +385,7 @@ func TestClaudeAgentSessionStoresReturnedSessionID(t *testing.T) {
 	state := &claudeAgentState{sessions: make(map[string]*ClaudeAgentSessionState)}
 	client := &claudeAgentClient{
 		state: state,
-		runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+		runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 			messages := make(chan claude.Message, 1)
 			errs := make(chan error)
 			messages <- claude.ResultMessage{SessionID: "claude-returned", StopReason: "end_turn"}
@@ -365,10 +411,10 @@ func TestClaudeAgentSessionStoresReturnedSessionID(t *testing.T) {
 
 func TestClaudeAgentResumePromptSkipsLocalAssistantMessages(t *testing.T) {
 	state := &claudeAgentState{sessions: map[string]*ClaudeAgentSessionState{"tau-1": {SessionID: "claude-1", LastMessageCount: 2}}}
-	var gotPrompt string
+	var gotPrompt any
 	client := &claudeAgentClient{
 		state: state,
-		runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+		runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 			gotPrompt = prompt
 			messages := make(chan claude.Message, 1)
 			errs := make(chan error)
@@ -389,7 +435,7 @@ func TestClaudeAgentResumePromptSkipsLocalAssistantMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	if gotPrompt != "Tool result bash: file list" {
+	if claudeAgentPromptString(t, gotPrompt) != "Tool result bash: file list" {
 		t.Fatalf("prompt = %q, want only the tool result", gotPrompt)
 	}
 }
@@ -397,11 +443,11 @@ func TestClaudeAgentResumePromptSkipsLocalAssistantMessages(t *testing.T) {
 func TestClaudeAgentCompactionStartsNewSession(t *testing.T) {
 	tauSessionID := "df6b5a63-2697-4307-9d9c-6ccf515f4fa6"
 	state := &claudeAgentState{sessions: map[string]*ClaudeAgentSessionState{tauSessionID: {SessionID: "old-claude", LastMessageCount: 4, CompactionSignature: "Session Summary: old"}}}
-	var gotPrompt string
+	var gotPrompt any
 	var gotOpts claude.Options
 	client := &claudeAgentClient{
 		state: state,
-		runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+		runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 			gotPrompt = prompt
 			gotOpts = opts
 			messages := make(chan claude.Message, 1)
@@ -427,7 +473,7 @@ func TestClaudeAgentCompactionStartsNewSession(t *testing.T) {
 	if !strings.Contains(gotOpts.SystemPrompt, "Session Summary: compacted") {
 		t.Fatalf("system prompt = %q", gotOpts.SystemPrompt)
 	}
-	if gotPrompt != "User: after compact" {
+	if claudeAgentPromptString(t, gotPrompt) != "User: after compact" {
 		t.Fatalf("prompt = %q", gotPrompt)
 	}
 	if state.sessions[tauSessionID].SessionID != "new-claude" {
@@ -448,22 +494,23 @@ func TestClaudeAgentResumeSendsOnlyNewMessages(t *testing.T) {
 	if opts.Resume != "claude-1" {
 		t.Fatalf("resume = %q", opts.Resume)
 	}
-	if strings.Contains(prompt, "old") {
-		t.Fatalf("prompt replayed old content: %q", prompt)
+	got := claudeAgentPromptString(t, prompt)
+	if strings.Contains(got, "old") {
+		t.Fatalf("prompt replayed old content: %q", got)
 	}
-	if !strings.Contains(prompt, "Tool result lookup: new tool") || !strings.Contains(prompt, "User: new user") {
-		t.Fatalf("prompt missing new content: %q", prompt)
+	if !strings.Contains(got, "Tool result lookup: new tool") || !strings.Contains(got, "User: new user") {
+		t.Fatalf("prompt missing new content: %q", got)
 	}
 }
 
 func TestClaudeAgentModelChangeStartsNewSession(t *testing.T) {
 	tauSessionID := "f2df8aa3-20c8-4483-8f67-97604bd017de"
 	state := &claudeAgentState{sessions: map[string]*ClaudeAgentSessionState{tauSessionID: {SessionID: "old-claude", LastMessageCount: 2, ModelID: "sonnet"}}}
-	var gotPrompt string
+	var gotPrompt any
 	var gotOpts claude.Options
 	client := &claudeAgentClient{
 		state: state,
-		runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+		runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 			gotPrompt = prompt
 			gotOpts = opts
 			messages := make(chan claude.Message, 1)
@@ -490,7 +537,7 @@ func TestClaudeAgentModelChangeStartsNewSession(t *testing.T) {
 	if gotOpts.SessionID == "" || gotOpts.SessionID == tauSessionID {
 		t.Fatalf("session id = %q, want fresh uuid", gotOpts.SessionID)
 	}
-	if gotPrompt != "User: old\n\nAssistant: old response\n\nUser: new" {
+	if claudeAgentPromptString(t, gotPrompt) != "User: old\n\nAssistant: old response\n\nUser: new" {
 		t.Fatalf("prompt = %q", gotPrompt)
 	}
 	if state.sessions[tauSessionID].SessionID != "new-claude" || state.sessions[tauSessionID].ModelID != "opus" {
@@ -501,7 +548,7 @@ func TestClaudeAgentModelChangeStartsNewSession(t *testing.T) {
 func TestClaudeAgentStreamMaxTurnsIsToolUse(t *testing.T) {
 	client := &claudeAgentClient{
 		state: &claudeAgentState{sessions: make(map[string]*ClaudeAgentSessionState)},
-		runner: func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error) {
+		runner: func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error) {
 			messages := make(chan claude.Message, 2)
 			errs := make(chan error)
 			messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.ToolUseBlock{ID: "call_1", Name: "bash", Input: map[string]any{"command": "ls"}}}}

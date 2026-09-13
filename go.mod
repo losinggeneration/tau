@@ -13,7 +13,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/go-hclog v0.14.1
 	github.com/hashicorp/go-plugin v1.6.0
-	github.com/losinggeneration/claude-agent-sdk-go v0.0.0-20260828202644-aa7cb799a38b
+	github.com/losinggeneration/claude-agent-sdk-go v0.0.0-20260913031048-005b7bd4027c
 	github.com/losinggeneration/rovel v0.0.0-20260905094329-b07631bb21d3
 	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/stretchr/testify v1.11.1

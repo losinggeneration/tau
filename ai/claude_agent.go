@@ -11,7 +11,7 @@ import (
 	claude "github.com/losinggeneration/claude-agent-sdk-go"
 )
 
-type claudeAgentRunner func(ctx context.Context, prompt string, opts claude.Options) (<-chan claude.Message, <-chan error)
+type claudeAgentRunner func(ctx context.Context, prompt any, opts claude.Options) (<-chan claude.Message, <-chan error)
 
 type claudeAgentClient struct {
 	runner claudeAgentRunner
@@ -149,22 +149,22 @@ func claudeAgentReachedMaxTurns(m claude.ResultMessage) bool {
 	return m.Subtype == "error_max_turns" || m.TerminalReason == "max_turns"
 }
 
-func (c *claudeAgentClient) buildRequest(model *Model, prompt *Context, opts *options) (string, claude.Options, claudeAgentRequestState) {
+func (c *claudeAgentClient) buildRequest(model *Model, prompt *Context, opts *options) (any, claude.Options, claudeAgentRequestState) {
 	sdkOptions := claudeAgentBuildOptions(model, prompt, opts)
 	sessionState := c.sessionState(opts, prompt, model)
 	requestState := claudeAgentRequestState{messageCount: len(claudeAgentMessages(prompt)), compactionSignature: claudeAgentCompactionSignature(prompt)}
 	if opts == nil || opts.sessionID == "" || sessionState == nil {
-		return claudeAgentBuildPrompt(prompt), sdkOptions, requestState
+		return claudeAgentPromptContent(claudeAgentMessages(prompt)), sdkOptions, requestState
 	}
 
 	requestState.key = opts.sessionID
 	if sessionState.SessionID != "" {
 		sdkOptions.Resume = sessionState.SessionID
-		return claudeAgentBuildPromptFromMessages(claudeAgentResumeMessages(claudeAgentNewMessages(prompt, sessionState.LastMessageCount))), sdkOptions, requestState
+		return claudeAgentPromptContent(claudeAgentResumeMessages(claudeAgentNewMessages(prompt, sessionState.LastMessageCount))), sdkOptions, requestState
 	}
 
 	sdkOptions.SessionID = uuid.NewString()
-	return claudeAgentBuildPrompt(prompt), sdkOptions, requestState
+	return claudeAgentPromptContent(claudeAgentMessages(prompt)), sdkOptions, requestState
 }
 
 func (c *claudeAgentClient) sessionState(opts *options, prompt *Context, model *Model) *ClaudeAgentSessionState {
@@ -229,15 +229,114 @@ func (c *claudeAgentClient) storeReturnedSession(requestState claudeAgentRequest
 	session.CompactionSignature = requestState.compactionSignature
 }
 
-func claudeAgentBuildPrompt(prompt *Context) string {
-	return claudeAgentBuildPromptFromMessages(claudeAgentMessages(prompt))
-}
-
 func claudeAgentMessages(prompt *Context) []Message {
 	if prompt == nil {
 		return nil
 	}
 	return prompt.Messages
+}
+
+// claudeAgentPromptContent builds the CLI streaming-input prompt: a plain
+// string unless some message carries an image, in which case the conversation
+// becomes content blocks so the images reach the model.
+func claudeAgentPromptContent(messages []Message) any {
+	if claudeAgentHasImage(messages) {
+		return claudeAgentBuildPromptBlocks(messages)
+	}
+	return claudeAgentBuildPromptFromMessages(messages)
+}
+
+func claudeAgentHasImage(messages []Message) bool {
+	for _, msg := range messages {
+		for _, block := range msg.ContentBlocks() {
+			if block.Type == ContentBlockImage {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func claudeAgentMessagePrefix(msg Message) string {
+	switch msg.Role {
+	case "user":
+		return "User: "
+	case "assistant":
+		return "Assistant: "
+	case messageRoleTool, messageRoleToolResult:
+		name := msg.ToolName
+		if name == "" {
+			name = "unknown"
+		}
+		return "Tool result " + name + ": "
+	}
+	return ""
+}
+
+// claudeAgentBuildPromptBlocks mirrors claudeAgentBuildPromptFromMessages but
+// keeps images as base64 image blocks instead of dropping them.
+func claudeAgentBuildPromptBlocks(messages []Message) []map[string]any {
+	blocks := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		prefix := claudeAgentMessagePrefix(msg)
+		if prefix == "" {
+			continue
+		}
+		if text, ok := msg.ContentString(); ok {
+			if strings.TrimSpace(text) != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": prefix + text})
+			}
+			continue
+		}
+		var texts []string
+		flush := func() {
+			if len(texts) == 0 {
+				return
+			}
+			if s := strings.Join(texts, "\n"); strings.TrimSpace(s) != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": prefix + s})
+			}
+			texts = nil
+		}
+		for _, block := range msg.ContentBlocks() {
+			switch block.Type {
+			case ContentBlockText, ContentBlockToolResult:
+				if strings.TrimSpace(block.Text) != "" {
+					texts = append(texts, block.Text)
+				}
+			case ContentBlockImage:
+				if block.Data == "" {
+					continue
+				}
+				flush()
+				blocks = append(blocks, map[string]any{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": block.MimeType,
+						"data":       block.Data,
+					},
+				})
+			}
+		}
+		flush()
+	}
+	return blocks
+}
+
+func claudeAgentBuildPromptFromMessages(messages []Message) string {
+	parts := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		text := claudeAgentMessageText(msg)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		if prefix := claudeAgentMessagePrefix(msg); prefix != "" {
+			parts = append(parts, prefix+text)
+		}
+	}
+
+	return strings.Join(parts, "\n\n")
 }
 
 func claudeAgentNewMessages(prompt *Context, previousCount int) []Message {
@@ -260,31 +359,6 @@ func claudeAgentResumeMessages(messages []Message) []Message {
 		kept = append(kept, msg)
 	}
 	return kept
-}
-
-func claudeAgentBuildPromptFromMessages(messages []Message) string {
-	parts := make([]string, 0, len(messages))
-	for _, msg := range messages {
-		text := claudeAgentMessageText(msg)
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-
-		switch msg.Role {
-		case "user":
-			parts = append(parts, "User: "+text)
-		case "assistant":
-			parts = append(parts, "Assistant: "+text)
-		case messageRoleTool, messageRoleToolResult:
-			name := msg.ToolName
-			if name == "" {
-				name = "unknown"
-			}
-			parts = append(parts, "Tool result "+name+": "+text)
-		}
-	}
-
-	return strings.Join(parts, "\n\n")
 }
 
 func claudeAgentCompactionSignature(prompt *Context) string {
