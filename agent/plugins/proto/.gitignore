@@ -1,3 +1,0 @@
-# Generated protobuf / gRPC stubs. Regenerate with:
-#   go generate ./agent/plugins/proto/...
-*.pb.go

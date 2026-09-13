@@ -40,10 +40,6 @@ imp-v-spec
 *.working
 *.working.*
 
-# Generated / proto
-**/gen/*.pb.go
-**/*.pb.gw.go
-
 # Local environment
 .env
 .env.local
