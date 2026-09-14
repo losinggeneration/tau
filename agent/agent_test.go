@@ -1779,6 +1779,9 @@ func TestPromptMidRunReplaceMessagesRebasesContext(t *testing.T) {
 	if !strings.Contains(secondPrompt.SystemPrompt, "Session Summary: compacted away") {
 		t.Fatalf("second model call does not carry the compaction summary in its system prompt: %q", secondPrompt.SystemPrompt)
 	}
+	if n := len(secondPrompt.Messages); n == 0 || secondPrompt.Messages[n-1].Role != "user" {
+		t.Fatalf("second model call must end with a user message after compaction (providers reject empty input): %#v", secondPrompt.Messages)
+	}
 	for _, m := range secondPrompt.Messages {
 		if m.Role == "toolResult" {
 			t.Fatalf("second model call received an orphan tool result: %#v", m)

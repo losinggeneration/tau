@@ -1025,6 +1025,12 @@ func liftSystemMessagesIntoPrompt(systemPrompt string, messages []*Message) (str
 		parts = append(parts, trimmed)
 	}
 	parts = append(parts, systemParts...)
+	// A compaction that lands mid-turn leaves only the summary. Providers
+	// reject a request with no conversational input, so ask the model to
+	// resume from the summary.
+	if len(out) == 0 {
+		out = append(out, NewUserMessage("Continue from where you left off."))
+	}
 	return strings.Join(parts, "\n\n"), out
 }
 
