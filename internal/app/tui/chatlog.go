@@ -108,6 +108,11 @@ type renderCacheKey struct {
 	componentID string
 	revision    uint64
 	width       int
+
+	// expanded distinguishes the two render states of a component whose
+	// preview can be clicked open (truncated user messages, capped tool
+	// previews), so toggling cannot hit the other state's cached rows.
+	expanded bool
 }
 
 type renderCacheEntry struct {
@@ -208,6 +213,12 @@ type ChatLog struct {
 	// plugin extensions Registry so plugins see the same state
 	// the chat log does. Nil is a valid value (no observer).
 	toolExpansionHandler func(id string, expanded bool)
+
+	// expanded records components whose truncated preview has been clicked
+	// open: user messages render in full with a collapse hint instead of the
+	// capped preview, and tool previews drop their line caps. Keyed by
+	// component ID. Guarded by mu.
+	expanded map[string]bool
 
 	mu sync.Mutex
 
@@ -452,6 +463,7 @@ func (c *ChatLog) setConversation(conv *ConversationModel, clearRendered bool) {
 	if clearRendered {
 		c.renderCache = nil
 		c.renderCacheOrder = nil
+		c.expanded = nil
 	}
 	c.mu.Unlock()
 
@@ -575,6 +587,13 @@ func (c *ChatLog) Handle(e tauui.Event, ctx *tauui.Ctx) bool {
 		c.mu.Unlock()
 		if selectionText != "" && ctx != nil && ctx.ClipboardWrite != nil {
 			ctx.ClipboardWrite(selectionText)
+		}
+		// A single click that selected nothing (no drag; multi-clicks produce a
+		// non-empty word/line selection) toggles a truncated user message between
+		// its capped preview and the full text. Rovel only populates ClickCount on
+		// press, so the release-side count is 0 for a plain click.
+		if me.ClickCount <= 1 && selectionText == "" {
+			c.toggleExpandedAt(me.X, me.Y)
 		}
 		invalidateRect(ctx, rect)
 		return true
@@ -1300,6 +1319,7 @@ func (c *ChatLog) renderComponent(ctx context.Context, component ChatComponent, 
 	key := renderCacheKey{componentID: component.ID, revision: component.Revision, width: width}
 	if key.componentID != "" && key.revision != 0 {
 		c.mu.Lock()
+		key.expanded = c.expanded[component.ID]
 		entry, ok := c.renderCache[key]
 		if ok {
 			c.metrics.CacheHits++
@@ -1951,17 +1971,127 @@ func (c *ChatLog) renderSystemComponent(ctx context.Context, component ChatCompo
 
 const maxUserMessageRenderLines = 20
 
+const (
+	userMessageTruncatedText = "... (user message truncated)"
+	bashTruncatedText        = "... (bash output truncated)"
+	collapseHintText         = "... (click to collapse)"
+)
+
 func (c *ChatLog) renderUserComponent(ctx context.Context, component ChatComponent, width int) ([]renderLine, int, int) {
 	body := strings.TrimRight(component.Text, "\n")
-	lines := c.appendPaddedMarkdownBox(ctx, nil, body, width, c.pal().user, paddedBoxOptions{
-		MaxContentLines: maxUserMessageRenderLines,
-		TruncatedText:   "... (user message truncated)",
-	})
+	opts := paddedBoxOptions{FooterText: collapseHintText}
+	if !c.componentExpanded(component.ID) {
+		opts = paddedBoxOptions{MaxContentLines: maxUserMessageRenderLines, TruncatedText: userMessageTruncatedText}
+	}
+	lines := c.appendPaddedMarkdownBox(ctx, nil, body, width, c.pal().user, opts)
 	for _, image := range component.Images {
 		imageLines, _, _ := c.renderImageComponent(ctx, ChatComponent{Image: image}, width)
 		lines = append(lines, imageLines...)
 	}
 	return lines, len(lines), len(component.Text)
+}
+
+// toggleExpandedAt flips the render of the truncated component containing
+// content row (x, y) between its capped preview and the full content. Plain
+// clicks on a truncated user message or capped tool preview open it; clicking
+// again collapses. Schedules a re-render only when a state actually changed.
+func (c *ChatLog) toggleExpandedAt(x, y int) {
+	c.mu.Lock()
+	line := y - c.rect.Y
+	var component ChatComponent
+	if line >= 0 && line < len(c.lines) {
+		for i := range c.renderedState.spans {
+			if i < len(c.renderedState.components) {
+				if span := c.renderedState.spans[i]; line >= span.start && line < span.end {
+					component = c.renderedState.components[i]
+					break
+				}
+			}
+		}
+	}
+	expanded := c.expanded[component.ID]
+	width := c.rect.W
+	c.mu.Unlock()
+
+	if component.ID == "" {
+		return
+	}
+	switch component.Kind {
+	case ChatComponentUser:
+		// A message within the line cap has nothing hidden, so there is nothing
+		// to expand; clicking it must not grow a collapse hint either.
+		if !expanded && !c.userMessageExceedsRenderLimit(component, width) {
+			return
+		}
+	case ChatComponentToolExecution:
+		if !expanded && !c.toolExceedsRenderLimit(component) {
+			return
+		}
+	default:
+		return
+	}
+
+	expanded = !expanded
+	c.mu.Lock()
+	if expanded {
+		if c.expanded == nil {
+			c.expanded = make(map[string]bool)
+		}
+		c.expanded[component.ID] = true
+	} else {
+		delete(c.expanded, component.ID)
+	}
+	c.mu.Unlock()
+	if component.Kind == ChatComponentToolExecution && component.ToolExecution.CallID != "" {
+		// Plugins observe the same toggle the chat log renders.
+		c.SetToolExpanded(component.ToolExecution.CallID, expanded)
+	}
+	c.scheduleCurrentSnapshot()
+}
+
+// componentExpanded reports whether the component's truncated preview has been
+// clicked open. Safe from the render worker; guarded by mu like the map.
+func (c *ChatLog) componentExpanded(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.expanded[id]
+}
+
+// toolExceedsRenderLimit reports whether the tool's built-in rendering caps
+// its preview at this state, i.e. whether clicking it has anything to reveal.
+// Mirrors the caps the renderers apply so the limits have one source of truth.
+func (c *ChatLog) toolExceedsRenderLimit(component ChatComponent) bool {
+	tool := component.ToolExecution
+	switch tool.Name {
+	case "bash":
+		_, truncated := previewLines(tool.Output, bashToolPreviewLines)
+		return truncated
+	case "read":
+		if !toolExecutionFailed(tool) {
+			return false
+		}
+		_, truncated := previewLines(tool.Output, readToolPreviewLines)
+		return truncated
+	case "write":
+		_, truncated := previewLines(writeContentFromArgs(tool.Args), writeContentPreviewLines)
+		return truncated
+	case "edit":
+		diff := editDiffFromDetails(component.ToolDetails)
+		return diff != "" && compactEditDiffTruncated(diff)
+	default:
+		return false
+	}
+}
+
+// userMessageExceedsRenderLimit reports whether the user message's markdown
+// rendering is capped by maxUserMessageRenderLines at width, i.e. whether its
+// preview carries the truncation marker.
+func (c *ChatLog) userMessageExceedsRenderLimit(component ChatComponent, width int) bool {
+	if width <= 0 {
+		return false
+	}
+	rows := c.newChatMarkdown(strings.TrimRight(component.Text, "\n")).Render(max(1, width-2))
+	return len(rows) > maxUserMessageRenderLines
 }
 
 func (c *ChatLog) renderImageComponent(ctx context.Context, component ChatComponent, width int) ([]renderLine, int, int) {
@@ -2189,7 +2319,11 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 		out = append(out, renderLine{text: " " + status, st: c.pal().dim})
 	}
 
-	outputLines, truncated := previewLines(tool.Output, bashToolPreviewLines)
+	limit := bashToolPreviewLines
+	if c.componentExpanded(component.ID) {
+		limit = 0
+	}
+	outputLines, truncated := previewLines(tool.Output, limit)
 	if len(outputLines) > 0 {
 		for _, line := range outputLines {
 			if ctx.Err() != nil {
@@ -2199,7 +2333,9 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 			out = append(out, renderLine{text: " " + cappedLine, st: st})
 		}
 		if truncated {
-			out = append(out, renderLine{text: " ... (bash output truncated)", st: c.pal().dim})
+			out = append(out, renderLine{text: " " + bashTruncatedText, st: c.pal().dim})
+		} else if limit == 0 {
+			out = append(out, renderLine{text: " " + collapseHintText, st: c.pal().dim})
 		}
 	} else if tool.State == toolExecutionComplete {
 		out = append(out, renderLine{text: " (no output)", st: c.pal().dim})
@@ -2241,7 +2377,11 @@ func (c *ChatLog) appendBashToolExecutionChrome(ctx context.Context, out []rende
 			out = append(out, renderLine{text: border.Line(wrappedSegment(command, row)), st: commandStyle})
 		}
 	}
-	outputLines, truncated := previewLines(tool.Output, bashToolPreviewLines)
+	limit := bashToolPreviewLines
+	if c.componentExpanded(component.ID) {
+		limit = 0
+	}
+	outputLines, truncated := previewLines(tool.Output, limit)
 	if len(outputLines) > 0 {
 		out = append(out, renderLine{text: border.Rule(), st: borderStyle})
 		for _, rawLine := range outputLines {
@@ -2259,7 +2399,9 @@ func (c *ChatLog) appendBashToolExecutionChrome(ctx context.Context, out []rende
 			}
 		}
 		if truncated {
-			out = append(out, renderLine{text: border.Line("... (bash output truncated)"), st: dimStyle})
+			out = append(out, renderLine{text: border.Line(bashTruncatedText), st: dimStyle})
+		} else if limit == 0 {
+			out = append(out, renderLine{text: border.Line(collapseHintText), st: dimStyle})
 		}
 	} else if tool.State == toolExecutionComplete {
 		out = append(out, renderLine{text: border.Rule(), st: borderStyle})
@@ -2296,7 +2438,11 @@ func (c *ChatLog) appendReadToolExecution(ctx context.Context, out []renderLine,
 	if !toolExecutionFailed(tool) {
 		return out
 	}
-	lines, truncated := previewLines(tool.Output, readToolPreviewLines)
+	limit := readToolPreviewLines
+	if c.componentExpanded(component.ID) {
+		limit = 0
+	}
+	lines, truncated := previewLines(tool.Output, limit)
 	for _, line := range lines {
 		if ctx.Err() != nil {
 			return out
@@ -2305,6 +2451,8 @@ func (c *ChatLog) appendReadToolExecution(ctx context.Context, out []renderLine,
 	}
 	if truncated {
 		out = append(out, renderLine{text: chatLogRenderRow(" ... (read output truncated)", width), st: c.pal().dim})
+	} else if limit == 0 && len(lines) > 0 {
+		out = append(out, renderLine{text: chatLogRenderRow(" "+collapseHintText, width), st: c.pal().dim})
 	}
 	return out
 }
@@ -2339,11 +2487,19 @@ func (c *ChatLog) appendEditToolExecution(ctx context.Context, out []renderLine,
 	out = append(out, renderLine{text: chatLogRenderRow(" "+renderEditToolCall(tool, component.Text), width), st: st.WithAttr(tauui.AttrBold)})
 	if diff := editDiffFromDetails(component.ToolDetails); diff != "" {
 		out = append(out, renderLine{text: " ", st: st})
-		for _, line := range compactEditDiffLines(diff) {
+		expanded := c.componentExpanded(component.ID)
+		diffLines := strings.Split(strings.TrimRight(diff, "\n"), "\n")
+		if !expanded {
+			diffLines = compactEditDiffLines(diff)
+		}
+		for _, line := range diffLines {
 			if ctx.Err() != nil {
 				return out
 			}
 			out = append(out, renderLine{text: chatLogRenderRow(" "+line, width), st: c.editDiffLineStyle(line, st)})
+		}
+		if expanded && compactEditDiffTruncated(diff) {
+			out = append(out, renderLine{text: chatLogRenderRow(" "+collapseHintText, width), st: c.pal().dim})
 		}
 		return out
 	}
@@ -2366,13 +2522,20 @@ func (c *ChatLog) appendWriteToolExecution(ctx context.Context, out []renderLine
 	st := c.toolStyle(tool)
 	out = append(out, renderLine{text: " ", st: c.pal().spacer})
 	out = append(out, renderLine{text: chatLogRenderRow(" "+renderWriteToolCall(tool, component.Text), width), st: st.WithAttr(tauui.AttrBold)})
-	if preview := writeContentPreviewFromArgs(tool.Args); len(preview) > 0 {
+	limit := writeContentPreviewLines
+	if c.componentExpanded(component.ID) {
+		limit = 0
+	}
+	if preview := writeContentPreviewFromArgs(tool.Args, limit); len(preview) > 0 {
 		out = append(out, renderLine{text: " ", st: st})
 		for _, line := range preview {
 			if ctx.Err() != nil {
 				return out
 			}
 			out = append(out, renderLine{text: chatLogRenderRow(" "+line, width), st: st})
+		}
+		if limit == 0 {
+			out = append(out, renderLine{text: chatLogRenderRow(" "+collapseHintText, width), st: c.pal().dim})
 		}
 		return out
 	}
@@ -2425,7 +2588,10 @@ func renderWriteToolCall(tool ToolExecutionComponent, fallback string) string {
 	return "write " + path
 }
 
-func writeContentPreviewFromArgs(args string) []string {
+// writeContentPreviewFromArgs renders the write call's content preview with at
+// most limit content rows; limit <= 0 renders all of them. When rows were
+// dropped, a "... (N more lines)" marker closes the preview.
+func writeContentPreviewFromArgs(args string, limit int) []string {
 	if args == "" {
 		return nil
 	}
@@ -2439,17 +2605,31 @@ func writeContentPreviewFromArgs(args string) []string {
 	}
 	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 	total := len(lines)
-	truncated := total > writeContentPreviewLines
-	if truncated {
-		lines = lines[:writeContentPreviewLines]
+	if limit > 0 && total > limit {
+		lines = lines[:limit]
+		out := make([]string, 0, len(lines)+2)
+		out = append(out, "new file preview:")
+		out = append(out, lines...)
+		out = append(out, fmt.Sprintf("... (%d more lines)", total-limit))
+		return out
 	}
-	out := make([]string, 0, len(lines)+2)
+	out := make([]string, 0, len(lines)+1)
 	out = append(out, "new file preview:")
 	out = append(out, lines...)
-	if truncated {
-		out = append(out, fmt.Sprintf("... (%d more lines)", total-writeContentPreviewLines))
-	}
 	return out
+}
+
+// writeContentFromArgs returns the raw content a write call would preview.
+func writeContentFromArgs(args string) string {
+	if args == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(args), &m); err != nil {
+		return ""
+	}
+	content, _ := m["content"].(string)
+	return content
 }
 
 func editDiffFromDetails(details any) string {
@@ -2486,6 +2666,23 @@ func compactEditDiffLines(diff string) []string {
 		out = append(out, "     ...")
 	}
 	return out
+}
+
+// compactEditDiffTruncated reports whether compactEditDiffLines drops rows
+// from diff, i.e. whether the compact preview hides anything.
+func compactEditDiffTruncated(diff string) bool {
+	lines := strings.Split(strings.TrimRight(diff, "\n"), "\n")
+	changed := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+			changed = i
+			break
+		}
+	}
+	if changed < 0 {
+		return false
+	}
+	return changed-editDiffContextLines > 0 || changed+editDiffContextLines+1 < len(lines)
 }
 
 func (c *ChatLog) editDiffLineStyle(line string, base tauui.Style) tauui.Style {
@@ -2820,6 +3017,7 @@ func (c *ChatLog) appendMarkdown(ctx context.Context, out []renderLine, body str
 type paddedBoxOptions struct {
 	MaxContentLines int
 	TruncatedText   string
+	FooterText      string
 }
 
 func (c *ChatLog) appendPaddedMarkdownBox(ctx context.Context, out []renderLine, body string, width int, st tauui.Style, opts ...paddedBoxOptions) []renderLine {
@@ -2838,6 +3036,9 @@ func (c *ChatLog) appendPaddedMarkdownBox(ctx context.Context, out []renderLine,
 	}
 	if opt.MaxContentLines > 0 && len(rows) > opt.MaxContentLines {
 		rows = append(append([]string(nil), rows[:opt.MaxContentLines]...), opt.TruncatedText)
+	}
+	if opt.FooterText != "" {
+		rows = append(rows, opt.FooterText)
 	}
 	for _, row := range rows {
 		if ctx.Err() != nil {

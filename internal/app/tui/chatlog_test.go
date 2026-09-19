@@ -1991,3 +1991,315 @@ func TestChatLogTableChromeFollowsTheme(t *testing.T) {
 		})
 	}
 }
+
+// clickChatLogRow simulates a plain single click (press + release, no drag) on
+// content row y. The release deliberately carries no ClickCount: rovel only
+// populates it on press, so the release-side count is zero in production.
+func clickChatLogRow(t *testing.T, log *ChatLog, y int) {
+	t.Helper()
+	ctx := &tauui.Ctx{Invalidate: func(tauui.Rect) {}}
+	if !log.Handle(tauui.MouseEvent{X: 2, Y: y, Button: tauui.MouseButtonLeft, Action: tauui.MousePress, ClickCount: 1}, ctx) {
+		t.Fatal("mouse press was not handled")
+	}
+	if !log.Handle(tauui.MouseEvent{X: 2, Y: y, Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease}, ctx) {
+		t.Fatal("mouse release was not handled")
+	}
+}
+
+func chatLogJoinedRows(t *testing.T, log *ChatLog) string {
+	t.Helper()
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return strings.Join(renderLineTexts(log.lines), "\n")
+}
+
+// TestChatLogUserMessageClickTogglesExpansion verifies that clicking a
+// truncated user message expands it in place and clicking it again restores
+// the capped preview.
+func TestChatLogUserMessageClickTogglesExpansion(t *testing.T) {
+	conv := NewConversationModel()
+	var b strings.Builder
+	for i := range maxUserMessageRenderLines + 10 {
+		fmt.Fprintf(&b, "line-%02d\n", i)
+	}
+	conv.AddUserMessage(b.String())
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 200})
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, userMessageTruncatedText) || strings.Contains(joined, "line-29") {
+		t.Fatalf("collapsed preview wrong:\n%s", joined)
+	}
+
+	// Dragging a selection across the message must not toggle it.
+	ctx := &tauui.Ctx{Invalidate: func(tauui.Rect) {}}
+	if !log.Handle(tauui.MouseEvent{X: 2, Y: 5, Button: tauui.MouseButtonLeft, Action: tauui.MousePress}, ctx) ||
+		!log.Handle(tauui.MouseEvent{X: 12, Y: 5, Button: tauui.MouseButtonLeft, Action: tauui.MouseDrag}, ctx) ||
+		!log.Handle(tauui.MouseEvent{X: 12, Y: 5, Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease}, ctx) {
+		t.Fatal("drag selection was not handled")
+	}
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, userMessageTruncatedText) {
+		t.Fatalf("drag selection unexpectedly toggled expansion:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, 5)
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, "line-29") || !strings.Contains(joined, collapseHintText) || strings.Contains(joined, userMessageTruncatedText) {
+		t.Fatalf("expanded message wrong:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, 5)
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, userMessageTruncatedText) || strings.Contains(joined, "line-29") {
+		t.Fatalf("re-collapsed preview wrong:\n%s", joined)
+	}
+}
+
+// TestChatLogUserMessageClickShortMessageDoesNotExpand verifies that clicking
+// a user message within the render cap is a no-op: nothing is hidden, so no
+// collapse hint may appear.
+func TestChatLogUserMessageClickShortMessageDoesNotExpand(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddUserMessage("short message")
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 20})
+	waitForChatLog(t, log)
+
+	revision := log.Revision()
+	clickChatLogRow(t, log, 1)
+
+	if got := log.Revision(); got != revision {
+		t.Fatalf("revision = %d after clicking short message, want unchanged %d", got, revision)
+	}
+	if joined := chatLogJoinedRows(t, log); strings.Contains(joined, collapseHintText) {
+		t.Fatalf("short message grew a collapse hint:\n%s", joined)
+	}
+}
+
+// TestChatLogUserMessageExpansionSurvivesStreaming verifies the expanded state
+// is keyed per message: an assistant streaming update after an expansion must
+// not collapse the expanded user message back to its preview.
+func TestChatLogUserMessageExpansionSurvivesStreaming(t *testing.T) {
+	conv := NewConversationModel()
+	var b strings.Builder
+	for i := range maxUserMessageRenderLines + 10 {
+		fmt.Fprintf(&b, "line-%02d\n", i)
+	}
+	conv.AddUserMessage(b.String())
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 200})
+	waitForChatLog(t, log)
+
+	clickChatLogRow(t, log, 5)
+	waitForChatLog(t, log)
+
+	conv.BeginAssistantMessage()
+	conv.AppendAssistantText("streaming reply")
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, "line-29") {
+		t.Fatalf("streaming update collapsed the expanded user message:\n%s", joined)
+	}
+	if !strings.Contains(chatLogJoinedRows(t, log), "streaming reply") {
+		t.Fatal("assistant stream text missing")
+	}
+}
+
+// chatLogComponentRow returns a content row inside the rendered span of the
+// first component of the given kind, for tests that click a specific component.
+func chatLogComponentRow(t *testing.T, log *ChatLog, kind ChatComponentKind) int {
+	t.Helper()
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for i := range log.renderedState.components {
+		if log.renderedState.components[i].Kind == kind {
+			span := log.renderedState.spans[i]
+			return span.start + (span.end-span.start)/2
+		}
+	}
+	t.Fatalf("no component of kind %q in the rendered state", kind)
+	return 0
+}
+
+func bashOutputOfLines(n int) string {
+	var b strings.Builder
+	for i := range n {
+		fmt.Fprintf(&b, "out-%02d\n", i)
+	}
+	return b.String()
+}
+
+// TestChatLogBashToolClickTogglesExpansion verifies that clicking a bash box
+// whose output is over the preview cap reveals the full output plus a collapse
+// hint, and clicking again restores the capped preview.
+func TestChatLogBashToolClickTogglesExpansion(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call-1", "bash", `{"command":"ls"}`)
+	conv.AddToolResultWithID("call-1", bashOutputOfLines(bashToolPreviewLines+10), false)
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 200})
+	waitForChatLog(t, log)
+
+	toolRow := chatLogComponentRow(t, log, ChatComponentToolExecution)
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, bashTruncatedText) || strings.Contains(joined, "out-29") {
+		t.Fatalf("collapsed bash preview wrong:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, toolRow)
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, "out-29") || !strings.Contains(joined, collapseHintText) || strings.Contains(joined, bashTruncatedText) {
+		t.Fatalf("expanded bash output wrong:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, toolRow)
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, bashTruncatedText) || strings.Contains(joined, "out-29") {
+		t.Fatalf("re-collapsed bash preview wrong:\n%s", joined)
+	}
+}
+
+// TestChatLogShortBashToolClickDoesNotExpand verifies that clicking a bash box
+// within the preview cap is a no-op.
+func TestChatLogShortBashToolClickDoesNotExpand(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call-1", "bash", `{"command":"ls"}`)
+	conv.AddToolResultWithID("call-1", "one\ntwo", false)
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 20})
+	waitForChatLog(t, log)
+
+	revision := log.Revision()
+	clickChatLogRow(t, log, chatLogComponentRow(t, log, ChatComponentToolExecution))
+
+	if got := log.Revision(); got != revision {
+		t.Fatalf("revision = %d after clicking short bash box, want unchanged %d", got, revision)
+	}
+	if joined := chatLogJoinedRows(t, log); strings.Contains(joined, collapseHintText) {
+		t.Fatalf("short bash box grew a collapse hint:\n%s", joined)
+	}
+}
+
+// TestChatLogEditDiffClickTogglesExpansion verifies that clicking an edit box
+// whose compact diff dropped rows reveals the full diff, and clicking again
+// restores the compact window.
+func TestChatLogEditDiffClickTogglesExpansion(t *testing.T) {
+	var lines []string
+	for i := range 10 {
+		lines = append(lines, fmt.Sprintf(" ctx-%02d", i))
+	}
+	lines = append(lines, "-old", "+new")
+	for i := range 10 {
+		lines = append(lines, fmt.Sprintf(" ctx-b%02d", i))
+	}
+	diff := strings.Join(lines, "\n")
+
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call-1", "edit", `{"path":"f.go"}`)
+	conv.AddToolResultWithDetails("call-1", "", "ok", false, map[string]any{"diff": diff})
+	if !compactEditDiffTruncated(diff) {
+		t.Fatal("test diff is not compacted; test is invalid")
+	}
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 200})
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); strings.Contains(joined, "ctx-00") || !strings.Contains(joined, "ctx-06") || !strings.Contains(joined, "     ...") {
+		t.Fatalf("expected compacted diff with hidden rows:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, chatLogComponentRow(t, log, ChatComponentToolExecution))
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, "ctx-b09") || !strings.Contains(joined, collapseHintText) {
+		t.Fatalf("expanded diff missing tail rows or collapse hint:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, chatLogComponentRow(t, log, ChatComponentToolExecution))
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, "     ...") || strings.Contains(joined, "ctx-b09") {
+		t.Fatalf("re-collapsed diff wrong:\n%s", joined)
+	}
+}
+
+// TestChatLogWritePreviewClickTogglesExpansion verifies the same toggle for a
+// write box whose content preview is capped.
+func TestChatLogWritePreviewClickTogglesExpansion(t *testing.T) {
+	var b strings.Builder
+	for i := range writeContentPreviewLines + 5 {
+		fmt.Fprintf(&b, "content-%02d\n", i)
+	}
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call-1", "write", `{"path":"f.go"}`)
+	conv.AddToolResultWithName("call-1", "write", "ok", false)
+	// The write preview comes from args; re-add the call with full content.
+	conv.AddToolCallWithID("call-2", "write", fmt.Sprintf(`{"path":"g.go","content":%q}`, strings.TrimRight(b.String(), "\n")))
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 200})
+	waitForChatLog(t, log)
+
+	rows := chatLogJoinedRows(t, log)
+	if !strings.Contains(rows, "content-09") || strings.Contains(rows, "content-14") || !strings.Contains(rows, "... (5 more lines)") {
+		t.Fatalf("collapsed write preview wrong:\n%s", rows)
+	}
+
+	// Two write boxes exist; click the second (call-2). Its span is the second
+	// tool-execution component.
+	log.mu.Lock()
+	var secondToolRow int
+	found := 0
+	for i := range log.renderedState.components {
+		if log.renderedState.components[i].Kind == ChatComponentToolExecution {
+			found++
+			if found == 2 {
+				span := log.renderedState.spans[i]
+				secondToolRow = span.start + (span.end-span.start)/2
+			}
+		}
+	}
+	log.mu.Unlock()
+	if found < 2 {
+		t.Fatalf("found %d tool components, want 2", found)
+	}
+
+	clickChatLogRow(t, log, secondToolRow)
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, "content-14") || !strings.Contains(joined, collapseHintText) {
+		t.Fatalf("expanded write preview wrong:\n%s", joined)
+	}
+}
+
+// TestChatLogToolClickNotifiesExpansionHandler verifies the plugin-facing hook
+// observes the same toggle the chat log renders, keyed by call ID.
+func TestChatLogToolClickNotifiesExpansionHandler(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call-1", "bash", `{"command":"ls"}`)
+	conv.AddToolResultWithID("call-1", bashOutputOfLines(bashToolPreviewLines+5), false)
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 200})
+	waitForChatLog(t, log)
+
+	var gotID string
+	var gotExpanded bool
+	log.SetToolExpansionHandler(func(id string, expanded bool) { gotID, gotExpanded = id, expanded })
+
+	clickChatLogRow(t, log, chatLogComponentRow(t, log, ChatComponentToolExecution))
+	waitForChatLog(t, log)
+
+	if gotID != "call-1" || !gotExpanded {
+		t.Fatalf("expansion handler observed (%q, %v), want (call-1, true)", gotID, gotExpanded)
+	}
+}
