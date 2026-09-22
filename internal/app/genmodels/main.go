@@ -355,22 +355,12 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 		}
 	}
 
-	if data, ok := payload["kimi-for-coding"]; ok {
-		_, hasCanonicalModel := data.Models["kimi-for-coding"]
+	if data, ok := payload["kimi-code-plan-global"]; ok {
 		for id, model := range data.Models {
 			if !model.ToolCall {
 				continue
 			}
-			if id == "k2p5" && hasCanonicalModel {
-				continue
-			}
-			normalizedID := id
-			normalizedName := firstNonEmpty(model.Name, id)
-			if id == "k2p5" {
-				normalizedID = "kimi-for-coding"
-				normalizedName = "Kimi For Coding"
-			}
-			result = append(result, newModel(normalizedID, normalizedName, tauai.APIAnthropicMessages, "kimi-coding", "https://api.kimi.com/coding", model.Reasoning, model.Modalities.Input, costProfile(model.Cost.Input, model.Cost.Output, model.Cost.CacheRead, model.Cost.CacheWrite), defaultInt(model.Limit.Context, 4096), defaultInt(model.Limit.Output, 4096)))
+			result = append(result, newModel(id, firstNonEmpty(model.Name, id), tauai.APIAnthropicMessages, "kimi-coding", "https://api.kimi.com/coding", model.Reasoning, model.Modalities.Input, costProfile(model.Cost.Input, model.Cost.Output, model.Cost.CacheRead, model.Cost.CacheWrite), defaultInt(model.Limit.Context, 4096), defaultInt(model.Limit.Output, 4096)))
 		}
 	}
 
