@@ -52,11 +52,14 @@ func (a *App) applySessionEvent(e sdk.Event) {
 		a.setStatus(compactionStatusKey, a.throbberFrame()+" "+compactionRunningMessage)
 		a.startThrobber()
 	case "compaction_end":
-		summary, tokensBefore := compactionPayload(e.Payload)
+		summary, tokensBefore, fallbackErr := compactionPayload(e.Payload)
 		a.compactionRunning = false
 		a.clearStatus(compactionStatusKey)
 		if !a.isStreaming() {
 			a.stopThrobber()
+		}
+		if fallbackErr != "" {
+			summary = "Compaction fell back to a local summary — model call failed: " + fallbackErr + "\n\n" + summary
 		}
 		a.conv.AddCompactionSummary(summary, tokensBefore)
 		a.refreshChat()
@@ -78,13 +81,15 @@ func (a *App) throbberFrame() string {
 }
 
 // compactionPayload pulls the summary and pre-compaction token count out of a
-// compaction_end payload. The payload crosses the SDK boundary as a map, and a
-// session that omits either field yields the zero value rather than an error:
-// a missing token count costs a detail in the header, not the summary itself.
-func compactionPayload(payload any) (summary string, tokensBefore int) {
+// compaction_end payload, plus the fallback error when the model-driven
+// summary failed and the SDK substituted a local one. The payload crosses the
+// SDK boundary as a map, and a session that omits either field yields the zero
+// value rather than an error: a missing token count costs a detail in the
+// header, not the summary itself.
+func compactionPayload(payload any) (summary string, tokensBefore int, fallbackErr string) {
 	fields, ok := payload.(map[string]any)
 	if !ok {
-		return "", 0
+		return "", 0, ""
 	}
 	if s, ok := fields["summary"].(string); ok {
 		summary = strings.TrimSpace(s)
@@ -98,5 +103,8 @@ func compactionPayload(payload any) (summary string, tokensBefore int) {
 	case float64:
 		tokensBefore = int(n)
 	}
-	return summary, tokensBefore
+	if s, ok := fields["fallback_error"].(string); ok {
+		fallbackErr = s
+	}
+	return summary, tokensBefore, fallbackErr
 }

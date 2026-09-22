@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/losinggeneration/tau/agent"
@@ -1030,7 +1031,8 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 
 	transcriptStr := transcript.String()
 
-	// Try plugin compaction hook first if plugin manager is available.
+	// Try the plugin compaction hook first when plugins are available; fall
+	// through to the built-in model-driven summarization otherwise.
 	var summary string
 	if s.pluginManager != nil {
 		tokensBefore := int64(0)
@@ -1038,24 +1040,18 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 			tokensBefore += int64(msg.Usage.TotalTokens)
 		}
 		result := s.pluginManager.DispatchCompactionHook(transcriptStr, tokensBefore, s.id)
-		if result.Summary != "" {
-			summary = result.Summary
-		} else {
-			// Fall back to built-in model-driven summarization.
-			summarizationPrompt := compaction.BuildSummarizationPrompt(transcriptStr)
-			var err error
-			summary, err = s.callModelForSummary(ctx, summarizationPrompt, transcriptStr, instructions)
-			if err != nil {
-				summary = s.buildNaiveSummary(state, instructions)
-			}
-		}
-	} else {
-		// No plugin manager; use built-in model-driven summarization.
+		summary = result.Summary
+	}
+	var summarizeErr error
+	if summary == "" {
 		summarizationPrompt := compaction.BuildSummarizationPrompt(transcriptStr)
 		var err error
 		summary, err = s.callModelForSummary(ctx, summarizationPrompt, transcriptStr, instructions)
 		if err != nil {
-			// Fallback to naive summary if model call fails
+			// Keep the session usable with a naive summary, but never silently:
+			// the warning and the compaction_end payload both record the failure.
+			summarizeErr = err
+			s.logger.Warn("compaction model call failed; using naive summary", "error", err)
 			summary = s.buildNaiveSummary(state, instructions)
 		}
 	}
@@ -1101,17 +1097,28 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	}
 	// The frontend copy carries the summary and the token count: §9 has the UI
 	// commit a summary message when compaction ends, and it has no other way to
-	// learn what the summary was.
-	s.notify("compaction_end", map[string]any{
+	// learn what the summary was. A model-call failure is flagged so frontends
+	// can show that the summary is a local fallback rather than model output.
+	endPayload := map[string]any{
 		"session_id":          s.id,
 		"reason":              "manual",
 		"summary":             summary,
 		"tokens_before":       tokensBefore,
 		"custom_instructions": instructions,
-	})
+	}
+	if summarizeErr != nil {
+		endPayload["fallback"] = true
+		endPayload["fallback_error"] = summarizeErr.Error()
+	}
+	s.notify("compaction_end", endPayload)
 
 	return nil
 }
+
+// summaryMaxOutputTokens caps the summarization request's output. A summary
+// never needs the model's full output budget (often 64K+), and providers that
+// validate input+output against the context window reject such requests.
+const summaryMaxOutputTokens = 8192
 
 // callModelForSummary calls the model to generate a summary using the compaction prompt.
 func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, transcript, customInstructions string) (string, error) {
@@ -1134,11 +1141,12 @@ func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, tr
 		SystemPrompt: systemPrompt,
 		Messages: []ai.Message{
 			{Role: "user", Content: instruction},
-			{Role: "user", Content: transcript},
+			{Role: "user", Content: trimTranscriptForSummary(transcript, s.model.ContextWindow)},
 		},
 	}
 
-	msg, err := client.Complete(ctx, s.model, prompt, s.compactionCompletionOptions(ctx)...)
+	opts := append(s.compactionCompletionOptions(ctx), ai.WithMaxTokens(summaryMaxOutputTokens))
+	msg, err := client.Complete(ctx, s.model, prompt, opts...)
 	if err != nil {
 		return "", fmt.Errorf("model completion: %w", err)
 	}
@@ -1151,6 +1159,35 @@ func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, tr
 	}
 
 	return "", fmt.Errorf("no text content in summarization response")
+}
+
+// trimTranscriptForSummary keeps the most recent transcript characters that
+// fit the model's context window (chars/4 estimate, minus the reserve for the
+// summary output and prompt overhead). Compaction runs exactly when history
+// is huge; an untrimmed transcript gets rejected by the provider and the
+// summary silently degrades to the naive fallback.
+// ponytail: tail-only trim drops the oldest history; chunked iterative
+// summarization (pi-style) is the upgrade path if that loss matters.
+func trimTranscriptForSummary(transcript string, contextWindow int) string {
+	if contextWindow <= 0 {
+		return transcript
+	}
+	budgetTokens := contextWindow - compaction.DefaultSettings.ReserveTokens
+	if budgetTokens < 1024 {
+		budgetTokens = 1024
+	}
+	maxChars := budgetTokens * 4
+	if len(transcript) <= maxChars {
+		return transcript
+	}
+	cut := len(transcript) - maxChars
+	// Advance to a rune boundary (≤3 bytes) so the trim never splits a
+	// UTF-8 sequence. Line alignment would be nicer but a single huge
+	// message can overshoot the entire budget.
+	for cut < len(transcript) && !utf8.RuneStart(transcript[cut]) {
+		cut++
+	}
+	return "[...older transcript truncated to fit the context window...]\n" + transcript[cut:]
 }
 
 // compactionCompletionOptions mirrors the authentication/session options the

@@ -298,6 +298,39 @@ func TestAnthropicConvertMessagesHandlesRedactedThinking(t *testing.T) {
 	}
 }
 
+// TestAnthropicBuildRequestHonorsMaxTokensOption pins the compaction bug where
+// every anthropic-messages request sent model.MaxTokens (e.g. 64K), ignoring
+// the WithMaxTokens option every other provider honors. A summarization
+// request near the context window then asks for tens of thousands of output
+// tokens on top of a near-full prompt, and providers reject the request.
+func TestAnthropicBuildRequestHonorsMaxTokensOption(t *testing.T) {
+	client := &anthropicClient{
+		model: &Model{
+			ID:        "claude-sonnet-4-6",
+			API:       APIAnthropicMessages,
+			Provider:  ProviderAnthropic,
+			MaxTokens: 64000,
+		},
+	}
+
+	var o options
+	o.maxTokens = 8192
+
+	reqBody, err := client.buildRequest(client.model, &Context{Messages: []Message{}}, &o)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+
+	var req anthropicRequest
+	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+
+	if req.MaxTokens != 8192 {
+		t.Fatalf("max_tokens = %d, want 8192 (WithMaxTokens must override model.MaxTokens)", req.MaxTokens)
+	}
+}
+
 func TestAnthropicBuildRequestWithToolChoice(t *testing.T) {
 	client := &anthropicClient{
 		model: &Model{

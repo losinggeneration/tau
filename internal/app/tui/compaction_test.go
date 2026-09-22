@@ -134,24 +134,58 @@ func TestCompactionIndicatorUsesItsOwnStatusKey(t *testing.T) {
 // which turns every number into a float64.
 func TestCompactionPayloadDecoding(t *testing.T) {
 	cases := []struct {
-		name       string
-		payload    any
-		wantText   string
-		wantTokens int
+		name         string
+		payload      any
+		wantText     string
+		wantTokens   int
+		wantFallback string
 	}{
-		{"native ints", map[string]any{"summary": "s", "tokens_before": 42}, "s", 42},
-		{"json floats", map[string]any{"summary": "s", "tokens_before": float64(42)}, "s", 42},
-		{"int64", map[string]any{"summary": "s", "tokens_before": int64(42)}, "s", 42},
-		{"missing count", map[string]any{"summary": "s"}, "s", 0},
-		{"missing summary", map[string]any{"tokens_before": 42}, "", 42},
-		{"not a map", "nonsense", "", 0},
-		{"nil", nil, "", 0},
+		{"native ints", map[string]any{"summary": "s", "tokens_before": 42}, "s", 42, ""},
+		{"json floats", map[string]any{"summary": "s", "tokens_before": float64(42)}, "s", 42, ""},
+		{"int64", map[string]any{"summary": "s", "tokens_before": int64(42)}, "s", 42, ""},
+		{"missing count", map[string]any{"summary": "s"}, "s", 0, ""},
+		{"missing summary", map[string]any{"tokens_before": 42}, "", 42, ""},
+		{"fallback error", map[string]any{"summary": "s", "tokens_before": 42, "fallback": true, "fallback_error": "provider 400"}, "s", 42, "provider 400"},
+		{"not a map", "nonsense", "", 0, ""},
+		{"nil", nil, "", 0, ""},
 	}
 	for _, tc := range cases {
-		summary, tokens := compactionPayload(tc.payload)
-		if summary != tc.wantText || tokens != tc.wantTokens {
-			t.Errorf("%s: got (%q, %d), want (%q, %d)", tc.name, summary, tokens, tc.wantText, tc.wantTokens)
+		summary, tokens, fallbackErr := compactionPayload(tc.payload)
+		if summary != tc.wantText || tokens != tc.wantTokens || fallbackErr != tc.wantFallback {
+			t.Errorf("%s: got (%q, %d, %q), want (%q, %d, %q)", tc.name, summary, tokens, fallbackErr, tc.wantText, tc.wantTokens, tc.wantFallback)
 		}
+	}
+}
+
+// When the model-driven summary fails, the SDK flags the compaction_end
+// payload; the transcript must show the summary came from the local fallback
+// rather than presenting it as model output.
+func TestCompactionEndMarksFallbackSummary(t *testing.T) {
+	a := newTestApp(t)
+
+	a.applySessionEvent(sdk.Event{
+		Type: "compaction_end",
+		Payload: map[string]any{
+			"summary":        "user: hi",
+			"tokens_before":  10,
+			"fallback":       true,
+			"fallback_error": "provider 400: prompt is too long",
+		},
+	})
+
+	components := a.conv.Snapshot().Components
+	if len(components) != 1 {
+		t.Fatalf("got %d components, want 1", len(components))
+	}
+	text := components[0].Text
+	if !strings.Contains(text, "fell back") {
+		t.Errorf("summary text = %q, want the fallback marker", text)
+	}
+	if !strings.Contains(text, "prompt is too long") {
+		t.Errorf("summary text = %q, want the fallback cause", text)
+	}
+	if !strings.Contains(text, "user: hi") {
+		t.Errorf("summary text = %q, want the summary body preserved", text)
 	}
 }
 

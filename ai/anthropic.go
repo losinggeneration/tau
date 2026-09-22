@@ -297,7 +297,7 @@ func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options) 
 func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options) (string, error) {
 	req := anthropicRequest{
 		Model:     model.ID,
-		MaxTokens: model.MaxTokens,
+		MaxTokens: getMaxTokens(o, model),
 		Stream:    true,
 	}
 

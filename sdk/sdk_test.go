@@ -2584,6 +2584,121 @@ func TestBuildNaiveSummaryPreservesExistingSummaryAndSkipsToolNoise(t *testing.T
 	assert.NotContains(t, summary, "github.com/losinggeneration/tau/agent")
 }
 
+// TestCompactTrimsTranscriptToFitContextWindow pins the size-dependent failure
+// where /compact stopped calling the model: the summarization request carried
+// the full session transcript plus the model's full output budget, so any
+// session near its context window was rejected by the provider, the error was
+// swallowed, and a naive local summary silently replaced the model call.
+func TestCompactTrimsTranscriptToFitContextWindow(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	provider := &recordingProvider{
+		api:          "test-api-sdk",
+		responseText: "trimmed summary",
+		caps:         ai.Capabilities{Tools: true, Streaming: true, Vision: true},
+	}
+	ai.Register("test-api-sdk", provider)
+	model := &ai.Model{
+		ID:            "compact-trim-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		ContextWindow: 128_000,
+		MaxTokens:     64_000,
+	}
+	ai.RegisterModel(model)
+
+	session := &agentSession{
+		model: model,
+		clientFactory: func(m *ai.Model) (ai.Client, error) {
+			return provider.NewClient(m)
+		},
+	}
+	session.agent = mustNewAgentForTest(t, model)
+
+	// Seed history far larger than the window: ~300K tokens of text.
+	var msgs []*agent.Message
+	for i := 0; i < 3; i++ {
+		msgs = append(msgs, &agent.Message{
+			Role:    agent.RoleUser,
+			Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: strings.Repeat(fmt.Sprintf("msg%d-", i), 100_000)}},
+		})
+	}
+	session.agent.ReplaceMessages(msgs)
+
+	require.NoError(t, session.Compact(testContext(t)))
+
+	prompt := provider.LastPrompt()
+	require.NotNil(t, prompt, "compaction must call the model even when history exceeds the context window")
+	require.Len(t, prompt.Messages, 2)
+	transcript, ok := prompt.Messages[1].ContentString()
+	require.True(t, ok, "transcript message should be plain text")
+
+	// Estimated tokens (chars/4) must fit inside window minus the reserve.
+	const budgetTokens = 128_000 - 16_384
+	if got := len(transcript) / 4; got > budgetTokens+64 {
+		t.Fatalf("transcript ≈ %d tokens exceeds %d budget; provider would reject the request near the context window", got, budgetTokens)
+	}
+	// The tail (most recent history) must survive the trim.
+	assert.Contains(t, transcript, "msg2-", "trimmed transcript must keep the most recent messages")
+
+	opts := provider.CompleteOptions()
+	assert.Greater(t, opts.MaxTokens, 0, "summary request must cap output tokens explicitly")
+	assert.LessOrEqual(t, opts.MaxTokens, 8192,
+		"summary MaxTokens = %d, want a modest cap ≤ 8192 (not the model's full output budget)", opts.MaxTokens)
+}
+
+// TestCompactReportsModelFallback pins the observability half of the /compact
+// bug: when the summarization call fails, Compact silently substituted a
+// naive local summary. The failure never reached the session log or the
+// compaction_end payload, so "compact didn't call the model" was invisible.
+func TestCompactReportsModelFallback(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	model := &ai.Model{
+		ID:            "compact-fallback-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		ContextWindow: 128_000,
+	}
+	ai.RegisterModel(model)
+
+	var logBuf bytes.Buffer
+	session := &agentSession{
+		model:  model,
+		logger: logging.NewText(&logBuf, slog.LevelWarn),
+		clientFactory: func(m *ai.Model) (ai.Client, error) {
+			return &mockClient{completeFn: func(ctx context.Context, model *ai.Model, prompt *ai.Context, opts ...ai.Option) (*ai.AssistantMessage, error) {
+				return nil, errors.New("provider 400: prompt is too long")
+			}}, nil
+		},
+	}
+	session.agent = mustNewAgentForTest(t, model)
+	session.agent.ReplaceMessages([]*agent.Message{
+		{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "remember the keyword radish"}}},
+	})
+
+	var endPayload any
+	session.SetEventObserver(func(e Event) {
+		if e.Type == "compaction_end" {
+			endPayload = e.Payload
+		}
+	})
+
+	require.NoError(t, session.Compact(testContext(t)))
+
+	messages := session.GetMessages()
+	require.Len(t, messages, 1)
+	assert.Contains(t, messages[0].Text, "radish", "naive fallback keeps recent conversation")
+
+	assert.Contains(t, logBuf.String(), "prompt is too long",
+		"the swallowed model error must reach the session log so silent fallbacks are diagnosable")
+
+	payload, ok := endPayload.(map[string]any)
+	require.True(t, ok, "compaction_end payload missing")
+	assert.Equal(t, true, payload["fallback"], "compaction_end must mark that the summary is a local fallback")
+	assert.Contains(t, fmt.Sprint(payload["fallback_error"]), "prompt is too long")
+}
+
 func TestSessionCompactUsesAuthenticatedClientFactory(t *testing.T) {
 	model := &ai.Model{
 		ID:       "compaction-test",
