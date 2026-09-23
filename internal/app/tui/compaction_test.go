@@ -134,25 +134,26 @@ func TestCompactionIndicatorUsesItsOwnStatusKey(t *testing.T) {
 // which turns every number into a float64.
 func TestCompactionPayloadDecoding(t *testing.T) {
 	cases := []struct {
-		name         string
-		payload      any
-		wantText     string
-		wantTokens   int
-		wantFallback string
+		name          string
+		payload       any
+		wantText      string
+		wantTokens    int
+		wantFallback  bool
+		wantFallbackE string
 	}{
-		{"native ints", map[string]any{"summary": "s", "tokens_before": 42}, "s", 42, ""},
-		{"json floats", map[string]any{"summary": "s", "tokens_before": float64(42)}, "s", 42, ""},
-		{"int64", map[string]any{"summary": "s", "tokens_before": int64(42)}, "s", 42, ""},
-		{"missing count", map[string]any{"summary": "s"}, "s", 0, ""},
-		{"missing summary", map[string]any{"tokens_before": 42}, "", 42, ""},
-		{"fallback error", map[string]any{"summary": "s", "tokens_before": 42, "fallback": true, "fallback_error": "provider 400"}, "s", 42, "provider 400"},
-		{"not a map", "nonsense", "", 0, ""},
-		{"nil", nil, "", 0, ""},
+		{"native ints", map[string]any{"summary": "s", "tokens_before": 42}, "s", 42, false, ""},
+		{"json floats", map[string]any{"summary": "s", "tokens_before": float64(42)}, "s", 42, false, ""},
+		{"int64", map[string]any{"summary": "s", "tokens_before": int64(42)}, "s", 42, false, ""},
+		{"missing count", map[string]any{"summary": "s"}, "s", 0, false, ""},
+		{"missing summary", map[string]any{"tokens_before": 42}, "", 42, false, ""},
+		{"fallback error", map[string]any{"summary": "s", "tokens_before": 42, "fallback": true, "fallback_error": "provider 400"}, "s", 42, true, "provider 400"},
+		{"not a map", "nonsense", "", 0, false, ""},
+		{"nil", nil, "", 0, false, ""},
 	}
 	for _, tc := range cases {
-		summary, tokens, fallbackErr := compactionPayload(tc.payload)
-		if summary != tc.wantText || tokens != tc.wantTokens || fallbackErr != tc.wantFallback {
-			t.Errorf("%s: got (%q, %d, %q), want (%q, %d, %q)", tc.name, summary, tokens, fallbackErr, tc.wantText, tc.wantTokens, tc.wantFallback)
+		summary, tokens, fallback, fallbackErr := compactionPayload(tc.payload)
+		if summary != tc.wantText || tokens != tc.wantTokens || fallback != tc.wantFallback || fallbackErr != tc.wantFallbackE {
+			t.Errorf("%s: got (%q, %d, %v, %q), want (%q, %d, %v, %q)", tc.name, summary, tokens, fallback, fallbackErr, tc.wantText, tc.wantTokens, tc.wantFallback, tc.wantFallbackE)
 		}
 	}
 }
@@ -177,8 +178,15 @@ func TestCompactionEndMarksFallbackSummary(t *testing.T) {
 	if len(components) != 1 {
 		t.Fatalf("got %d components, want 1", len(components))
 	}
-	text := components[0].Text
-	if !strings.Contains(text, "fell back") {
+	c := components[0]
+	if !c.Fallback {
+		t.Error("component not flagged as a fallback summary")
+	}
+	if !strings.Contains(c.Custom.Title, "Local fallback summary") {
+		t.Errorf("title = %q, want the local fallback header", c.Custom.Title)
+	}
+	text := c.Text
+	if !strings.Contains(text, "model call failed") {
 		t.Errorf("summary text = %q, want the fallback marker", text)
 	}
 	if !strings.Contains(text, "prompt is too long") {
@@ -186,6 +194,59 @@ func TestCompactionEndMarksFallbackSummary(t *testing.T) {
 	}
 	if !strings.Contains(text, "user: hi") {
 		t.Errorf("summary text = %q, want the summary body preserved", text)
+	}
+}
+
+// A fallback compaction renders on the fallback tint, not the regular
+// compaction box, and the transcript export carries the fallback title.
+func TestFallbackCompactionSummaryRendersAndExportsWithFallbackStyling(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddFallbackCompactionSummary("user: hi", "provider 400", 10_000)
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 60, H: 30})
+	waitForChatLog(t, log)
+
+	log.mu.Lock()
+	rows := renderLineTexts(log.lines)
+	styles := make([]tauui.Style, len(log.lines))
+	for i, l := range log.lines {
+		styles[i] = l.st
+	}
+	log.mu.Unlock()
+
+	pal := defaultChatPalette()
+	joined := strings.Join(rows, "\n")
+	if !strings.Contains(joined, compactionLabel) {
+		t.Errorf("rendered fallback summary missing %q:\n%s", compactionLabel, joined)
+	}
+	if !strings.Contains(joined, "Local fallback summary") {
+		t.Errorf("rendered fallback summary missing the fallback header:\n%s", joined)
+	}
+	var labelStyled, boxStyled bool
+	for i, row := range rows {
+		if strings.Contains(row, compactionLabel) {
+			if styles[i] != pal.compactionFallbackLabel {
+				t.Errorf("label row %q style = %#v, want the fallback label style %#v", row, styles[i], pal.compactionFallbackLabel)
+			}
+			labelStyled = true
+		}
+		if strings.Contains(row, "Local fallback summary") {
+			if styles[i].BG != pal.compactionFallback.BG {
+				t.Errorf("title row %q BG = %#v, want the fallback box BG %#v", row, styles[i].BG, pal.compactionFallback.BG)
+			}
+			boxStyled = true
+		}
+	}
+	if !labelStyled || !boxStyled {
+		t.Errorf("fallback rows not rendered (label=%v box=%v)", labelStyled, boxStyled)
+	}
+
+	out := FormatTranscriptMarkdown(conv.Snapshot(), TranscriptFormatOptions{})
+	if !strings.Contains(out, "Local fallback summary") {
+		t.Errorf("transcript export dropped the fallback title:\n%s", out)
+	}
+	if !strings.Contains(out, "model call failed") {
+		t.Errorf("transcript export dropped the fallback cause:\n%s", out)
 	}
 }
 

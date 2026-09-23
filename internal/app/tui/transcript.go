@@ -131,7 +131,11 @@ func componentTranscriptMarkdown(component ChatComponent, opts TranscriptFormatO
 	case ChatComponentImage:
 		return component.Image.FallbackText(), true
 	case ChatComponentCompactionSummary:
-		return "◇ Context compacted\n" + trimmed, true
+		title := strings.TrimSpace(component.Custom.Title)
+		if title == "" {
+			title = "Context compacted"
+		}
+		return "◇ " + title + "\n" + trimmed, true
 	case ChatComponentBranchSummary:
 		return "◇ Branch\n" + trimmed, true
 	case ChatComponentDiff:

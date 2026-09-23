@@ -132,6 +132,9 @@ type ChatComponent struct {
 	Custom        CustomComponent
 	Collapsed     bool
 	Revision      uint64
+	// Fallback marks a compaction summary the model did not write — the model
+	// call failed and the SDK substituted a local summary.
+	Fallback bool
 }
 
 // toolComponentRole resolves the role a tool execution renders as: errors and
@@ -215,6 +218,9 @@ type conversationItem struct {
 	// tokensBefore is the context size a compaction reclaimed. Zero when the
 	// session did not report one.
 	tokensBefore int
+	// fallback marks a compaction whose model call failed and degraded to a
+	// local summary; the chat log renders it on the fallback tint.
+	fallback bool
 
 	// projection memoizes component(). Every mutation of an item assigns a
 	// fresh revision, so a memo tagged with the revision it was built from is
@@ -456,9 +462,14 @@ func (i *conversationItem) buildComponent() ChatComponent {
 		component.Kind = ChatComponentCompactionSummary
 		component.Role = RoleSystem
 		component.Text = i.text
+		component.Fallback = i.fallback
+		title := compactionTitle(i.tokensBefore)
+		if i.fallback {
+			title = fallbackCompactionTitle(i.tokensBefore)
+		}
 		component.Custom = CustomComponent{
 			Type:    compactionCustomType,
-			Title:   compactionTitle(i.tokensBefore),
+			Title:   title,
 			Summary: i.text,
 		}
 	default:
@@ -879,18 +890,40 @@ const compactionCustomType = "compaction"
 // compactionTitle is the header row above a compaction summary. The token count
 // is what makes the row worth reading — it says how much context came back.
 func compactionTitle(tokensBefore int) string {
+	return compactionTitleText("Context compacted", tokensBefore)
+}
+
+// fallbackCompactionTitle is the header for a summary the model did not write:
+// the compaction degraded to a local summary after the model call failed.
+func fallbackCompactionTitle(tokensBefore int) string {
+	return compactionTitleText("Local fallback summary", tokensBefore)
+}
+
+func compactionTitleText(prefix string, tokensBefore int) string {
 	if tokensBefore <= 0 {
-		return "Context compacted"
+		return prefix
 	}
-	return "Context compacted · " + formatTokenCount(tokensBefore) + " tokens summarized"
+	return prefix + " · " + formatTokenCount(tokensBefore) + " tokens summarized"
 }
 
 // AddCompactionSummary commits the summary a compaction produced (app.md §9:
 // compaction_end "commits a summary message"). Empty summaries are dropped —
 // an empty box tells the user nothing and still costs transcript rows.
 func (m *ConversationModel) AddCompactionSummary(summary string, tokensBefore int) {
-	summary = strings.TrimRight(summary, "\n")
-	if strings.TrimSpace(summary) == "" {
+	m.commitCompactionSummary(summary, tokensBefore, false)
+}
+
+// AddFallbackCompactionSummary commits the local summary substituted when the
+// model call failed. The error leads the body so the degraded provenance is
+// the first thing read, and the item is flagged so the chat log renders it on
+// the fallback tint instead of the regular compaction box.
+func (m *ConversationModel) AddFallbackCompactionSummary(summary, fallbackErr string, tokensBefore int) {
+	m.commitCompactionSummary("model call failed: "+fallbackErr+"\n\n"+summary, tokensBefore, true)
+}
+
+func (m *ConversationModel) commitCompactionSummary(text string, tokensBefore int, fallback bool) {
+	text = strings.TrimRight(text, "\n")
+	if strings.TrimSpace(text) == "" {
 		return
 	}
 	m.committed = append(m.committed, conversationItem{
@@ -898,8 +931,9 @@ func (m *ConversationModel) AddCompactionSummary(summary string, tokensBefore in
 		kind:         conversationItemCompactionSummary,
 		role:         RoleSystem,
 		revision:     m.nextRevision(),
-		text:         summary,
+		text:         text,
 		tokensBefore: tokensBefore,
+		fallback:     fallback,
 	})
 	m.notify()
 }

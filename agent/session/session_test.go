@@ -26,6 +26,7 @@ func TestEntryTypes(t *testing.T) {
 		{EntryTypeModelChange, false},
 		{EntryTypeThinkingChange, false},
 		{EntryTypeCustom, false},
+		{EntryTypeError, false},
 	}
 	for _, tt := range tests {
 		if got := tt.typ.InContext(); got != tt.inContext {
@@ -417,6 +418,58 @@ func TestCompactionContext(t *testing.T) {
 	}
 	if ctx[2].ID != msg4.ID {
 		t.Errorf("ctx[2].ID = %v, want msg4", ctx[2].ID)
+	}
+}
+
+// A fallback compaction is not a real truncation pointer: retrying /compact
+// must see the messages the failed attempt summarized, so ContextEntriesUnwound
+// skips fallback compactions and restores the pre-fallback boundary.
+func TestContextEntriesUnwoundSkipsFallbackCompactions(t *testing.T) {
+	dir := t.TempDir()
+	header := NewHeader("/test", nil, nil)
+	w, _ := CreateSessionFile(dir, header)
+
+	msg1 := NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"1"}`), nil)
+	w.Append(msg1)
+	msg2 := NewMessageEntry(&msg1.ID, json.RawMessage(`{"role":"assistant","content":"2"}`), nil)
+	w.Append(msg2)
+
+	// Successful compaction: boundary at msg2.
+	sc := NewCompactionEntry("good summary", msg2.ID, 100, 20, false)
+	w.Append(sc)
+
+	msg3 := NewMessageEntry(&msg2.ID, json.RawMessage(`{"role":"user","content":"3"}`), nil)
+	w.Append(msg3)
+
+	// Fallback compaction on top: boundary at msg3.
+	fc := NewCompactionEntry("naive fallback", msg3.ID, 90, 10, false)
+	fc.Fallback = true
+	w.Append(fc)
+
+	w.Close()
+
+	r, _ := ReadFile(w.Path())
+
+	// Normal context: the fallback compaction is the truncation pointer.
+	ctx := r.ContextEntries()
+	if len(ctx) == 0 || ctx[0].ID != fc.ID {
+		t.Fatalf("ContextEntries[0] = %+v, want the fallback compaction", ctx)
+	}
+
+	// Unwound: the fallback is ignored; the good compaction bounds context.
+	unwound := r.ContextEntriesUnwound()
+	if len(unwound) == 0 || unwound[0].ID != sc.ID {
+		t.Fatalf("ContextEntriesUnwound[0] = %+v, want the successful compaction", unwound)
+	}
+	found := map[string]bool{}
+	for _, e := range unwound {
+		found[e.ID] = true
+	}
+	if !found[msg2.ID] || !found[msg3.ID] {
+		t.Error("unwound context missing the entries the fallback compaction replaced")
+	}
+	if found[fc.ID] {
+		t.Error("unwound context must not include the fallback compaction summary")
 	}
 }
 

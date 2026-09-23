@@ -26,6 +26,7 @@ const (
 	EntryTypeModelChange    EntryType = "model_change"
 	EntryTypeThinkingChange EntryType = "thinking_level_change"
 	EntryTypeLabel          EntryType = "label"
+	EntryTypeError          EntryType = "error"
 	EntryTypeCustom         EntryType = "custom"
 	EntryTypeCustomMessage  EntryType = "custom_message"
 )
@@ -93,7 +94,7 @@ type Entry struct {
 	// SessionInfo fields
 	Name *string `json:"name,omitempty"`
 
-	// ModelChange fields
+	// ModelChange / Error fields
 	Provider *string `json:"provider,omitempty"`
 	Model    *string `json:"model,omitempty"`
 
@@ -108,11 +109,11 @@ type Entry struct {
 	SteeringCount int `json:"steering_count,omitempty"`
 	FollowUpCount int `json:"follow_up_count,omitempty"`
 
-	// CompactionLifecycle fields
+	// CompactionLifecycle / Error fields
 	Aborted      bool   `json:"aborted,omitempty"`
 	ErrorMessage string `json:"error,omitempty"`
 
-	// Custom / CustomMessage fields
+	// Custom / CustomMessage / Error fields
 	CustomType *string         `json:"custom_type,omitempty"`
 	Data       json.RawMessage `json:"data,omitempty"`
 }
@@ -203,6 +204,20 @@ func NewModelChangeEntry(provider, model string) Entry {
 	e := NewEntry(EntryTypeModelChange, nil)
 	e.Provider = &provider
 	e.Model = &model
+	return e
+}
+
+// NewErrorEntry creates an error entry recording a failed provider request.
+// Error entries are session-log diagnostics: they are excluded from LLM
+// context, so replay never feeds the failure back to the model, but keep the
+// provider, model, error text, and (in Data) a summary of the rejected
+// request shape for troubleshooting.
+func NewErrorEntry(provider, model, message string, data json.RawMessage) Entry {
+	e := NewEntry(EntryTypeError, nil)
+	e.Provider = &provider
+	e.Model = &model
+	e.ErrorMessage = message
+	e.Data = data
 	return e
 }
 

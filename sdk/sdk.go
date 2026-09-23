@@ -942,6 +942,7 @@ func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Messag
 			promptErr = s.agent.Prompt(ctx, agentMsg)
 		}
 		if promptErr != nil {
+			s.recordProviderError(promptErr)
 			s.emit(events, Event{
 				Type:      "error",
 				SessionID: s.id,
@@ -1018,10 +1019,14 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 		"custom_instructions": instructions,
 	})
 
-	// Build a summary from the current agent messages using the model
+	// Build a summary from the current agent messages using the model.
+	// Retry semantics: when the log's most recent compaction is a local
+	// fallback, the live context is that degraded summary — a retry must
+	// instead compact the same messages the failed attempt saw.
 	state := s.agent.State()
+	compactMessages := s.compactionInputMessages(state.Messages)
 	var transcript strings.Builder
-	for _, msg := range state.Messages {
+	for _, msg := range compactMessages {
 		role := string(msg.Role)
 		for _, block := range msg.Content {
 			if block.Type == ai.ContentBlockText && block.Text != "" {
@@ -1037,7 +1042,7 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	var summary string
 	if s.pluginManager != nil {
 		tokensBefore := int64(0)
-		for _, msg := range state.Messages {
+		for _, msg := range compactMessages {
 			tokensBefore += int64(msg.Usage.TotalTokens)
 		}
 		result := s.pluginManager.DispatchCompactionHook(transcriptStr, tokensBefore, s.id)
@@ -1045,7 +1050,7 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	}
 	var summarizeErr error
 	if summary == "" {
-		summarizationPrompt := compaction.BuildSummarizationPrompt(transcriptStr)
+		summarizationPrompt := compaction.BuildSummarizationPrompt()
 		var err error
 		summary, err = s.callModelForSummary(ctx, summarizationPrompt, transcriptStr, instructions)
 		if err != nil {
@@ -1053,14 +1058,14 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 			// the warning and the compaction_end payload both record the failure.
 			summarizeErr = err
 			s.logger.Warn("compaction model call failed; using naive summary", "error", err)
-			summary = s.buildNaiveSummary(state, instructions)
+			summary = s.buildNaiveSummary(compactMessages, instructions)
 		}
 	}
 
 	// Counted once, before the messages are replaced: the entry, the event, and
 	// any frontend indicator all have to quote the same figure.
 	tokensBefore := 0
-	for _, msg := range state.Messages {
+	for _, msg := range compactMessages {
 		tokensBefore += msg.Usage.TotalTokens
 	}
 
@@ -1123,10 +1128,73 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	return nil
 }
 
-// summaryMaxOutputTokens caps the summarization request's output. A summary
-// never needs the model's full output budget (often 64K+), and providers that
-// validate input+output against the context window reject such requests.
+// summaryMaxOutputTokens caps the summarization request's *visible* output.
+// A summary never needs the model's full output budget (often 64K+), and
+// providers that validate input+output against the context window reject
+// such requests.
 const summaryMaxOutputTokens = 8192
+
+// summaryMaxTokens returns the summarization request's output cap. Thinking
+// models count reasoning against the same cap as visible text (zai glm-5.3:
+// max_tokens covers reasoning_content + content), so a thinking level adds
+// its budget on top of the summary budget — otherwise the model reasons away
+// the cap and the visible summary collapses to a fragment cut at the length
+// limit. Normal prompts get the same treatment implicitly by falling back to
+// the model's full MaxTokens; the compact path sets an explicit cap, so the
+// adjustment has to be explicit too.
+func (s *agentSession) summaryMaxTokens() int {
+	s.mu.Lock()
+	level := s.thinkingLevel
+	s.mu.Unlock()
+	if level == "" || level == agent.ThinkingOff || s.model == nil || !s.model.Reasoning {
+		return summaryMaxOutputTokens
+	}
+	maxTokens := summaryMaxOutputTokens + ai.ThinkingBudgetForLevel(ai.ReasoningLevel(level), nil)
+	if s.model.MaxTokens > 0 && s.model.MaxTokens < maxTokens {
+		return s.model.MaxTokens
+	}
+	return maxTokens
+}
+
+// compactionInputMessages selects the message set to compact. When the
+// session log's most recent compaction is a local fallback, the live context
+// holds that degraded summary; the retry must instead compact the same
+// messages the failed attempt saw, unwinding the fallback (and any earlier
+// trailing fallbacks) from the persisted log. Falls back to the live message
+// list when there is no session file to read.
+func (s *agentSession) compactionInputMessages(live []*agent.Message) []*agent.Message {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	s.mu.Unlock()
+	if writer == nil {
+		return live
+	}
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	if err != nil {
+		return live
+	}
+	entries := reader.ContextEntries()
+	if len(entries) == 0 || entries[0].Type != sessionpkg.EntryTypeCompaction || !entries[0].Fallback {
+		return live
+	}
+	unwound := agentMessagesFromUnwoundContext(reader)
+	if len(unwound) == 0 {
+		return live
+	}
+	return unwound
+}
+
+// agentMessagesFromUnwoundContext converts the fallback-unwound context
+// entries to agent messages for a compaction retry.
+func agentMessagesFromUnwoundContext(reader *sessionpkg.Reader) []*agent.Message {
+	var sessionMsgs []*sessionpkg.Message
+	for _, entry := range reader.ContextEntriesUnwound() {
+		if msg := entry.ToAgentMessage(); msg != nil {
+			sessionMsgs = append(sessionMsgs, msg)
+		}
+	}
+	return sessionMessagesToAgentMessages(sessionMsgs)
+}
 
 // callModelForSummary calls the model to generate a summary using the compaction prompt.
 func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, transcript, customInstructions string) (string, error) {
@@ -1153,20 +1221,29 @@ func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, tr
 		},
 	}
 
-	opts := append(s.compactionCompletionOptions(ctx), ai.WithMaxTokens(summaryMaxOutputTokens))
+	opts := append(s.compactionCompletionOptions(ctx), ai.WithMaxTokens(s.summaryMaxTokens()))
 	msg, err := client.Complete(ctx, s.model, prompt, opts...)
 	if err != nil {
 		return "", fmt.Errorf("model completion: %w", err)
 	}
-
-	// Extract text content from response
-	for _, block := range msg.Content {
-		if block.Type == ai.ContentBlockText && block.Text != "" {
-			return block.Text, nil
-		}
+	// A length stop means the provider cut the response at the output cap
+	// mid-generation. Accepting it persists a truncated fragment as the
+	// summary, which then replaces the entire session context. Treat it as a
+	// failed summarization so the caller falls back and a retry can succeed.
+	if msg.StopReason == ai.StopReasonLength {
+		return "", fmt.Errorf("summarization stopped at the output token limit (finish_reason=length); the summary would be truncated")
 	}
 
-	return "", fmt.Errorf("no text content in summarization response")
+	var b strings.Builder
+	for _, block := range msg.Content {
+		if block.Type == ai.ContentBlockText {
+			b.WriteString(block.Text)
+		}
+	}
+	if b.Len() == 0 {
+		return "", fmt.Errorf("no text content in summarization response")
+	}
+	return b.String(), nil
 }
 
 // trimTranscriptForSummary keeps the most recent transcript characters that
@@ -1253,7 +1330,7 @@ func (s *agentSession) getClient() (ai.Client, error) {
 }
 
 // buildNaiveSummary creates a fallback summary when model-driven summarization is not available.
-func (s *agentSession) buildNaiveSummary(state agent.State, customInstructions string) string {
+func (s *agentSession) buildNaiveSummary(messages []*agent.Message, customInstructions string) string {
 	var summary strings.Builder
 	if customInstructions != "" {
 		summary.WriteString("Custom focus: ")
@@ -1261,7 +1338,7 @@ func (s *agentSession) buildNaiveSummary(state agent.State, customInstructions s
 		summary.WriteString(".\n")
 	}
 
-	priorSummaries := preservedSessionSummaries(state.Messages)
+	priorSummaries := preservedSessionSummaries(messages)
 	if len(priorSummaries) > 0 {
 		summary.WriteString("Prior context:\n")
 		for _, prior := range priorSummaries {
@@ -1271,7 +1348,7 @@ func (s *agentSession) buildNaiveSummary(state agent.State, customInstructions s
 		}
 	}
 
-	recent := recentConversationHighlights(state.Messages, 8)
+	recent := recentConversationHighlights(messages, 8)
 	if len(recent) > 0 {
 		summary.WriteString("Recent conversation:\n")
 		for _, line := range recent {
@@ -1958,6 +2035,109 @@ func (s *agentSession) ensureSessionWriter() (*sessionpkg.Writer, error) {
 	s.mu.Unlock()
 
 	return writer, nil
+}
+
+// recordProviderError appends an error entry to the session log when a
+// provider request fails. Without it, API rejections (e.g. zai 1214 "The
+// messages parameter is illegal") surface only as a transient UI event, and
+// the request shape that was rejected is unrecoverable after the fact.
+// User aborts are not failures and are not recorded.
+func (s *agentSession) recordProviderError(err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	writer, werr := s.ensureSessionWriter()
+	if werr != nil {
+		s.logger.Warn("session write failed", "error", werr)
+		return
+	}
+	if writer == nil {
+		return
+	}
+
+	state := s.agent.State()
+	summary := errorRequestSummary(state.Messages, state.SystemPrompt)
+	if s.model != nil {
+		summary["api"] = s.model.API
+	}
+	s.mu.Lock()
+	thinking := string(s.thinkingLevel)
+	parentID := s.parentMsgID
+	s.mu.Unlock()
+	if thinking != "" {
+		summary["thinkingLevel"] = thinking
+	}
+	data, merr := json.Marshal(summary)
+	if merr != nil {
+		s.logger.Warn("marshal error request summary", "error", merr)
+		data = nil
+	}
+
+	var provider, modelID string
+	if s.model != nil {
+		provider, modelID = s.model.Provider, s.model.ID
+	}
+	entry := sessionpkg.NewErrorEntry(provider, modelID, err.Error(), data)
+	if parentID != nil {
+		entry.ParentID = parentID
+	}
+	if aerr := writer.Append(entry); aerr != nil {
+		s.logger.Warn("session write failed", "error", aerr)
+	}
+}
+
+// errorRequestSummary captures the shape of the request that failed: the
+// message sequence with per-message block kinds and sizes. Message contents
+// already live in the session's message entries; this records the structure
+// providers actually validate (role order, tool-call pairing, empty content)
+// so a rejection can be diagnosed from the session log alone.
+func errorRequestSummary(messages []*agent.Message, systemPrompt string) map[string]any {
+	const maxMessages = 200
+	msgs := make([]map[string]any, 0, min(len(messages), maxMessages))
+	for i, msg := range messages {
+		if i >= maxMessages {
+			break
+		}
+		if msg == nil {
+			continue
+		}
+		m := map[string]any{"role": string(msg.Role)}
+		var blocks []string
+		for _, b := range msg.Content {
+			switch b.Type {
+			case ai.ContentBlockText:
+				blocks = append(blocks, fmt.Sprintf("text:%d", len(b.Text)))
+			case ai.ContentBlockThinking:
+				blocks = append(blocks, fmt.Sprintf("thinking:%d", len(b.Thinking)))
+			case ai.ContentBlockToolCall:
+				blocks = append(blocks, "toolCall:"+b.Name)
+			case ai.ContentBlockImage:
+				blocks = append(blocks, "image")
+			}
+		}
+		if len(blocks) > 0 {
+			m["blocks"] = blocks
+		}
+		if msg.ToolCallID != "" {
+			m["toolCallId"] = msg.ToolCallID
+			m["toolName"] = msg.ToolName
+		}
+		if msg.IsError {
+			m["isError"] = true
+		}
+		if msg.ErrorMessage != "" {
+			m["errorMessage"] = msg.ErrorMessage
+		}
+		msgs = append(msgs, m)
+	}
+	out := map[string]any{
+		"messages":          msgs,
+		"systemPromptChars": len(systemPrompt),
+	}
+	if len(messages) > maxMessages {
+		out["messagesTruncated"] = true
+	}
+	return out
 }
 
 // appendMessageToSession writes a message to the session file.
@@ -3986,7 +4166,10 @@ func agentMessagesFromSessionReader(reader *sessionpkg.Reader, atEntry string) (
 			}
 		}
 	}
+	return sessionMessagesToAgentMessages(sessionMsgs), nil
+}
 
+func sessionMessagesToAgentMessages(sessionMsgs []*sessionpkg.Message) []*agent.Message {
 	messages := make([]*agent.Message, 0, len(sessionMsgs))
 	for _, sm := range sessionMsgs {
 		messages = append(messages, &agent.Message{
@@ -4004,8 +4187,7 @@ func agentMessagesFromSessionReader(reader *sessionpkg.Reader, atEntry string) (
 			Timestamp:    sm.Timestamp,
 		})
 	}
-
-	return messages, nil
+	return messages
 }
 
 func sessionEntries(reader *sessionpkg.Reader) []sessionpkg.Entry {

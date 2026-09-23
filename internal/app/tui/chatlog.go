@@ -29,6 +29,11 @@ type chatPalette struct {
 	// customLabel is its `[compaction]`/`[branch]`/`[skill]` tag.
 	custom, customLabel tauui.Style
 
+	// compactionFallback is the block a local fallback compaction summary
+	// renders on — the custom tint pushed toward red so a degraded summary is
+	// visible at a glance. compactionFallbackLabel styles its tag.
+	compactionFallback, compactionFallbackLabel tauui.Style
+
 	bashMode, diffAdded, diffRemoved, diffContext tauui.Color
 
 	// borderColors is the dynamic border's state→colour table, resolved when
@@ -1393,8 +1398,13 @@ const compactionLabel = "[compaction]"
 
 // renderLabelledSummary draws a summary block: a bold label row, the header
 // line, then the body — all on the custom-message background, so it reads as
-// app-generated provenance rather than as something the model said.
+// app-generated provenance rather than as something the model said. A summary
+// flagged as a local fallback renders on the fallback tint instead.
 func (c *ChatLog) renderLabelledSummary(ctx context.Context, component ChatComponent, label string, width int) ([]renderLine, int, int) {
+	box, labelStyle := c.pal().custom, c.pal().customLabel
+	if component.Fallback {
+		box, labelStyle = c.pal().compactionFallback, c.pal().compactionFallbackLabel
+	}
 	body := component.Text
 	if strings.TrimSpace(body) == "" {
 		body = component.Custom.FallbackText()
@@ -1406,11 +1416,11 @@ func (c *ChatLog) renderLabelledSummary(ctx context.Context, component ChatCompo
 	rows = append(rows, strings.Split(strings.TrimRight(body, "\n"), "\n")...)
 
 	lines := []renderLine{{text: " ", st: c.pal().spacer}}
-	lines = c.appendPaddedTextBox(ctx, lines, rows, width, c.pal().custom)
+	lines = c.appendPaddedTextBox(ctx, lines, rows, width, box)
 	// The label row is the first content row inside the box: one leading blank
 	// row from appendPaddedTextBox, plus the spacer this function opened with.
 	if len(lines) > 2 {
-		lines[2].st = c.pal().customLabel
+		lines[2].st = labelStyle
 	}
 	return lines, len(lines), len(body)
 }

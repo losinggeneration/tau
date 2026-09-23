@@ -352,12 +352,12 @@ func (c *CLI) callModelForSummary(ctx context.Context, transcript string) (strin
 	}
 
 	// Build the summarization prompt using the compaction template
-	systemPrompt := compaction.BuildSummarizationPrompt(transcript)
+	systemPrompt := compaction.BuildSummarizationPrompt()
 
 	prompt := &ai.Context{
 		SystemPrompt: systemPrompt,
 		Messages: []ai.Message{
-			{Role: "user", Content: "Generate a concise summary of the conversation transcript following the instructions above."},
+			{Role: "user", Content: transcript},
 		},
 	}
 
@@ -483,12 +483,12 @@ func (c *CLI) callModelForBranchSummary(ctx context.Context, transcript string) 
 	}
 
 	// Build the summarization prompt
-	systemPrompt := compaction.BuildSummarizationPrompt(transcript)
+	systemPrompt := compaction.BuildSummarizationPrompt()
 
 	prompt := &ai.Context{
 		SystemPrompt: systemPrompt,
 		Messages: []ai.Message{
-			{Role: "user", Content: "Generate a concise summary of this branch's conversation. Focus on the key changes and decisions made in this branch compared to the parent."},
+			{Role: "user", Content: "Summarize this branch's conversation. Focus on the key changes and decisions made in this branch compared to the parent.\n\n" + transcript},
 		},
 	}
 

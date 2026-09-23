@@ -9,10 +9,8 @@ You are a session compaction assistant. Your job is to produce a concise but com
 5. **Preserve error/gotcha context**: Any errors encountered, workarounds applied, or non-obvious constraints discovered.
 6. **Preserve code state**: If code was written or modified, summarize the current state of the implementation.
 7. **Be factual**: Do not add information not present in the transcript.
-8. **Be concise**: Aim for 10-20%% of the original transcript length.
+8. **Be concise**: Aim for 10-20% of the original transcript length.
 
-## Transcript
-
-%s
+The transcript follows as the next user message.
 
 ## Summary

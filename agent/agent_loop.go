@@ -1016,7 +1016,15 @@ func liftSystemMessagesIntoPrompt(systemPrompt string, messages []*Message) (str
 		}
 		systemParts = append(systemParts, text)
 	}
-	if len(systemParts) == 0 {
+
+	// A compaction that lands mid-turn leaves a transcript that is
+	// summary-only or begins with an assistant tool-call turn (the orphaned
+	// results ahead of it are dropped, and there is no user message before
+	// it). Providers reject both shapes — an empty messages array, or a first
+	// message that is not from the user (zai/GLM error 1214) — so ask the
+	// model to resume from the summary.
+	needsLeadingUser := len(out) == 0 || out[0].Role != RoleUser
+	if len(systemParts) == 0 && !needsLeadingUser {
 		return systemPrompt, messages
 	}
 
@@ -1025,11 +1033,8 @@ func liftSystemMessagesIntoPrompt(systemPrompt string, messages []*Message) (str
 		parts = append(parts, trimmed)
 	}
 	parts = append(parts, systemParts...)
-	// A compaction that lands mid-turn leaves only the summary. Providers
-	// reject a request with no conversational input, so ask the model to
-	// resume from the summary.
-	if len(out) == 0 {
-		out = append(out, NewUserMessage("Continue from where you left off."))
+	if needsLeadingUser {
+		out = append([]*Message{NewUserMessage("Continue from where you left off.")}, out...)
 	}
 	return strings.Join(parts, "\n\n"), out
 }

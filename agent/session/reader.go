@@ -302,6 +302,19 @@ func (r *Reader) ActiveBranch() []string {
 // ContextEntries returns entries on the active branch that should be included
 // in LLM context, respecting the most recent compaction as a truncation pointer.
 func (r *Reader) ContextEntries() []Entry {
+	return r.contextEntries(false)
+}
+
+// ContextEntriesUnwound is ContextEntries with local-fallback compactions
+// unwound: fallback compaction entries are skipped when resolving the
+// truncation pointer, so the messages a failed compaction replaced are back
+// in context and the fallback summaries are dropped. Retrying /compact after
+// a fallback must summarize the same message set the failed attempt saw.
+func (r *Reader) ContextEntriesUnwound() []Entry {
+	return r.contextEntries(true)
+}
+
+func (r *Reader) contextEntries(unwindFallbacks bool) []Entry {
 	branch := r.ActiveBranch()
 	if len(branch) == 0 {
 		return nil
@@ -325,6 +338,9 @@ func (r *Reader) ContextEntries() []Entry {
 	for i := len(r.entries) - 1; i >= 0; i-- {
 		e := &r.entries[i]
 		if e.Type == EntryTypeCompaction && e.FirstKeptID != nil {
+			if unwindFallbacks && e.Fallback {
+				continue
+			}
 			// Check if this compaction is on the active branch by checking
 			// if first_kept_id is on the branch
 			if onBranch[*e.FirstKeptID] {

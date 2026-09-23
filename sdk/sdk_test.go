@@ -166,6 +166,7 @@ type recordingProvider struct {
 	responseText string
 	caps         ai.Capabilities
 	usage        ai.Usage
+	streamErr    error
 
 	mu              sync.Mutex
 	lastPrompt      *ai.Context
@@ -208,6 +209,10 @@ type recordingClient struct {
 
 func (c *recordingClient) Stream(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
 	c.provider.setLastPrompt(prompt, opts...)
+
+	if c.provider.streamErr != nil {
+		return c.provider.streamErr
+	}
 
 	partial := ai.AssistantMessage{
 		Role:      "assistant",
@@ -2576,7 +2581,7 @@ func TestBuildNaiveSummaryPreservesExistingSummaryAndSkipsToolNoise(t *testing.T
 		},
 	}
 
-	summary := (&agentSession{}).buildNaiveSummary(state, "remember to keep the keyword")
+	summary := (&agentSession{}).buildNaiveSummary(state.Messages, "remember to keep the keyword")
 
 	assert.Contains(t, summary, "pickle")
 	assert.Contains(t, summary, "Prior context")
@@ -2647,6 +2652,68 @@ func TestCompactTrimsTranscriptToFitContextWindow(t *testing.T) {
 		"summary MaxTokens = %d, want a modest cap ≤ 8192 (not the model's full output budget)", opts.MaxTokens)
 }
 
+// TestCompactSendsTranscriptOnce pins the zai glm-5.3 /compact failure at
+// ~62% of a 1M-token window: the summarization request embedded the transcript
+// twice — once inside the system prompt template and once as the user message —
+// so the request was ~124% of the window once a session passed ~50%, the
+// provider rejected it with "Prompt exceeds max length", and compaction
+// silently degraded to the naive local summary. The transcript must be sent
+// exactly once and the whole request must fit the window.
+func TestCompactSendsTranscriptOnce(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	provider := &recordingProvider{
+		api:          "test-api-sdk",
+		responseText: "single copy summary",
+		caps:         ai.Capabilities{Tools: true, Streaming: true},
+	}
+	ai.Register("test-api-sdk", provider)
+	model := &ai.Model{
+		ID:            "compact-single-copy-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		ContextWindow: 1_000_000,
+	}
+	ai.RegisterModel(model)
+
+	session := &agentSession{
+		model: model,
+		clientFactory: func(m *ai.Model) (ai.Client, error) {
+			return provider.NewClient(m)
+		},
+	}
+	session.agent = mustNewAgentForTest(t, model)
+
+	// ~62% of the window — under the trim budget (window−16K), so trimming
+	// cannot save the request if the transcript is duplicated. The incident
+	// transcript measured 2.37M chars ≈ 592K tokens against a 1M window.
+	const marker = "UNIQUE-TRANSCRIPT-MARKER"
+	msgText := marker + strings.Repeat("x", 2_480_000)
+	session.agent.ReplaceMessages([]*agent.Message{
+		{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msgText}}},
+	})
+
+	require.NoError(t, session.Compact(testContext(t)))
+
+	prompt := provider.LastPrompt()
+	require.NotNil(t, prompt, "compaction must call the model")
+
+	var all strings.Builder
+	all.WriteString(prompt.SystemPrompt)
+	for _, m := range prompt.Messages {
+		if text, ok := m.ContentString(); ok {
+			all.WriteString(text)
+		}
+	}
+
+	assert.Equal(t, 1, strings.Count(all.String(), marker),
+		"transcript must be sent exactly once; a second copy rejects any session past ~50% of the window")
+
+	if got := all.Len() / 4; got > 1_000_000-16_384 {
+		t.Fatalf("summarization request ≈ %d tokens exceeds the 983,616 budget; the provider would reject it near 62%% context usage", got)
+	}
+}
+
 // TestCompactPassesSessionThinkingLevelToSummarizer pins the zai/glm-5.3
 // compaction fallback: the summarization call sent no reasoning option, so
 // the OpenAI-compat layer explicitly disabled thinking (enable_thinking:
@@ -2698,6 +2765,139 @@ func TestCompactPassesSessionThinkingLevelToSummarizer(t *testing.T) {
 		assert.Equal(t, ai.ReasoningLevel(""), provider.CompleteOptions().Reasoning,
 			"thinking off must not inject a reasoning option")
 	})
+}
+
+// TestCompactAddsThinkingBudgetToSummaryMaxTokens pins the truncated-summary
+// incident: thinking models (zai glm-5.3) count reasoning against the same
+// max_tokens cap as visible text. A summarization request capped at
+// summaryMaxOutputTokens with thinking enabled lets the model reason away
+// the whole budget; the visible summary collapses to a one-line fragment cut
+// at the length cap and then replaces the entire session context. The request
+// must add the thinking budget on top of the summary budget.
+func TestCompactAddsThinkingBudgetToSummaryMaxTokens(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	provider := &recordingProvider{
+		api:          "test-api-sdk",
+		responseText: "summary with keyword lovage",
+		caps:         ai.Capabilities{Tools: true, Streaming: true},
+	}
+	ai.Register("test-api-sdk", provider)
+	model := &ai.Model{
+		ID:            "compact-thinking-budget-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		Reasoning:     true,
+		MaxTokens:     65_536,
+		ContextWindow: 128_000,
+	}
+	ai.RegisterModel(model)
+
+	newSession := func(level agent.ThinkingLevel) *agentSession {
+		session := &agentSession{
+			model:         model,
+			thinkingLevel: level,
+			clientFactory: func(m *ai.Model) (ai.Client, error) {
+				return provider.NewClient(m)
+			},
+		}
+		session.agent = mustNewAgentForTest(t, model)
+		session.agent.ReplaceMessages([]*agent.Message{
+			{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "remember the keyword lovage"}}},
+		})
+		return session
+	}
+
+	t.Run("thinking level adds its budget", func(t *testing.T) {
+		require.NoError(t, newSession(agent.ThinkingMedium).Compact(testContext(t)))
+		assert.Equal(t, summaryMaxOutputTokens+ai.ThinkingBudgetForLevel(ai.ReasoningMedium, nil),
+			provider.CompleteOptions().MaxTokens,
+			"reasoning shares the output cap with visible text; the thinking budget must be added on top or the model reasons away the summary")
+	})
+
+	t.Run("off keeps the bare cap", func(t *testing.T) {
+		require.NoError(t, newSession(agent.ThinkingOff).Compact(testContext(t)))
+		assert.Equal(t, summaryMaxOutputTokens, provider.CompleteOptions().MaxTokens,
+			"thinking off must keep the plain summary cap")
+	})
+
+	t.Run("clamped to model max output", func(t *testing.T) {
+		smallModel := &ai.Model{
+			ID:            "compact-thinking-budget-small-model",
+			Provider:      "test-provider",
+			API:           "test-api-sdk",
+			Reasoning:     true,
+			MaxTokens:     12_000,
+			ContextWindow: 128_000,
+		}
+		ai.RegisterModel(smallModel)
+		session := newSession(agent.ThinkingHigh)
+		session.model = smallModel
+		require.NoError(t, session.Compact(testContext(t)))
+		assert.Equal(t, 12_000, provider.CompleteOptions().MaxTokens,
+			"adjusted cap must never exceed the model's max output")
+	})
+}
+
+// TestCompactRejectsLengthTruncatedSummary pins the second half of the
+// incident: callModelForSummary ignored the response StopReason and returned
+// the first text block verbatim, so a thinking model that hit the output cap
+// mid-summary had its opening fragment persisted as the summary — wiping the
+// whole session context down to one line. A length-stopped response must be
+// treated as a failed summarization and fall back.
+func TestCompactRejectsLengthTruncatedSummary(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	model := &ai.Model{
+		ID:            "compact-length-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		Reasoning:     true,
+		ContextWindow: 128_000,
+	}
+	ai.RegisterModel(model)
+
+	storage, err := sessionpkg.NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	writer, err := storage.Create(sessionpkg.NewHeader(".", nil, nil, "length cut"))
+	require.NoError(t, err)
+	parent := "parent-entry"
+
+	cut := &mockClient{completeFn: func(context.Context, *ai.Model, *ai.Context, ...ai.Option) (*ai.AssistantMessage, error) {
+		return &ai.AssistantMessage{
+			Role:       "assistant",
+			Content:    []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "Let me verify the current state before proceeding:"}},
+			StopReason: ai.StopReasonLength,
+		}, nil
+	}}
+
+	var logBuf bytes.Buffer
+	session := &agentSession{
+		model:         model,
+		logger:        logging.NewText(&logBuf, slog.LevelWarn),
+		sessionWriter: writer,
+		parentMsgID:   &parent,
+		clientFactory: func(m *ai.Model) (ai.Client, error) { return cut, nil },
+	}
+	session.agent = mustNewAgentForTest(t, model)
+	session.agent.ReplaceMessages([]*agent.Message{
+		{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "remember the keyword chervil"}}},
+	})
+
+	require.NoError(t, session.Compact(testContext(t)))
+	require.NoError(t, writer.Close())
+
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	require.NoError(t, err)
+	entries := reader.EntriesByType(sessionpkg.EntryTypeCompaction)
+	require.NotEmpty(t, entries)
+	entry := entries[len(entries)-1]
+	assert.True(t, entry.Fallback,
+		"a length-truncated summary must be flagged as a fallback, not stored as model output")
+	assert.Contains(t, entry.FallbackError, "output token limit")
+	assert.NotEqual(t, "Let me verify the current state before proceeding:", *entry.Summary,
+		"the truncated fragment must never be persisted as the summary")
+	assert.Contains(t, *entry.Summary, "chervil", "fallback must keep recent conversation")
 }
 
 // TestCompactMarksFallbackInSessionLog pins the observability gap where a
@@ -2781,6 +2981,115 @@ func TestCompactMarksFallbackInSessionLog(t *testing.T) {
 		assert.False(t, entry.Fallback)
 		assert.Empty(t, entry.FallbackError)
 		assert.NotContains(t, raw, `"fallback":`, "successful compaction must not carry fallback fields")
+	})
+}
+
+// TestCompactRetriesAfterFallbackCompaction pins the retry semantics: a
+// fallback compaction is not real context. A later /compact must summarize
+// the messages the first failed attempt saw — the fallback summaries are
+// never sent as compaction input — and keep retrying until one succeeds.
+func TestCompactRetriesAfterFallbackCompaction(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	provider := &recordingProvider{
+		api:          "test-api-sdk",
+		responseText: "model summary mentioning basil",
+		caps:         ai.Capabilities{Tools: true, Streaming: true},
+	}
+	ai.Register("test-api-sdk", provider)
+	model := &ai.Model{
+		ID:            "compact-retry-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		ContextWindow: 128_000,
+	}
+	ai.RegisterModel(model)
+
+	newSession := func(t *testing.T) (*agentSession, func(bool)) {
+		t.Helper()
+		storage, err := sessionpkg.NewStorageAt(t.TempDir())
+		require.NoError(t, err)
+		header := sessionpkg.NewHeader(".", nil, nil, "retry fallback")
+		writer, err := storage.Create(header)
+		require.NoError(t, err)
+
+		msg := sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"remember the keyword basil"}`), nil)
+		require.NoError(t, writer.Append(msg))
+
+		failing := true
+		session := &agentSession{
+			model:  model,
+			logger: logging.NewText(&bytes.Buffer{}, slog.LevelWarn),
+			clientFactory: func(m *ai.Model) (ai.Client, error) {
+				if failing {
+					return &mockClient{completeFn: func(context.Context, *ai.Model, *ai.Context, ...ai.Option) (*ai.AssistantMessage, error) {
+						return nil, errors.New("zai: status 400: cannot be disabled")
+					}}, nil
+				}
+				return provider.NewClient(m)
+			},
+		}
+		parent := msg.ID
+		session.sessionWriter = writer
+		session.parentMsgID = &parent
+		session.agent = mustNewAgentForTest(t, model)
+		session.agent.ReplaceMessages([]*agent.Message{
+			{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "remember the keyword basil"}}},
+		})
+		return session, func(f bool) { failing = f }
+	}
+
+	lastCompaction := func(t *testing.T, session *agentSession) sessionpkg.Entry {
+		t.Helper()
+		reader, err := sessionpkg.ReadFile(session.sessionWriter.Path())
+		require.NoError(t, err)
+		entries := reader.EntriesByType(sessionpkg.EntryTypeCompaction)
+		require.NotEmpty(t, entries)
+		return entries[len(entries)-1]
+	}
+
+	t.Run("second compact retries the original messages", func(t *testing.T) {
+		session, setFailing := newSession(t)
+		require.NoError(t, session.Compact(testContext(t))) // fallback
+		require.True(t, lastCompaction(t, session).Fallback)
+
+		setFailing(false)
+		require.NoError(t, session.Compact(testContext(t))) // retry succeeds
+
+		entry := lastCompaction(t, session)
+		assert.False(t, entry.Fallback, "retry compaction must be model-driven")
+		require.NotNil(t, entry.Summary)
+		assert.Contains(t, *entry.Summary, "basil")
+
+		prompt := provider.LastPrompt()
+		require.NotNil(t, prompt, "retry must call the model")
+		require.Len(t, prompt.Messages, 2)
+		transcript, ok := prompt.Messages[1].ContentString()
+		require.True(t, ok, "transcript message should be plain text")
+		assert.Contains(t, transcript, "remember the keyword basil",
+			"retry must summarize the original messages, not the fallback summary")
+		assert.NotContains(t, transcript, "Recent conversation",
+			"the local fallback summary must never be compaction input")
+
+		live := session.GetMessages()
+		require.Len(t, live, 1)
+		assert.Contains(t, live[0].Text, "model summary mentioning basil")
+	})
+
+	t.Run("third compact retries after two fallbacks", func(t *testing.T) {
+		session, setFailing := newSession(t)
+		require.NoError(t, session.Compact(testContext(t))) // fallback 1
+		require.NoError(t, session.Compact(testContext(t))) // fallback 2
+
+		setFailing(false)
+		require.NoError(t, session.Compact(testContext(t))) // retry succeeds
+
+		entry := lastCompaction(t, session)
+		assert.False(t, entry.Fallback)
+		transcript, ok := provider.LastPrompt().Messages[1].ContentString()
+		require.True(t, ok)
+		assert.Contains(t, transcript, "remember the keyword basil")
+		assert.NotContains(t, transcript, "Recent conversation")
 	})
 }
 
@@ -4161,6 +4470,78 @@ func TestSteerAndFollowUp_WriteQueueUpdateEntry(t *testing.T) {
 	last := queueUpdates[len(queueUpdates)-1]
 	assert.EqualValues(t, 2, last["steering_count"])
 	assert.EqualValues(t, 1, last["follow_up_count"])
+}
+
+// TestSendProviderFailureWritesErrorEntry verifies that a failed provider
+// request is recorded in the session log with the provider, model, error
+// text, and the shape of the request that was rejected — what you need to
+// diagnose an API rejection (e.g. zai 1214) from the log alone. The entry
+// must stay out of LLM context so replaying the session never feeds the
+// failure back to the model.
+func TestSendProviderFailureWritesErrorEntry(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+
+	provider, explicitModel := registerRecordingProvider(t, "unused")
+	provider.streamErr = errors.New(`zai: status 400: {"error":{"code":"1214","message":"The messages parameter is illegal. Please check the documentation."}}`)
+	tmpDir := t.TempDir()
+	rt, err := NewRuntime(RuntimeOptions{
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		SessionsDir:     tmpDir,
+		ExplicitModel:   explicitModel,
+	})
+	require.NoError(t, err)
+
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	defer func() { _ = sess.Close(testContext(t)) }()
+
+	events, err := sess.Send(testContext(t), Message{Text: "hi"})
+	require.NoError(t, err)
+	var sawErrorEvent bool
+	for _, e := range collectSessionEvents(t, events) {
+		if e.Type == "error" {
+			sawErrorEvent = true
+		}
+	}
+	require.True(t, sawErrorEvent, "provider failure must surface an error event")
+
+	storage := rt.GetSessionStorage()
+	files := sessionJSONLFiles(t, storage.Dir())
+	require.NotEmpty(t, files, "session file must be created in storage dir")
+	data, err := os.ReadFile(files[0])
+	require.NoError(t, err)
+
+	var errorEntry map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+		if entry["type"] == "error" {
+			errorEntry = entry
+		}
+	}
+	require.NotNil(t, errorEntry, "failed provider request must be recorded as an error entry")
+	assert.Equal(t, "test-provider", errorEntry["provider"])
+	assert.Equal(t, "test-model", errorEntry["model"])
+	assert.Contains(t, errorEntry["error"], "1214")
+
+	dataField, ok := errorEntry["data"].(map[string]any)
+	require.True(t, ok, "error entry must carry the request summary in data")
+	msgs, ok := dataField["messages"].([]any)
+	require.True(t, ok, "request summary must list messages")
+	require.NotEmpty(t, msgs)
+	first, ok := msgs[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "user", first["role"], "request summary should start with the user prompt")
+
+	// The error entry must not re-enter LLM context on replay.
+	reader, err := sessionpkg.ReadFile(files[0])
+	require.NoError(t, err)
+	replayed := reader.ToAgentMessages()
+	require.Len(t, replayed, 1)
+	assert.Equal(t, "user", string(replayed[0].Role))
 }
 
 // TestResolveModel_NoModelReturnsSentinel verifies that ResolveModel

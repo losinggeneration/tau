@@ -7,9 +7,7 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
-	"fmt"
 	"math"
-	"strings"
 
 	"github.com/losinggeneration/tau/ai"
 )
@@ -159,18 +157,21 @@ func EstimateTokens(msg *AgentMessage) int {
 //go:embed prompt.txt
 var summarizationPrompt embed.FS
 
-// BuildSummarizationPrompt builds the system prompt for summarization from a transcript.
-func BuildSummarizationPrompt(transcript string) string {
+// BuildSummarizationPrompt builds the system prompt for summarization. The
+// transcript itself is delivered as the user message by the caller; embedding
+// it here too put two copies in one request, so providers rejected compaction
+// once a session passed ~50% of its context window ("Prompt exceeds max length").
+func BuildSummarizationPrompt() string {
 	promptTemplate, err := summarizationPrompt.ReadFile("prompt.txt")
 	if err != nil {
 		// Fallback to inline prompt
-		return inlineSummarizationPrompt(transcript)
+		return inlineSummarizationPrompt()
 	}
-	return strings.Replace(string(promptTemplate), "%s", transcript, 1)
+	return string(promptTemplate)
 }
 
-func inlineSummarizationPrompt(transcript string) string {
-	return fmt.Sprintf(`You are a session compaction assistant. Your job is to produce a concise but complete summary of the following conversation transcript. The summary will replace the original messages in the session's LLM context, so it MUST preserve all information needed for the assistant to continue the conversation effectively.
+func inlineSummarizationPrompt() string {
+	return `You are a session compaction assistant. Your job is to produce a concise but complete summary of the following conversation transcript. The summary will replace the original messages in the session's LLM context, so it MUST preserve all information needed for the assistant to continue the conversation effectively.
 
 ## Instructions
 
@@ -181,13 +182,11 @@ func inlineSummarizationPrompt(transcript string) string {
 5. **Preserve error/gotcha context**: Any errors encountered, workarounds applied, or non-obvious constraints discovered.
 6. **Preserve code state**: If code was written or modified, summarize the current state of the implementation.
 7. **Be factual**: Do not add information not present in the transcript.
-8. **Be concise**: Aim for 10-20%% of the original transcript length.
+8. **Be concise**: Aim for 10-20% of the original transcript length.
 
-## Transcript
+The transcript follows as the next user message.
 
-%s
-
-## Summary`, transcript)
+## Summary`
 }
 
 // ContextUsageEstimate contains the estimated context token breakdown.

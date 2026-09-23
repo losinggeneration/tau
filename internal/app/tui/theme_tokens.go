@@ -95,6 +95,14 @@ type themeTokens struct {
 	// renders those with `muted`; tau tints them so a notice is
 	// distinguishable from dimmed chrome at a glance.
 	SystemText tauui.Color
+
+	// CompactionFallbackBg and CompactionFallbackLabel are tau extensions for
+	// a compaction that degraded to a local summary after the model call
+	// failed: the custom-message hues pushed toward red, so the degraded
+	// provenance is visible without reading the body. Text stays
+	// CustomMessageText.
+	CompactionFallbackBg    tauui.Color
+	CompactionFallbackLabel tauui.Color
 }
 
 // defaultThemeTokens is the dark token set every unnamed/unknown theme
@@ -165,6 +173,9 @@ func defaultThemeTokens() themeTokens {
 
 		BashMode:   tauui.ColorRGB(220, 180, 80),
 		SystemText: tauui.ColorRGB(190, 170, 220),
+
+		CompactionFallbackBg:    tauui.ColorRGB(66, 34, 56),
+		CompactionFallbackLabel: tauui.ColorRGB(228, 130, 185),
 	}
 }
 
@@ -289,8 +300,10 @@ func (t *themeTokens) tokenTargets() map[string]*tauui.Color {
 		"bashmode": &t.BashMode,
 
 		// tau extensions, outside the spec's required set.
-		"surface":    &t.Surface,
-		"systemtext": &t.SystemText,
+		"surface":                 &t.Surface,
+		"systemtext":              &t.SystemText,
+		"compactionfallbackbg":    &t.CompactionFallbackBg,
+		"compactionfallbacklabel": &t.CompactionFallbackLabel,
 	}
 }
 
@@ -416,6 +429,9 @@ func (t *themeTokens) chatPalette() chatPalette {
 		// and reusing that green said it was.
 		custom:      tauui.Style{FG: t.CustomMessageText, BG: t.CustomMessageBg},
 		customLabel: tauui.Style{FG: t.CustomMessageLabel, BG: t.CustomMessageBg, Attr: tauui.AttrBold},
+
+		compactionFallback:      tauui.Style{FG: t.CustomMessageText, BG: t.CompactionFallbackBg},
+		compactionFallbackLabel: tauui.Style{FG: t.CompactionFallbackLabel, BG: t.CompactionFallbackBg, Attr: tauui.AttrBold},
 
 		bashMode:    t.BashMode,
 		diffAdded:   t.ToolDiffAdded,

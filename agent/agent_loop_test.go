@@ -2606,3 +2606,77 @@ func TestStreamAssistantResponseDropsOrphanToolResultsFromInitialContext(t *test
 		t.Fatal("kept tool result was dropped along with the orphan")
 	}
 }
+
+// After a mid-turn compaction, the rebased transcript can begin with an
+// assistant tool-call turn (the summary is lifted into the system prompt,
+// orphan results are dropped, and no user message remains ahead of it).
+// Providers reject a request whose first message is not from the user —
+// zai/GLM returns error 1214 ("The messages parameter is illegal") — so the
+// send path must prepend a synthetic user turn, like it already does for the
+// summary-only case.
+func TestStreamAssistantResponsePrependsUserWhenContextStartsWithAssistant(t *testing.T) {
+	call, err := CreateToolCall("read", map[string]any{"path": "/tmp"})
+	if err != nil {
+		t.Fatalf("CreateToolCall: %v", err)
+	}
+
+	var got *ai.Context
+	client := stubClient{
+		stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+			got = prompt
+			partial := ai.AssistantMessage{Role: "assistant", Timestamp: time.Now().UnixMilli()}
+			handler(ctx, ai.Start{Partial: partial})
+			partial.Content = []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "done"}}
+			final := partial
+			final.StopReason = ai.StopReasonStop
+			handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: final})
+			return nil
+		},
+	}
+
+	summary := &Message{
+		Role:      RoleSystem,
+		Content:   []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "Session Summary: cut mid-turn"}},
+		Timestamp: time.Now(),
+	}
+	assistantWithCall := &Message{
+		Role: RoleAssistant,
+		Content: []ai.ContentBlock{{
+			Type:      ai.ContentBlockToolCall,
+			ID:        call.ID,
+			Name:      call.Name,
+			Arguments: call.Arguments,
+		}},
+		Timestamp: time.Now(),
+	}
+
+	_, err = RunAgentLoopContinue(
+		context.Background(),
+		&AgentContext{
+			Model: &ai.Model{ID: "test", Provider: ai.ProviderOpenAI},
+			Messages: []*Message{
+				summary,
+				assistantWithCall,
+				NewToolMessage(call.ID, "read", "file contents", false),
+			},
+		},
+		AgentLoopConfig{
+			Model:         &ai.Model{ID: "test", Provider: ai.ProviderOpenAI},
+			ConvertToLlm:  DefaultConvertToLlm,
+			ClientFactory: func(model *ai.Model) (ai.Client, error) { return client, nil },
+		},
+		func(Event) {},
+	)
+	if err != nil {
+		t.Fatalf("RunAgentLoopContinue: %v", err)
+	}
+	if got == nil {
+		t.Fatal("model was not called")
+	}
+	if len(got.Messages) == 0 {
+		t.Fatal("provider request had no messages")
+	}
+	if got.Messages[0].Role != "user" {
+		t.Fatalf("first provider message role = %q, want user (assistant-first transcripts are rejected by providers)", got.Messages[0].Role)
+	}
+}
