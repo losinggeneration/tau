@@ -2676,3 +2676,50 @@ func TestPackageDiscoveryNestedSkillCategories(t *testing.T) {
 		"category-dir .md must not load as a loose skill")
 	assert.Len(t, found, 2, "exactly the two directory skills, got: %v", found)
 }
+
+// TestUserDirsOverride verifies the UserDirs map redirects user-global
+// discovery per kind, with kinds left out falling back to ~/.tau/agent.
+func TestUserDirsOverride(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+
+	// A skill in the overridden skills dir.
+	sharedSkills := t.TempDir()
+	err := os.WriteFile(filepath.Join(sharedSkills, "shared-skill.md"),
+		[]byte("---\nname: shared-skill\n---\n# Shared"), 0o644)
+	require.NoError(t, err)
+
+	// A prompt in the default user location (no override for prompts).
+	defaultPrompts := filepath.Join(home, ".tau", "agent", "prompts")
+	err = os.MkdirAll(defaultPrompts, 0o755)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(defaultPrompts, "local-prompt.md"),
+		[]byte("# Local prompt"), 0o644)
+	require.NoError(t, err)
+
+	entries, err := Walk(DiscoveryConfig{
+		HomeDir:           home,
+		CWD:               cwd,
+		DisableThemes:     true,
+		DisableExtensions: true,
+		UserDirs: map[ArtifactKind]string{
+			KindSkill: sharedSkills,
+		},
+	})
+	require.NoError(t, err)
+
+	var foundSkill, foundPrompt bool
+	for _, e := range entries {
+		switch {
+		case e.Kind == KindSkill && strings.HasSuffix(e.SourcePath, "shared-skill.md"):
+			if e.Tier != TierUser {
+				t.Fatalf("overridden skill tier = %v, want user", e.Tier)
+			}
+			foundSkill = true
+		case e.Kind == KindPrompt && strings.HasSuffix(e.SourcePath, "local-prompt.md"):
+			foundPrompt = true
+		}
+	}
+	assert.True(t, foundSkill, "skill from UserDirs override not discovered")
+	assert.True(t, foundPrompt, "prompt from default user dir not discovered")
+}

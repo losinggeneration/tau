@@ -42,6 +42,7 @@ import (
 	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/internal/app/tui"
 	"github.com/losinggeneration/tau/logging"
+	"github.com/losinggeneration/tau/paths"
 	"github.com/losinggeneration/tau/rpc/server"
 	"github.com/losinggeneration/tau/sdk"
 	"github.com/losinggeneration/tau/ui"
@@ -91,6 +92,10 @@ func CLI() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	// Promote --config-dir to TAU_CONFIG_DIR before any flag parsing or
+	// plugin discovery so every subsystem resolves paths consistently.
+	promoteConfigDirFlag(os.Args)
+
 	root := newRootCommand()
 
 	cleanArgs, pluginCLIFlags := preprocessPluginCLIArgs(os.Args)
@@ -137,37 +142,61 @@ func providerBaseURL(reg *ai.ModelRegistry, provider string) string {
 	return ""
 }
 
+// promoteConfigDirFlag copies --config-dir from raw argv into TAU_CONFIG_DIR.
+// Manual scan because consumers (plugin CLI-flag discovery, settings loads)
+// run before urfave/cli parses flags.
+func promoteConfigDirFlag(args []string) {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return
+		}
+		var val string
+		switch {
+		case arg == "--config-dir":
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				val = args[i+1]
+			}
+		case strings.HasPrefix(arg, "--config-dir="):
+			val = strings.TrimPrefix(arg, "--config-dir=")
+		default:
+			continue
+		}
+		if val != "" {
+			if err := os.Setenv("TAU_CONFIG_DIR", val); err != nil {
+				fmt.Fprintf(os.Stderr, "set TAU_CONFIG_DIR: %v\n", err)
+			}
+		}
+		return
+	}
+}
+
 // configDir returns the tau config directory, defaulting to ~/.tau/agent.
 func configDir() string {
-	if dir := os.Getenv("TAU_CONFIG_DIR"); dir != "" {
-		return dir
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".tau"
-	}
-	return filepath.Join(home, ".tau", "agent")
+	return paths.ConfigDir()
 }
 
-// sessionsDir returns the sessions directory, defaulting to <configDir>/sessions.
-// It respects TAU_SESSION_DIR environment variable override.
-func sessionsDir() string {
-	if dir := os.Getenv("TAU_SESSION_DIR"); dir != "" {
-		return dir
+// sessionDir returns the sessions directory. Precedence: TAU_SESSION_DIR,
+// then sessionDir in settings.json, then <configDir>/sessions. The
+// --session-dir flag is applied by sessionDirForCmd on top of this.
+func sessionDir() string {
+	var configured string
+	if settings, err := loadSettings(); err == nil && settings != nil {
+		configured = settings.SessionDir
 	}
-	return filepath.Join(configDir(), "sessions")
+	return paths.Dir("TAU_SESSION_DIR", configured, filepath.Join(configDir(), "sessions"))
 }
 
-// sessionsDirForCmd returns the sessions directory, respecting --session-dir flag override.
+// sessionDirForCmd returns the sessions directory, respecting --session-dir flag override.
 // If the command has the session-dir flag set and non-empty, that value is used.
 // Otherwise falls back to TAU_SESSION_DIR env var, then the default location.
-func sessionsDirForCmd(cmd *cli.Command) string {
+func sessionDirForCmd(cmd *cli.Command) string {
 	if cmd != nil {
 		if dir := cmd.String("session-dir"); dir != "" {
 			return dir
 		}
 	}
-	return sessionsDir()
+	return sessionDir()
 }
 
 // loadSettings loads and merges user + project settings.
@@ -405,7 +434,7 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		applyPluginCLIFlags(ctx, pluginMgr)
 	}
 
-	sessDir := sessionsDirForCmd(cmd)
+	sessDir := sessionDirForCmd(cmd)
 	opts.SessionsDir = sessDir
 
 	sessionStorage, err := session.NewStorageAt(sessDir)
@@ -433,6 +462,7 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		SettingsPaths:    getSettingsArtifactPaths(settings),
 		CLIPaths:         cliPaths,
 		PackagePaths:     []string{userDir, projectDir},
+		UserDirs:         artifactUserDirs(settings),
 		CommandsRegistry: reg,
 		// Honor artifact discovery control flags.
 		DisableSkills:  cmd != nil && cmd.Bool("no-skills"),
@@ -495,6 +525,24 @@ func stdoutBytes(data []byte) error {
 	return nil
 }
 
+// artifactUserDirs resolves the user-global artifact directories per kind.
+// Precedence: TAU_SKILLS_DIR/TAU_PROMPTS_DIR/TAU_THEMES_DIR, then the
+// matching settings.json field, then <configDir>/<kind>.
+func artifactUserDirs(settings *ai.Settings) map[artifacts.ArtifactKind]string {
+	var skillsSetting, promptsSetting, themesSetting string
+	if settings != nil {
+		skillsSetting = settings.SkillDir
+		promptsSetting = settings.PromptDir
+		themesSetting = settings.ThemeDir
+	}
+	cfgDir := configDir()
+	return map[artifacts.ArtifactKind]string{
+		artifacts.KindSkill:  paths.Dir("TAU_SKILLS_DIR", skillsSetting, filepath.Join(cfgDir, "skills")),
+		artifacts.KindPrompt: paths.Dir("TAU_PROMPTS_DIR", promptsSetting, filepath.Join(cfgDir, "prompts")),
+		artifacts.KindTheme:  paths.Dir("TAU_THEMES_DIR", themesSetting, filepath.Join(cfgDir, "themes")),
+	}
+}
+
 // getSettingsArtifactPaths extracts artifact paths from settings.json. The
 // flat schema uses Skills/Prompts/Themes string slices per the Pi spec.
 func getSettingsArtifactPaths(settings *ai.Settings) map[artifacts.ArtifactKind][]string {
@@ -520,14 +568,15 @@ func getSettingsArtifactPaths(settings *ai.Settings) map[artifacts.ArtifactKind]
 	return result
 }
 
-// packagesDirs returns the user and project package directories.
+// packagesDirs returns the user and project package directories. User dir
+// precedence: TAU_PACKAGE_DIR, then packageDir in settings.json, then
+// <configDir>/packages.
 func packagesDirs() (userDir, projectDir string) {
-	cfgDir := configDir()
-	if dir := os.Getenv("TAU_PACKAGE_DIR"); dir != "" {
-		userDir = dir
-	} else {
-		userDir = filepath.Join(cfgDir, "packages")
+	var configured string
+	if settings, err := loadSettings(); err == nil && settings != nil {
+		configured = settings.PackageDir
 	}
+	userDir = paths.Dir("TAU_PACKAGE_DIR", configured, filepath.Join(configDir(), "packages"))
 	projectDir = ".tau/packages"
 	return
 }
@@ -1565,7 +1614,7 @@ func runSessionsList(ctx context.Context, cmd *cli.Command) error {
 		CWD:   cmd.String("cwd"),
 	}
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1757,7 +1806,7 @@ func runSessionsShow(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1781,7 +1830,7 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 	recliing := cmd.Args().Slice()[1:]
 
 	// Validate the session exists before doing any work.
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1818,7 +1867,7 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	// Override: target the explicit session ID instead of any auto-detection.
-	rtOpts.SessionsDir = sessionsDirForCmd(cmd)
+	rtOpts.SessionsDir = sessionDirForCmd(cmd)
 	rtOpts.ResumeSessionID = id
 
 	rt, err := sdk.NewRuntime(rtOpts)
@@ -1910,7 +1959,7 @@ func runSessionsRename(ctx context.Context, cmd *cli.Command) error {
 	}
 	id, newName := args[0], args[1]
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1931,7 +1980,7 @@ func runSessionsMove(ctx context.Context, cmd *cli.Command) error {
 	}
 	id, newCWD := args[0], args[1]
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1952,7 +2001,7 @@ func runSessionsDelete(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1967,7 +2016,7 @@ func runSessionsDelete(ctx context.Context, cmd *cli.Command) error {
 
 // runSessionsCleanupEmpty handles the `tau sessions cleanup-empty` subcommand.
 func runSessionsCleanupEmpty(ctx context.Context, cmd *cli.Command) error {
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2001,7 +2050,7 @@ func runSessionsRestore(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2021,7 +2070,7 @@ func runSessionsCompact(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2042,7 +2091,7 @@ func runSessionsSummarizeBranch(ctx context.Context, cmd *cli.Command) error {
 	}
 	id, branchTip := args[0], args[1]
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2067,7 +2116,7 @@ func runSessionsFork(ctx context.Context, cmd *cli.Command) error {
 		atEntry = &at
 	}
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2094,7 +2143,7 @@ func runSessionsExport(ctx context.Context, cmd *cli.Command) error {
 		NoCollapse: cmd.Bool("no-collapse"),
 	}
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2118,7 +2167,7 @@ func runSessionsShare(ctx context.Context, cmd *cli.Command) error {
 
 	isPublic := cmd.Bool("public")
 
-	sessCLI, err := session.NewCLI(sessionsDirForCmd(cmd))
+	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -4220,12 +4269,12 @@ func getCWD() string {
 }
 
 // findLatestResumableSession finds the most recently created resumable session.
-func findLatestResumableSession(sessionsDir string) (string, error) {
-	if sessionsDir == "" {
-		sessionsDir = filepath.Join(configDir(), "sessions")
+func findLatestResumableSession(sessionDir string) (string, error) {
+	if sessionDir == "" {
+		sessionDir = filepath.Join(configDir(), "sessions")
 	}
 
-	storage, err := session.NewStorageAt(sessionsDir)
+	storage, err := session.NewStorageAt(sessionDir)
 	if err != nil {
 		return "", fmt.Errorf("open session storage: %w", err)
 	}
@@ -4359,6 +4408,7 @@ Prompt composition:
   --image, -i        Include image in conversation (may be repeated)
 
 Runtime options:
+  --config-dir <dir> Tau config directory (default ~/.tau/agent; env TAU_CONFIG_DIR)
   --provider         Provider to use for this run (overrides default)
   --api-key          API key for the provider (overrides credential store)
   --system-prompt    Override the default system prompt

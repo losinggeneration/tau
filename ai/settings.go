@@ -197,6 +197,18 @@ type Settings struct {
 	TreeFilterMode         string `json:"treeFilterMode,omitempty"`     // default|no-tools|user-only|labeled-only|all
 	SessionDir             string `json:"sessionDir,omitempty"`
 
+	// Directory overrides for shared or split installs (e.g. ~/.tau.work
+	// alongside ~/.tau, or skills shared between them). Each field is one
+	// level below the matching TAU_*_DIR environment variable and one above
+	// the default under the config dir. packageDir overrides the user
+	// packages directory, extensionDir the user extensions directory, and
+	// skillDir/promptDir/themeDir the user artifact directories.
+	PackageDir   string `json:"packageDir,omitempty"`
+	ExtensionDir string `json:"extensionDir,omitempty"`
+	SkillDir     string `json:"skillDir,omitempty"`
+	PromptDir    string `json:"promptDir,omitempty"`
+	ThemeDir     string `json:"themeDir,omitempty"`
+
 	// === Nested groups ===
 
 	Compaction      CompactionSettings       `json:"compaction,omitempty"`
@@ -453,6 +465,11 @@ func MergeSettings(user, project *Settings) *Settings {
 	out.LayoutMode = pickStr(user.LayoutMode, project.LayoutMode)
 	out.TreeFilterMode = pickStr(user.TreeFilterMode, project.TreeFilterMode)
 	out.SessionDir = pickStr(user.SessionDir, project.SessionDir)
+	out.PackageDir = pickStr(user.PackageDir, project.PackageDir)
+	out.ExtensionDir = pickStr(user.ExtensionDir, project.ExtensionDir)
+	out.SkillDir = pickStr(user.SkillDir, project.SkillDir)
+	out.PromptDir = pickStr(user.PromptDir, project.PromptDir)
+	out.ThemeDir = pickStr(user.ThemeDir, project.ThemeDir)
 
 	// Bools: project overrides only when explicitly true (Pi behavior —
 	// project setting `false` does not silently flip a user-set `true`).

@@ -27,6 +27,7 @@ import (
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/logging"
+	"github.com/losinggeneration/tau/paths"
 	"github.com/losinggeneration/tau/ui"
 )
 
@@ -2718,44 +2719,38 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 		u = ui.NewNoOpUI()
 	}
 	sessionsDir := opts.SessionsDir
-	if sessionsDir == "" {
-		if dir := os.Getenv("TAU_SESSION_DIR"); dir != "" {
-			sessionsDir = dir
-		} else {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				sessionsDir = filepath.Join(home, ".tau", "agent", "sessions")
-			}
-		}
-	}
 
 	// Load settings with sensible defaults if not provided.
-	// This matches the CLI behavior: load user settings (~/.tau/agent/settings.json),
+	// This matches the CLI behavior: load user settings (<configDir>/settings.json),
 	// merge project settings (.tau/settings.json) with project taking precedence.
 	settings := opts.Settings
 	if settings == nil {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			userSettingsPath := filepath.Join(home, ".tau", "agent", "settings.json")
-			userSettings, err := ai.LoadSettings(userSettingsPath)
-			if err == nil && userSettings != nil {
-				// Also try to load project settings from .tau/settings.json
-				projectSettings, _ := ai.LoadSettings(".tau/settings.json")
-				settings = ai.MergeSettings(userSettings, projectSettings)
-			}
+		userSettingsPath := filepath.Join(paths.ConfigDir(), "settings.json")
+		userSettings, err := ai.LoadSettings(userSettingsPath)
+		if err == nil && userSettings != nil {
+			// Also try to load project settings from .tau/settings.json
+			projectSettings, _ := ai.LoadSettings(".tau/settings.json")
+			settings = ai.MergeSettings(userSettings, projectSettings)
 		}
+	}
+
+	// Sessions default: TAU_SESSION_DIR, then sessionDir from settings, then
+	// <configDir>/sessions. Matches the CLI resolution chain.
+	if sessionsDir == "" {
+		var configured string
+		if settings != nil {
+			configured = settings.SessionDir
+		}
+		sessionsDir = paths.Dir("TAU_SESSION_DIR", configured, filepath.Join(paths.ConfigDir(), "sessions"))
 	}
 
 	// Initialize credential store with file backend if not provided
 	credStore := opts.CredentialStore
 	if credStore == nil {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			authPath := filepath.Join(home, ".tau", "agent", "auth.json")
-			fileBackend := store.NewFileBackend(authPath, store.Options{RefreshFuncs: store.OAuthProviderRefreshFuncs()})
-			if err := fileBackend.EnsureDir(); err == nil {
-				credStore = fileBackend
-			}
+		authPath := filepath.Join(paths.ConfigDir(), "auth.json")
+		fileBackend := store.NewFileBackend(authPath, store.Options{RefreshFuncs: store.OAuthProviderRefreshFuncs()})
+		if err := fileBackend.EnsureDir(); err == nil {
+			credStore = fileBackend
 		}
 	}
 
@@ -3321,17 +3316,15 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	}
 
 	// SYSTEM.md overrides the system prompt; APPEND_SYSTEM.md is appended.
-	// Both lookups respect <cwd>/.tau first then ~/.tau/agent.
-	if homeDir, hErr := os.UserHomeDir(); hErr == nil {
-		if sys, sErr := loadSystemPrompt(filepath.Join(homeDir, ".tau", "agent"), cwd); sErr == nil && sys != "" {
-			agentCfg.SystemPrompt = sys
+	// Both lookups respect <cwd>/.tau first then the user config dir.
+	if sys, sErr := loadSystemPrompt(paths.ConfigDir(), cwd); sErr == nil && sys != "" {
+		agentCfg.SystemPrompt = sys
+	}
+	if appendSys, aErr := loadAppendSystemPrompt(paths.ConfigDir(), cwd); aErr == nil && appendSys != "" {
+		if agentCfg.SystemAddendum != "" {
+			agentCfg.SystemAddendum += "\n\n"
 		}
-		if appendSys, aErr := loadAppendSystemPrompt(filepath.Join(homeDir, ".tau", "agent"), cwd); aErr == nil && appendSys != "" {
-			if agentCfg.SystemAddendum != "" {
-				agentCfg.SystemAddendum += "\n\n"
-			}
-			agentCfg.SystemAddendum += appendSys
-		}
+		agentCfg.SystemAddendum += appendSys
 	}
 
 	// SessionOptions.SystemPrompt is the explicit CLI override and wins over

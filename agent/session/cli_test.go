@@ -248,3 +248,46 @@ func writeTestAuth(path string, creds map[string]ai.Credential) error {
 	}
 	return os.WriteFile(path, data, 0o600)
 }
+
+// TestNewCLISessionDirResolution verifies NewCLI resolves the sessions dir
+// through the settings.json sessionDir field and the TAU_SESSION_DIR env var,
+// falling back to <configDir>/sessions.
+func TestNewCLISessionDirResolution(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Setenv("TAU_SESSION_DIR", "")
+
+	// Default: <configDir>/sessions.
+	c, err := NewCLI("")
+	if err != nil {
+		t.Fatalf("NewCLI default: %v", err)
+	}
+	if want := filepath.Join(cfgDir, "sessions"); c.Storage.baseDir != want {
+		t.Fatalf("default baseDir = %q, want %q", c.Storage.baseDir, want)
+	}
+
+	// settings.json sessionDir wins over the default.
+	settingsDir := filepath.Join(t.TempDir(), "sessions-from-settings")
+	settings := `{"sessionDir": "` + settingsDir + `"}`
+	if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	c, err = NewCLI("")
+	if err != nil {
+		t.Fatalf("NewCLI settings: %v", err)
+	}
+	if c.Storage.baseDir != settingsDir {
+		t.Fatalf("settings baseDir = %q, want %q", c.Storage.baseDir, settingsDir)
+	}
+
+	// TAU_SESSION_DIR wins over settings.
+	envDir := filepath.Join(t.TempDir(), "sessions-from-env")
+	t.Setenv("TAU_SESSION_DIR", envDir)
+	c, err = NewCLI("")
+	if err != nil {
+		t.Fatalf("NewCLI env: %v", err)
+	}
+	if c.Storage.baseDir != envDir {
+		t.Fatalf("env baseDir = %q, want %q", c.Storage.baseDir, envDir)
+	}
+}

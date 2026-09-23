@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/losinggeneration/tau/paths"
 )
 
 // packageDirs returns the package search paths (project-local first, then global).
 func (m *Manager) packageDirs() []string {
-	home, _ := os.UserHomeDir()
-
 	var dirs []string
 
 	// Project-local first, then global.
@@ -18,9 +18,20 @@ func (m *Manager) packageDirs() []string {
 		projectPkgs := filepath.Join(filepath.Dir(projectDir), "packages")
 		dirs = append(dirs, projectPkgs)
 	}
-	dirs = append(dirs, filepath.Join(home, ".tau", "agent", "packages"))
+	dirs = append(dirs, m.userPackageDir())
 
 	return dirs
+}
+
+// userPackageDir resolves the user-global packages directory:
+// TAU_PACKAGE_DIR, then packageDir from settings.json, then
+// <configDir>/packages.
+func (m *Manager) userPackageDir() string {
+	var configured string
+	if m.settings != nil {
+		configured = m.settings.PackageDir
+	}
+	return paths.Dir("TAU_PACKAGE_DIR", configured, filepath.Join(m.configDir, "packages"))
 }
 
 // scanPackagesDir scans a packages directory for tau-package.toml files with [plugin] sections.

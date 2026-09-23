@@ -23,6 +23,10 @@ var RootFlags = []cli.Flag{
 		Name:  "version",
 		Usage: "Print version information",
 	},
+	&cli.StringFlag{
+		Name:  "config-dir",
+		Usage: "Tau config directory (default ~/.tau/agent; also TAU_CONFIG_DIR)",
+	},
 	&cli.BoolFlag{
 		Name:    "verbose",
 		Aliases: []string{"V"},

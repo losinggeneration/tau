@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/losinggeneration/tau/paths"
 )
 
 const (
@@ -24,22 +26,10 @@ type Storage struct {
 	baseDir string
 }
 
-// NewStorage creates a Storage rooted at ~/.tau/agent/sessions/.
+// NewStorage creates a Storage rooted at <configDir>/sessions.
 // The directory is created if it doesn't exist.
 func NewStorage() (*Storage, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
-	}
-	baseDir := filepath.Join(home, ".tau", "agent", sessionsDirName)
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create sessions dir: %w", err)
-	}
-	storage := &Storage{baseDir: baseDir}
-	if err := storage.MigrateToCWDDirs(); err != nil {
-		return nil, fmt.Errorf("migrate sessions: %w", err)
-	}
-	return storage, nil
+	return NewStorageAt(filepath.Join(paths.ConfigDir(), sessionsDirName))
 }
 
 // NewStorageAt creates a Storage at a custom path (for testing).

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/losinggeneration/tau/paths"
 )
 
 // UsageEntry records a single LLM call for the cumulative usage log.
@@ -35,12 +37,7 @@ var (
 func GetUsageLogger() (*UsageLogger, error) {
 	var initErr error
 	usageLoggerOnce.Do(func() {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			initErr = fmt.Errorf("get home dir: %w", err)
-			return
-		}
-		dir := filepath.Join(home, ".tau", "agent")
+		dir := paths.ConfigDir()
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			initErr = fmt.Errorf("create agent dir: %w", err)
 			return

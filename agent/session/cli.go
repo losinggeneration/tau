@@ -17,6 +17,7 @@ import (
 	"github.com/losinggeneration/tau/agent/compaction"
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/ai/store"
+	"github.com/losinggeneration/tau/paths"
 )
 
 // CLI provides the `tau sessions` subcommand implementation.
@@ -37,13 +38,19 @@ type CLI struct {
 }
 
 // NewCLI creates a CLI backed by the default session storage and credential store.
-// If sessionsDir is empty, the default location (~/.tau/agent/sessions) is used.
-func NewCLI(sessionsDir string) (*CLI, error) {
+// If sessionsDir is empty, it resolves TAU_SESSION_DIR, then sessionDir from
+// settings.json, then <configDir>/sessions.
+func NewCLI(sessionDir string) (*CLI, error) {
 	cfgDir := configDir()
-	if sessionsDir == "" {
-		sessionsDir = filepath.Join(cfgDir, "sessions")
+	userSettings, _ := ai.LoadSettings(filepath.Join(cfgDir, "settings.json"))
+	if sessionDir == "" {
+		var configured string
+		if userSettings != nil {
+			configured = userSettings.SessionDir
+		}
+		sessionDir = paths.Dir("TAU_SESSION_DIR", configured, filepath.Join(cfgDir, "sessions"))
 	}
-	storage, err := NewStorageAt(sessionsDir)
+	storage, err := NewStorageAt(sessionDir)
 	if err != nil {
 		return nil, fmt.Errorf("session storage: %w", err)
 	}
@@ -53,8 +60,6 @@ func NewCLI(sessionsDir string) (*CLI, error) {
 	if err := fb.EnsureDir(); err != nil {
 		return nil, fmt.Errorf("ensure auth dir: %w", err)
 	}
-
-	userSettings, _ := ai.LoadSettings(filepath.Join(cfgDir, "settings.json"))
 
 	cli := &CLI{
 		Storage:  storage,
@@ -79,14 +84,7 @@ func NewCLI(sessionsDir string) (*CLI, error) {
 
 // configDir returns the tau config directory, defaulting to ~/.tau/agent.
 func configDir() string {
-	if dir := os.Getenv("TAU_CONFIG_DIR"); dir != "" {
-		return dir
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".tau"
-	}
-	return filepath.Join(home, ".tau", "agent")
+	return paths.ConfigDir()
 }
 
 // ListOptions controls what sessions List returns.

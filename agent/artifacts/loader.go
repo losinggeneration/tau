@@ -44,8 +44,11 @@ type LoaderOptions struct {
 	PluginReloader func(context.Context) error
 	// CWD is the current working directory for project-local discovery.
 	CWD string
-	// SettingsPaths are explicit artifact paths from settings.json.
+	// SettingsPaths are explicit paths from settings.json.
 	SettingsPaths map[ArtifactKind][]string
+	// UserDirs overrides the user-global artifact directories per kind.
+	// Empty entries default to ~/.tau/agent/<subdir>.
+	UserDirs map[ArtifactKind]string
 	// CLIPaths are explicit artifact paths from CLI flags.
 	CLIPaths map[ArtifactKind][]string
 	// PackagePaths are directories to scan for installed packages.
@@ -68,6 +71,7 @@ func NewLoader(opts LoaderOptions) (*Loader, error) {
 	cfg := &DiscoveryConfig{
 		CWD:            opts.CWD,
 		SettingsPaths:  opts.SettingsPaths,
+		UserDirs:       opts.UserDirs,
 		CLIPaths:       opts.CLIPaths,
 		PackagePaths:   opts.PackagePaths,
 		DisableSkills:  opts.DisableSkills,

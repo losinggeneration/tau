@@ -306,3 +306,45 @@ func TestSettings_ThinkingLevelFor(t *testing.T) {
 		t.Errorf("nil settings = %q, want empty", got)
 	}
 }
+
+// TestDirectoryOverrideFieldsRoundTrip verifies the per-directory override
+// fields parse from JSON, merge project-over-user, and save back.
+func TestDirectoryOverrideFieldsRoundTrip(t *testing.T) {
+	raw := `{
+		"sessionDir": "/sessions",
+		"packageDir": "/pkgs",
+		"extensionDir": "/ext",
+		"skillDir": "/skills",
+		"promptDir": "/prompts",
+		"themeDir": "/themes"
+	}`
+	user, err := ParseSettings([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if user.SessionDir != "/sessions" || user.PackageDir != "/pkgs" || user.ExtensionDir != "/ext" ||
+		user.SkillDir != "/skills" || user.PromptDir != "/prompts" || user.ThemeDir != "/themes" {
+		t.Fatalf("parsed fields: %+v", user)
+	}
+
+	project := &Settings{SkillDir: "/project-skills"}
+	merged := MergeSettings(user, project)
+	if merged.SkillDir != "/project-skills" {
+		t.Fatalf("project should override skillsDir: %q", merged.SkillDir)
+	}
+	if merged.SessionDir != "/sessions" || merged.PackageDir != "/pkgs" {
+		t.Fatalf("other fields should survive merge: %+v", merged)
+	}
+
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := SaveSettings(path, merged); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	reloaded, err := LoadSettings(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.SkillDir != "/project-skills" || reloaded.ExtensionDir != "/ext" {
+		t.Fatalf("round-trip lost fields: %+v", reloaded)
+	}
+}

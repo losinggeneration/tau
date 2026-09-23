@@ -5,19 +5,19 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+
+	"github.com/losinggeneration/tau/paths"
 )
 
 // pluginDirs returns the plugin search paths.
 func (m *Manager) pluginDirs() []string {
-	home, _ := os.UserHomeDir()
-
 	var dirs []string
 
 	// Project-local first, then global.
 	if projectDir := m.projectPluginDir(); projectDir != "" {
 		dirs = append(dirs, projectDir)
 	}
-	dirs = append(dirs, filepath.Join(home, ".tau", "agent", "extensions"))
+	dirs = append(dirs, m.userExtensionDir())
 
 	// Add extension paths from CLI flags (--extension).
 	// Caller holds the lock (ReloadNamed holds m.mu.Lock(),
@@ -29,6 +29,17 @@ func (m *Manager) pluginDirs() []string {
 	}
 
 	return dirs
+}
+
+// userExtensionDir resolves the user-global extensions directory:
+// TAU_EXTENSIONS_DIR, then extensionsDir from settings.json, then
+// <configDir>/extensions.
+func (m *Manager) userExtensionDir() string {
+	var configured string
+	if m.settings != nil {
+		configured = m.settings.ExtensionDir
+	}
+	return paths.Dir("TAU_EXTENSIONS_DIR", configured, filepath.Join(m.configDir, "extensions"))
 }
 
 // AddExtensionPath adds a path to the list of extension search paths.

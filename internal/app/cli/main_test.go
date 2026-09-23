@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/packages"
 	"github.com/losinggeneration/tau/agent/session"
 	"github.com/losinggeneration/tau/ai"
@@ -1889,5 +1890,104 @@ func TestDaemonTokenAddListRevoke(t *testing.T) {
 	err := revokeCmd.Run(context.Background(), []string{"tau", "daemon", "token", "revoke", "phone"})
 	if err == nil {
 		t.Fatal("revoking unknown device succeeded; want error")
+	}
+}
+
+func TestSessionsDirResolution(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Setenv("TAU_SESSION_DIR", "")
+
+	if want := filepath.Join(cfgDir, "sessions"); sessionDir() != want {
+		t.Fatalf("default = %q, want %q", sessionDir(), want)
+	}
+
+	settings := `{"sessionDir": "/from/settings"}`
+	if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	if got := sessionDir(); got != "/from/settings" {
+		t.Fatalf("settings = %q, want /from/settings", got)
+	}
+
+	t.Setenv("TAU_SESSION_DIR", "/from/env")
+	if got := sessionDir(); got != "/from/env" {
+		t.Fatalf("env = %q, want /from/env", got)
+	}
+}
+
+func TestPackagesDirsResolution(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Setenv("TAU_PACKAGE_DIR", "")
+
+	userDir, _ := packagesDirs()
+	if want := filepath.Join(cfgDir, "packages"); userDir != want {
+		t.Fatalf("default = %q, want %q", userDir, want)
+	}
+
+	settings := `{"packageDir": "/pkgs/settings"}`
+	if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(settings), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	userDir, _ = packagesDirs()
+	if userDir != "/pkgs/settings" {
+		t.Fatalf("settings = %q, want /pkgs/settings", userDir)
+	}
+
+	t.Setenv("TAU_PACKAGE_DIR", "/pkgs/env")
+	userDir, _ = packagesDirs()
+	if userDir != "/pkgs/env" {
+		t.Fatalf("env = %q, want /pkgs/env", userDir)
+	}
+}
+
+func TestArtifactUserDirsResolution(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Setenv("TAU_SKILLS_DIR", "")
+
+	dirs := artifactUserDirs(nil)
+	if want := filepath.Join(cfgDir, "skills"); dirs[artifacts.KindSkill] != want {
+		t.Fatalf("default skills = %q, want %q", dirs[artifacts.KindSkill], want)
+	}
+
+	t.Setenv("TAU_SKILLS_DIR", "/skills/env")
+	dirs = artifactUserDirs(nil)
+	if dirs[artifacts.KindSkill] != "/skills/env" {
+		t.Fatalf("env skills = %q, want /skills/env", dirs[artifacts.KindSkill])
+	}
+
+	s := ai.Settings{SkillDir: "/skills/settings"}
+	dirs = artifactUserDirs(&s)
+	if dirs[artifacts.KindSkill] != "/skills/env" {
+		t.Fatalf("env should win over settings: %q", dirs[artifacts.KindSkill])
+	}
+
+	t.Setenv("TAU_SKILLS_DIR", "")
+	dirs = artifactUserDirs(&s)
+	if dirs[artifacts.KindSkill] != "/skills/settings" {
+		t.Fatalf("settings skills = %q, want /skills/settings", dirs[artifacts.KindSkill])
+	}
+}
+
+func TestPromoteConfigDirFlag(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", "")
+
+	promoteConfigDirFlag([]string{"tau", "--config-dir=/tmp/a"})
+	if got := os.Getenv("TAU_CONFIG_DIR"); got != "/tmp/a" {
+		t.Fatalf("inline form: got %q", got)
+	}
+
+	t.Setenv("TAU_CONFIG_DIR", "")
+	promoteConfigDirFlag([]string{"tau", "--config-dir", "/tmp/b", "do", "things"})
+	if got := os.Getenv("TAU_CONFIG_DIR"); got != "/tmp/b" {
+		t.Fatalf("space form: got %q", got)
+	}
+
+	t.Setenv("TAU_CONFIG_DIR", "")
+	promoteConfigDirFlag([]string{"tau", "prompt", "--", "--config-dir=/tmp/c"})
+	if got := os.Getenv("TAU_CONFIG_DIR"); got != "" {
+		t.Fatalf("after -- should be ignored: got %q", got)
 	}
 }

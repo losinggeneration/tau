@@ -141,6 +141,11 @@ type DiscoveryConfig struct {
 	CWD string
 	// SettingsPaths are explicit paths from settings.json.
 	SettingsPaths map[ArtifactKind][]string
+	// UserDirs overrides the user-global artifact directories per kind.
+	// Kinds without an entry (or with an empty value) default to
+	// <HomeDir>/.tau/agent/<subdir>. Callers resolve env/config-dir policy
+	// before building this map; Walk itself reads no environment.
+	UserDirs map[ArtifactKind]string
 	// CLIPaths are explicit paths from CLI flags.
 	CLIPaths map[ArtifactKind][]string
 	// PackagePaths are directories to scan for installed packages.
@@ -238,24 +243,26 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 
 	// 3. User-global paths (TierUser)
 	userAgentDir := filepath.Join(cfg.HomeDir, ".tau", "agent")
+	userDir := func(kind ArtifactKind, def string) string {
+		if dir := cfg.UserDirs[kind]; dir != "" {
+			return dir
+		}
+		return filepath.Join(userAgentDir, def)
+	}
 	if !cfg.DisableSkills {
-		skillsDir := filepath.Join(userAgentDir, "skills")
-		e, _ := discoverDir(skillsDir, KindSkill, TierUser, false, cfg.HomeDir)
+		e, _ := discoverDir(userDir(KindSkill, "skills"), KindSkill, TierUser, false, cfg.HomeDir)
 		entries = append(entries, e...)
 	}
 	if !cfg.DisablePrompts {
-		promptsDir := filepath.Join(userAgentDir, "prompts")
-		e, _ := discoverDir(promptsDir, KindPrompt, TierUser, false, cfg.HomeDir)
+		e, _ := discoverDir(userDir(KindPrompt, "prompts"), KindPrompt, TierUser, false, cfg.HomeDir)
 		entries = append(entries, e...)
 	}
 	if !cfg.DisableThemes {
-		themesDir := filepath.Join(userAgentDir, "themes")
-		e, _ := discoverDir(themesDir, KindTheme, TierUser, false, cfg.HomeDir)
+		e, _ := discoverDir(userDir(KindTheme, "themes"), KindTheme, TierUser, false, cfg.HomeDir)
 		entries = append(entries, e...)
 	}
 	if !cfg.DisableExtensions {
-		extensionsDir := filepath.Join(userAgentDir, "extensions")
-		e, _ := discoverDir(extensionsDir, KindExtension, TierUser, false, cfg.HomeDir)
+		e, _ := discoverDir(userDir(KindExtension, "extensions"), KindExtension, TierUser, false, cfg.HomeDir)
 		entries = append(entries, e...)
 	}
 
