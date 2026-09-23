@@ -2647,6 +2647,143 @@ func TestCompactTrimsTranscriptToFitContextWindow(t *testing.T) {
 		"summary MaxTokens = %d, want a modest cap ≤ 8192 (not the model's full output budget)", opts.MaxTokens)
 }
 
+// TestCompactPassesSessionThinkingLevelToSummarizer pins the zai/glm-5.3
+// compaction fallback: the summarization call sent no reasoning option, so
+// the OpenAI-compat layer explicitly disabled thinking (enable_thinking:
+// false) for reasoning models. Always-thinking models reject that with
+// "1210 ... cannot be disabled" and compaction silently degraded to a local
+// summary. The session's selected thinking level must ride along so the
+// summarization request looks like a normal prompt.
+func TestCompactPassesSessionThinkingLevelToSummarizer(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	provider := &recordingProvider{
+		api:          "test-api-sdk",
+		responseText: "summary with keyword fennel",
+		caps:         ai.Capabilities{Tools: true, Streaming: true},
+	}
+	ai.Register("test-api-sdk", provider)
+	model := &ai.Model{
+		ID:            "compact-thinking-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		Reasoning:     true,
+		ContextWindow: 128_000,
+	}
+	ai.RegisterModel(model)
+
+	newSession := func(level agent.ThinkingLevel) *agentSession {
+		session := &agentSession{
+			model:         model,
+			thinkingLevel: level,
+			clientFactory: func(m *ai.Model) (ai.Client, error) {
+				return provider.NewClient(m)
+			},
+		}
+		session.agent = mustNewAgentForTest(t, model)
+		session.agent.ReplaceMessages([]*agent.Message{
+			{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "remember the keyword fennel"}}},
+		})
+		return session
+	}
+
+	t.Run("selected level forwarded", func(t *testing.T) {
+		require.NoError(t, newSession(agent.ThinkingHigh).Compact(testContext(t)))
+		assert.Equal(t, ai.ReasoningHigh, provider.CompleteOptions().Reasoning,
+			"compaction must forward the session thinking level so reasoning models don't get thinking disabled")
+	})
+
+	t.Run("off stays off", func(t *testing.T) {
+		require.NoError(t, newSession(agent.ThinkingOff).Compact(testContext(t)))
+		assert.Equal(t, ai.ReasoningLevel(""), provider.CompleteOptions().Reasoning,
+			"thinking off must not inject a reasoning option")
+	})
+}
+
+// TestCompactMarksFallbackInSessionLog pins the observability gap where a
+// fallback compaction was indistinguishable from a model-driven one in the
+// persisted session file: the compaction entry needs fallback/fallback_error
+// fields so the log alone shows the summarization model call failed and a
+// local naive summary was substituted.
+func TestCompactMarksFallbackInSessionLog(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+	model := &ai.Model{
+		ID:            "compact-fallback-log-model",
+		Provider:      "test-provider",
+		API:           "test-api-sdk",
+		ContextWindow: 128_000,
+	}
+	ai.RegisterModel(model)
+
+	compactWith := func(t *testing.T, client ai.Client) ([]sessionpkg.Entry, string) {
+		t.Helper()
+		storage, err := sessionpkg.NewStorageAt(t.TempDir())
+		require.NoError(t, err)
+		header := sessionpkg.NewHeader(".", nil, nil, "fallback log")
+		writer, err := storage.Create(header)
+		require.NoError(t, err)
+
+		parent := "parent-entry"
+		session := &agentSession{
+			model:         model,
+			logger:        logging.NewText(&bytes.Buffer{}, slog.LevelWarn),
+			sessionWriter: writer,
+			parentMsgID:   &parent,
+			clientFactory: func(m *ai.Model) (ai.Client, error) { return client, nil },
+		}
+		session.agent = mustNewAgentForTest(t, model)
+		session.agent.ReplaceMessages([]*agent.Message{
+			{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "remember the keyword sorrel"}}},
+		})
+
+		require.NoError(t, session.Compact(testContext(t)))
+		require.NoError(t, writer.Close())
+
+		data, err := os.ReadFile(writer.Path())
+		require.NoError(t, err)
+		reader, err := sessionpkg.ReadFile(writer.Path())
+		require.NoError(t, err)
+		return reader.Entries(), string(data)
+	}
+
+	findCompaction := func(t *testing.T, entries []sessionpkg.Entry) sessionpkg.Entry {
+		t.Helper()
+		for _, e := range entries {
+			if e.Type == sessionpkg.EntryTypeCompaction {
+				return e
+			}
+		}
+		t.Fatal("no compaction entry in session log")
+		return sessionpkg.Entry{}
+	}
+
+	t.Run("model failure flags the entry", func(t *testing.T) {
+		failing := &mockClient{completeFn: func(context.Context, *ai.Model, *ai.Context, ...ai.Option) (*ai.AssistantMessage, error) {
+			return nil, errors.New("zai: status 400: cannot be disabled")
+		}}
+		entries, raw := compactWith(t, failing)
+
+		entry := findCompaction(t, entries)
+		assert.True(t, entry.Fallback, "persisted compaction entry must record the local fallback")
+		assert.Contains(t, entry.FallbackError, "cannot be disabled")
+		assert.Contains(t, raw, `"fallback":true`, "wire format must carry fallback:true")
+		assert.Contains(t, raw, `"fallback_error":"`, "wire format must carry fallback_error")
+	})
+
+	t.Run("model success leaves the entry unflagged", func(t *testing.T) {
+		provider := &recordingProvider{api: "test-api-sdk", responseText: "model summary", caps: ai.Capabilities{Tools: true, Streaming: true}}
+		client, err := provider.NewClient(model)
+		require.NoError(t, err)
+		entries, raw := compactWith(t, client)
+
+		entry := findCompaction(t, entries)
+		assert.False(t, entry.Fallback)
+		assert.Empty(t, entry.FallbackError)
+		assert.NotContains(t, raw, `"fallback":`, "successful compaction must not carry fallback fields")
+	})
+}
+
 // TestCompactReportsModelFallback pins the observability half of the /compact
 // bug: when the summarization call fails, Compact silently substituted a
 // naive local summary. The failure never reached the session log or the

@@ -79,11 +79,13 @@ type Entry struct {
 	NewPosition *string `json:"new_position,omitempty"`
 
 	// Compaction fields
-	Summary      *string `json:"summary,omitempty"`
-	FirstKeptID  *string `json:"first_kept_entry_id,omitempty"`
-	TokensBefore *int    `json:"tokens_before,omitempty"`
-	TokensAfter  *int    `json:"tokens_after,omitempty"`
-	FromHook     bool    `json:"from_hook,omitempty"`
+	Summary       *string `json:"summary,omitempty"`
+	FirstKeptID   *string `json:"first_kept_entry_id,omitempty"`
+	TokensBefore  *int    `json:"tokens_before,omitempty"`
+	TokensAfter   *int    `json:"tokens_after,omitempty"`
+	FromHook      bool    `json:"from_hook,omitempty"`
+	Fallback      bool    `json:"fallback,omitempty"`
+	FallbackError string  `json:"fallback_error,omitempty"`
 
 	// BranchSummary fields
 	FromID *string `json:"from_id,omitempty"`

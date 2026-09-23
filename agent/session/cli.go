@@ -172,6 +172,12 @@ func (c *CLI) Show(ctx context.Context, id string, w io.Writer) error {
 		case EntryTypeCompaction:
 			if e.Summary != nil {
 				out.Printf("[%s] compaction (hook=%v)\n", ts, e.FromHook)
+				if e.Fallback {
+					out.Printf("  fallback: local summary (model call failed)\n")
+					if e.FallbackError != "" {
+						out.Printf("  error: %s\n", e.FallbackError)
+					}
+				}
 				out.Printf("  kept from: %s\n", func() string {
 					if e.FirstKeptID != nil {
 						return (*e.FirstKeptID)[:8]

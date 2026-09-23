@@ -1072,6 +1072,13 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	if writer != nil && parentID != nil {
 		entry := sessionpkg.NewCompactionEntry(summary, *parentID, tokensBefore, 0, false)
 		entry.ID = sessionpkg.NewID()
+		if summarizeErr != nil {
+			// The session log must show this compaction degraded to a local
+			// summary; without the flag a silent fallback is indistinguishable
+			// from a model-driven one when reading the file later.
+			entry.Fallback = true
+			entry.FallbackError = summarizeErr.Error()
+		}
 		if err := writer.Append(entry); err != nil {
 			return fmt.Errorf("append compaction entry: %w", err)
 		}
@@ -1198,6 +1205,15 @@ func trimTranscriptForSummary(transcript string, contextWindow int) string {
 // caller falls back to the naive instant summary.
 func (s *agentSession) compactionCompletionOptions(ctx context.Context) []ai.Option {
 	opts := []ai.Option{ai.WithSessionID(s.id)}
+	// Mirror buildAIOptions: with no level set, the OpenAI-compat layer sends
+	// enable_thinking:false, which always-thinking models (zai glm-5.3) reject
+	// (error 1210) — so forward the session's level like a normal prompt does.
+	s.mu.Lock()
+	level := s.thinkingLevel
+	s.mu.Unlock()
+	if level != "" && level != agent.ThinkingOff {
+		opts = append(opts, ai.WithReasoning(ai.ReasoningLevel(level)))
+	}
 	if s.model == nil || s.credentialProvider == nil {
 		return opts
 	}
