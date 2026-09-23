@@ -134,6 +134,7 @@ func NewCommands() *Commands {
 	c.Register(Command{Name: "new", Description: "Start a new session", Handler: cmdNew})
 	c.Register(Command{Name: "compact", Description: "Compact session history", Handler: cmdCompact})
 	c.Register(Command{Name: "resume", Description: "Resume a saved session", Handler: cmdResume})
+	c.Register(Command{Name: "history", Description: "Show the full session history (uncompacted)", Handler: cmdHistory})
 	// /reload is deliberately not registered here: the session's command
 	// pipeline owns it (artifact + plugin reload), and a local entry — even a
 	// stub — would shadow that handler.
@@ -534,6 +535,26 @@ func cmdShowModel(app *App, _ string) {
 
 func cmdQuit(app *App, _ string) {
 	app.quit()
+}
+
+// cmdHistory re-seeds the chat log with the entire persisted transcript,
+// ignoring compaction truncation: the default resume view starts at the most
+// recent compaction, so pre-compaction messages are otherwise unreachable from
+// the TUI. This is display-only; the agent's context stays compacted.
+func cmdHistory(app *App, _ string) {
+	if app == nil || app.sess == nil {
+		return
+	}
+	full, ok := app.sess.(sdk.FullMessageLister)
+	if !ok {
+		app.conv.AddError("history: full history is unavailable for this session")
+		app.refreshChat()
+		return
+	}
+	messages := full.GetAllMessages()
+	app.replaceConversation(NewConversationModel())
+	app.populateChatFromMessages(messages, "full session history (context stays compacted)")
+	app.refreshChat()
 }
 
 func cmdResume(app *App, args string) {

@@ -2988,6 +2988,55 @@ func TestCompactMarksFallbackInSessionLog(t *testing.T) {
 // fallback compaction is not real context. A later /compact must summarize
 // the messages the first failed attempt saw — the fallback summaries are
 // never sent as compaction input — and keep retrying until one succeeds.
+// GetAllMessages is the full-history view for UIs: unlike GetMessages (the
+// live agent context, truncated at the most recent compaction) it walks the
+// session file so pre-compaction messages and in-place summaries are included.
+func TestGetAllMessagesReturnsFullTranscript(t *testing.T) {
+	storage, err := sessionpkg.NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	header := sessionpkg.NewHeader(".", nil, nil, "full transcript")
+	writer, err := storage.Create(header)
+	require.NoError(t, err)
+
+	msg1 := sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"before the compaction"}`), nil)
+	require.NoError(t, writer.Append(msg1))
+	msg2 := sessionpkg.NewMessageEntry(&msg1.ID, json.RawMessage(`{"role":"assistant","content":"acknowledged"}`), nil)
+	require.NoError(t, writer.Append(msg2))
+	compaction := sessionpkg.NewCompactionEntry("early history summarized", msg2.ID, 100, 20, false)
+	require.NoError(t, writer.Append(compaction))
+	msg3 := sessionpkg.NewMessageEntry(&msg2.ID, json.RawMessage(`{"role":"user","content":"after the compaction"}`), nil)
+	require.NoError(t, writer.Append(msg3))
+	require.NoError(t, writer.Close())
+
+	session := &agentSession{
+		logger:        logging.NewText(&bytes.Buffer{}, slog.LevelWarn),
+		sessionWriter: writer,
+	}
+	session.agent = mustNewAgentForTest(t, nil)
+	session.agent.ReplaceMessages([]*agent.Message{
+		{Role: agent.RoleSystem, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "Session Summary: early history summarized"}}},
+		{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "after the compaction"}}},
+	})
+
+	live := session.GetMessages()
+	if len(live) != 2 {
+		t.Fatalf("GetMessages count = %d, want 2 (compacted live context)", len(live))
+	}
+
+	all := session.GetAllMessages()
+	var texts []string
+	for _, m := range all {
+		texts = append(texts, m.Text)
+	}
+	// The compaction kept msg2 onward, so its summary sits between the
+	// summarized msg1 and the kept msg2.
+	joined := strings.Join(texts, "|")
+	want := "before the compaction|Session Summary: early history summarized|acknowledged|after the compaction"
+	if joined != want {
+		t.Errorf("GetAllMessages texts = %q, want %q", joined, want)
+	}
+}
+
 func TestCompactRetriesAfterFallbackCompaction(t *testing.T) {
 	ai.Clear()
 	ai.Init()

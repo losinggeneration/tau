@@ -346,6 +346,12 @@ type Compactor interface {
 // MessageLister exposes the session's in-memory messages.
 type MessageLister interface{ GetMessages() []Message }
 
+// FullMessageLister exposes the entire persisted transcript on the active
+// branch, ignoring compaction truncation: pre-compaction messages are included
+// and each compaction summary appears in place. For UIs that want to display
+// full history; the agent context stays compacted.
+type FullMessageLister interface{ GetAllMessages() []Message }
+
 // ForkMessageLister exposes user messages suitable for fork pickers.
 type ForkMessageLister interface{ GetUserMessagesForForking() []Message }
 
@@ -633,6 +639,7 @@ var (
 	_ RetryController               = (*agentSession)(nil)
 	_ CompactionController          = (*agentSession)(nil)
 	_ MessageLister                 = (*agentSession)(nil)
+	_ FullMessageLister             = (*agentSession)(nil)
 	_ ForkMessageLister             = (*agentSession)(nil)
 	_ HTMLExporter                  = (*agentSession)(nil)
 	_ Namer                         = (*agentSession)(nil)
@@ -1838,6 +1845,28 @@ func (s *agentSession) GetMessages() []Message {
 		messages = append(messages, sdkMessageFromAgent(msg))
 	}
 	return messages
+}
+
+// GetAllMessages returns the full persisted transcript, ignoring compaction
+// truncation. Falls back to the live message list when there is no session
+// file to read (ephemeral sessions), so callers get the best available view.
+func (s *agentSession) GetAllMessages() []Message {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	s.mu.Unlock()
+	if writer == nil {
+		return s.GetMessages()
+	}
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	if err != nil {
+		return s.GetMessages()
+	}
+	msgs := sessionMessagesToAgentMessages(reader.AllMessages())
+	out := make([]Message, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, sdkMessageFromAgent(msg))
+	}
+	return out
 }
 
 func (s *agentSession) GetUserMessagesForForking() []Message {

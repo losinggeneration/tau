@@ -473,6 +473,58 @@ func TestContextEntriesUnwoundSkipsFallbackCompactions(t *testing.T) {
 	}
 }
 
+// AllMessages is the full-history view: every message on the active branch in
+// order, compaction summaries in place, ignoring compaction truncation. UIs
+// seed a full transcript from it; the agent context must still use
+// ToAgentMessages, which starts at the most recent compaction.
+func TestAllMessagesIgnoresCompactionTruncation(t *testing.T) {
+	dir := t.TempDir()
+	header := NewHeader("/test", nil, nil)
+	w, _ := CreateSessionFile(dir, header)
+
+	msg1 := NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"1"}`), nil)
+	w.Append(msg1)
+	msg2 := NewMessageEntry(&msg1.ID, json.RawMessage(`{"role":"assistant","content":"2"}`), nil)
+	w.Append(msg2)
+	msg3 := NewMessageEntry(&msg2.ID, json.RawMessage(`{"role":"user","content":"3"}`), nil)
+	w.Append(msg3)
+
+	compaction := NewCompactionEntry("Summary of 1-2", msg3.ID, 100, 20, false)
+	w.Append(compaction)
+
+	msg4 := NewMessageEntry(&msg3.ID, json.RawMessage(`{"role":"assistant","content":"4"}`), nil)
+	w.Append(msg4)
+
+	w.Close()
+
+	r, _ := ReadFile(w.Path())
+
+	if got := len(r.ToAgentMessages()); got != 3 {
+		t.Fatalf("ToAgentMessages count = %d, want 3 (summary + post-compaction)", got)
+	}
+
+	all := r.AllMessages()
+	var roles, texts []string
+	for _, m := range all {
+		roles = append(roles, string(m.Role))
+		for _, block := range m.Content {
+			if block.Type == ai.ContentBlockText {
+				texts = append(texts, block.Text)
+			}
+		}
+	}
+	if len(all) != 5 {
+		t.Fatalf("AllMessages count = %d, want 5 (all four messages + the summary in place)", len(all))
+	}
+	wantTexts := []string{"1", "2", "Session Summary: Summary of 1-2", "3", "4"}
+	if strings.Join(texts, "|") != strings.Join(wantTexts, "|") {
+		t.Errorf("AllMessages texts = %q, want %q", texts, wantTexts)
+	}
+	if roles[2] != string(MessageRoleSystem) {
+		t.Errorf("summary in place role = %q, want system", roles[2])
+	}
+}
+
 func TestReaderTree(t *testing.T) {
 	dir := t.TempDir()
 	header := NewHeader("/test", nil, nil)

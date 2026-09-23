@@ -28,7 +28,7 @@ func TestCommandsBuiltins(t *testing.T) {
 		"help", "model", "show-model", "quit",
 		"settings", "scoped-models", "export", "import", "share",
 		"copy", "name", "session", "changelog", "hotkeys", "layout", "fork",
-		"tree", "login", "logout", "new", "compact", "resume",
+		"tree", "login", "logout", "new", "compact", "resume", "history",
 	}
 	got := make([]string, 0, len(c.All()))
 	for _, cmd := range c.All() {
@@ -68,16 +68,16 @@ func TestCommandsFilter(t *testing.T) {
 		prefix string
 		want   []string
 	}{
-		// Empty prefix returns all 22 builtins. We list them
+		// Empty prefix returns all builtins. We list them
 		// explicitly so any change to NewCommands is caught here
 		// (this is the canonical command list for the TUI).
 		{"", []string{
 			"help", "model", "show-model", "quit",
 			"settings", "scoped-models", "export", "import", "share",
 			"copy", "name", "session", "changelog", "hotkeys", "layout", "fork",
-			"tree", "login", "logout", "new", "compact", "resume",
+			"tree", "login", "logout", "new", "compact", "resume", "history",
 		}},
-		{"h", []string{"help", "hotkeys"}},
+		{"h", []string{"help", "history", "hotkeys"}},
 		{"c", []string{"changelog", "compact", "copy"}},
 		{"q", []string{"quit"}},
 		{"m", []string{"model"}},
@@ -468,12 +468,12 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 	fs.mu.Unlock()
 
 	items := app.completionItems("")
-	// The local registry has 22 entries (4 originals + 18 stubs).
-	// Plus 2 from the session = 24. We don't assert the exact list
+	// The local registry has 23 entries (4 originals + 19 stubs).
+	// Plus 2 from the session = 25. We don't assert the exact list
 	// ordering beyond the first five (the originals) so
 	// future stub additions don't break this test.
-	if len(items) != 24 {
-		t.Fatalf("completionItems = %d items, want 24 (22 local + 2 external)", len(items))
+	if len(items) != 25 {
+		t.Fatalf("completionItems = %d items, want 25 (23 local + 2 external)", len(items))
 	}
 	wantLocal := []string{"help", "model", "show-model", "quit", "settings"}
 	for i, name := range wantLocal {
@@ -527,10 +527,10 @@ func TestRegisterUnregisterAtRuntime(t *testing.T) {
 	// show-model, quit) plus 18 interactive stubs/commands (settings,
 	// scoped-models, export, import, share, copy, name, session,
 	// changelog, hotkeys, fork, tree, login, logout, new, compact,
-	// resume). /reload is not a TUI local — the session owns it.
-	// With 1 plugin registered, All() returns 23.
-	if got := len(c.All()); got != 23 {
-		t.Errorf("All() length = %d, want 23 (22 builtins + 1 plugin)", got)
+	// resume, history). /reload is not a TUI local — the session owns it.
+	// With 1 plugin registered, All() returns 24.
+	if got := len(c.All()); got != 24 {
+		t.Errorf("All() length = %d, want 24 (23 builtins + 1 plugin)", got)
 	}
 	if !c.Unregister("plugin-cmd") {
 		t.Error("Unregister(plugin-cmd) returned false")
@@ -753,6 +753,54 @@ func TestCmdTreeShowsSessionParents(t *testing.T) {
 		if !strings.Contains(msgs[0].Text, must) {
 			t.Fatalf("tree output missing %q:\n%s", must, msgs[0].Text)
 		}
+	}
+}
+
+// /history re-seeds the chat log with the full persisted transcript: the
+// default resume view is the compacted context, so pre-compaction messages are
+// otherwise unreachable from the TUI. The agent context is untouched.
+func TestCmdHistorySeedsFullTranscript(t *testing.T) {
+	app := newTestApp(t)
+	fs := app.sess.(*fakeSession)
+	fs.messages = []sdkpkg.Message{
+		{Role: "system", Text: "Session Summary: early history"},
+		{Role: "user", Text: "after the compaction"},
+	}
+	fs.allMessages = []sdkpkg.Message{
+		{Role: "user", Text: "before the compaction"},
+		{Role: "assistant", Text: "acknowledged"},
+		{Role: "system", Text: "Session Summary: early history"},
+		{Role: "user", Text: "after the compaction"},
+	}
+
+	cmdHistory(app, "")
+
+	var joined []string
+	for _, m := range app.conv.Messages() {
+		joined = append(joined, m.Text)
+	}
+	all := strings.Join(joined, "\n")
+	for _, want := range []string{"before the compaction", "acknowledged", "Session Summary: early history", "after the compaction", "full session history"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("/history output missing %q:\n%s", want, all)
+		}
+	}
+}
+
+// A session that cannot supply the full transcript reports it instead of
+// silently doing nothing.
+func TestCmdHistoryWithoutFullListerReportsUnavailable(t *testing.T) {
+	app := newTestApp(t)
+	app.sess = &sessionNoFollowUp{inner: app.sess.(*fakeSession)}
+
+	cmdHistory(app, "")
+
+	msgs := app.conv.Messages()
+	if len(msgs) != 1 || msgs[0].Role != RoleError {
+		t.Fatalf("messages = %+v, want one error row", msgs)
+	}
+	if !strings.Contains(msgs[0].Text, "full history") {
+		t.Errorf("error = %q, want the full-history unavailability notice", msgs[0].Text)
 	}
 }
 

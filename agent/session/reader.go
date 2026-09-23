@@ -197,6 +197,59 @@ func (r *Reader) ToAgentMessages() []*Message {
 	return messages
 }
 
+// AllMessages returns every message on the active branch in order, ignoring
+// compaction truncation: pre-compaction messages are included and each
+// compaction summary appears in place as its "Session Summary:" system
+// message, right before the first entry that compaction kept. This is the
+// full-history view for display and replay; the agent context must use
+// ToAgentMessages, which starts at the most recent compaction.
+func (r *Reader) AllMessages() []*Message {
+	branch := r.ActiveBranch()
+	if len(branch) == 0 {
+		return nil
+	}
+	byID := make(map[string]*Entry, len(r.entries))
+	for i := range r.entries {
+		byID[r.entries[i].ID] = &r.entries[i]
+	}
+	onBranch := make(map[string]bool, len(branch))
+	for _, id := range branch {
+		onBranch[id] = true
+	}
+	// Compaction entries are detached from the tree (nil parent, no children —
+	// later messages keep parenting to the last message), so a branch walk
+	// alone skips them. Anchor each one before the first entry it kept; that is
+	// also where it belongs chronologically in the full view.
+	summariesBefore := make(map[string][]*Entry)
+	for i := range r.entries {
+		e := &r.entries[i]
+		if e.Type != EntryTypeCompaction || e.FirstKeptID == nil || !onBranch[*e.FirstKeptID] {
+			continue
+		}
+		summariesBefore[*e.FirstKeptID] = append(summariesBefore[*e.FirstKeptID], e)
+	}
+	messages := make([]*Message, 0, len(branch)+len(summariesBefore))
+	appendInContext := func(e *Entry) {
+		if !e.Type.InContext() {
+			return
+		}
+		if msg := e.ToAgentMessage(); msg != nil {
+			messages = append(messages, msg)
+		}
+	}
+	for _, id := range branch {
+		for _, e := range summariesBefore[id] {
+			appendInContext(e)
+		}
+		e, ok := byID[id]
+		if !ok {
+			continue
+		}
+		appendInContext(e)
+	}
+	return messages
+}
+
 // CurrentPosition resolves the current position in the session tree.
 // It returns the entry ID of the current head. If a position_change exists,
 // it finds the last message after that position_change whose ancestry includes

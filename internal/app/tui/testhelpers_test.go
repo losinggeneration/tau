@@ -51,6 +51,7 @@ type fakeSession struct {
 	setThinkingErr   error
 	thinkingLevels   []string
 	messages         []sdkpkg.Message
+	allMessages      []sdkpkg.Message
 	compactCalls     int
 	compactArgs      []string
 	compactErr       error
@@ -157,6 +158,21 @@ func (f *fakeSession) GetMessages() []sdkpkg.Message {
 	defer f.mu.Unlock()
 	out := make([]sdkpkg.Message, len(f.messages))
 	copy(out, f.messages)
+	return out
+}
+
+// GetAllMessages reports allMessages when set, mimicking the full persisted
+// transcript; otherwise it mirrors GetMessages like an ephemeral session does.
+func (f *fakeSession) GetAllMessages() []sdkpkg.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.allMessages == nil {
+		out := make([]sdkpkg.Message, len(f.messages))
+		copy(out, f.messages)
+		return out
+	}
+	out := make([]sdkpkg.Message, len(f.allMessages))
+	copy(out, f.allMessages)
 	return out
 }
 
