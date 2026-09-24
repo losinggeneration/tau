@@ -37,6 +37,53 @@ func TestMarkdown_WrapsPadsAndExpandsTabs(t *testing.T) {
 	}
 }
 
+// TestMarkdownRenderWrappedMarksSoftWrapContinuations pins the wrap state
+// RenderWrapped reports: rows a word wrap produced beyond the first carry
+// Cont=true, while rows that start a new source line do not. Copy/reflow
+// consumers need this to join wrapped rows without inventing line breaks.
+func TestMarkdownRenderWrappedMarksSoftWrapContinuations(t *testing.T) {
+	md := NewMarkdown("alpha beta gamma delta epsilon zeta")
+	rows := md.RenderWrapped(12)
+	if len(rows) < 3 {
+		t.Fatalf("RenderWrapped rows = %#v, want at least 3 wrapped rows", rows)
+	}
+	for i, row := range rows {
+		if i == 0 {
+			if row.Cont {
+				t.Fatalf("first row marked as continuation: %#v", rows)
+			}
+			continue
+		}
+		if !row.Cont {
+			t.Fatalf("row %d (%q) not marked as continuation: %#v", i, row.Text, rows)
+		}
+	}
+
+	two := NewMarkdown("short\n\nalso short").RenderWrapped(40)
+	for i, row := range two {
+		if row.Cont {
+			t.Fatalf("separate source rows must not be continuations: row %d = %#v", i, row)
+		}
+	}
+}
+
+// TestMarkdownRenderDelegatesToRenderWrapped keeps Render an exact projection
+// of RenderWrapped's text so the two paths can never drift.
+func TestMarkdownRenderDelegatesToRenderWrapped(t *testing.T) {
+	md := NewMarkdown("# Title\n- one\nsome long paragraph that wraps at a narrow width for sure")
+	for _, width := range []int{5, 12, 40} {
+		got := md.Render(width)
+		wrapped := md.RenderWrapped(width)
+		want := make([]string, len(wrapped))
+		for i, row := range wrapped {
+			want[i] = row.Text
+		}
+		if !equalStrings(got, want) {
+			t.Fatalf("Render(%d) = %#v, want %#v", width, got, want)
+		}
+	}
+}
+
 func TestMarkdown_HeadingsListsAndCode(t *testing.T) {
 	md := NewMarkdown("# Title\n- one\n```\nfmt.Println(1)\n```")
 	got := md.Render(40)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/losinggeneration/tau/ai"
 	sdkpkg "github.com/losinggeneration/tau/sdk"
+	tauui "github.com/losinggeneration/tau/tui"
 )
 
 // sdkSlashInfo is a local alias so the merge test reads naturally.
@@ -551,6 +552,36 @@ func names(cs []Command) []string {
 	return out
 }
 
+// TestCmdCopyCopiesLastReplyByDefault pins that bare /copy is wired to the
+// real implementation: it copies the last assistant reply to the clipboard,
+// not a "coming soon" stub. /copy all and /copy last keep their explicit forms.
+func TestCmdCopyCopiesLastReplyByDefault(t *testing.T) {
+	app := newTestApp(t)
+	app.conv.AddUserMessage("question")
+	app.conv.AddAssistantMessage("the answer")
+
+	var copied string
+	ctx := &tauui.Ctx{ClipboardWrite: func(s string) { copied = s }}
+	app.loopMu.Lock()
+	app.loopCtx = ctx
+	app.loopMu.Unlock()
+
+	cmd, ok := app.cmds.Lookup("copy")
+	if !ok {
+		t.Fatal("copy command not registered")
+	}
+	cmd.Handler(app, "")
+
+	if copied != "the answer" {
+		t.Fatalf("clipboard = %q, want the last assistant reply %q", copied, "the answer")
+	}
+	msgs := app.conv.Messages()
+	last := msgs[len(msgs)-1]
+	if last.Role != RoleSystem || last.Text != "copy: copied last" {
+		t.Fatalf("notice = %q (%s), want \"copy: copied last\" (system)", last.Text, last.Role)
+	}
+}
+
 // TestStubCommandsSurfaceComingSoon verifies each not-yet-wired interactive
 // command surfaces a "coming soon" notice in the chat log when invoked,
 //
@@ -564,7 +595,6 @@ func TestStubCommandsSurfaceComingSoon(t *testing.T) {
 		{"export", "Export the session to a file (coming soon)"},
 		{"import", "Import a session from a file (coming soon)"},
 		{"share", "Share the session (coming soon)"},
-		{"copy", "Copy the last assistant reply to the clipboard (coming soon)"},
 		{"changelog", "Show the changelog (coming soon)"},
 	}
 	for _, tc := range stubs {

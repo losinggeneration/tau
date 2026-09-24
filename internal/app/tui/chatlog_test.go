@@ -287,6 +287,168 @@ func TestChatLogSelectionClampsToVisibleWidth(t *testing.T) {
 	}
 }
 
+func chatLogContentRowBounds(t *testing.T, log *ChatLog, component int) (first, last int) {
+	t.Helper()
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if component < 0 || component >= len(log.renderedState.spans) {
+		t.Fatalf("component %d not in rendered state", component)
+	}
+	span := log.renderedState.spans[component]
+	if span.start < 0 || span.end > len(log.lines) {
+		t.Fatalf("span %+v outside rendered lines", span)
+	}
+	first, last = -1, -1
+	for i := span.start; i < span.end; i++ {
+		if strings.TrimSpace(tauui.StripANSI(log.lines[i].text)) != "" {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if first < 0 {
+		t.Fatalf("component %d rendered no content rows", component)
+	}
+	return first, last
+}
+
+func dragSelectChatLogRows(t *testing.T, log *ChatLog, y0, y1 int, copied *string) {
+	t.Helper()
+	ctx := &tauui.Ctx{
+		Invalidate:     func(tauui.Rect) {},
+		ClipboardWrite: func(s string) { *copied = s },
+	}
+	if !log.Handle(tauui.MouseEvent{X: 0, Y: y0, Button: tauui.MouseButtonLeft, Action: tauui.MousePress}, ctx) {
+		t.Fatal("mouse press was not handled")
+	}
+	if !log.Handle(tauui.MouseEvent{X: 500, Y: y1, Button: tauui.MouseButtonLeft, Action: tauui.MouseDrag}, ctx) {
+		t.Fatal("mouse drag was not handled")
+	}
+	if !log.Handle(tauui.MouseEvent{X: 500, Y: y1, Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease}, ctx) {
+		t.Fatal("mouse release was not handled")
+	}
+}
+
+// TestChatLogWholeMessageSelectionCopiesUnwrappedText pins that a drag across
+// every rendered row of one message copies the message's own text. Copying the
+// word-wrapped render rows instead leaks hard line breaks at the terminal's
+// wrap width, which mangles wrapped paragraphs, code, and tables.
+func TestChatLogWholeMessageSelectionCopiesUnwrappedText(t *testing.T) {
+	const body = "This is a long assistant paragraph that word wraps across several terminal rows when the chat width is narrow."
+	conv := NewConversationModel()
+	conv.AddAssistantMessage(body)
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 30, H: 20})
+	waitForChatLog(t, log)
+
+	first, last := chatLogContentRowBounds(t, log, 0)
+	if first == last {
+		t.Fatal("test message did not wrap onto multiple rows; test is invalid")
+	}
+
+	var copied string
+	dragSelectChatLogRows(t, log, first, last, &copied)
+	if copied != body {
+		t.Fatalf("copied whole-message selection = %q, want the unwrapped message text %q", copied, body)
+	}
+}
+
+// TestChatLogPartialWrappedSelectionCopiesVisibleRows pins that selecting only
+// part of a wrapped message keeps copying exactly the visible cells: the
+// whole-message copy path must not fire for partial selections.
+func TestChatLogPartialWrappedSelectionCopiesVisibleRows(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddAssistantMessage("one two three four five six seven eight nine ten eleven twelve")
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 20, H: 20})
+	waitForChatLog(t, log)
+
+	first, last := chatLogContentRowBounds(t, log, 0)
+	if first == last {
+		t.Fatal("test message did not wrap onto multiple rows; test is invalid")
+	}
+
+	log.mu.Lock()
+	firstRowText := tauui.StripANSI(log.lines[first].text)
+	log.mu.Unlock()
+
+	var copied string
+	ctx := &tauui.Ctx{
+		Invalidate:     func(tauui.Rect) {},
+		ClipboardWrite: func(s string) { copied = s },
+	}
+	if !log.Handle(tauui.MouseEvent{X: 1, Y: first, Button: tauui.MouseButtonLeft, Action: tauui.MousePress}, ctx) ||
+		!log.Handle(tauui.MouseEvent{X: 500, Y: first, Button: tauui.MouseButtonLeft, Action: tauui.MouseDrag}, ctx) ||
+		!log.Handle(tauui.MouseEvent{X: 500, Y: first, Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease}, ctx) {
+		t.Fatal("selection events were not handled")
+	}
+	if want := strings.TrimPrefix(firstRowText, " "); copied != want {
+		t.Fatalf("copied partial selection = %q, want the visible first row %q", copied, want)
+	}
+}
+
+// TestChatLogWholeTranscriptSelectionJoinsComponentTexts pins the multi-message
+// drag: selecting several complete messages copies each message's text,
+// joined the way /copy all formats them, instead of interleaved wrapped rows.
+func TestChatLogWholeTranscriptSelectionJoinsComponentTexts(t *testing.T) {
+	const firstBody = "First assistant message with more than enough words to wrap across several rows."
+	const secondBody = "Second assistant message that also wraps comfortably across multiple rows here."
+	conv := NewConversationModel()
+	conv.AddAssistantMessage(firstBody)
+	conv.AddAssistantMessage(secondBody)
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 30, H: 20})
+	waitForChatLog(t, log)
+
+	firstStart, _ := chatLogContentRowBounds(t, log, 0)
+	_, secondEnd := chatLogContentRowBounds(t, log, 1)
+
+	var copied string
+	dragSelectChatLogRows(t, log, firstStart, secondEnd, &copied)
+	if want := firstBody + "\n\n" + secondBody; copied != want {
+		t.Fatalf("copied multi-message selection = %q, want %q", copied, want)
+	}
+}
+
+// TestChatLogPartialSelectionAcrossWrappedRowsJoinsSoftWrap pins the partial
+// copy path: dragging from mid-row through the end of a wrapped message must
+// not put a hard break at the terminal's wrap width. Soft-wrapped rows join
+// with the space the wrap consumed; only real source line breaks survive.
+func TestChatLogPartialSelectionAcrossWrappedRowsJoinsSoftWrap(t *testing.T) {
+	const body = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+	conv := NewConversationModel()
+	conv.AddAssistantMessage(body)
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 20, H: 20})
+	waitForChatLog(t, log)
+
+	first, last := chatLogContentRowBounds(t, log, 0)
+	if first == last {
+		t.Fatal("test message did not wrap onto multiple rows; test is invalid")
+	}
+
+	// Press at the third content cell so the selection is partial (the
+	// whole-message copy path must not take it), then drag through the row end.
+	var copied string
+	ctx := &tauui.Ctx{
+		Invalidate:     func(tauui.Rect) {},
+		ClipboardWrite: func(s string) { copied = s },
+	}
+	if !log.Handle(tauui.MouseEvent{X: 3, Y: first, Button: tauui.MouseButtonLeft, Action: tauui.MousePress}, ctx) ||
+		!log.Handle(tauui.MouseEvent{X: 500, Y: last, Button: tauui.MouseButtonLeft, Action: tauui.MouseDrag}, ctx) ||
+		!log.Handle(tauui.MouseEvent{X: 500, Y: last, Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease}, ctx) {
+		t.Fatal("selection events were not handled")
+	}
+
+	if strings.Contains(copied, "\n") {
+		t.Fatalf("copied partial selection carries hard breaks at wrap points: %q", copied)
+	}
+	if want := body[2:]; copied != want {
+		t.Fatalf("copied partial selection = %q, want soft-wrapped join %q", copied, want)
+	}
+}
+
 func TestChatLogRapidUpdatesCoalesceToLatestSnapshot(t *testing.T) {
 	conv := NewConversationModel()
 	conv.AddUserMessage("initial")

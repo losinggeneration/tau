@@ -102,7 +102,16 @@ func (m *Markdown) SetPadding(horizontal, vertical int) {
 	m.paddingY = vertical
 }
 
-func (m *Markdown) Render(width int) []string {
+// MarkdownRow is one rendered markdown row plus its wrap state. Cont marks a
+// row that only exists because word wrapping split the previous row's source
+// line, so copy/reflow consumers can join rows without inventing breaks.
+type MarkdownRow struct {
+	Text string
+	Cont bool
+}
+
+// RenderWrapped renders like Render but reports each row's soft-wrap state.
+func (m *Markdown) RenderWrapped(width int) []MarkdownRow {
 	if m == nil || width <= 0 || !m.visible {
 		return nil
 	}
@@ -119,42 +128,54 @@ func (m *Markdown) Render(width int) []string {
 	rows := renderMarkdownASTWithOpts([]byte(source), contentW, markdownRenderOptions{tableChrome: m.tableChrome})
 	prefix := repeatSpace(m.paddingX)
 
-	out := []string{}
+	out := []MarkdownRow{}
 	for range m.paddingY {
-		out = append(out, repeatSpace(width))
+		out = append(out, MarkdownRow{Text: repeatSpace(width)})
 	}
 	for _, row := range rows {
 		switch {
 		case row == markdownDivider:
-			out = append(out, padRightANSI(prefix+strings.Repeat("─", contentW)+prefix, width))
+			out = append(out, MarkdownRow{Text: padRightANSI(prefix+strings.Repeat("─", contentW)+prefix, width)})
 		case strings.HasPrefix(row, "│ "):
 			if TextWidth(row) <= contentW {
-				out = append(out, padRightANSI(prefix+row+prefix, width))
+				out = append(out, MarkdownRow{Text: padRightANSI(prefix+row+prefix, width)})
 				continue
 			}
 			wrapped := ansi.Wrap(strings.TrimPrefix(row, "│ "), max(1, contentW-2))
-			for _, line := range wrapped {
-				out = append(out, padRightANSI(prefix+"│ "+line+prefix, width))
+			for i, line := range wrapped {
+				out = append(out, MarkdownRow{Text: padRightANSI(prefix+"│ "+line+prefix, width), Cont: i > 0})
 			}
 		case IsImageLine(row):
 			if strings.Contains(row, "\x1b_G") && !strings.HasSuffix(row, "\\") {
 				row += "\\"
 			}
-			out = append(out, row)
+			out = append(out, MarkdownRow{Text: row})
 		case strings.Contains(row, "\x1b_G"):
-			out = append(out, row+"\\")
+			out = append(out, MarkdownRow{Text: row + "\\"})
 		case TextWidth(row) == 0 && row == "":
-			out = append(out, repeatSpace(width))
+			out = append(out, MarkdownRow{Text: repeatSpace(width)})
 		default:
-			for _, line := range ansi.Wrap(row, contentW) {
-				out = append(out, padRightANSI(prefix+line+prefix, width))
+			for i, line := range ansi.Wrap(row, contentW) {
+				out = append(out, MarkdownRow{Text: padRightANSI(prefix+line+prefix, width), Cont: i > 0})
 			}
 		}
 	}
 	for range m.paddingY {
-		out = append(out, repeatSpace(width))
+		out = append(out, MarkdownRow{Text: repeatSpace(width)})
 	}
 
+	return out
+}
+
+func (m *Markdown) Render(width int) []string {
+	rows := m.RenderWrapped(width)
+	if rows == nil {
+		return nil
+	}
+	out := make([]string, len(rows))
+	for i, row := range rows {
+		out[i] = row.Text
+	}
 	return out
 }
 

@@ -9,14 +9,6 @@ import (
 	"github.com/losinggeneration/tau/sdk"
 )
 
-func cmdCopyOrStub(app *App, args string) {
-	if strings.TrimSpace(args) == "" {
-		cmdStub("copy", "Copy the last assistant reply to the clipboard (coming soon)")(app, args)
-		return
-	}
-	cmdCopy(app, args)
-}
-
 func cmdCopy(app *App, args string) {
 	if app == nil || app.conv == nil {
 		return

@@ -68,11 +68,22 @@ func defaultChatPalette() chatPalette {
 }
 
 // renderLine is a single styled terminal row produced by wrapping message
-// content to the chat width.
+// content to the chat width. join records how the row continues the previous
+// one for text copying: a real source break, or a soft wrap that consumed
+// either nothing (character wrap) or one space (word wrap).
 type renderLine struct {
 	text string
 	st   tauui.Style
+	join chatLogJoin
 }
+
+type chatLogJoin uint8
+
+const (
+	joinHard  chatLogJoin = iota // real line break in the source
+	joinNone                     // character-wrap continuation: copy with no separator
+	joinSpace                    // word-wrap continuation: the wrap consumed one space
+)
 
 type chatLogPosition struct {
 	line int
@@ -1097,6 +1108,11 @@ func (c *ChatLog) lineSelectionAtLocked(pos chatLogPosition) chatLogSelection {
 	}
 }
 
+// selectedTextLocked returns the clipboard text for the active selection. A
+// selection covering every content row of one or more whole components copies
+// those components' own text: the word-wrapped render rows would otherwise put
+// hard line breaks at the wrap width, mangling wrapped paragraphs, code, and
+// tables. Partial selections keep copying the exact visible cells.
 func (c *ChatLog) selectedTextLocked() string {
 	start, end, ok := normalizedChatLogSelection(c.selection)
 	if !ok || len(c.lines) == 0 {
@@ -1107,28 +1123,120 @@ func (c *ChatLog) selectedTextLocked() string {
 	if start == end {
 		return ""
 	}
+	if text, ok := c.componentSelectionTextLocked(start, end); ok {
+		return text
+	}
 
 	var b strings.Builder
 	for line := start.line; line <= end.line; line++ {
+		ln := c.lines[line]
 		lineStart := 0
-		lineEnd := tauui.TextWidth(c.lines[line].text)
+		lineEnd := tauui.TextWidth(ln.text)
 		if line == start.line {
 			lineStart = start.col
 		}
 		if line == end.line {
 			lineEnd = end.col
 		}
+		if line > start.line {
+			// A soft-wrapped row continues the previous row's source line, so
+			// it joins with the whitespace its wrap consumed (or nothing for a
+			// character wrap) instead of a newline.
+			switch ln.join {
+			case joinNone:
+				// Character wrap consumed nothing between the rows.
+			case joinSpace:
+				b.WriteByte(' ')
+			default:
+				b.WriteByte('\n')
+			}
+		}
 		if lineStart < lineEnd {
 			// ANSISliceStrict returns the visible-cell slice with any SGR
 			// sequences that landed inside it preserved; StripANSI then
 			// removes the escapes so the clipboard receives plain text.
-			b.WriteString(tauui.StripANSI(tauui.ANSISliceStrict(c.lines[line].text, lineStart, lineEnd)))
-		}
-		if line != end.line {
-			b.WriteByte('\n')
+			piece := tauui.StripANSI(tauui.ANSISliceStrict(ln.text, lineStart, lineEnd))
+			if ln.join != joinHard {
+				// Soft rows carry the row's padding columns at both ends; the
+				// join already accounts for the source whitespace between them.
+				piece = strings.Trim(piece, " ")
+			}
+			b.WriteString(piece)
 		}
 	}
 	return b.String()
+}
+
+// componentSelectionTextLocked returns the logical text of the contiguous run
+// of components the selection fully covers. ok is false when the selection is
+// partial or bleeds into rows outside the run, in which case the caller falls
+// back to copying visible cells. Spans partition the transcript rows in order,
+// so a covered run's texts join like the transcript formatter joins components.
+func (c *ChatLog) componentSelectionTextLocked(start, end chatLogPosition) (string, bool) {
+	state := c.renderedState
+	first, last := -1, -1
+	for i := range state.spans {
+		if i >= len(state.components) || !c.spanCoveredBySelectionLocked(state.spans[i], start, end) {
+			continue
+		}
+		if first < 0 {
+			first = i
+		}
+		last = i
+	}
+	if first < 0 {
+		return "", false
+	}
+	// Rows outside the covered run mean the user also selected part of a
+	// neighbouring component; that is a partial selection, not a message copy.
+	if start.line < state.spans[first].start || end.line >= state.spans[last].end {
+		return "", false
+	}
+	texts := make([]string, 0, last-first+1)
+	for i := first; i <= last; i++ {
+		if !c.spanCoveredBySelectionLocked(state.spans[i], start, end) {
+			return "", false
+		}
+		texts = append(texts, strings.TrimRight(state.components[i].Text, "\n"))
+	}
+	text := strings.Join(texts, "\n\n")
+	if strings.TrimSpace(text) == "" {
+		return "", false
+	}
+	return text, true
+}
+
+// spanCoveredBySelectionLocked reports whether the selection includes every
+// content row of one component's render span, from the row's first content
+// column (col 0 is the row's left padding) through its last visible cell.
+// Single-content-row spans never qualify: nothing was wrapped, so the
+// visible-cell copy is already faithful and keeps inline-code styling intact.
+func (c *ChatLog) spanCoveredBySelectionLocked(span chatLogMessageSpan, start, end chatLogPosition) bool {
+	if span.start < 0 || span.end <= span.start || span.end > len(c.lines) {
+		return false
+	}
+	first, last := -1, -1
+	for i := span.start; i < span.end; i++ {
+		if strings.TrimSpace(tauui.StripANSI(c.lines[i].text)) != "" {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if first < 0 || first == last {
+		return false
+	}
+	if start.line > first || end.line < last {
+		return false
+	}
+	if start.line == first && start.col > 1 {
+		return false
+	}
+	if end.line == last && end.col < tauui.TextWidth(c.lines[last].text) {
+		return false
+	}
+	return true
 }
 
 func (c *ChatLog) paintSelectionForLine(d tauui.Drawer, rect tauui.Rect, line int, ln renderLine, sel chatLogSelection, rowStyle tauui.Style, ctx *tauui.Ctx) {
@@ -2322,7 +2430,11 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 			if i == 0 {
 				lineStyle = commandStyle
 			}
-			out = append(out, renderLine{text: " " + wrappedSegment(prefix, row), st: lineStyle})
+			line := renderLine{text: " " + wrappedSegment(prefix, row), st: lineStyle}
+			if i > 0 {
+				line.join = joinSpace
+			}
+			out = append(out, line)
 		}
 	}
 	if status := bashToolStatusSuffix(tool); status != "" {
@@ -2380,11 +2492,15 @@ func (c *ChatLog) appendBashToolExecutionChrome(ctx context.Context, out []rende
 	}
 	if cmd != "" {
 		command := "$ " + expandChatLogTabs(cmd)
-		for _, row := range tauui.WrapLines(command, tauui.WrapOptions{Width: border.InnerWidth(), Mode: tauui.WrapWord}) {
+		for i, row := range tauui.WrapLines(command, tauui.WrapOptions{Width: border.InnerWidth(), Mode: tauui.WrapWord}) {
 			if ctx.Err() != nil {
 				return out
 			}
-			out = append(out, renderLine{text: border.Line(wrappedSegment(command, row)), st: commandStyle})
+			line := renderLine{text: border.Line(wrappedSegment(command, row)), st: commandStyle}
+			if i > 0 {
+				line.join = joinSpace
+			}
+			out = append(out, line)
 		}
 	}
 	limit := bashToolPreviewLines
@@ -2439,7 +2555,11 @@ func (c *ChatLog) appendReadToolExecution(ctx context.Context, out []renderLine,
 		if i == 0 {
 			lineStyle = st.WithAttr(tauui.AttrBold)
 		}
-		out = append(out, renderLine{text: " " + wrappedSegment(call, row), st: lineStyle})
+		line := renderLine{text: " " + wrappedSegment(call, row), st: lineStyle}
+		if i > 0 {
+			line.join = joinSpace
+		}
+		out = append(out, line)
 	}
 	// A successful read is fully described by its call line: echoing the file
 	// back would bury the transcript in content the user already has on disk.
@@ -3011,7 +3131,7 @@ func (c *ChatLog) appendMarkdown(ctx context.Context, out []renderLine, body str
 	if textWidth < 1 {
 		textWidth = 1
 	}
-	rows := c.newChatMarkdown(body).Render(textWidth)
+	rows := c.newChatMarkdown(body).RenderWrapped(textWidth)
 	if len(rows) == 0 {
 		return append(out, renderLine{text: " ", st: st})
 	}
@@ -3019,7 +3139,11 @@ func (c *ChatLog) appendMarkdown(ctx context.Context, out []renderLine, body str
 		if ctx.Err() != nil {
 			return out
 		}
-		out = append(out, renderLine{text: " " + strings.TrimRight(row, " "), st: st})
+		line := renderLine{text: " " + strings.TrimRight(row.Text, " "), st: st}
+		if row.Cont {
+			line.join = joinNone
+		}
+		out = append(out, line)
 	}
 	return out
 }
@@ -3036,30 +3160,33 @@ func (c *ChatLog) appendPaddedMarkdownBox(ctx context.Context, out []renderLine,
 	}
 	out = append(out, renderLine{text: strings.Repeat(" ", width), st: st})
 	innerWidth := max(1, width-2)
-	rows := c.newChatMarkdown(body).Render(innerWidth)
+	rows := c.newChatMarkdown(body).RenderWrapped(innerWidth)
 	if len(rows) == 0 {
-		rows = []string{""}
+		rows = []tauui.MarkdownRow{{}}
 	}
 	var opt paddedBoxOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
 	if opt.MaxContentLines > 0 && len(rows) > opt.MaxContentLines {
-		rows = append(append([]string(nil), rows[:opt.MaxContentLines]...), opt.TruncatedText)
+		rows = append(append([]tauui.MarkdownRow(nil), rows[:opt.MaxContentLines]...), tauui.MarkdownRow{Text: opt.TruncatedText})
 	}
 	if opt.FooterText != "" {
-		rows = append(rows, opt.FooterText)
+		rows = append(rows, tauui.MarkdownRow{Text: opt.FooterText})
 	}
 	for _, row := range rows {
 		if ctx.Err() != nil {
 			return out
 		}
-		row = tauui.StripANSI(row)
-		text := " " + strings.TrimRight(row, " ")
+		text := " " + strings.TrimRight(tauui.StripANSI(row.Text), " ")
 		if tauui.TextWidth(text) < width {
 			text += strings.Repeat(" ", width-tauui.TextWidth(text))
 		}
-		out = append(out, renderLine{text: text, st: st})
+		line := renderLine{text: text, st: st}
+		if row.Cont {
+			line.join = joinNone
+		}
+		out = append(out, line)
 	}
 	out = append(out, renderLine{text: strings.Repeat(" ", width), st: st})
 	return out
@@ -3079,12 +3206,16 @@ func (c *ChatLog) appendPaddedTextBox(ctx context.Context, out []renderLine, bod
 		if len(rows) == 0 {
 			rows = []string{""}
 		}
-		for _, row := range rows {
+		for i, row := range rows {
 			text := " " + strings.TrimRight(row, " ")
 			if tauui.TextWidth(text) < width {
 				text += strings.Repeat(" ", width-tauui.TextWidth(text))
 			}
-			out = append(out, renderLine{text: text, st: st})
+			line := renderLine{text: text, st: st}
+			if i > 0 {
+				line.join = joinNone
+			}
+			out = append(out, line)
 		}
 	}
 	out = append(out, renderLine{text: strings.Repeat(" ", width), st: st})
@@ -3109,11 +3240,15 @@ func (c *ChatLog) appendWrapped(ctx context.Context, out []renderLine, body stri
 			out = append(out, renderLine{text: " ", st: st})
 			continue
 		}
-		for _, wl := range tauui.WrapLines(logicalLine, tauui.WrapOptions{Width: textWidth, Mode: tauui.WrapWord}) {
+		for i, wl := range tauui.WrapLines(logicalLine, tauui.WrapOptions{Width: textWidth, Mode: tauui.WrapWord}) {
 			if ctx.Err() != nil {
 				return out
 			}
-			out = append(out, renderLine{text: " " + wrappedSegment(logicalLine, wl), st: st})
+			line := renderLine{text: " " + wrappedSegment(logicalLine, wl), st: st}
+			if i > 0 {
+				line.join = joinSpace
+			}
+			out = append(out, line)
 		}
 	}
 	return out

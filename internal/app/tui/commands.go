@@ -121,7 +121,7 @@ func NewCommands() *Commands {
 	c.Register(Command{Name: "export", Description: "Export the current session", Handler: cmdExportOrStub})
 	c.Register(Command{Name: "import", Description: "Import a session", Handler: cmdStub("import", "Import a session from a file (coming soon)")})
 	c.Register(Command{Name: "share", Description: "Share the session", Handler: cmdStub("share", "Share the session (coming soon)")})
-	c.Register(Command{Name: "copy", Description: "Copy the last reply", Handler: cmdCopyOrStub})
+	c.Register(Command{Name: "copy", Description: "Copy the last reply", Handler: cmdCopy})
 	c.Register(Command{Name: "name", Description: "Name this session", Handler: cmdName})
 	c.Register(Command{Name: "session", Description: "Open the session workspace", Handler: cmdSessionWorkspace})
 	c.Register(Command{Name: "changelog", Description: "Show the changelog", Handler: cmdStub("changelog", "Show the changelog (coming soon)")})
