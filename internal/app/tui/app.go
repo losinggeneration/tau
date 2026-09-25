@@ -168,6 +168,7 @@ const (
 	selectorModeModels                       // picking a model
 	selectorModeSessions                     // picking a session to resume
 	selectorModeFiles                        // picking a file reference after @
+	selectorModeFork                         // picking a message to fork from
 )
 
 // EditorHeight is the number of content rows reserved for the prompt editor
@@ -433,6 +434,8 @@ type App struct {
 	// selected, cancelled, or the editor leaves `/resume` mode.
 	sessionSelectorCache      []sdk.SessionInfo
 	sessionSelectorCacheValid bool
+	forkEntries               []sdk.ForkEntry
+	forkShowAll               bool
 	// renameSession renames a persisted session from the workspace UI.
 	renameSession func(context.Context, string, string) error
 	// pinSession and unpinSession update workspace pin state.
@@ -3629,6 +3632,14 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 		}
 	}
 
+	// Fork picker mode. Triggered by typing `/fork ` (with trailing
+	// whitespace). It uses the same inline selector as /model and /resume;
+	// Tab switches between prompts and all messages.
+	if strings.HasPrefix(text, "/fork") && len(text) > 5 && (text[5] == ' ' || text[5] == '\t') {
+		a.openForkSelector(ctx)
+		return
+	}
+
 	// Session picker mode. Triggered by typing `/resume ` (with trailing
 	// whitespace). The focused row fills/commits the session ID through the
 	// same inline selector used for commands and models.
@@ -3896,6 +3907,9 @@ func (a *App) applySelector(_ int, item tauui.SelectorItem) {
 		a.editor.Model().SetCursor(cursor)
 		a.dismissSelector()
 		a.invalidateSelectorLayout(true, false, ctx)
+	case selectorModeFork:
+		a.dismissSelector()
+		forkTo(a, item.Value)
 	}
 }
 
@@ -3918,6 +3932,10 @@ func (a *App) applyFileSelectorCompletion(name string) (string, int, bool) {
 // The dialog picker claims Tab when it's visible — Tab activates
 // the focused item the same way Enter does.
 func (a *App) applySelectorFromAction(ctx *tauui.Ctx) bool {
+	if a.selectorMode == selectorModeFork && a.selector != nil && a.selector.Shown() {
+		a.toggleForkSelector(ctx)
+		return true
+	}
 	if a.dialogPicker != nil && a.dialogPicker.Shown() {
 		if a.dialogPicker.Component() != nil {
 			a.dialogPicker.HandleAction(int(tauui.ActionActivate), ctx)
@@ -3973,10 +3991,9 @@ func (a *App) activateAndSend(ctx *tauui.Ctx) bool {
 	// we want to know which mode the user was in when they hit Enter so
 	// the commit step does the right thing.
 	mode := a.selectorMode
-	// Apply the focused item. This fills the editor and either dismisses
-	// the selector (model or non-model command) or switches it from
-	// command mode to model mode (`/model`).
-	a.applySelectorFromAction(ctx)
+	// Select directly. Tab has mode-specific behavior for the fork picker and
+	// must not leak into Enter activation.
+	a.handleSelectorAction(int(tauui.ActionSelect))
 	// Now commit. trySubmit looks at the editor text and dispatches:
 	//   - /model <id>  → applyModelFromArgs (commits the model)
 	//   - /model       → switches the inline selector into model mode
@@ -3988,7 +4005,7 @@ func (a *App) activateAndSend(ctx *tauui.Ctx) bool {
 	if mode == selectorModeNone {
 		return true
 	}
-	if mode == selectorModeFiles {
+	if mode == selectorModeFiles || mode == selectorModeFork {
 		return true
 	}
 	if ctx == nil || ctx.FocusedID != a.editor.ID() {
@@ -4055,6 +4072,10 @@ func (a *App) dismissSelector() {
 	}
 	if a.selectorMode == selectorModeSessions {
 		a.clearSessionSelectorCache()
+	}
+	if a.selectorMode == selectorModeFork {
+		a.forkEntries = nil
+		a.forkShowAll = false
 	}
 	a.selector.SetShown(false)
 	a.selectorMode = selectorModeNone

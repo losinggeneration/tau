@@ -1789,9 +1789,10 @@ func TestSessionResumeAndFork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open fork: %v", err)
 	}
-	// Fork copies parent entries, so it should have: forkMsg only (fork starts fresh with copy)
-	if r.MessageCount() != 1 {
-		t.Errorf("Fork MessageCount = %d, want 1 (fork has its own message only)", r.MessageCount())
+	// Fork copies the parent's entries into the child file, so the fork is
+	// self-contained: 3 inherited messages plus its own.
+	if r.MessageCount() != 4 {
+		t.Errorf("Fork MessageCount = %d, want 4 (3 inherited + own)", r.MessageCount())
 	}
 
 	// Verify fork references parent

@@ -204,6 +204,12 @@ func cmdForkOrStub(app *App, args string) {
 }
 
 func cmdFork(app *App, args string) {
+	forkTo(app, strings.TrimSpace(args))
+}
+
+// forkTo forks the current session at entry (empty entry = fork from the
+// latest point) and switches to the new session.
+func forkTo(app *App, entry string) {
 	if app == nil || app.conv == nil || app.sess == nil {
 		return
 	}
@@ -222,7 +228,6 @@ func cmdFork(app *App, args string) {
 		app.refreshChat()
 		return
 	}
-	entry := strings.TrimSpace(args)
 	newSess, err := app.sessionFactory(app.ctxOrBackground(), sdk.SessionOptions{ForkFrom: id, ForkFromEntry: entry, CWD: state.CWD(), UI: nil})
 	if err != nil {
 		app.conv.AddError("fork: " + err.Error())
@@ -255,5 +260,10 @@ func cmdFork(app *App, args string) {
 	app.refreshFooterStats(app.loopContext())
 	app.replaceConversation(NewConversationModel())
 	app.seedChatFromSession(newSess, "Forked session "+id+" -> "+newSess.ID())
+	// The `/fork ` trigger leaves its text in the editor; it must not
+	// survive into the forked session.
+	if ctx := app.loopContext(); ctx != nil && app.editor != nil {
+		app.editor.SetText(ctx, "")
+	}
 	app.refreshChat()
 }

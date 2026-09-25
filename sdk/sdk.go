@@ -355,6 +355,22 @@ type FullMessageLister interface{ GetAllMessages() []Message }
 // ForkMessageLister exposes user messages suitable for fork pickers.
 type ForkMessageLister interface{ GetUserMessagesForForking() []Message }
 
+// ForkEntry is a user or agent message that can serve as a fork point.
+type ForkEntry struct {
+	// EntryID is the session entry ID to pass as SessionOptions.ForkFromEntry.
+	EntryID string
+	// Role is "user" or "assistant".
+	Role string
+	// Text is the plain-text content for list display.
+	Text string
+}
+
+// ForkEntryLister exposes the current branch's forkable messages with the
+// entry IDs a fork picker needs.
+type ForkEntryLister interface {
+	GetForkEntries() ([]ForkEntry, error)
+}
+
 // HTMLExporter exports a session as an HTML file.
 type HTMLExporter interface {
 	ExportHTML(ctx context.Context, path string) (string, error)
@@ -641,6 +657,7 @@ var (
 	_ MessageLister                 = (*agentSession)(nil)
 	_ FullMessageLister             = (*agentSession)(nil)
 	_ ForkMessageLister             = (*agentSession)(nil)
+	_ ForkEntryLister               = (*agentSession)(nil)
 	_ HTMLExporter                  = (*agentSession)(nil)
 	_ Namer                         = (*agentSession)(nil)
 	_ LastAssistantTexter           = (*agentSession)(nil)
@@ -1878,6 +1895,53 @@ func (s *agentSession) GetUserMessagesForForking() []Message {
 		}
 	}
 	return users
+}
+
+// GetForkEntries returns the user and assistant messages on the session's
+// current branch, oldest first, with the entry IDs needed to fork at them.
+// A session that has not been persisted yet has no entries.
+func (s *agentSession) GetForkEntries() ([]ForkEntry, error) {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	s.mu.Unlock()
+	if writer == nil {
+		return nil, nil
+	}
+	writerPath := writer.Path()
+	reader, err := sessionpkg.ReadFile(writerPath)
+	if err != nil {
+		return nil, fmt.Errorf("read session for fork entries: %w", err)
+	}
+	branch := entriesTo(sessionEntries(reader), reader.CurrentPosition())
+	out := make([]ForkEntry, 0, len(branch))
+	for _, entry := range branch {
+		if !entry.Type.InContext() {
+			continue
+		}
+		msg := entry.ToAgentMessage()
+		if msg == nil {
+			continue
+		}
+		role := string(msg.Role)
+		if role != string(agent.RoleUser) && role != string(agent.RoleAssistant) {
+			continue
+		}
+		out = append(out, ForkEntry{EntryID: entry.ID, Role: role, Text: forkEntryText(msg.Content)})
+	}
+	return out, nil
+}
+
+func forkEntryText(blocks []ai.ContentBlock) string {
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case ai.ContentBlockText:
+			parts = append(parts, block.Text)
+		case ai.ContentBlockToolCall:
+			parts = append(parts, strings.TrimSpace(fmt.Sprintf("tool: %s %s", block.Name, block.Arguments)))
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (s *agentSession) ExportHTML(_ context.Context, path string) (string, error) {
@@ -3753,12 +3817,19 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 			if opts.ForkFromEntry != "" {
 				atEntry = &opts.ForkFromEntry
 			}
-			// Fork creates a new session with parent reference
+			// Fork creates a new session with parent reference; the fork
+			// copies the inherited entries into the child file, so chain
+			// new messages onto the copied branch's last entry.
 			sessionWriter, err = storage.Fork(opts.ForkFrom, atEntry)
 			if err != nil {
 				// Fork failed - continue without session writing
 				sessionWriter = nil
 			} else {
+				if reader, posErr := sessionpkg.ReadFile(sessionWriter.Path()); posErr == nil {
+					if pos := reader.CurrentPosition(); pos != "" {
+						resumedParentMsgID = &pos
+					}
+				}
 				header, headerErr := sessionpkg.ReadHeader(sessionWriter.Path())
 				if headerErr == nil {
 					sessionID = header.ID

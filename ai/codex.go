@@ -515,9 +515,6 @@ func buildCodexRequestBody(model *Model, aiCtx *Context, o *options) map[string]
 	if o.temperature != nil {
 		body["temperature"] = *o.temperature
 	}
-	if o.maxTokens > 0 {
-		body["max_output_tokens"] = o.maxTokens
-	}
 	if o.topP != nil {
 		body["top_p"] = *o.topP
 	}

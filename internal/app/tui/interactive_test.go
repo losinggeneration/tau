@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
 )
 
@@ -266,18 +268,25 @@ func TestInteractiveCommands_ExportWithArgs(t *testing.T) {
 	}
 }
 
-// TestInteractiveCommands_ForkStub verifies /fork without args
-// surfaces the coming-soon notice.
-func TestInteractiveCommands_ForkStub(t *testing.T) {
+// TestInteractiveCommands_ForkEmpty verifies /fork without args forks
+// from the latest point instead of opening a picker; the picker lives
+// on `/fork ` (trailing space).
+func TestInteractiveCommands_ForkEmpty(t *testing.T) {
 	app := newTestApp(t)
 	app.conv.Clear()
-	cmdForkOrStub(app, "")
-	msgs := app.conv.Messages()
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(msgs))
+	app.dialogPicker = tauui.NewDialogPicker()
+	app.dialogPicker.SetOnCancel(app.dismissDialog)
+	var gotOpts sdk.SessionOptions
+	app.sessionFactory = func(_ context.Context, opts sdk.SessionOptions) (sdk.Session, error) {
+		gotOpts = opts
+		return &fakeSession{stateID: "new"}, nil
 	}
-	if !strings.Contains(msgs[0].Text, "fork") {
-		t.Errorf("fork stub should mention 'fork': %q", msgs[0].Text)
+	cmdForkOrStub(app, "")
+	if app.dialogPicker.Shown() {
+		t.Fatal("bare /fork should not open the fork picker")
+	}
+	if gotOpts.ForkFromEntry != "" {
+		t.Fatalf("ForkFromEntry = %q, want empty (latest point)", gotOpts.ForkFromEntry)
 	}
 }
 

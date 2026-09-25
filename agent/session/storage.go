@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -340,7 +341,11 @@ func (s *Storage) GetBranchEntries(sessionID string, fromID string) ([]Entry, er
 	return path, nil
 }
 
-// Fork creates a new session that references a parent session.
+// Fork creates a new session that references a parent session. The parent's
+// inherited entries are copied into the new file (the branch up to atEntry,
+// or the whole session when atEntry is nil) so the child is self-contained:
+// resume, export, and pickers read one file and cleanup can delete parents
+// without orphaning children.
 func (s *Storage) Fork(parentID string, atEntry *string) (*Writer, error) {
 	parentPath, err := s.resolveID(parentID)
 	if err != nil {
@@ -358,6 +363,37 @@ func (s *Storage) Fork(parentID string, atEntry *string) (*Writer, error) {
 	w, err := s.Create(header)
 	if err != nil {
 		return nil, err
+	}
+
+	copyErr := func() error {
+		if atEntry != nil {
+			branch, err := s.GetBranchEntries(parentHeader.ID, *atEntry)
+			if err != nil {
+				return fmt.Errorf("read fork branch: %w", err)
+			}
+			for _, entry := range branch {
+				if err := w.Append(entry); err != nil {
+					return fmt.Errorf("copy fork entry: %w", err)
+				}
+			}
+			return nil
+		}
+		r, err := ReadFile(parentPath)
+		if err != nil {
+			return fmt.Errorf("read parent for fork: %w", err)
+		}
+		for _, entry := range r.Entries() {
+			if err := w.Append(entry); err != nil {
+				return fmt.Errorf("copy fork entry: %w", err)
+			}
+		}
+		return nil
+	}()
+	if copyErr != nil {
+		if closeErr := w.Close(); closeErr != nil {
+			return nil, errors.Join(copyErr, fmt.Errorf("close fork writer: %w", closeErr))
+		}
+		return nil, copyErr
 	}
 
 	// Invalidate index cache so the new session shows up in List

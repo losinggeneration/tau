@@ -2292,3 +2292,30 @@ func TestModelSelectorEmptyWhenNoProviders(t *testing.T) {
 		t.Error("expected applyModelFromArgs to return false (picker fallback) when no models are available")
 	}
 }
+
+// TestRefreshSelectorForkSpaceOpensInlineSelector verifies `/fork ` opens the
+// shared inline selector used by /model and /resume.
+func TestRefreshSelectorForkSpaceOpensInlineSelector(t *testing.T) {
+	a := newAppWithSelector(t)
+	a.sess = &forkEntrySession{fakeSession: &fakeSession{stateID: "old"}, entries: forkPickerEntries()}
+	a.sessionFactory = func(_ context.Context, _ sdk.SessionOptions) (sdk.Session, error) {
+		return &fakeSession{stateID: "new"}, nil
+	}
+	a.loopCtx = stubCtx()
+	a.editor.SetText(stubCtx(), "/fork ")
+
+	a.refreshSelector("/fork", nil)
+	if a.selectorMode != selectorModeCommands {
+		t.Fatalf("typing /fork expected command mode, got %d", a.selectorMode)
+	}
+	a.refreshSelector("/fork ", nil)
+	if !a.selector.Shown() || a.selectorMode != selectorModeFork {
+		t.Fatalf("typing /fork ' ' should open inline fork selector, shown=%v mode=%d", a.selector.Shown(), a.selectorMode)
+	}
+	if a.dialogPicker.Shown() {
+		t.Fatal("fork should not open the differently styled dialog picker")
+	}
+	if text := a.editor.Text(); text != "/fork " {
+		t.Fatalf("editor text = %q, want /fork ", text)
+	}
+}

@@ -5146,3 +5146,87 @@ func TestAutoCompactionFiresMidTurnWhenToolResultsGrowContext(t *testing.T) {
 			"second model call must not carry the pre-compaction tool result")
 	}
 }
+
+func TestForkEntryTextIncludesToolCalls(t *testing.T) {
+	blocks := []ai.ContentBlock{
+		{Type: ai.ContentBlockText, Text: "Checking files"},
+		{Type: ai.ContentBlockToolCall, Name: "read", Arguments: json.RawMessage(`{"path":"README.md"}`)},
+		{Type: ai.ContentBlockToolCall, Name: "bash", Arguments: json.RawMessage(`{"command":"go test ./..."}`)},
+	}
+
+	assert.Equal(t, "Checking files\ntool: read {\"path\":\"README.md\"}\ntool: bash {\"command\":\"go test ./...\"}", forkEntryText(blocks))
+}
+
+func TestGetForkEntries(t *testing.T) {
+	_, explicitModel := registerRecordingProvider(t, "final response")
+
+	rt, err := NewRuntime(RuntimeOptions{
+		SessionsDir:     t.TempDir(),
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		ExplicitModel:   explicitModel,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rt.Close(testContext(t)) })
+
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sess.Close(testContext(t)) })
+
+	events, err := sess.Send(testContext(t), Message{Text: "hello"})
+	require.NoError(t, err)
+	_ = collectSessionEvents(t, events)
+
+	fl, ok := sess.(ForkEntryLister)
+	require.True(t, ok, "session must implement ForkEntryLister")
+	entries, err := fl.GetForkEntries()
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	assert.Equal(t, "user", entries[0].Role)
+	assert.Equal(t, "hello", entries[0].Text)
+	assert.NotEmpty(t, entries[0].EntryID)
+	assert.Equal(t, "assistant", entries[1].Role)
+	assert.Equal(t, "final response", entries[1].Text)
+	assert.NotEmpty(t, entries[1].EntryID)
+
+	// An entry ID from the list must be usable as a fork point: forking at
+	// the user message yields a session whose history stops before the reply.
+	forked, err := rt.NewSession(testContext(t), SessionOptions{
+		ForkFrom:      sess.ID(),
+		ForkFromEntry: entries[0].EntryID,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = forked.Close(testContext(t)) })
+
+	ml, ok := forked.(MessageLister)
+	require.True(t, ok)
+	msgs := ml.GetMessages()
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "user", msgs[0].Role)
+	assert.Equal(t, "hello", msgs[0].Text)
+
+	// The child file now holds the inherited branch, so its fork list
+	// starts from the same entry and forking the child works from it.
+	fl2, ok := forked.(ForkEntryLister)
+	require.True(t, ok)
+	forkEntries, err := fl2.GetForkEntries()
+	require.NoError(t, err)
+	require.Len(t, forkEntries, 1)
+	assert.Equal(t, "user", forkEntries[0].Role)
+	assert.Equal(t, "hello", forkEntries[0].Text)
+	assert.Equal(t, entries[0].EntryID, forkEntries[0].EntryID)
+
+	// A fork of the fork at that entry must also be self-contained.
+	grandchild, err := rt.NewSession(testContext(t), SessionOptions{
+		ForkFrom:      forked.ID(),
+		ForkFromEntry: forkEntries[0].EntryID,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = grandchild.Close(testContext(t)) })
+
+	fl3, ok := grandchild.(ForkEntryLister)
+	require.True(t, ok)
+	gcEntries, err := fl3.GetForkEntries()
+	require.NoError(t, err)
+	require.Len(t, gcEntries, 1)
+	assert.Equal(t, "hello", gcEntries[0].Text)
+}

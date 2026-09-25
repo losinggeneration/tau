@@ -76,6 +76,7 @@ func TestBuildCodexRequestBodyMatchesResponsesParity(t *testing.T) {
 		textVerbosity:    "high",
 		reasoningEffort:  "minimal",
 		reasoningSummary: "detailed",
+		maxTokens:        8192,
 	})
 
 	if got := body["store"]; got != false {
@@ -113,6 +114,9 @@ func TestBuildCodexRequestBodyMatchesResponsesParity(t *testing.T) {
 	}
 	if _, ok := body["messages"]; ok {
 		t.Fatalf("messages = %v, want omitted", body["messages"])
+	}
+	if _, ok := body["max_output_tokens"]; ok {
+		t.Fatalf("max_output_tokens = %v, want omitted because the Codex endpoint rejects it", body["max_output_tokens"])
 	}
 	tools, ok := body["tools"].([]map[string]any)
 	if !ok || len(tools) != 1 {
