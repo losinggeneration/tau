@@ -1666,6 +1666,29 @@ func TestBuildContextFileAddendumOrdersGlobalThenProjectRootToCWD(t *testing.T) 
 	}
 }
 
+func TestNewSession_SystemPromptScopesProjectSearchesToCWD(t *testing.T) {
+	provider, explicitModel := registerRecordingProvider(t, "ok")
+	cwd := t.TempDir()
+
+	rt, err := NewRuntime(RuntimeOptions{
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		ExplicitModel:   explicitModel,
+	})
+	require.NoError(t, err)
+
+	sess, err := rt.NewSession(testContext(t), SessionOptions{CWD: cwd})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, sess.Close(testContext(t))) }()
+
+	events, err := sess.Send(testContext(t), Message{Text: "find the Go files"})
+	require.NoError(t, err)
+	_ = collectSessionEvents(t, events)
+
+	prompt := provider.LastPrompt().SystemPrompt
+	assert.Contains(t, prompt, "Treat "+cwd+" as the project root")
+	assert.Contains(t, prompt, "keep them scoped to it unless the user directs you elsewhere")
+}
+
 func TestNewSession_ContextFilesRespectsDisableFlag(t *testing.T) {
 	provider, explicitModel := registerRecordingProvider(t, "context response")
 

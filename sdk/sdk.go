@@ -3572,6 +3572,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	}
 
 	var addendumParts []string
+	addendumParts = append(addendumParts, fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd))
 	if !r.noContextFiles {
 		if contextAddendum, err := buildContextFileAddendum(cwd); err == nil && contextAddendum != "" {
 			addendumParts = append(addendumParts, contextAddendum)
