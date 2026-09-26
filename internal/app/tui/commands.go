@@ -128,6 +128,7 @@ func NewCommands() *Commands {
 	c.Register(Command{Name: "hotkeys", Description: "Show keybinding hints", Handler: cmdHotkeys})
 	c.Register(Command{Name: "layout", Description: "Switch layout: fixed or document", Handler: cmdLayout})
 	c.Register(Command{Name: "fork", Description: "Fork session (space: pick point)", Handler: cmdForkOrStub})
+	c.Register(Command{Name: "forget", Description: "Drop messages from a picked point onward", Handler: cmdForget})
 	c.Register(Command{Name: "tree", Description: "Show the session tree", Handler: cmdTreeOrStub})
 	c.Register(Command{Name: "login", Description: "Sign in", Handler: cmdLogin})
 	c.Register(Command{Name: "logout", Description: "Sign out", Handler: cmdLogout})

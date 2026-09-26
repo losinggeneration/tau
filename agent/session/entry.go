@@ -31,6 +31,10 @@ const (
 	EntryTypeCustomMessage  EntryType = "custom_message"
 )
 
+// EntryStatusDeleted marks an entry dropped by /forget. Readers skip it, so
+// it never reaches context, display, export, or forks.
+const EntryStatusDeleted = "deleted"
+
 // InContext returns true if the entry type is included in LLM context.
 func (t EntryType) InContext() bool {
 	switch t {
@@ -71,6 +75,7 @@ type Entry struct {
 	ID        string    `json:"id"`
 	ParentID  *string   `json:"parent_id,omitempty"`
 	Timestamp string    `json:"timestamp"`
+	Status    string    `json:"status,omitempty"`
 
 	// Message fields (EntryTypeMessage)
 	Message json.RawMessage `json:"message,omitempty"`

@@ -207,6 +207,43 @@ func cmdFork(app *App, args string) {
 	forkTo(app, strings.TrimSpace(args))
 }
 
+// cmdForget opens the forget picker; the editor path reaches it through
+// trySubmit, this covers other dispatchers.
+func cmdForget(app *App, _ string) {
+	if app == nil {
+		return
+	}
+	app.openForgetSelector(app.loopContext())
+}
+
+// forgetFrom drops entry and everything after it from the session, then
+// redraws the chat from the remaining context.
+func forgetFrom(app *App, entry string) {
+	if app == nil || app.conv == nil || app.sess == nil {
+		return
+	}
+	if ctx := app.loopContext(); ctx != nil && app.editor != nil {
+		app.editor.SetText(ctx, "")
+	}
+	f, ok := app.sess.(sdk.Forgetter)
+	if !ok {
+		app.conv.AddError("forget: session does not support forgetting messages")
+		app.refreshChat()
+		return
+	}
+	if err := f.Forget(entry); err != nil {
+		app.conv.AddError("forget: " + err.Error())
+		app.refreshChat()
+		return
+	}
+	app.replaceConversation(NewConversationModel())
+	if lister, ok := app.sess.(sdk.MessageLister); ok {
+		app.populateChatFromMessages(lister.GetMessages(), "")
+	}
+	app.refreshFooterStats(app.loopContext())
+	app.refreshChat()
+}
+
 // forkTo forks the current session at entry (empty entry = fork from the
 // latest point) and switches to the new session.
 func forkTo(app *App, entry string) {

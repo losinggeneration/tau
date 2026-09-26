@@ -5180,6 +5180,60 @@ func TestForkEntryTextIncludesToolCalls(t *testing.T) {
 	assert.Equal(t, "Checking files\ntool: read {\"path\":\"README.md\"}\ntool: bash {\"command\":\"go test ./...\"}", forkEntryText(blocks))
 }
 
+func TestForget(t *testing.T) {
+	_, explicitModel := registerRecordingProvider(t, "final response")
+
+	rt, err := NewRuntime(RuntimeOptions{
+		SessionsDir:     t.TempDir(),
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		ExplicitModel:   explicitModel,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rt.Close(testContext(t)) })
+
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	for _, text := range []string{"one", "two"} {
+		events, err := sess.Send(testContext(t), Message{Text: text})
+		require.NoError(t, err)
+		_ = collectSessionEvents(t, events)
+	}
+
+	f, ok := sess.(Forgetter)
+	require.True(t, ok, "session must implement Forgetter")
+	entries, err := f.GetForgetEntries()
+	require.NoError(t, err)
+	require.Len(t, entries, 4)
+	assert.Equal(t, "two", entries[2].Text)
+
+	require.NoError(t, f.Forget(entries[2].EntryID))
+	ml := sess.(MessageLister)
+	msgs := ml.GetMessages()
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "one", msgs[0].Text)
+
+	// New turns continue from the kept history, not the forgotten branch.
+	events, err := sess.Send(testContext(t), Message{Text: "three"})
+	require.NoError(t, err)
+	_ = collectSessionEvents(t, events)
+	entries, err = f.GetForgetEntries()
+	require.NoError(t, err)
+	var texts []string
+	for _, e := range entries {
+		texts = append(texts, e.Text)
+	}
+	assert.Equal(t, []string{"one", "final response", "three", "final response"}, texts)
+
+	id := sess.ID()
+	require.NoError(t, sess.Close(testContext(t)))
+	resumed, err := rt.NewSession(testContext(t), SessionOptions{SessionID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resumed.Close(testContext(t)) })
+	msgs = resumed.(MessageLister).GetMessages()
+	require.Len(t, msgs, 4)
+	assert.Equal(t, "three", msgs[2].Text)
+}
+
 func TestGetForkEntries(t *testing.T) {
 	_, explicitModel := registerRecordingProvider(t, "final response")
 

@@ -169,6 +169,7 @@ const (
 	selectorModeSessions                     // picking a session to resume
 	selectorModeFiles                        // picking a file reference after @
 	selectorModeFork                         // picking a message to fork from
+	selectorModeForget                       // picking a message to forget from
 )
 
 // EditorHeight is the number of content rows reserved for the prompt editor
@@ -2031,6 +2032,11 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 		// the in-layout model picker; with args the args are the model
 		// id the user typed (or pre-filled by Tab), and we resolve the
 		// id to a provider/id key and switch the session's model.
+		if name == "forget" {
+			a.editor.SetText(ctx, "/forget ")
+			a.refreshSelector("/forget ", ctx)
+			return true
+		}
 		if name == "model" {
 			if args == "" {
 				a.editor.SetText(ctx, "/model ")
@@ -3640,6 +3646,13 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 		return
 	}
 
+	// Forget picker mode. Same picker as /fork, but a selection is required:
+	// `/forget` alone also lands here via trySubmit.
+	if strings.HasPrefix(text, "/forget") && len(text) > 7 && (text[7] == ' ' || text[7] == '\t') {
+		a.openForgetSelector(ctx)
+		return
+	}
+
 	// Session picker mode. Triggered by typing `/resume ` (with trailing
 	// whitespace). The focused row fills/commits the session ID through the
 	// same inline selector used for commands and models.
@@ -3910,6 +3923,9 @@ func (a *App) applySelector(_ int, item tauui.SelectorItem) {
 	case selectorModeFork:
 		a.dismissSelector()
 		forkTo(a, item.Value)
+	case selectorModeForget:
+		a.dismissSelector()
+		forgetFrom(a, item.Value)
 	}
 }
 
@@ -3932,7 +3948,7 @@ func (a *App) applyFileSelectorCompletion(name string) (string, int, bool) {
 // The dialog picker claims Tab when it's visible — Tab activates
 // the focused item the same way Enter does.
 func (a *App) applySelectorFromAction(ctx *tauui.Ctx) bool {
-	if a.selectorMode == selectorModeFork && a.selector != nil && a.selector.Shown() {
+	if (a.selectorMode == selectorModeFork || a.selectorMode == selectorModeForget) && a.selector != nil && a.selector.Shown() {
 		a.toggleForkSelector(ctx)
 		return true
 	}
@@ -4005,7 +4021,7 @@ func (a *App) activateAndSend(ctx *tauui.Ctx) bool {
 	if mode == selectorModeNone {
 		return true
 	}
-	if mode == selectorModeFiles || mode == selectorModeFork {
+	if mode == selectorModeFiles || mode == selectorModeFork || mode == selectorModeForget {
 		return true
 	}
 	if ctx == nil || ctx.FocusedID != a.editor.ID() {
@@ -4073,7 +4089,7 @@ func (a *App) dismissSelector() {
 	if a.selectorMode == selectorModeSessions {
 		a.clearSessionSelectorCache()
 	}
-	if a.selectorMode == selectorModeFork {
+	if a.selectorMode == selectorModeFork || a.selectorMode == selectorModeForget {
 		a.forkEntries = nil
 		a.forkShowAll = false
 	}

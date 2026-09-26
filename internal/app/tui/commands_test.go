@@ -28,7 +28,7 @@ func TestCommandsBuiltins(t *testing.T) {
 	want := []string{
 		"help", "model", "show-model", "quit",
 		"settings", "scoped-models", "export", "import", "share",
-		"copy", "name", "session", "changelog", "hotkeys", "layout", "fork",
+		"copy", "name", "session", "changelog", "hotkeys", "layout", "fork", "forget",
 		"tree", "login", "logout", "new", "compact", "resume", "history",
 	}
 	got := make([]string, 0, len(c.All()))
@@ -75,7 +75,7 @@ func TestCommandsFilter(t *testing.T) {
 		{"", []string{
 			"help", "model", "show-model", "quit",
 			"settings", "scoped-models", "export", "import", "share",
-			"copy", "name", "session", "changelog", "hotkeys", "layout", "fork",
+			"copy", "name", "session", "changelog", "hotkeys", "layout", "fork", "forget",
 			"tree", "login", "logout", "new", "compact", "resume", "history",
 		}},
 		{"h", []string{"help", "history", "hotkeys"}},
@@ -469,12 +469,12 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 	fs.mu.Unlock()
 
 	items := app.completionItems("")
-	// The local registry has 23 entries (4 originals + 19 stubs).
+	// The local registry has 24 entries (4 originals + 20 stubs).
 	// Plus 2 from the session = 25. We don't assert the exact list
 	// ordering beyond the first five (the originals) so
 	// future stub additions don't break this test.
-	if len(items) != 25 {
-		t.Fatalf("completionItems = %d items, want 25 (23 local + 2 external)", len(items))
+	if len(items) != 26 {
+		t.Fatalf("completionItems = %d items, want 26 (24 local + 2 external)", len(items))
 	}
 	wantLocal := []string{"help", "model", "show-model", "quit", "settings"}
 	for i, name := range wantLocal {
@@ -529,9 +529,9 @@ func TestRegisterUnregisterAtRuntime(t *testing.T) {
 	// scoped-models, export, import, share, copy, name, session,
 	// changelog, hotkeys, fork, tree, login, logout, new, compact,
 	// resume, history). /reload is not a TUI local — the session owns it.
-	// With 1 plugin registered, All() returns 24.
-	if got := len(c.All()); got != 24 {
-		t.Errorf("All() length = %d, want 24 (23 builtins + 1 plugin)", got)
+	// With 1 plugin registered, All() returns 25.
+	if got := len(c.All()); got != 25 {
+		t.Errorf("All() length = %d, want 25 (24 builtins + 1 plugin)", got)
 	}
 	if !c.Unregister("plugin-cmd") {
 		t.Error("Unregister(plugin-cmd) returned false")

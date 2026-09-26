@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -66,6 +67,82 @@ func (w *Writer) Append(entry any) (err error) {
 		return fmt.Errorf("write entry: %w", err)
 	}
 	return w.file.Sync()
+}
+
+// MarkDeleted sets "status": "deleted" on the entries with the given IDs.
+// The file is rewritten atomically and the writer reopens the replacement, so
+// later appends land in the rewritten file.
+func (w *Writer) MarkDeleted(ids []string) (err error) {
+	drop := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		drop[id] = true
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return fmt.Errorf("session writer closed")
+	}
+
+	old := w.file
+	if err := syscall.Flock(int(old.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock session: %w", err)
+	}
+	defer func() {
+		if old == w.file {
+			if unlockErr := syscall.Flock(int(old.Fd()), syscall.LOCK_UN); unlockErr != nil && err == nil {
+				err = fmt.Errorf("unlock session: %w", unlockErr)
+			}
+		}
+	}()
+
+	data, err := os.ReadFile(w.path)
+	if err != nil {
+		return fmt.Errorf("read session: %w", err)
+	}
+	var lines []json.RawMessage
+	for i, line := range bytes.Split(data, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		if i > 0 {
+			if line, err = markDeleted(line, drop); err != nil {
+				return err
+			}
+		}
+		lines = append(lines, line)
+	}
+	if err := writeMigratedFile(w.path, lines); err != nil {
+		return fmt.Errorf("rewrite session: %w", err)
+	}
+
+	f, err := os.OpenFile(w.path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("reopen session file: %w", err)
+	}
+	w.file = f
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("close replaced session file: %w", err)
+	}
+	return nil
+}
+
+func markDeleted(line []byte, drop map[string]bool) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(line, &fields); err != nil {
+		// Malformed lines are skipped by readers; keep them untouched.
+		return line, nil
+	}
+	var id string
+	if err := json.Unmarshal(fields["id"], &id); err != nil || !drop[id] {
+		return line, nil
+	}
+	fields["status"] = json.RawMessage(`"` + EntryStatusDeleted + `"`)
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("marshal deleted entry: %w", err)
+	}
+	return out, nil
 }
 
 // AppendHeader writes the session header as the first line.

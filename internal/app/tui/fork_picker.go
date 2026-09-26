@@ -16,19 +16,45 @@ func (a *App) openForkSelector(ctx *tauui.Ctx) {
 		a.refreshChat()
 		return
 	}
-	if a.selectorMode != selectorModeFork {
+	a.openMessageSelector(ctx, selectorModeFork, func() ([]sdk.ForkEntry, error) {
 		lister, ok := a.sess.(sdk.ForkEntryLister)
 		if !ok {
-			a.forkEntries = nil
-		} else {
-			entries, err := lister.GetForkEntries()
-			if err != nil {
-				a.conv.AddError("fork: " + err.Error())
-				a.refreshChat()
-				return
-			}
-			a.forkEntries = entries
+			return nil, nil
 		}
+		return lister.GetForkEntries()
+	})
+}
+
+func (a *App) openForgetSelector(ctx *tauui.Ctx) {
+	if a == nil || a.selector == nil {
+		return
+	}
+	a.openMessageSelector(ctx, selectorModeForget, func() ([]sdk.ForkEntry, error) {
+		f, ok := a.sess.(sdk.Forgetter)
+		if !ok {
+			return nil, nil
+		}
+		return f.GetForgetEntries()
+	})
+	if a.selectorMode == selectorModeForget && len(a.forkEntries) == 0 {
+		a.dismissSelector()
+		a.invalidateSelectorLayout(true, false, ctx)
+		a.conv.AddError("forget: no messages to forget")
+		a.refreshChat()
+	}
+}
+
+// openMessageSelector shows the message picker shared by /fork and /forget,
+// focused on the newest entry. Entries load once per opening.
+func (a *App) openMessageSelector(ctx *tauui.Ctx, mode selectorMode, load func() ([]sdk.ForkEntry, error)) {
+	if a.selectorMode != mode {
+		entries, err := load()
+		if err != nil {
+			a.conv.AddError(selectorModeName(mode) + ": " + err.Error())
+			a.refreshChat()
+			return
+		}
+		a.forkEntries = entries
 		a.forkShowAll = false
 	}
 	if a.dialogPicker != nil && a.dialogPicker.Shown() {
@@ -39,14 +65,21 @@ func (a *App) openForkSelector(ctx *tauui.Ctx) {
 	a.selector.SetItems(a.forkSelectorItems())
 	a.selector.SetFocused(len(a.selector.Items()) - 1)
 	a.selector.SetShown(true)
-	a.selectorMode = selectorModeFork
+	a.selectorMode = mode
 	a.invalidateSelectorLayout(wasShown, wasShown && a.selector.MinSize() != wasSize, ctx)
+}
+
+func selectorModeName(mode selectorMode) string {
+	if mode == selectorModeForget {
+		return "forget"
+	}
+	return "fork"
 }
 
 func (a *App) forkSelectorItems() []tauui.SelectorItem {
 	items := make([]tauui.SelectorItem, 0, len(a.forkEntries))
 	for _, entry := range a.forkEntries {
-		if !a.forkShowAll && entry.Role != "user" {
+		if !a.forkShowAll && entry.Role != "user" && entry.Role != "compaction" {
 			continue
 		}
 		text := strings.Join(strings.Fields(entry.Text), " ")
@@ -54,8 +87,11 @@ func (a *App) forkSelectorItems() []tauui.SelectorItem {
 			text = "(no text)"
 		}
 		role := entry.Role
-		if role == "user" {
+		switch role {
+		case "user":
 			role = "you"
+		case "compaction":
+			role = "summary"
 		}
 		items = append(items, tauui.SelectorItem{Name: text, Description: role, Value: entry.EntryID})
 	}

@@ -112,6 +112,9 @@ func ReadFile(path string) (reader *Reader, err error) {
 			// Skip malformed entries but continue reading
 			continue
 		}
+		if entry.Status == EntryStatusDeleted {
+			continue
+		}
 		entries = append(entries, entry)
 	}
 
@@ -204,6 +207,19 @@ func (r *Reader) ToAgentMessages() []*Message {
 // full-history view for display and replay; the agent context must use
 // ToAgentMessages, which starts at the most recent compaction.
 func (r *Reader) AllMessages() []*Message {
+	entries := r.AllEntries()
+	messages := make([]*Message, 0, len(entries))
+	for _, e := range entries {
+		if msg := e.ToAgentMessage(); msg != nil {
+			messages = append(messages, msg)
+		}
+	}
+	return messages
+}
+
+// AllEntries returns the in-context entries behind AllMessages, in the same
+// order, so callers can address them by entry ID.
+func (r *Reader) AllEntries() []Entry {
 	branch := r.ActiveBranch()
 	if len(branch) == 0 {
 		return nil
@@ -228,26 +244,56 @@ func (r *Reader) AllMessages() []*Message {
 		}
 		summariesBefore[*e.FirstKeptID] = append(summariesBefore[*e.FirstKeptID], e)
 	}
-	messages := make([]*Message, 0, len(branch)+len(summariesBefore))
-	appendInContext := func(e *Entry) {
-		if !e.Type.InContext() {
-			return
-		}
-		if msg := e.ToAgentMessage(); msg != nil {
-			messages = append(messages, msg)
-		}
-	}
+	out := make([]Entry, 0, len(branch)+len(summariesBefore))
 	for _, id := range branch {
 		for _, e := range summariesBefore[id] {
-			appendInContext(e)
+			out = append(out, *e)
 		}
-		e, ok := byID[id]
-		if !ok {
-			continue
+		if e, ok := byID[id]; ok && e.Type.InContext() {
+			out = append(out, *e)
 		}
-		appendInContext(e)
 	}
-	return messages
+	return out
+}
+
+// ForgetSet resolves the entries /forget drops when forgetting from entryID
+// (a message on the active branch or a compaction anchored to it): that
+// branch entry and everything after it, compactions anchored to any of them,
+// and position changes pointing at them. parent is the entry the branch
+// resumes from, empty when nothing remains.
+func (r *Reader) ForgetSet(entryID string) (ids []string, parent string, err error) {
+	target := r.FindByID(entryID)
+	if target == nil {
+		return nil, "", fmt.Errorf("entry %q not found", entryID)
+	}
+	from := entryID
+	if target.Type == EntryTypeCompaction {
+		if target.FirstKeptID == nil {
+			return nil, "", fmt.Errorf("compaction %q has no anchor", entryID)
+		}
+		from = *target.FirstKeptID
+	}
+	branch := r.ActiveBranch()
+	idx := slices.Index(branch, from)
+	if idx < 0 {
+		return nil, "", fmt.Errorf("entry %q is not on the active branch", entryID)
+	}
+	if first := r.FindByID(branch[idx]); first != nil && first.ParentID != nil {
+		parent = *first.ParentID
+	}
+	drop := make(map[string]bool, len(branch)-idx)
+	for _, id := range branch[idx:] {
+		drop[id] = true
+	}
+	ids = slices.Clone(branch[idx:])
+	for _, e := range r.entries {
+		switch {
+		case e.Type == EntryTypeCompaction && e.FirstKeptID != nil && drop[*e.FirstKeptID],
+			e.Type == EntryTypePositionChange && e.NewPosition != nil && drop[*e.NewPosition]:
+			ids = append(ids, e.ID)
+		}
+	}
+	return ids, parent, nil
 }
 
 // CurrentPosition resolves the current position in the session tree.

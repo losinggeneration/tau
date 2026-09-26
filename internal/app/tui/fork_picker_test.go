@@ -162,3 +162,84 @@ type forkEntrySession struct {
 func (f *forkEntrySession) GetForkEntries() ([]sdk.ForkEntry, error) {
 	return f.entries, nil
 }
+
+type forgetSession struct {
+	*fakeSession
+	entries []sdk.ForkEntry
+	forgot  string
+	kept    []sdk.Message
+}
+
+func (f *forgetSession) GetForgetEntries() ([]sdk.ForkEntry, error) { return f.entries, nil }
+
+func (f *forgetSession) Forget(entryID string) error {
+	f.forgot = entryID
+	f.fakeSession.messages = f.kept
+	return nil
+}
+
+func TestForgetCommandRequiresSelection(t *testing.T) {
+	a := newAppWithSelector(t)
+	entries := append([]sdk.ForkEntry{{EntryID: "c0", Role: "compaction", Text: "summary text"}}, forkPickerEntries()...)
+	sess := &forgetSession{
+		fakeSession: &fakeSession{stateID: "s", messages: []sdk.Message{{Role: "user", Text: "stale"}}},
+		entries:     entries,
+		kept:        []sdk.Message{{Role: "user", Text: "first prompt"}, {Role: "assistant", Text: "agent reply"}},
+	}
+	a.sess = sess
+	a.loopCtx = stubCtx()
+	a.conv.AddUserMessage("stale")
+
+	ctx := stubCtx()
+	ctx.FocusedID = a.editor.ID()
+	a.editor.SetText(ctx, "/forget")
+	if !a.trySubmit(ctx) {
+		t.Fatal("/forget was not handled")
+	}
+	if sess.forgot != "" {
+		t.Fatalf("/forget without a selection forgot %q", sess.forgot)
+	}
+	if a.selectorMode != selectorModeForget || !a.selector.Shown() {
+		t.Fatalf("forget selector shown=%v mode=%d", a.selector.Shown(), a.selectorMode)
+	}
+	items := a.selector.Items()
+	if len(items) != 3 || items[0].Description != "summary" || items[2].Value != "e3" {
+		t.Fatalf("items = %#v", items)
+	}
+	if got := a.selector.Focused(); got != 2 {
+		t.Fatalf("focused = %d, want bottom entry 2", got)
+	}
+
+	a.handleSelectorAction(int(tauui.ActionMoveUp))
+	if !a.activateAndSend(ctx) {
+		t.Fatal("Enter was not handled")
+	}
+	if sess.forgot != "e1" {
+		t.Fatalf("forgot %q, want e1", sess.forgot)
+	}
+	if a.selector.Shown() || a.editor.Text() != "" {
+		t.Fatalf("selector shown=%v editor=%q after forget", a.selector.Shown(), a.editor.Text())
+	}
+	var texts []string
+	for _, m := range a.conv.Messages() {
+		texts = append(texts, m.Text)
+	}
+	if want := []string{"first prompt", "agent reply"}; fmt.Sprint(texts) != fmt.Sprint(want) {
+		t.Fatalf("chat = %q, want %q", texts, want)
+	}
+}
+
+func TestForgetSelectorWithoutEntriesReportsError(t *testing.T) {
+	a := newAppWithSelector(t)
+	a.sess = &forgetSession{fakeSession: &fakeSession{stateID: "s"}}
+
+	a.openForgetSelector(stubCtx())
+
+	if a.selector.Shown() || a.selectorMode != selectorModeNone {
+		t.Fatalf("selector shown=%v mode=%d", a.selector.Shown(), a.selectorMode)
+	}
+	msgs := a.conv.Messages()
+	if len(msgs) == 0 || msgs[len(msgs)-1].Text != "forget: no messages to forget" {
+		t.Fatalf("messages = %#v", msgs)
+	}
+}

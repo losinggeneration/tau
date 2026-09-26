@@ -371,6 +371,15 @@ type ForkEntryLister interface {
 	GetForkEntries() ([]ForkEntry, error)
 }
 
+// Forgetter drops messages from the session's history. GetForgetEntries
+// lists every message on the current branch, including pre-compaction ones
+// and compaction summaries (Role "compaction"); Forget drops the given entry
+// and everything after it.
+type Forgetter interface {
+	GetForgetEntries() ([]ForkEntry, error)
+	Forget(entryID string) error
+}
+
 // HTMLExporter exports a session as an HTML file.
 type HTMLExporter interface {
 	ExportHTML(ctx context.Context, path string) (string, error)
@@ -658,6 +667,7 @@ var (
 	_ FullMessageLister             = (*agentSession)(nil)
 	_ ForkMessageLister             = (*agentSession)(nil)
 	_ ForkEntryLister               = (*agentSession)(nil)
+	_ Forgetter                     = (*agentSession)(nil)
 	_ HTMLExporter                  = (*agentSession)(nil)
 	_ Namer                         = (*agentSession)(nil)
 	_ LastAssistantTexter           = (*agentSession)(nil)
@@ -1929,6 +1939,82 @@ func (s *agentSession) GetForkEntries() ([]ForkEntry, error) {
 		out = append(out, ForkEntry{EntryID: entry.ID, Role: role, Text: forkEntryText(msg.Content)})
 	}
 	return out, nil
+}
+
+// GetForgetEntries returns the entries /forget can drop from, oldest first.
+func (s *agentSession) GetForgetEntries() ([]ForkEntry, error) {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	s.mu.Unlock()
+	if writer == nil {
+		return nil, nil
+	}
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	if err != nil {
+		return nil, fmt.Errorf("read session for forget entries: %w", err)
+	}
+	var out []ForkEntry
+	for _, entry := range reader.AllEntries() {
+		if entry.Type == sessionpkg.EntryTypeCompaction && entry.Summary != nil {
+			out = append(out, ForkEntry{EntryID: entry.ID, Role: string(sessionpkg.EntryTypeCompaction), Text: *entry.Summary})
+			continue
+		}
+		msg := entry.ToAgentMessage()
+		if msg == nil {
+			continue
+		}
+		role := string(msg.Role)
+		if role != string(agent.RoleUser) && role != string(agent.RoleAssistant) {
+			continue
+		}
+		out = append(out, ForkEntry{EntryID: entry.ID, Role: role, Text: forkEntryText(msg.Content)})
+	}
+	return out, nil
+}
+
+// Forget marks entryID and every later entry on the current branch deleted,
+// then reloads the agent context from what remains.
+func (s *agentSession) Forget(entryID string) error {
+	if s.agent.State().IsStreaming {
+		return fmt.Errorf("cannot forget while the agent is running")
+	}
+	s.mu.Lock()
+	writer := s.sessionWriter
+	s.mu.Unlock()
+	if writer == nil {
+		return fmt.Errorf("session is not persisted")
+	}
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	if err != nil {
+		return fmt.Errorf("read session: %w", err)
+	}
+	ids, parent, err := reader.ForgetSet(entryID)
+	if err != nil {
+		return err
+	}
+	if err := writer.MarkDeleted(ids); err != nil {
+		return fmt.Errorf("mark entries deleted: %w", err)
+	}
+	if parent != "" {
+		if err := writer.Append(sessionpkg.NewPositionChangeEntry(parent)); err != nil {
+			return fmt.Errorf("append position change: %w", err)
+		}
+	}
+	if reader, err = sessionpkg.ReadFile(writer.Path()); err != nil {
+		return fmt.Errorf("reread session: %w", err)
+	}
+	messages, err := agentMessagesFromSessionReader(reader, "")
+	if err != nil {
+		return err
+	}
+	s.agent.ReplaceMessages(messages)
+	s.mu.Lock()
+	s.parentMsgID = nil
+	if pos := reader.CurrentPosition(); pos != "" {
+		s.parentMsgID = &pos
+	}
+	s.mu.Unlock()
+	return nil
 }
 
 func forkEntryText(blocks []ai.ContentBlock) string {
