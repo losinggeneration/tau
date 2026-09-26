@@ -605,3 +605,26 @@ func TestLayoutSwitchResetsCount(t *testing.T) {
 		t.Errorf("pendingNewMessages = %d after switch to document, want 0", a.pendingNewMessages)
 	}
 }
+
+// Session-advertised commands with the same name as a TUI-local command
+// must not reach the popup, /help, or autocomplete twice: local dispatch
+// already wins, so the duplicate entry is display noise (e.g. /sessions
+// listed once as the workspace and again as the shell builtin).
+func TestExternalCommandsSkipLocalDuplicates(t *testing.T) {
+	app := newTestApp(t)
+	fs := app.sess.(*fakeSession)
+	fs.mu.Lock()
+	fs.slashInfos = []sdkSlashInfo{
+		{Name: "sessions", Description: "shell-oriented builtin", Source: "builtin"},
+		{Name: "skill:x", Description: "skill command", Source: "skill"},
+	}
+	fs.mu.Unlock()
+
+	got := app.externalCommands()
+	if len(got) != 1 {
+		t.Fatalf("externalCommands = %+v, want only the non-local entry", got)
+	}
+	if got[0].Name != "skill:x" {
+		t.Fatalf("externalCommands[0] = %q, want skill:x", got[0].Name)
+	}
+}

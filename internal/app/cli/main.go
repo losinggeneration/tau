@@ -3418,6 +3418,13 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 		},
 		PinSession:   rt.PinSession,
 		UnpinSession: rt.UnpinSession,
+		DeleteSession: func(ctx context.Context, id string) error {
+			storage := rt.GetSessionStorage()
+			if storage == nil {
+				return fmt.Errorf("session storage unavailable")
+			}
+			return storage.Delete(id)
+		},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build tui: %v\n", err)

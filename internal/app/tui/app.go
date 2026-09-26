@@ -442,6 +442,9 @@ type App struct {
 	// pinSession and unpinSession update workspace pin state.
 	pinSession   SessionActionFunc
 	unpinSession SessionActionFunc
+	// deleteSession moves a persisted session to the trash from the
+	// workspace UI.
+	deleteSession SessionActionFunc
 
 	// loopCtx is the most recent *tauui.Ctx observed during a paint pass. The
 	// toolkit's Invalidate closure is stable for the app's lifetime, so it is
@@ -540,6 +543,9 @@ type Options struct {
 	PinSession SessionActionFunc
 	// UnpinSession removes a workspace pin.
 	UnpinSession SessionActionFunc
+	// DeleteSession moves a persisted session to the trash from the
+	// workspace UI.
+	DeleteSession SessionActionFunc
 	// ThemeColors resolves a theme name to its colour tokens, so themes
 	// discovered as resources actually repaint the UI. Nil restricts the app to
 	// its built-in token sets.
@@ -612,6 +618,7 @@ func New(opts Options) (*App, error) {
 		renameSession:   opts.RenameSession,
 		pinSession:      opts.PinSession,
 		unpinSession:    opts.UnpinSession,
+		deleteSession:   opts.DeleteSession,
 		authStore:       opts.CredentialStore,
 		credentialStore: opts.CredentialStore,
 		settingsPath:    opts.SettingsPath,
@@ -4173,10 +4180,21 @@ func (a *App) dismissSelectorIfVisibleCtx(ctx *tauui.Ctx) bool {
 // ExternalCommandsProvider or exposes no commands. Safe to call from
 // the app loop.
 func (a *App) externalCommands() []ExternalCommand {
+	// Same-named session commands are shadowed by the local registry:
+	// dispatch already prefers the local handler, so listing both would
+	// show one entry twice (e.g. /sessions as both the workspace and the
+	// shell-oriented builtin).
+	local := a.cmds.All()
+	owned := make(map[string]struct{}, len(local))
+	for _, c := range local {
+		owned[c.Name] = struct{}{}
+	}
 	var out []ExternalCommand
 	if a.sess != nil {
-		infos := a.sess.SlashCommands()
-		for _, info := range infos {
+		for _, info := range a.sess.SlashCommands() {
+			if _, dup := owned[info.Name]; dup {
+				continue
+			}
 			out = append(out, ExternalCommand{
 				Name:         info.Name,
 				Description:  info.Description,

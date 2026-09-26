@@ -17,9 +17,22 @@ type workspaceOverlay struct {
 	sessions []sdk.SessionInfo
 	filter   string
 	focused  int
-	rename   bool
-	name     string
+	// scroll is the index of the first item row on screen. The dialog
+	// clips the render at its height, so without windowing, focus moved
+	// into rows past the visible area and disappeared.
+	scroll int
+	rename bool
+	name   string
+	// confirmDelete arms the y-to-confirm prompt for the focused row.
+	// The trash is restorable, but 'd' landing on the wrong row after a
+	// filter change should not cost the user a session anyway.
+	confirmDelete bool
 }
+
+// maxWorkspaceRows caps the item rows the overlay renders. The component
+// API is height-unaware (Render takes only width), so the overlay windows
+// itself instead of letting the dialog clip a full list.
+const maxWorkspaceRows = 10
 
 func newWorkspaceOverlay(app *App, sessions []sdk.SessionInfo) *workspaceOverlay {
 	sessions = append([]sdk.SessionInfo(nil), sessions...)
@@ -38,14 +51,21 @@ func (o *workspaceOverlay) Render(width int) []string {
 		rows = append(rows, "Enter save · Esc cancel")
 		return rows
 	}
-	rows = append(rows, "Workspace — Enter resume · n new · f fork · r rename · p pin · Esc close")
+	if sess, ok := o.focusedSession(); ok && o.confirmDelete {
+		rows = append(rows, fmt.Sprintf("Delete %s %s? Moves the session to trash.", shortSessionID(sess.ID), sessionInfoDisplayPrompt(sess)))
+		rows = append(rows, "y confirm · any other key cancel")
+		return rows
+	}
+	rows = append(rows, "Workspace — Enter resume · n new · f fork · r rename · p pin · d delete · Esc close")
 	rows = append(rows, "> "+o.filter)
 	items := o.items()
 	if len(items) == 0 {
 		rows = append(rows, "no sessions")
 		return rows
 	}
-	for i, sess := range items {
+	first, last := o.window(len(items))
+	for i := first; i < last; i++ {
+		sess := items[i]
 		mark := "  "
 		if i == o.focused {
 			mark = "→ "
@@ -82,6 +102,10 @@ func (o *workspaceOverlay) HandleKey(ke tauui.KeyEvent) {
 		o.handleRenameKey(ke)
 		return
 	}
+	if o.confirmDelete {
+		o.handleConfirmDeleteKey(ke)
+		return
+	}
 	switch ke.Key {
 	case tauui.KeyUp:
 		o.move(-1)
@@ -109,6 +133,8 @@ func (o *workspaceOverlay) HandleKey(ke tauui.KeyEvent) {
 			o.togglePinFocused()
 		case 'r':
 			o.startRename()
+		case 'd':
+			o.startDelete()
 		default:
 			if ke.Mod == 0 && ke.Rune >= 32 {
 				o.filter += string(ke.Rune)
@@ -134,6 +160,52 @@ func (o *workspaceOverlay) handleRenameKey(ke tauui.KeyEvent) {
 			o.name += string(ke.Rune)
 		}
 	}
+}
+
+func (o *workspaceOverlay) startDelete() {
+	sess, ok := o.focusedSession()
+	if !ok || o.app == nil {
+		return
+	}
+	if o.app.SessionID() == sess.ID {
+		o.app.conv.AddError("workspace: cannot delete the active session")
+		o.app.refreshChat()
+		return
+	}
+	o.confirmDelete = true
+}
+
+func (o *workspaceOverlay) handleConfirmDeleteKey(ke tauui.KeyEvent) {
+	if ke.Key == tauui.KeyRune && ke.Mod == 0 && ke.Rune == 'y' {
+		o.commitDelete()
+		return
+	}
+	o.confirmDelete = false
+}
+
+func (o *workspaceOverlay) commitDelete() {
+	o.confirmDelete = false
+	sess, ok := o.focusedSession()
+	if !ok || o.app == nil {
+		return
+	}
+	if o.app.deleteSession == nil {
+		o.app.conv.AddError("workspace: deleting is unavailable")
+		o.app.refreshChat()
+		return
+	}
+	if err := o.app.deleteSession(o.app.ctxOrBackground(), sess.ID); err != nil {
+		o.app.conv.AddError("workspace delete: " + err.Error())
+		o.app.refreshChat()
+		return
+	}
+	for i := range o.sessions {
+		if o.sessions[i].ID == sess.ID {
+			o.sessions = append(o.sessions[:i], o.sessions[i+1:]...)
+			break
+		}
+	}
+	o.clamp()
 }
 
 func (o *workspaceOverlay) items() []sdk.SessionInfo {
@@ -170,6 +242,7 @@ func (o *workspaceOverlay) clamp() {
 	items := o.items()
 	if len(items) == 0 {
 		o.focused = 0
+		o.scroll = 0
 		return
 	}
 	if o.focused < 0 {
@@ -178,6 +251,29 @@ func (o *workspaceOverlay) clamp() {
 	if o.focused >= len(items) {
 		o.focused = len(items) - 1
 	}
+	// Keep the focused row inside the rendered window.
+	if o.scroll < 0 {
+		o.scroll = 0
+	}
+	if o.scroll > o.focused {
+		o.scroll = o.focused
+	}
+	if o.focused >= o.scroll+maxWorkspaceRows {
+		o.scroll = o.focused - maxWorkspaceRows + 1
+	}
+	if o.scroll+maxWorkspaceRows > len(items) {
+		o.scroll = max(0, len(items)-maxWorkspaceRows)
+	}
+}
+
+// window returns the [first, last) item indexes to render.
+func (o *workspaceOverlay) window(length int) (int, int) {
+	last := min(length, o.scroll+maxWorkspaceRows)
+	if o.scroll >= last {
+		// Stale offset (list shrank without a clamp pass).
+		return 0, min(length, maxWorkspaceRows)
+	}
+	return o.scroll, last
 }
 
 func (o *workspaceOverlay) resumeFocused() {

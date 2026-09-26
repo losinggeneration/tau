@@ -28,7 +28,7 @@ func TestCommandsBuiltins(t *testing.T) {
 	want := []string{
 		"help", "model", "show-model", "quit",
 		"settings", "scoped-models", "export", "import", "share",
-		"copy", "name", "session", "changelog", "hotkeys", "layout", "fork", "forget",
+		"copy", "name", "session", "sessions", "changelog", "hotkeys", "layout", "fork", "forget",
 		"tree", "login", "logout", "new", "compact", "resume", "history",
 	}
 	got := make([]string, 0, len(c.All()))
@@ -75,15 +75,15 @@ func TestCommandsFilter(t *testing.T) {
 		{"", []string{
 			"help", "model", "show-model", "quit",
 			"settings", "scoped-models", "export", "import", "share",
-			"copy", "name", "session", "changelog", "hotkeys", "layout", "fork", "forget",
+			"copy", "name", "session", "sessions", "changelog", "hotkeys", "layout", "fork", "forget",
 			"tree", "login", "logout", "new", "compact", "resume", "history",
 		}},
 		{"h", []string{"help", "history", "hotkeys"}},
 		{"c", []string{"changelog", "compact", "copy"}},
 		{"q", []string{"quit"}},
 		{"m", []string{"model"}},
-		// Several s-prefix commands: scoped-models, session, settings, share, show-model.
-		{"s", []string{"scoped-models", "session", "settings", "share", "show-model"}},
+		// Several s-prefix commands: scoped-models, session, sessions, settings, share, show-model.
+		{"s", []string{"scoped-models", "session", "sessions", "settings", "share", "show-model"}},
 		{"HE", []string{"help"}}, // case-insensitive
 		{"zz", nil},
 	}
@@ -389,6 +389,50 @@ func TestTrySubmitShowModelHandledLocally(t *testing.T) {
 	}
 }
 
+// /sessions must open the TUI's session workspace instead of being
+// forwarded to the session's command pipeline, whose builtin answer
+// ("use tau sessions <subcommand> from the shell") is impossible to
+// follow from inside the TUI.
+func TestTrySubmitSessionsOpensWorkspace(t *testing.T) {
+	app := newTestApp(t)
+	app.dialogPicker = tauui.NewDialogPicker()
+	app.dialogPicker.SetOnCancel(app.dismissDialog)
+	fs := app.sess.(*fakeSession)
+	fs.mu.Lock()
+	// The runtime command registry advertises a shell-oriented "sessions"
+	// builtin; the TUI must shadow it locally rather than forward.
+	fs.slashInfos = []sdkSlashInfo{{Name: "sessions", Description: "List, fork, export, and share sessions", Source: "builtin"}}
+	fs.mu.Unlock()
+	app.sessionLister = func(context.Context) ([]sdkpkg.SessionInfo, error) {
+		return []sdkpkg.SessionInfo{{ID: "abc12345", Name: "demo", Created: "2026-01-01T00:00:00Z"}}, nil
+	}
+	editor := newPromptEditorForTest()
+	app.editor = editor
+	app.footer = newFooterForTest()
+	editor.SetText(testCtx(), "/sessions")
+	ctx := testCtx()
+	ctx.FocusedID = editor.ID()
+
+	if !app.trySubmit(ctx) {
+		t.Fatal("trySubmit did not consume /sessions")
+	}
+	if editor.Text() != "" {
+		t.Errorf("editor text after submit = %q, want empty", editor.Text())
+	}
+	if !app.dialogPicker.Shown() {
+		t.Fatal("/sessions did not open the session workspace overlay")
+	}
+	if app.dialogPicker.Component() == nil {
+		t.Fatal("/sessions opened an empty dialog picker; want the workspace overlay")
+	}
+	fs.mu.Lock()
+	sent := append([]string(nil), fs.sentTexts...)
+	fs.mu.Unlock()
+	if len(sent) != 0 {
+		t.Fatalf("/sessions forwarded to the session: %v", sent)
+	}
+}
+
 func TestTrySubmitHandlesLocalCommand(t *testing.T) {
 	app := newTestApp(t)
 	editor := newPromptEditorForTest()
@@ -465,16 +509,18 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 	fs.slashInfos = []sdkSlashInfo{
 		{Name: "model", Description: "switch model", Source: "builtin"},
 		{Name: "fork", Description: "fork the session", Source: "builtin"},
+		{Name: "ext-cmd", Description: "only from the session", Source: "plugin"},
 	}
 	fs.mu.Unlock()
 
 	items := app.completionItems("")
-	// The local registry has 24 entries (4 originals + 20 stubs).
-	// Plus 2 from the session = 25. We don't assert the exact list
-	// ordering beyond the first five (the originals) so
-	// future stub additions don't break this test.
+	// The local registry has 25 entries; the two same-named session
+	// commands are shadowed by the local registry, leaving one external
+	// entry. We don't assert the exact list ordering beyond the first
+	// five (the originals) so future stub additions don't break this
+	// test.
 	if len(items) != 26 {
-		t.Fatalf("completionItems = %d items, want 26 (24 local + 2 external)", len(items))
+		t.Fatalf("completionItems = %d items, want 26 (25 local + 1 external)", len(items))
 	}
 	wantLocal := []string{"help", "model", "show-model", "quit", "settings"}
 	for i, name := range wantLocal {
@@ -485,12 +531,10 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 			t.Errorf("item[%d] = %q has nil handler; local commands must keep theirs", i, items[i].Name)
 		}
 	}
-	// External items (the last two) must have nil handlers so the
+	// External items (the last one) must have nil handlers so the
 	// TUI forwards them to the session.
-	for i := len(items) - 2; i < len(items); i++ {
-		if items[i].Handler != nil {
-			t.Errorf("external item[%d] = %q has non-nil handler; should be nil so the TUI forwards", i, items[i].Name)
-		}
+	if items[len(items)-1].Handler != nil {
+		t.Errorf("external item %q has non-nil handler; should be nil so the TUI forwards", items[len(items)-1].Name)
 	}
 
 	items = app.completionItems("comp")
@@ -498,17 +542,10 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 		t.Errorf("filter /comp = %v, want [compact]", names(items))
 	}
 	items = app.completionItems("mod")
-	// The local /model builtin and the session-supplied model command
-	// share the same name; both are returned. A future implementation
-	// could de-duplicate by source, but for now the popup handles the
-	// duplicate visually.
-	if len(items) != 2 {
-		t.Errorf("filter /mod length = %d, want 2 (local + session)", len(items))
-	}
-	for _, item := range items {
-		if item.Name != "model" {
-			t.Errorf("filter /mod contains %q, want only \"model\"", item.Name)
-		}
+	// The local /model builtin shadows the session-supplied model
+	// command: one entry, not two.
+	if len(items) != 1 || items[0].Name != "model" {
+		t.Errorf("filter /mod = %v, want only the local model", names(items))
 	}
 }
 
@@ -524,14 +561,15 @@ func TestRegisterUnregisterAtRuntime(t *testing.T) {
 	if _, ok := c.Lookup("plugin-cmd"); !ok {
 		t.Fatal("plugin-cmd not present after register")
 	}
-	// NewCommands seeds 22 builtins: 4 originals (help, model,
-	// show-model, quit) plus 18 interactive stubs/commands (settings,
+	// NewCommands seeds the builtins: 4 originals (help, model,
+	// show-model, quit) plus the interactive stubs/commands (settings,
 	// scoped-models, export, import, share, copy, name, session,
-	// changelog, hotkeys, fork, tree, login, logout, new, compact,
-	// resume, history). /reload is not a TUI local — the session owns it.
-	// With 1 plugin registered, All() returns 25.
-	if got := len(c.All()); got != 25 {
-		t.Errorf("All() length = %d, want 25 (24 builtins + 1 plugin)", got)
+	// sessions, changelog, hotkeys, fork, tree, login, logout, new,
+	// compact, resume, history, layout, forget). /reload is not a TUI
+	// local — the session owns it. With 1 plugin registered, All()
+	// returns 26.
+	if got := len(c.All()); got != 26 {
+		t.Errorf("All() length = %d, want 26 (25 builtins + 1 plugin)", got)
 	}
 	if !c.Unregister("plugin-cmd") {
 		t.Error("Unregister(plugin-cmd) returned false")

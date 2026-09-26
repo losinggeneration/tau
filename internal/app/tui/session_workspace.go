@@ -57,8 +57,16 @@ func cmdSessionWorkspace(app *App, _ string) {
 	overlay := newWorkspaceOverlay(app, sessions)
 	app.dialogPicker.SetComponent(overlay)
 	app.dialogPicker.SetHeader("/session")
+	app.dialogPicker.SetOnCancel(app.dismissDialog)
 	app.dialogPicker.Reset()
 	app.dialogPicker.SetShown(true)
+	// The overlay owns text input (filter, rename, delete confirm), so
+	// it needs focus: with the editor still focused, the keymap bridge
+	// only forwards Tab/Enter/arrows/Space and every other rune lands
+	// in the prompt. Mirrors openHistorySearch.
+	if app.app != nil {
+		app.app.SetFocus(app.dialogPicker.ID())
+	}
 	if ctx := app.loopContext(); ctx != nil {
 		if ctx.InvalidateLayout != nil {
 			ctx.InvalidateLayout()

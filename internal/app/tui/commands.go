@@ -124,6 +124,10 @@ func NewCommands() *Commands {
 	c.Register(Command{Name: "copy", Description: "Copy the last reply", Handler: cmdCopy})
 	c.Register(Command{Name: "name", Description: "Name this session", Handler: cmdName})
 	c.Register(Command{Name: "session", Description: "Open the session workspace", Handler: cmdSessionWorkspace})
+	// /sessions is the plural alias users type coming from `tau sessions`
+	// on the shell. Same workspace; the shell builtin's "run from the
+	// shell" reply is useless inside the TUI.
+	c.Register(Command{Name: "sessions", Description: "Browse saved sessions (resume, fork, rename, pin)", Handler: cmdSessionWorkspace})
 	c.Register(Command{Name: "changelog", Description: "Show the changelog", Handler: cmdStub("changelog", "Show the changelog (coming soon)")})
 	c.Register(Command{Name: "hotkeys", Description: "Show keybinding hints", Handler: cmdHotkeys})
 	c.Register(Command{Name: "layout", Description: "Switch layout: fixed or document", Handler: cmdLayout})
