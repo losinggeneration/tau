@@ -577,8 +577,38 @@ func runLoop(
 			// is the canonical transformation seam.
 			dispatchEvent("before_provider_request", eventPayloadModel(model))
 
-			// Stream assistant response
+			// Stream assistant response. A usage-limit failure (429 carrying a
+			// reset time) is surfaced in the transcript and retried once the
+			// window passes instead of ending the run.
 			message, err := streamAssistantResponse(ctx, currentCtx, config, client, model, systemPrompt, opts, emit)
+			for err != nil {
+				resetAt, ok := ai.UsageLimitResetAt(err)
+				if !ok {
+					break
+				}
+
+				errMsg := &Message{
+					Role:               RoleAssistant,
+					Content:            []ai.ContentBlock{{Type: ai.ContentBlockText, Text: ""}},
+					IsError:            true,
+					API:                model.API,
+					Provider:           model.Provider,
+					Model:              model.ID,
+					StopReason:         ai.StopReasonError,
+					ErrorMessage:       err.Error(),
+					Timestamp:          time.Now(),
+					ExcludeFromContext: true,
+				}
+				emit(MessageStart{Message: errMsg})
+				emit(MessageEnd{Message: errMsg})
+				newMessages = append(newMessages, errMsg)
+
+				if waitErr := sleepUntil(ctx, resetAt.Add(usageLimitRetryBuffer)); waitErr != nil {
+					return newMessages, waitErr
+				}
+
+				message, err = streamAssistantResponse(ctx, currentCtx, config, client, model, systemPrompt, opts, emit)
+			}
 			if err != nil {
 				return newMessages, err
 			}
@@ -739,6 +769,22 @@ func getFollowUpMessages(ctx context.Context, config AgentLoopConfig) ([]*Messag
 	}
 
 	return nil, nil
+}
+
+// usageLimitRetryBuffer waits slightly past the provider-reported reset time
+// so a request landing exactly at the reset doesn't bounce off a stale quota.
+var usageLimitRetryBuffer = 5 * time.Second
+
+func sleepUntil(ctx context.Context, until time.Time) error {
+	timer := time.NewTimer(time.Until(until))
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // streamAssistantResponse streams an assistant response from the LLM.
