@@ -31,6 +31,7 @@ const (
 	actionIDMessageFollowUp       = "app.message.followUp"
 	actionIDMessageDequeue        = "app.message.dequeue"
 	actionIDHeaderExpand          = "app.header.expand"
+	actionIDChatScrollBottom      = "app.chat.scrollBottom"
 	actionIDHistorySearchBackward = "tau.input.historySearchBackward"
 	actionIDHistorySearchForward  = "tau.input.historySearchForward"
 	actionIDPaste                 = "app.clipboard.pasteImage"
@@ -73,6 +74,7 @@ func appKeybindingDefinitions() map[string]keybindings.Definition {
 		actionIDMessageFollowUp:       {DefaultKeys: nil, Description: "Queue a follow-up message"},
 		actionIDMessageDequeue:        {DefaultKeys: []string{"alt+backspace"}, Description: "Drop the first queued message"},
 		actionIDHeaderExpand:          {DefaultKeys: []string{"ctrl+o"}, Description: "Expand or collapse startup help"},
+		actionIDChatScrollBottom:      {DefaultKeys: []string{"ctrl+end"}, Description: "Scroll the chat to the bottom"},
 		actionIDHistorySearchBackward: {DefaultKeys: []string{"ctrl+r"}, Description: "Search prompt history backward"},
 		actionIDHistorySearchForward:  {DefaultKeys: []string{"ctrl+s"}, Description: "Search prompt history forward"},
 		actionIDPaste:                 {DefaultKeys: []string{"ctrl+v"}, Description: "Paste from clipboard"},
@@ -99,6 +101,7 @@ func appActions() map[string]tauui.Action {
 		actionIDMessageFollowUp:       AppActionMessageFollowUp,
 		actionIDMessageDequeue:        AppActionMessageDequeue,
 		actionIDHeaderExpand:          AppActionHeaderExpand,
+		actionIDChatScrollBottom:      AppActionChatScrollBottom,
 		actionIDHistorySearchBackward: AppActionHistorySearchBackward,
 		actionIDHistorySearchForward:  AppActionHistorySearchForward,
 		actionIDPaste:                 AppActionPaste,

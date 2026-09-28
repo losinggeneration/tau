@@ -14,6 +14,27 @@ func ctrl(r rune) tauui.Keystroke {
 	return tauui.Keystroke{Key: tauui.KeyRune, Rune: r, Mod: tauui.ModCtrl}
 }
 
+// app.chat.scrollBottom ships on Ctrl+End. The editor owns plain End (end of
+// line), so the chord has to resolve in the text-input context too — the
+// editor has focus virtually always, and jumping to the bottom of the chat
+// while typing is the common case.
+func TestChatScrollBottomResolvesInBothContexts(t *testing.T) {
+	a := newAppWithSelector(t)
+	km := appKeymap{app: a}
+	ks := tauui.Keystroke{Key: tauui.KeyEnd, Mod: tauui.ModCtrl}
+
+	for _, ctx := range []tauui.KeyContext{tauui.KeyCtxGlobal, tauui.KeyCtxTextInput} {
+		got, ok := km.Resolve(ctx, ks)
+		if !ok || got != AppActionChatScrollBottom {
+			t.Errorf("ctrl+end in ctx %v = (%v, %v), want AppActionChatScrollBottom", ctx, got, ok)
+		}
+	}
+	// Plain End stays with the editor's ActionEnd.
+	if got, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyEnd}); ok && got == AppActionChatScrollBottom {
+		t.Error("plain End was claimed by chat scroll; it must stay the editor's line-end")
+	}
+}
+
 // Every registered action id must have a Go action behind it and a definition
 // in front of it. A mismatch means a key that resolves to nothing, or a
 // documented binding no handler can receive.

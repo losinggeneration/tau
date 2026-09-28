@@ -97,8 +97,8 @@ func (a *App) SetLayoutMode(mode LayoutMode) {
 			// Re-anchoring to the end of the transcript is a programmatic
 			// follow, so any autoscroll suspension carried over from the
 			// other layout resumes with it. setAutoScrollOff also drops
-			// pendingNewMessages so the toast doesn't survive a switch that
-			// was meant to re-pin the view.
+			// pendingNewMessages so the new-message count doesn't survive
+			// a switch that was meant to re-pin the view.
 			a.setAutoScrollOff(false)
 		}
 	}

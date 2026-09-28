@@ -983,6 +983,7 @@ var hotkeyHintOrder = []string{
 	actionIDHistorySearchBackward,
 	actionIDHistorySearchForward,
 	actionIDHeaderExpand,
+	actionIDChatScrollBottom,
 }
 
 // keybindingHints renders "<keys>  <description>" for each configurable action,

@@ -155,6 +155,12 @@ const (
 	// the async response into the editor through the same paste path as
 	// bracketed paste. External id "app.clipboard.pasteImage".
 	AppActionPaste
+
+	// AppActionChatScrollBottom jumps the chat viewport to the end of the
+	// transcript and resumes follow-the-tail. It backs the scroll-to-bottom
+	// status line shown while the user is scrolled away. External id
+	// "app.chat.scrollBottom".
+	AppActionChatScrollBottom
 )
 
 // selectorMode enumerates the modes the inline Selector can be in. The
@@ -215,27 +221,27 @@ type App struct {
 	//
 	// Mutate only via setAutoScrollOff so the pendingNewMessages counter is
 	// reset whenever the user comes back to the bottom — without that, the
-	// "New messages" toast would survive a return-to-bottom and misreport the
-	// state.
+	// status line's new-message count would survive a return-to-bottom and
+	// misreport the state.
 	autoScrollOff bool
 	// pendingNewMessages is the count of new messages that arrived while the
 	// user was scrolled away from the end of the chat buffer. The conversation
 	// event adapter increments it per message boundary (assistant message_start,
 	// user message_end with a real row) while autoScrollOff is set, and the
-	// toast paints while it is non-zero. setAutoScrollOff clears it when the
-	// user returns to the bottom; transcript replacement and layout switches
-	// clear it for the same reason. The counter only ever increments in the
-	// fixed layout, where user-driven scroll-away is tracked; the document
-	// layout does not surface this indicator yet.
+	// chat status line paints the count while it is non-zero. setAutoScrollOff
+	// clears it when the user returns to the bottom; transcript replacement and
+	// layout switches clear it for the same reason. The counter only ever
+	// increments in the fixed layout, where user-driven scroll-away is tracked;
+	// the document layout does not surface this indicator yet.
 	pendingNewMessages int
-	// lastNewMessagesToastRect is the rect where the toast last painted, kept
-	// so a transition from non-zero to zero can invalidate the cells the toast
-	// was occupying. Without it, the toast would persist on screen until the
-	// next full repaint.
-	lastNewMessagesToastRect tauui.Rect
-	editor                   *tauui.PromptEditor
-	footer                   *Footer
-	root                     *Root
+	// lastChatStatusRect is the rect where the chat status line last painted,
+	// kept so a transition from visible to hidden can invalidate the cells the
+	// line was occupying. Without it, the line would persist on screen until
+	// the next full repaint.
+	lastChatStatusRect tauui.Rect
+	editor             *tauui.PromptEditor
+	footer             *Footer
+	root               *Root
 
 	// pending renders the queued follow-up messages above the editor
 	// in the layout stack. It collapses to 0x0 when the queue is
@@ -1023,13 +1029,17 @@ func (a *App) setAutoScrollOff(off bool) {
 	if !off {
 		a.resetNewMessageCount()
 	}
+	// The status line appears or disappears with this flag, and the scroll
+	// that flipped it only invalidates the viewport — invalidate both the
+	// line's old and new cells so the next paint matches the state.
+	a.invalidateChatStatus()
 }
 
 // chatScrolledAway reports whether new conversation rows should be counted
-// toward the "New messages" toast. It mirrors the live follow-the-tail state:
-// in the fixed layout that is autoScrollOff (set by user scroll events); in
-// the document layout no scroll-away tracking exists yet, so this stays false
-// and the toast never paints there.
+// toward the "New messages" count in the chat status line. It mirrors the
+// follow-the-tail state: in the fixed layout that is autoScrollOff (set by
+// user scroll events); in the document layout no scroll-away tracking exists
+// yet, so this stays false and the line never paints there.
 func (a *App) chatScrolledAway() bool {
 	if a == nil {
 		return false
@@ -1049,37 +1059,29 @@ func (a *App) noteNewMessage() {
 		return
 	}
 	a.pendingNewMessages++
-	a.invalidateNewMessagesToast()
+	a.invalidateChatStatus()
 }
 
-// resetNewMessageCount clears the counter and invalidates wherever the toast
-// last painted so the indicator disappears on the next frame. Called when the
-// user returns to the bottom, the transcript is replaced, or the layout is
-// switched in a way that re-anchors autoscroll.
+// resetNewMessageCount clears the counter and invalidates wherever the chat
+// status line last painted so the count disappears on the next frame. Called
+// when the user returns to the bottom, the transcript is replaced, or the
+// layout is switched in a way that re-anchors autoscroll.
 func (a *App) resetNewMessageCount() {
 	if a == nil {
 		return
 	}
 	if a.pendingNewMessages == 0 {
-		a.lastNewMessagesToastRect = tauui.Rect{}
 		return
 	}
 	a.pendingNewMessages = 0
-	r := a.lastNewMessagesToastRect
-	a.lastNewMessagesToastRect = tauui.Rect{}
-	if r.W <= 0 || r.H <= 0 {
-		return
-	}
-	if ctx := a.loopContext(); ctx != nil && ctx.Invalidate != nil {
-		ctx.Invalidate(r)
-	}
+	a.invalidateChatStatus()
 }
 
-// invalidateNewMessagesToast marks the area the toast occupies (or the root
-// if nothing is laid out yet) as dirty so the next paint updates or hides the
-// indicator. Counts only change at message boundaries, so the rate is bounded
-// by message arrival — not by streaming deltas.
-func (a *App) invalidateNewMessagesToast() {
+// invalidateChatStatus marks the area the chat status line occupies — both
+// where it last painted and where it would paint now — as dirty so the next
+// paint updates or hides the line. Counts only change at message boundaries,
+// so the rate is bounded by message arrival — not by streaming deltas.
+func (a *App) invalidateChatStatus() {
 	if a == nil {
 		return
 	}
@@ -1087,39 +1089,60 @@ func (a *App) invalidateNewMessagesToast() {
 	if ctx == nil || ctx.Invalidate == nil {
 		return
 	}
-	r := a.newMessagesToastRect()
-	if r.W <= 0 || r.H <= 0 {
-		if a.root != nil {
-			r = a.root.Rect()
-		}
+	if r := a.lastChatStatusRect; r.W > 0 && r.H > 0 {
+		ctx.Invalidate(r)
 	}
-	if r.W > 0 && r.H > 0 {
+	if r := a.chatStatusRect(); r.W > 0 && r.H > 0 {
 		ctx.Invalidate(r)
 	}
 }
 
-// newMessagesToastText is the exact text painted inside the toast. Format kept
-// in one place so tests can assert on it and a future localisation only
-// changes the strings here.
-func (a *App) newMessagesToastText() string {
-	return fmt.Sprintf("New messages (%d)", a.pendingNewMessages)
+// chatStatusText is the exact text painted in the chat status line. The line
+// is the single floating indicator above the prompt editor: the new-message
+// count while the user is scrolled away, plus how to jump back to the bottom.
+// Format kept in one place so tests can assert on it and a future
+// localisation only changes the strings here.
+func (a *App) chatStatusText() string {
+	if a == nil || !a.autoScrollOff {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if a.pendingNewMessages > 0 {
+		parts = append(parts, fmt.Sprintf("New messages (%d)", a.pendingNewMessages))
+	}
+	hint := "scroll to bottom"
+	if keys := a.chatScrollBottomKeys(); len(keys) > 0 {
+		hint += fmt.Sprintf(" (%s)", strings.Join(keys, "/"))
+	}
+	parts = append(parts, hint)
+	return strings.Join(parts, " · ")
 }
 
-// newMessagesToastRect computes where the toast would paint right now, given
-// the current layout. Returns a zero rect when the counter is zero, the
-// editor has not been laid out, or the editor's row is outside the viewport
-// (the document layout's scrolled-away editor). The rect is one row tall and
-// centred horizontally across the root width — capped so a very narrow
-// terminal does not produce negative widths.
-func (a *App) newMessagesToastRect() tauui.Rect {
-	if a == nil || a.pendingNewMessages <= 0 || a.root == nil || a.editor == nil {
+// chatScrollBottomKeys returns the user's configured keys for jumping to the
+// bottom of the chat, for display in the status line.
+func (a *App) chatScrollBottomKeys() []string {
+	manager := a.keybindings
+	if manager == nil {
+		manager = defaultAppKeybindings()
+	}
+	return manager.Keys(actionIDChatScrollBottom)
+}
+
+// chatStatusRect computes where the chat status line would paint right now,
+// given the current layout. Returns a zero rect when the user is not scrolled
+// away, the editor has not been laid out, or the editor's row is outside the
+// viewport (the document layout's scrolled-away editor). The rect is one row
+// tall and centred horizontally across the root width — capped so a very
+// narrow terminal does not produce negative widths.
+func (a *App) chatStatusRect() tauui.Rect {
+	if a == nil || !a.autoScrollOff || a.root == nil || a.editor == nil {
 		return tauui.Rect{}
 	}
 	rootRect := a.root.Rect()
 	if rootRect.W <= 0 || rootRect.H <= 0 {
 		return tauui.Rect{}
 	}
-	text := a.newMessagesToastText()
+	text := a.chatStatusText()
 	w := tauui.TextWidth(text)
 	if w > rootRect.W {
 		w = rootRect.W
@@ -1135,32 +1158,34 @@ func (a *App) newMessagesToastRect() tauui.Rect {
 	return tauui.Rect{X: x, Y: y, W: w, H: 1}
 }
 
-// paintNewMessagesToast draws the toast if the counter is non-zero. It is
-// called from Root.Paint after the layout has painted so the toast lands on
-// top of whatever row sits above the editor. The cells the toast overdraws
-// are the chat log's bottom row in the common case (no widgets-above); that
-// is the trade-off of a floating toast vs inserting a real layout region.
+// paintChatStatus draws the chat status line while the user is scrolled away
+// from the end of the transcript. It is called from Root.Paint after the
+// layout has painted so the line lands on top of whatever row sits above the
+// editor. The cells the line overdraws are the chat log's bottom row in the
+// common case (no widgets-above); that is the trade-off of a floating line vs
+// inserting a real layout region.
 //
-// Records lastNewMessagesToastRect so resetNewMessageCount can invalidate
-// exactly the cells the toast occupied when it disappears.
-func (a *App) paintNewMessagesToast(d tauui.Drawer) {
-	if a == nil || a.pendingNewMessages <= 0 || a.chat == nil {
+// Records lastChatStatusRect so invalidateChatStatus can erase exactly the
+// cells the line occupied when it disappears.
+func (a *App) paintChatStatus(d tauui.Drawer) {
+	if a == nil || a.chat == nil {
 		return
 	}
-	rect := a.newMessagesToastRect()
+	rect := a.chatStatusRect()
 	if rect.W <= 0 || rect.H <= 0 {
 		return
 	}
 	tokens := a.chat.ThemeTokens()
-	// Inverse of the chat background: the toast's background is the foreground
-	// colour, the toast's foreground is the background colour. On the default
-	// dark theme that reads as light grey (Text) on near-black (Surface) —
-	// matching the "gray background & black foreground" the spec describes.
+	// Inverse of the chat background: the line's background is the foreground
+	// colour, its foreground the background colour. On the default dark theme
+	// that reads as light grey (Text) on near-black (Surface) — matching the
+	// "gray background & black foreground" the spec describes for the toast
+	// this line grew out of.
 	bg := tokens.Text
 	fg := tokens.Surface
 	d.FillRect(rect, tauui.Style{FG: bg, BG: bg})
-	d.DrawText(tauui.Point{X: rect.X, Y: rect.Y}, a.newMessagesToastText(), tauui.Style{FG: fg, BG: bg})
-	a.lastNewMessagesToastRect = rect
+	d.DrawText(tauui.Point{X: rect.X, Y: rect.Y}, a.chatStatusText(), tauui.Style{FG: fg, BG: bg})
+	a.lastChatStatusRect = rect
 }
 
 // Root embeds the layout VStack and implements HandleAction so app-level
@@ -1207,6 +1232,9 @@ func (r *Root) Handle(e tauui.Event, ctx *tauui.Ctx) bool {
 	}
 	if ce, ok := e.(tauui.ClipboardResponseEvent); ok && r.app != nil {
 		return r.app.handlePaste(tauui.PasteEvent(ce), ctx)
+	}
+	if me, ok := e.(tauui.MouseEvent); ok && r.app != nil && r.app.chatStatusClick(me, ctx) {
+		return true
 	}
 	if r.app != nil && r.app.LayoutMode() == LayoutDocument && r.document != nil {
 		if r.document.Handle(e, ctx) {
@@ -1354,10 +1382,10 @@ func (r *Root) Paint(d tauui.Drawer, ctx *tauui.Ctx) {
 	} else {
 		r.VStack.Paint(d, ctx)
 	}
-	// The "New messages" toast floats above the editor. Painting it after the
-	// layout pass keeps it on top of whatever the chat log or widgets-above
-	// drew on that row.
-	r.app.paintNewMessagesToast(d)
+	// The chat status line (new-message count and scroll-to-bottom hint)
+	// floats above the editor. Painting it after the layout pass keeps it on
+	// top of whatever the chat log or widgets-above drew on that row.
+	r.app.paintChatStatus(d)
 }
 
 func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
@@ -1452,6 +1480,9 @@ func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
 		return true
 	case AppActionHeaderExpand:
 		r.app.ToggleHeaderExpanded()
+		return true
+	case AppActionChatScrollBottom:
+		r.app.jumpToChatBottom(ctx)
 		return true
 	}
 	// Returning false lets the toolkit apply its own focus-navigation fallback

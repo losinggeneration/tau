@@ -184,3 +184,56 @@ func TestProgrammaticScrollDoesNotChangeAutoscrollState(t *testing.T) {
 		t.Fatal("non-scroll mouse event suspended autoscroll")
 	}
 }
+
+// jumpToChatBottom backs the status line and app.chat.scrollBottom (Ctrl+End):
+// it must land the viewport on the end of the buffer and re-arm
+// follow-the-tail, including dropping the new-message count the status line
+// was advertising.
+func TestJumpToChatBottomScrollsAndResumes(t *testing.T) {
+	a, viewport, _, _ := newAutoscrollFixture(t)
+	ctx := &tauui.Ctx{Invalidate: func(tauui.Rect) {}}
+
+	viewport.ScrollBottom(ctx)
+	viewport.Handle(wheelEvent(tauui.MouseButtonWheelUp), ctx)
+	if !a.autoScrollOff {
+		t.Fatal("setup: user scroll did not suspend autoscroll")
+	}
+	a.noteNewMessage()
+	a.noteNewMessage()
+	if a.pendingNewMessages != 2 {
+		t.Fatalf("setup: pendingNewMessages = %d, want 2", a.pendingNewMessages)
+	}
+
+	a.jumpToChatBottom(ctx)
+
+	if !viewport.atBottom() {
+		t.Errorf("jump left the viewport at %d, want the end of the buffer", viewport.ScrollPos())
+	}
+	if a.autoScrollOff {
+		t.Error("jump did not resume autoscroll")
+	}
+	if a.pendingNewMessages != 0 {
+		t.Errorf("pendingNewMessages = %d after the jump, want 0", a.pendingNewMessages)
+	}
+}
+
+// In the document layout the document itself owns the scroll position, so the
+// same action must re-pin the document to its bottom. A viewport shorter than
+// the editor region alone guarantees the document is scrollable without
+// waiting on async chat renders.
+func TestJumpToChatBottomDocumentLayout(t *testing.T) {
+	a := newToastFixture(t)
+	a.SetLayoutMode(LayoutDocument)
+	doc := a.root.document
+	doc.Layout(tauui.Rect{X: 0, Y: 0, W: 80, H: 5})
+	doc.SetScrollBack(3)
+	if doc.AtBottom() {
+		t.Fatal("setup: document fixture is not scrollable")
+	}
+
+	a.jumpToChatBottom(testCtx())
+
+	if !doc.AtBottom() {
+		t.Errorf("jump left the document at scrollBack %d, want 0", doc.ScrollBack())
+	}
+}

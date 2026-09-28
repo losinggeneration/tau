@@ -136,3 +136,53 @@ func (a *App) chatUserScrolled(atBottom bool) {
 	}
 	a.setAutoScrollOff(!atBottom)
 }
+
+// jumpToChatBottom is the scroll-to-bottom action behind the chat status line
+// and its keybinding (app.chat.scrollBottom, Ctrl+End by default). In the
+// fixed shell, scrolling to the end of the buffer is what resuming
+// follow-the-tail means, so the two always go together: ScrollBottom moves
+// the viewport and setAutoScrollOff(false) re-arms follow-the-tail and drops
+// the new-message count. The programmatic scroll deliberately bypasses the
+// user-scroll observer — an app action is not a user wheel event — so the
+// flag is cleared here, the same way layout switches re-anchor it. In the
+// document layout the document owns the scroll position instead.
+func (a *App) jumpToChatBottom(ctx *tauui.Ctx) {
+	if a == nil {
+		return
+	}
+	if a.root != nil && a.root.document != nil && a.LayoutMode() == LayoutDocument {
+		doc := a.root.document
+		doc.SetScrollBack(0)
+		if ctx != nil {
+			if ctx.InvalidateLayout != nil {
+				ctx.InvalidateLayout()
+			}
+			if r := doc.Rect(); ctx.Invalidate != nil && r.W > 0 && r.H > 0 {
+				ctx.Invalidate(r)
+			}
+		}
+		return
+	}
+	if a.scroll == nil {
+		return
+	}
+	a.scroll.ScrollBottom(ctx)
+	a.setAutoScrollOff(false)
+}
+
+// chatStatusClick handles a left press on the chat status line above the
+// prompt editor: the line advertises how to jump back to the bottom, so
+// clicking it jumps. Runs before Root dispatches the event to the view under
+// the pointer, which would otherwise start a chat-log text selection on the
+// same row.
+func (a *App) chatStatusClick(me tauui.MouseEvent, ctx *tauui.Ctx) bool {
+	if a == nil || me.Button != tauui.MouseButtonLeft || me.Action != tauui.MousePress {
+		return false
+	}
+	rect := a.chatStatusRect()
+	if rect.W <= 0 || !rect.Contains(tauui.Point{X: me.X, Y: me.Y}) {
+		return false
+	}
+	a.jumpToChatBottom(ctx)
+	return true
+}

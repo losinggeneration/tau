@@ -384,6 +384,15 @@ func (q *quitWrapper) Children() []rovel.View {
 	return nil
 }
 
+// MouseOpaque stops the toolkit's hit test at the wrapper. Without it the
+// hit test descends through Children straight into the wrapped root's
+// regions and every mouse event is delivered to the deepest region view —
+// the root's Handle never runs, so its mouse routing (document wheel,
+// status-line clicks, deepest-view dispatch) is dead code. With it, mouse
+// events arrive at the wrapper, which forwards them to the wrapped root's
+// Handle for redistribution.
+func (q *quitWrapper) MouseOpaque() {}
+
 // HandleAction implements the action-handler contract.
 func (q *quitWrapper) HandleAction(act ui.Action, ctx *rovel.Ctx) bool {
 	if act == ui.Action(q.app.action) {

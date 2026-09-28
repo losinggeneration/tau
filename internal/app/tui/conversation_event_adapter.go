@@ -38,9 +38,9 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 		switch role {
 		case "assistant":
 			// A new assistant message is starting. If the user has scrolled
-			// away from the bottom, count it toward the "New messages" toast
-			// so the running count increments on the same boundary the user
-			// perceives as "a new message arriving".
+			// away from the bottom, count it toward the "New messages" count
+			// in the chat status line so the running count increments on the
+			// same boundary the user perceives as "a new message arriving".
 			app.noteNewMessage()
 			messageID, _ := plString(ev.Payload, "message_id")
 			a.finalizedAnonymousAssistant = false

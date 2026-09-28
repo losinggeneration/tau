@@ -818,6 +818,14 @@ func TestQuitWrapper_ActionQuitCallsQuit(t *testing.T) {
 	}
 }
 
+// The toolkit's hit test stops at views implementing MouseOpaque and
+// delivers them every mouse event for their rect. The wrapper must implement
+// it: without it the hit test descends through Children into the wrapped
+// root's regions, and the root's Handle never sees a mouse event — its
+// mouse routing (document wheel, status-line clicks, deepest-view dispatch)
+// becomes dead code.
+var _ interface{ MouseOpaque() } = (*quitWrapper)(nil)
+
 // TestQuitWrapper_PassesThroughOtherActions verifies the wrapper falls
 // through to the wrapped view for non-quit actions.
 func TestQuitWrapper_PassesThroughOtherActions(t *testing.T) {

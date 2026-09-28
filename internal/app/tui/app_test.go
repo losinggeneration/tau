@@ -477,30 +477,41 @@ func TestNoteNewMessageOnlyWhileScrolledAway(t *testing.T) {
 	}
 }
 
-// The toast text format is the user-facing contract; lock it so a
-// localisation or refactor cannot silently change "New messages (N)".
-func TestNewMessagesToastText(t *testing.T) {
+// The chat status line text format is the user-facing contract; lock it so a
+// localisation or refactor cannot silently change it. The line reads
+// "scroll to bottom (<keys>)", prefixed by the new-message count when any
+// arrived while the user was scrolled away.
+func TestChatStatusText(t *testing.T) {
 	a := newToastFixture(t)
-	a.pendingNewMessages = 1
-	if got := a.newMessagesToastText(); got != "New messages (1)" {
-		t.Errorf("text at count=1 = %q, want %q", got, "New messages (1)")
+
+	// Not scrolled away: nothing to advertise, even with a stale count.
+	a.pendingNewMessages = 3
+	if got := a.chatStatusText(); got != "" {
+		t.Errorf("text while following the tail = %q, want empty", got)
 	}
+
+	a.setAutoScrollOff(true)
+	a.pendingNewMessages = 0
+	if got := a.chatStatusText(); got != "scroll to bottom (ctrl+end)" {
+		t.Errorf("text scrolled away, no new messages = %q, want %q", got, "scroll to bottom (ctrl+end)")
+	}
+
 	a.pendingNewMessages = 42
-	if got := a.newMessagesToastText(); got != "New messages (42)" {
-		t.Errorf("text at count=42 = %q, want %q", got, "New messages (42)")
+	if got := a.chatStatusText(); got != "New messages (42) · scroll to bottom (ctrl+end)" {
+		t.Errorf("text scrolled away with count = %q, want %q", got, "New messages (42) · scroll to bottom (ctrl+end)")
 	}
 }
 
-// With the editor pinned to a known row, the toast should sit one row above
-// it, centred horizontally across the root, and exactly the text's width
-// tall (one row).
-func TestNewMessagesToastRectCentredAboveEditor(t *testing.T) {
+// With the editor pinned to a known row, the status line should sit one row
+// above it, centred horizontally across the root, and exactly the text's
+// width tall (one row).
+func TestChatStatusRectCentredAboveEditor(t *testing.T) {
 	a := newToastFixture(t)
 	a.editor.Layout(tauui.Rect{X: 0, Y: 10, W: 80, H: 1})
-	a.pendingNewMessages = 1
+	a.setAutoScrollOff(true)
 
-	rect := a.newMessagesToastRect()
-	text := a.newMessagesToastText()
+	rect := a.chatStatusRect()
+	text := a.chatStatusText()
 	wantW := tauui.TextWidth(text)
 
 	if rect.H != 1 {
@@ -518,33 +529,88 @@ func TestNewMessagesToastRectCentredAboveEditor(t *testing.T) {
 	}
 }
 
-// The toast must not paint (and the rect must be zero) when the counter is
-// zero — there is nothing to advertise.
-func TestNewMessagesToastRectHiddenWhenCountZero(t *testing.T) {
+// The status line must not paint (and the rect must be zero) while the user
+// follows the tail — there is nothing to advertise.
+func TestChatStatusRectHiddenWhileFollowing(t *testing.T) {
 	a := newToastFixture(t)
 	a.editor.Layout(tauui.Rect{X: 0, Y: 10, W: 80, H: 1})
+	a.pendingNewMessages = 2
 
-	if rect := a.newMessagesToastRect(); rect != (tauui.Rect{}) {
-		t.Errorf("rect = %+v with zero count, want zero rect", rect)
+	if rect := a.chatStatusRect(); rect != (tauui.Rect{}) {
+		t.Errorf("rect = %+v while following the tail, want zero rect", rect)
 	}
 }
 
-// A very narrow terminal must clamp the toast width so the centred x never
+// A very narrow terminal must clamp the status width so the centred x never
 // goes negative.
-func TestNewMessagesToastRectClampsToTerminalWidth(t *testing.T) {
+func TestChatStatusRectClampsToTerminalWidth(t *testing.T) {
 	a := newToastFixture(t)
 	a.editor.Layout(tauui.Rect{X: 0, Y: 5, W: 5, H: 1})
 	// Re-layout the Root at a narrow width.
 	rootRect := tauui.Rect{X: 0, Y: 0, W: 10, H: 20}
 	a.root.AppLayout.Layout(rootRect)
-	a.pendingNewMessages = 1
+	a.setAutoScrollOff(true)
 
-	rect := a.newMessagesToastRect()
+	rect := a.chatStatusRect()
 	if rect.W > rootRect.W {
 		t.Errorf("rect.W = %d exceeds root.W = %d", rect.W, rootRect.W)
 	}
 	if rect.X < rootRect.X || rect.X+rect.W > rootRect.X+rootRect.W {
 		t.Errorf("rect = %+v not contained in root = %+v", rect, rootRect)
+	}
+}
+
+// The status line advertises how to jump back to the bottom, so a left press
+// on it must jump — the Root intercepts the click before it can reach the
+// view underneath and start a chat-log selection. Presses elsewhere, and
+// non-press events on the line itself, must not.
+func TestChatStatusClickJumpsToBottom(t *testing.T) {
+	a, viewport, _, _ := newAutoscrollFixture(t)
+	// Layer the fixture's app into a real Root so the click path is the
+	// production one: Root.Handle intercepts on the status rect.
+	editorRect := tauui.Rect{X: 0, Y: 10, W: 40, H: 1}
+	a.editor = newPromptEditorForTest()
+	a.editor.Layout(editorRect)
+	appLayout := tauui.NewAppLayout(tauui.AppLayoutOpts{Editor: a.editor})
+	appLayout.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 20})
+	a.root = &Root{AppLayout: appLayout, app: a, layout: appLayout}
+
+	ctx := &tauui.Ctx{Invalidate: func(tauui.Rect) {}}
+	viewport.ScrollBottom(ctx)
+	viewport.Handle(wheelEvent(tauui.MouseButtonWheelUp), ctx)
+	if !a.autoScrollOff {
+		t.Fatal("setup: user scroll did not suspend autoscroll")
+	}
+	rect := a.chatStatusRect()
+	if rect.W <= 0 {
+		t.Fatal("setup: status line has no rect while scrolled away")
+	}
+
+	// A release (or a wheel event) on the line is not a click.
+	if a.root.Handle(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease, X: rect.X, Y: rect.Y}, ctx) {
+		t.Error("release on the status line was claimed by the click handler")
+	}
+	if !a.autoScrollOff {
+		t.Fatal("release on the status line resumed autoscroll")
+	}
+
+	// A press outside the line belongs to whatever sits under it.
+	if a.root.Handle(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MousePress, X: 1, Y: rect.Y}, ctx) {
+		t.Error("press left of the status line was claimed by the click handler")
+	}
+	if !a.autoScrollOff {
+		t.Fatal("press outside the status line resumed autoscroll")
+	}
+
+	// The click itself.
+	if !a.root.Handle(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MousePress, X: rect.X + rect.W/2, Y: rect.Y}, ctx) {
+		t.Error("press on the status line was not handled")
+	}
+	if a.autoScrollOff {
+		t.Error("clicking the status line did not resume autoscroll")
+	}
+	if !viewport.atBottom() {
+		t.Errorf("clicking the status line left the viewport at %d, want the end", viewport.ScrollPos())
 	}
 }
 
