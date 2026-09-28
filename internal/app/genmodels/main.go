@@ -517,7 +517,7 @@ func addStaticModels(models *[]*tauai.Model) {
 	// responses are enforced to a ~272k context by the backend regardless of
 	// the model's marketing window. codexModelIDs mirrors the models reported
 	// by GET chatgpt.com/backend-api/codex/models (visible ones only).
-	codexModelIDs := []string{"gpt-5.4-mini", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"}
+	codexModelIDs := []string{"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol"}
 	for _, id := range codexModelIDs {
 		base := findModel(*models, "openai", id)
 		if base == nil {
