@@ -14,11 +14,13 @@ var AnthropicCapabilities = Capabilities{
 	ParallelToolCalls: true,
 }
 
-// ClaudeAgentCapabilities is the conservative first-pass Claude Code Agent SDK surface.
+// ClaudeAgentCapabilities is the Claude Code Agent SDK surface. Vision is
+// true: the provider converts image content blocks into base64 image blocks
+// for streaming input (see claudeAgentBuildPromptBlocks).
 var ClaudeAgentCapabilities = Capabilities{
 	Tools:             true,
 	Streaming:         true,
-	Vision:            false,
+	Vision:            true,
 	Thinking:          true,
 	ParallelToolCalls: false,
 }
