@@ -2700,6 +2700,15 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 			SessionID: s.id,
 			Payload:   map[string]any{},
 		})
+	case agent.UsageLimitWait:
+		s.emit(ch, Event{
+			Type:      "usage_limit_wait",
+			SessionID: s.id,
+			Payload: map[string]any{
+				"provider":  e.Provider,
+				"resets_at": e.ResetsAt.Format(time.RFC3339),
+			},
+		})
 	case agent.MessageStart:
 		if e.Message != nil {
 			var parentID string

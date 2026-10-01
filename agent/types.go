@@ -410,6 +410,17 @@ type TurnEnd struct {
 
 func (TurnEnd) isEvent() {}
 
+// UsageLimitWait indicates the run hit a provider usage limit (HTTP 429 with
+// a provider-reported reset time) and is waiting until ResetsAt to retry.
+type UsageLimitWait struct {
+	// Provider is the provider that reported the exhausted limit.
+	Provider string
+	// ResetsAt is when the limit resets, in local time.
+	ResetsAt time.Time
+}
+
+func (UsageLimitWait) isEvent() {}
+
 // ToolStart indicates a tool is starting execution.
 type ToolStart struct {
 	ToolCallID string

@@ -603,6 +603,8 @@ func runLoop(
 				emit(MessageEnd{Message: errMsg})
 				newMessages = append(newMessages, errMsg)
 
+				emit(UsageLimitWait{Provider: model.Provider, ResetsAt: resetAt})
+
 				if waitErr := sleepUntil(ctx, resetAt.Add(usageLimitRetryBuffer)); waitErr != nil {
 					return newMessages, waitErr
 				}

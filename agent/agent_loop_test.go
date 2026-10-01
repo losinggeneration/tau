@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1110,6 +1111,8 @@ func eventLabel(event Event) string {
 			return fmt.Sprintf("tool_end:%s", e.Result.Message.ToolName)
 		}
 		return "tool_end"
+	case UsageLimitWait:
+		return "usage_limit_wait"
 	default:
 		return fmt.Sprintf("%T", event)
 	}
@@ -2744,6 +2747,9 @@ func TestRunAgentLoopUsageLimitWaitsAndRetries(t *testing.T) {
 	}
 	if strings.Count(strings.Join(events, ","), "message_end:assistant") != 2 {
 		t.Fatalf("events = %v, want two assistant message_end events (error + retry)", events)
+	}
+	if !slices.Contains(events, "usage_limit_wait") {
+		t.Fatalf("events = %v, want usage_limit_wait", events)
 	}
 }
 

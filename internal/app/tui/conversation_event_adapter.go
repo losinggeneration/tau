@@ -12,6 +12,9 @@ type conversationEventAdapter struct {
 	finalizedAssistantMessages  map[string]struct{}
 	finalizedUserMessages       map[string]struct{}
 	finalizedAnonymousAssistant bool
+	// lastErrorText dedupes the run-failure "error" event against the
+	// error assistant message (message_end) that carries the same text.
+	lastErrorText string
 }
 
 func newConversationEventAdapter(app *App) *conversationEventAdapter {
@@ -25,6 +28,7 @@ func (a *conversationEventAdapter) beginRun() {
 	a.finalizedAssistantMessages = nil
 	a.finalizedUserMessages = nil
 	a.finalizedAnonymousAssistant = false
+	a.lastErrorText = ""
 }
 
 func (a *conversationEventAdapter) handle(ev sdk.Event) {
@@ -44,6 +48,7 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 			app.noteNewMessage()
 			messageID, _ := plString(ev.Payload, "message_id")
 			a.finalizedAnonymousAssistant = false
+			app.clearUsageLimitWait()
 			app.ensureAssistantMessage(messageID)
 		case "user":
 			// User message_start is a lifecycle marker; the committed row is
@@ -117,7 +122,7 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 		app.resetEmptyAssistantResponses()
 		app.conv.ClearThinking()
 		if msg, _ := plString(ev.Payload, "message"); msg != "" {
-			app.conv.AddError(msg)
+			a.showError(msg)
 		}
 	case "message_end":
 		a.handleMessageEnd(ev)
@@ -174,6 +179,19 @@ func (a *conversationEventAdapter) handleMessageEnd(ev sdk.Event) {
 	} else if a.finalizedAnonymousAssistant && !app.conv.IsStreaming() {
 		return
 	}
+	// Error assistant messages (provider failures, usage-limit 429s) carry
+	// their text in error_message with empty content; show that instead of
+	// falling through to the empty-response counter below.
+	if errMsg, _ := plString(ev.Payload, "error_message"); errMsg != "" {
+		if content, _ := plStringAny(ev.Payload, "content", "text"); strings.TrimSpace(content) == "" {
+			app.resetEmptyAssistantResponses()
+			app.conv.ClearThinking()
+			app.conv.EndAssistantMessage()
+			a.showError(errMsg)
+			a.markAssistantMessageFinalized(messageID)
+			return
+		}
+	}
 	content, _ := plString(ev.Payload, "content")
 	if strings.TrimSpace(content) != "" {
 		app.resetEmptyAssistantResponses()
@@ -203,6 +221,17 @@ func (a *conversationEventAdapter) markAssistantMessageFinalized(messageID strin
 		a.finalizedAssistantMessages = make(map[string]struct{})
 	}
 	a.finalizedAssistantMessages[messageID] = struct{}{}
+}
+
+// showError appends an error row unless the identical text was just shown
+// (a run failure surfaces both as an error assistant message and as the
+// session's "error" event).
+func (a *conversationEventAdapter) showError(text string) {
+	if a == nil || a.app == nil || text == "" || text == a.lastErrorText {
+		return
+	}
+	a.lastErrorText = text
+	a.app.conv.AddError(text)
 }
 
 func payloadMessageID(payload any) string {

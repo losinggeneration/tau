@@ -384,7 +384,12 @@ type App struct {
 	// workingOverride replaces the default run message when an extension sets
 	// one. Guarded by workingMu because extensions may set it off-loop.
 	workingOverride string
-	workingMu       sync.Mutex
+	// usageLimitWaitUntil/Provider drive the run-message countdown while the
+	// agent is sleeping out a provider usage-limit window. Guarded by
+	// workingMu for the same reason.
+	usageLimitWaitUntil time.Time
+	usageLimitProvider  string
+	workingMu           sync.Mutex
 
 	// themeColors resolves discovered theme files to their colour tokens.
 	// Nil means only the built-in token sets are available.
@@ -2599,18 +2604,53 @@ func (a *App) refreshPending(ctx *tauui.Ctx) {
 // previously the hardcoded literal " working" with no way to change it.
 const defaultWorkingMessage = "Working..."
 
-// workingMessage returns the active run message: an extension's override when
-// one is set, otherwise the default.
+// workingMessage returns the active run message: the usage-limit countdown
+// while waiting out a provider window, an extension's override when one is
+// set, otherwise the default.
 func (a *App) workingMessage() string {
 	if a == nil {
 		return defaultWorkingMessage
 	}
 	a.workingMu.Lock()
 	defer a.workingMu.Unlock()
+	if !a.usageLimitWaitUntil.IsZero() {
+		label := "usage limit"
+		if a.usageLimitProvider != "" {
+			label = a.usageLimitProvider + " usage limit"
+		}
+		if d := time.Until(a.usageLimitWaitUntil); d > 0 {
+			return fmt.Sprintf("%s, retrying at %s (in %s)", label, a.usageLimitWaitUntil.Format(time.TimeOnly), d.Round(time.Second))
+		}
+		return label + ", retrying now"
+	}
 	if a.workingOverride != "" {
 		return a.workingOverride
 	}
 	return defaultWorkingMessage
+}
+
+// setUsageLimitWait switches the run message to a usage-limit countdown that
+// ticks with the run spinner until cleared. Safe to call from the app loop.
+func (a *App) setUsageLimitWait(provider string, until time.Time) {
+	if a == nil {
+		return
+	}
+	a.workingMu.Lock()
+	a.usageLimitProvider = provider
+	a.usageLimitWaitUntil = until
+	a.workingMu.Unlock()
+}
+
+// clearUsageLimitWait restores the ordinary run message. Safe to call from
+// the app loop.
+func (a *App) clearUsageLimitWait() {
+	if a == nil {
+		return
+	}
+	a.workingMu.Lock()
+	a.usageLimitProvider = ""
+	a.usageLimitWaitUntil = time.Time{}
+	a.workingMu.Unlock()
 }
 
 // SetWorkingMessage overrides the run message; an empty string restores the
@@ -4269,6 +4309,16 @@ func (a *App) ensureAssistantMessage(messageID ...string) {
 // the app loop (inside a posted callback).
 func (a *App) handleEvent(ev sdk.Event) {
 	switch ev.Type {
+	case "usage_limit_wait":
+		provider, _ := plString(ev.Payload, "provider")
+		until := time.Time{}
+		if raw, _ := plString(ev.Payload, "resets_at"); raw != "" {
+			parsed, err := time.Parse(time.RFC3339, raw)
+			if err == nil {
+				until = parsed
+			}
+		}
+		a.setUsageLimitWait(provider, until)
 	case "usage":
 		a.applyUsagePayload(ev.Payload)
 		a.refreshFooterStats(a.loopContext())
@@ -4293,6 +4343,7 @@ func (a *App) handleEvent(ev sdk.Event) {
 		a.conv.ClearThinking()
 		a.setStreaming(false)
 		a.setToolRunning(false)
+		a.clearUsageLimitWait()
 		a.syncPendingFromSession(a.loopContext())
 	default:
 		if a.conversationEvents == nil {
