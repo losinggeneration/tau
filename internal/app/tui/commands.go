@@ -138,6 +138,8 @@ func NewCommands() *Commands {
 	c.Register(Command{Name: "logout", Description: "Sign out", Handler: cmdLogout})
 	c.Register(Command{Name: "new", Description: "Start a new session", Handler: cmdNew})
 	c.Register(Command{Name: "compact", Description: "Compact session history", Handler: cmdCompact})
+	// nil handler: the session owns /retry, the entry is for completion.
+	c.Register(Command{Name: "retry", Description: "Resume an interrupted or failed run"})
 	c.Register(Command{Name: "resume", Description: "Resume a saved session", Handler: cmdResume})
 	c.Register(Command{Name: "history", Description: "Show the full session history (uncompacted)", Handler: cmdHistory})
 	// /reload is deliberately not registered here: the session's command

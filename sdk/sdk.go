@@ -783,6 +783,13 @@ func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, err
 	// If the message starts with "/" and we have a command registry, route
 	// the command through the registry instead of sending to the LLM.
 	// Slash commands like /reload should interrupt any active run first.
+	if strings.TrimSpace(msg.Text) == "/retry" {
+		if s.cancelFn != nil {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("session already processing")
+		}
+		return s.runLocked(ctx, s.agent.Continue), nil
+	}
 	isSlashCommand := strings.HasPrefix(msg.Text, "/") && s.cmdRegistry != nil
 	if s.cancelFn != nil {
 		if isSlashCommand {
@@ -916,6 +923,33 @@ func providerTriggerTokens(provider string) int {
 }
 
 func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Message) (<-chan Event, error) {
+	return s.runLocked(ctx, func(ctx context.Context) error {
+		content := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msg.Text}}
+		content = append(content, msg.Images...)
+		agentMsg := &agent.Message{
+			Role:      agent.RoleUser,
+			Content:   content,
+			Timestamp: time.Now(),
+		}
+
+		if err := s.appendUserMessageToSession(msg); err != nil {
+			s.logger.Warn("session write failed", "error", err)
+		}
+
+		// Auto-compaction check: trigger if context usage exceeds threshold.
+		s.autoCompactIfDue(ctx)
+
+		if msg.SystemAddendum != "" {
+			return s.agent.Prompt(ctx, agentMsg, agent.WithPromptSystemAddendum(msg.SystemAddendum))
+		}
+
+		return s.agent.Prompt(ctx, agentMsg)
+	}), nil
+}
+
+// runLocked starts an agent run on a goroutine and streams its events. The
+// caller holds s.mu; runLocked releases it.
+func (s *agentSession) runLocked(ctx context.Context, run func(context.Context) error) <-chan Event {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelFn = cancel
 	s.mu.Unlock()
@@ -942,18 +976,6 @@ func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Messag
 			},
 		})
 
-		content := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msg.Text}}
-		content = append(content, msg.Images...)
-		agentMsg := &agent.Message{
-			Role:      agent.RoleUser,
-			Content:   content,
-			Timestamp: time.Now(),
-		}
-
-		if err := s.appendUserMessageToSession(msg); err != nil {
-			s.logger.Warn("session write failed", "error", err)
-		}
-
 		unsubscribe := s.agent.Subscribe(func(event agent.Event, signal <-chan struct{}) {
 			s.handleAgentEvent(events, event)
 			// Tool results can push a running turn past the context-window
@@ -966,23 +988,14 @@ func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Messag
 		})
 		defer unsubscribe()
 
-		// Auto-compaction check: trigger if context usage exceeds threshold.
-		s.autoCompactIfDue(ctx)
-
-		var promptErr error
-		if msg.SystemAddendum != "" {
-			promptErr = s.agent.Prompt(ctx, agentMsg, agent.WithPromptSystemAddendum(msg.SystemAddendum))
-		} else {
-			promptErr = s.agent.Prompt(ctx, agentMsg)
-		}
-		if promptErr != nil {
-			s.recordProviderError(promptErr)
+		if err := run(ctx); err != nil {
+			s.recordProviderError(err)
 			s.emit(events, Event{
 				Type:      "error",
 				SessionID: s.id,
 				Payload: map[string]any{
 					"code":        "agent_error",
-					"message":     promptErr.Error(),
+					"message":     err.Error(),
 					"recoverable": false,
 				},
 			})
@@ -999,7 +1012,7 @@ func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Messag
 		})
 	}()
 
-	return events, nil
+	return events
 }
 
 // SendText is an ergonomic shortcut that sends a text-only message.

@@ -293,12 +293,23 @@ func (a *Agent) PromptMessages(ctx context.Context, msgs []*Message, opts ...Pro
 	return a.runPromptMessages(ctx, msgs, false, po.transform, po.systemAddendum)
 }
 
-// Continue continues the agent from its current state.
+// Continue continues the agent from its current state, resuming a run that
+// was interrupted or failed.
 func (a *Agent) Continue(ctx context.Context) error {
 	a.mu.Lock()
 	if a.activeRun != nil {
 		a.mu.Unlock()
 		return ErrAlreadyProcessing
+	}
+
+	// Failed/aborted assistant messages are never replayed to the model, so
+	// a run that ended on one resumes from the message before it.
+	for n := len(a.state.Messages); n > 0; n = len(a.state.Messages) {
+		last := a.state.Messages[n-1]
+		if last.Role != RoleAssistant || (last.StopReason != ai.StopReasonError && last.StopReason != ai.StopReasonAborted) {
+			break
+		}
+		a.state.Messages = a.state.Messages[:n-1]
 	}
 
 	if len(a.state.Messages) == 0 {

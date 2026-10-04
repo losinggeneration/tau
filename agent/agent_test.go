@@ -1791,3 +1791,40 @@ func TestPromptMidRunReplaceMessagesRebasesContext(t *testing.T) {
 		}
 	}
 }
+
+func TestContinueResumesAfterFailedAssistantMessage(t *testing.T) {
+	var lastRoles []string
+	client := stubClient{stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+		lastRoles = nil
+		for _, m := range prompt.Messages {
+			lastRoles = append(lastRoles, m.Role)
+		}
+		final := ai.AssistantMessage{Role: "assistant", Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "ok"}}, StopReason: ai.StopReasonStop, Timestamp: time.Now().UnixMilli()}
+		handler(ctx, ai.Start{Partial: ai.AssistantMessage{Role: "assistant", Timestamp: final.Timestamp}})
+		handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: final})
+		return nil
+	}}
+	a, err := New(NewConfig(
+		WithModel(&ai.Model{ID: "test", API: ai.APIOpenAICompletions, Provider: ai.ProviderOpenAI}),
+		WithClientFactory(func(model *ai.Model) (ai.Client, error) { return client, nil }),
+	))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a.ReplaceMessages([]*Message{
+		NewUserMessage("do the thing"),
+		{Role: RoleAssistant, StopReason: ai.StopReasonAborted, IsError: true, Timestamp: time.Now()},
+		{Role: RoleAssistant, StopReason: ai.StopReasonError, IsError: true, Timestamp: time.Now()},
+	})
+
+	if err := a.Continue(context.Background()); err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	if len(lastRoles) != 1 || lastRoles[0] != "user" {
+		t.Fatalf("prompt roles = %v, want [user]", lastRoles)
+	}
+	msgs := a.Messages()
+	if len(msgs) != 2 || msgs[1].StopReason != ai.StopReasonStop {
+		t.Fatalf("messages after retry = %d, want user + successful assistant", len(msgs))
+	}
+}
