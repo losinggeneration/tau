@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -32,30 +31,6 @@ func countLinesContaining(lines []string, substr string) int {
 		}
 	}
 	return n
-}
-
-// Bounded preview belongs to the specific built-in renderers. A tool the app
-// knows nothing about must render its whole result: truncating it would hide
-// output with no way to get it back.
-func TestGenericToolFallbackRendersFullOutput(t *testing.T) {
-	const total = 60
-	var output []string
-	for i := range total {
-		output = append(output, "generic-line-"+strconv.Itoa(i))
-	}
-	lines := renderedToolLines(t, "", func(conv *ConversationModel) {
-		conv.AddToolCallWithID("tool-1", "some_unknown_tool", `{}`)
-		conv.AddToolResultWithID("tool-1", strings.Join(output, "\n"), false)
-	})
-
-	for _, want := range []string{"generic-line-0", "generic-line-30", "generic-line-59"} {
-		if countLinesContaining(lines, want) == 0 {
-			t.Fatalf("generic tool output missing %q; got %d rows", want, len(lines))
-		}
-	}
-	if countLinesContaining(lines, "truncated") != 0 {
-		t.Fatalf("generic tool output was truncated: %#v", lines)
-	}
 }
 
 func TestBashToolPreviewIsBounded(t *testing.T) {

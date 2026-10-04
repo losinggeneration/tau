@@ -2296,6 +2296,38 @@ func bashOutputOfLines(n int) string {
 	return b.String()
 }
 
+// TestChatLogGenericToolClickTogglesExpansion verifies that a tool without a
+// dedicated renderer (plugin and MCP tools) is capped to a preview like the
+// built-in tools, and that clicking it toggles the full output.
+func TestChatLogGenericToolClickTogglesExpansion(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call-1", "plugin_tool", `{"q":"x"}`)
+	conv.AddToolResultWithID("call-1", bashOutputOfLines(genericToolPreviewLines+10), false)
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{X: 0, Y: 0, W: 40, H: 200})
+	waitForChatLog(t, log)
+
+	toolRow := chatLogComponentRow(t, log, ChatComponentToolExecution)
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, toolTruncatedText) || strings.Contains(joined, "out-29") {
+		t.Fatalf("collapsed generic preview wrong:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, toolRow)
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, "out-29") || !strings.Contains(joined, collapseHintText) || strings.Contains(joined, toolTruncatedText) {
+		t.Fatalf("expanded generic output wrong:\n%s", joined)
+	}
+
+	clickChatLogRow(t, log, toolRow)
+	waitForChatLog(t, log)
+
+	if joined := chatLogJoinedRows(t, log); !strings.Contains(joined, toolTruncatedText) || strings.Contains(joined, "out-29") {
+		t.Fatalf("re-collapsed generic preview wrong:\n%s", joined)
+	}
+}
+
 // TestChatLogBashToolClickTogglesExpansion verifies that clicking a bash box
 // whose output is over the preview cap reveals the full output plus a collapse
 // hint, and clicking again restores the capped preview.

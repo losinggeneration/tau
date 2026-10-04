@@ -2092,6 +2092,7 @@ const maxUserMessageRenderLines = 20
 const (
 	userMessageTruncatedText = "... (user message truncated)"
 	bashTruncatedText        = "... (bash output truncated)"
+	toolTruncatedText        = "... (tool output truncated)"
 	collapseHintText         = "... (click to collapse)"
 )
 
@@ -2142,7 +2143,7 @@ func (c *ChatLog) toggleExpandedAt(x, y int) {
 			return
 		}
 	case ChatComponentToolExecution:
-		if !expanded && !c.toolExceedsRenderLimit(component) {
+		if !expanded && !c.toolExceedsRenderLimit(component, width) {
 			return
 		}
 	default:
@@ -2178,8 +2179,12 @@ func (c *ChatLog) componentExpanded(id string) bool {
 // toolExceedsRenderLimit reports whether the tool's built-in rendering caps
 // its preview at this state, i.e. whether clicking it has anything to reveal.
 // Mirrors the caps the renderers apply so the limits have one source of truth.
-func (c *ChatLog) toolExceedsRenderLimit(component ChatComponent) bool {
+func (c *ChatLog) toolExceedsRenderLimit(component ChatComponent, width int) bool {
 	tool := component.ToolExecution
+	overrides := c.toolRenderOverrides(tool, width)
+	if overrides.partial() {
+		return c.genericToolExceedsRenderLimit(component, width, overrides)
+	}
 	switch tool.Name {
 	case "bash":
 		_, truncated := previewLines(tool.Output, bashToolPreviewLines)
@@ -2197,8 +2202,13 @@ func (c *ChatLog) toolExceedsRenderLimit(component ChatComponent) bool {
 		diff := editDiffFromDetails(component.ToolDetails)
 		return diff != "" && compactEditDiffTruncated(diff)
 	default:
-		return false
+		return c.genericToolExceedsRenderLimit(component, width, overrides)
 	}
+}
+
+func (c *ChatLog) genericToolExceedsRenderLimit(component ChatComponent, width int, overrides toolRenderOverrides) bool {
+	box := c.appendPaddedTextBox(context.Background(), nil, genericToolBody(component, overrides), width, tauui.Style{})
+	return len(box)-2 > genericToolPreviewLines
 }
 
 // userMessageExceedsRenderLimit reports whether the user message's markdown
@@ -2357,11 +2367,33 @@ func (c *ChatLog) toolRenderOverrides(tool ToolExecutionComponent, width int) to
 	return r.toolOverrides(tool, width)
 }
 
+// genericToolPreviewLines caps the generic tool box in rendered rows rather
+// than output lines: a plugin tool's bulk is as often one long wrapped args
+// line as it is many output lines.
+const genericToolPreviewLines = 20
+
 // appendGenericToolExecution renders the default tool shell: a spacer followed
 // by a padded state-background block holding the call line and the output.
 // Either half may be supplied by a plugin hook; whatever it does not supply is
-// rendered built-in.
+// rendered built-in. The block is capped to a preview until clicked open.
 func (c *ChatLog) appendGenericToolExecution(ctx context.Context, out []renderLine, component ChatComponent, width int, boxStyle tauui.Style, overrides toolRenderOverrides) []renderLine {
+	out = append(out, renderLine{text: " ", st: c.pal().spacer})
+	box := c.appendPaddedTextBox(ctx, nil, genericToolBody(component, overrides), width, boxStyle)
+	// box is a padding row, the content rows, then a padding row.
+	if len(box)-2 <= genericToolPreviewLines {
+		return append(out, box...)
+	}
+	hint, content := collapseHintText, box[1:len(box)-1]
+	if !c.componentExpanded(component.ID) {
+		hint, content = toolTruncatedText, content[:genericToolPreviewLines]
+	}
+	out = append(out, box[0])
+	out = append(out, content...)
+	out = append(out, renderLine{text: chatLogRenderRow(" "+hint, width), st: c.pal().dim.WithBG(boxStyle.BG)})
+	return append(out, box[len(box)-1])
+}
+
+func genericToolBody(component ChatComponent, overrides toolRenderOverrides) []string {
 	tool := component.ToolExecution
 
 	var body []string
@@ -2387,9 +2419,7 @@ func (c *ChatLog) appendGenericToolExecution(ctx context.Context, out []renderLi
 	if len(body) == 0 {
 		body = append(body, "(no output yet)")
 	}
-
-	out = append(out, renderLine{text: " ", st: c.pal().spacer})
-	return c.appendPaddedTextBox(ctx, out, body, width, boxStyle)
+	return body
 }
 
 const (
@@ -3286,10 +3316,8 @@ func bashCommandFromArgs(args string) string {
 	return strings.TrimSpace(cmd)
 }
 
-// toolOutputLines splits a tool's output for the generic fallback shell. It
-// deliberately does not truncate: bounded preview/expand is a property of the
-// specific built-in renderers (bash, read, write), not of every tool the model
-// happens to call. A generic tool that returns 500 lines returns 500 lines.
+// toolOutputLines splits a tool's output for the generic fallback shell. The
+// preview cap is applied to the rendered box, not here.
 func toolOutputLines(output string) []string {
 	output = strings.TrimRight(output, "\n")
 	if output == "" {
