@@ -5,18 +5,22 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/format"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	tauai "github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/ai/store"
+	"github.com/losinggeneration/tau/paths"
 )
 
 const (
@@ -177,7 +181,7 @@ func generateModels(ctx context.Context) ([]*tauai.Model, error) {
 	allModels = append(allModels, aiGatewayModels...)
 	allModels = filterModels(allModels)
 	allModels = applyOverrides(allModels)
-	addStaticModels(&allModels)
+	addStaticModels(&allModels, loadCodexModelIDs(ctx, client))
 	addAzureModels(&allModels)
 
 	models := dedupeModels(allModels)
@@ -427,6 +431,41 @@ func loadAIGateway(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 	return result, nil
 }
 
+// loadCodexModelIDs returns the models the Codex backend lists (visible ones
+// only), using TAU_CODEX_TOKEN or the stored openai-codex credential. Without
+// a usable credential it falls back to the previously generated list so
+// generation still works without a ChatGPT login.
+func loadCodexModelIDs(ctx context.Context, client *http.Client) []string {
+	ids, err := fetchCodexModelIDs(ctx, client)
+	if err == nil && len(ids) == 0 {
+		err = errors.New("backend returned no models")
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: codex model list not refreshed, keeping the generated one: %v\n", err)
+		for _, model := range tauai.ListModels(tauai.ProviderOpenAICodex) {
+			ids = append(ids, model.ID)
+		}
+	}
+	return ids
+}
+
+func fetchCodexModelIDs(ctx context.Context, client *http.Client) ([]string, error) {
+	token := os.Getenv("TAU_CODEX_TOKEN")
+	if token == "" {
+		authPath := filepath.Join(paths.ConfigDir(), "auth.json")
+		fb := store.NewFileBackend(authPath, store.Options{RefreshFuncs: store.OAuthProviderRefreshFuncs()})
+		cred, err := fb.Get(ctx, tauai.ProviderOpenAICodex)
+		if err != nil {
+			return nil, fmt.Errorf("get openai-codex credential: %w", err)
+		}
+		token, err = store.APIKeyFromCredential(tauai.ProviderOpenAICodex, cred)
+		if err != nil {
+			return nil, fmt.Errorf("get openai-codex token: %w", err)
+		}
+	}
+	return tauai.FetchCodexModelIDs(ctx, client, codexBaseURL, token)
+}
+
 func filterModels(models []*tauai.Model) []*tauai.Model {
 	result := make([]*tauai.Model, 0, len(models))
 	for _, model := range models {
@@ -485,7 +524,7 @@ func applyOverrides(models []*tauai.Model) []*tauai.Model {
 	return result
 }
 
-func addStaticModels(models *[]*tauai.Model) {
+func addStaticModels(models *[]*tauai.Model, codexModelIDs []string) {
 	appendIfMissing := func(model *tauai.Model) {
 		for _, existing := range *models {
 			if existing.Provider == model.Provider && existing.ID == model.ID {
@@ -515,12 +554,11 @@ func addStaticModels(models *[]*tauai.Model) {
 	// OpenAI Codex (ChatGPT OAuth) serves a subset of the openai lineup. Clone
 	// those models from the openai provider entries collected above; codex
 	// responses are enforced to a ~272k context by the backend regardless of
-	// the model's marketing window. codexModelIDs mirrors the models reported
-	// by GET chatgpt.com/backend-api/codex/models (visible ones only).
-	codexModelIDs := []string{"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol"}
+	// the model's marketing window. codexModelIDs comes from loadCodexModelIDs.
 	for _, id := range codexModelIDs {
 		base := findModel(*models, "openai", id)
 		if base == nil {
+			fmt.Fprintf(os.Stderr, "warning: codex model %q has no openai entry to clone; skipped\n", id)
 			continue
 		}
 		codex := cloneWithIDAndName(base, base.ID, base.Name)
