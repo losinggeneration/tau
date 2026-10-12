@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	claude "github.com/losinggeneration/claude-agent-sdk-go"
@@ -673,4 +674,94 @@ func eventTypeNames(events []StreamEvent) []string {
 		}
 	}
 	return names
+}
+
+func TestClaudeAgentStreamUsageLimit(t *testing.T) {
+	const message = "You've hit your session limit · resets 6:10am (America/Los_Angeles)"
+	for _, source := range []string{"text", "assistant", "errors", "result", "runner"} {
+		t.Run(source, func(t *testing.T) {
+			client := &claudeAgentClient{runner: func(context.Context, any, claude.Options) (<-chan claude.Message, <-chan error) {
+				messages := make(chan claude.Message, 2)
+				errs := make(chan error, 1)
+				result := claude.ResultMessage{IsError: true, StopReason: "error"}
+				switch source {
+				case "assistant":
+					messages <- claude.AssistantMessage{Error: "rate_limit", Content: []claude.ContentBlock{claude.TextBlock{Text: message}}}
+				case "text":
+					messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.TextBlock{Text: message}}}
+				case "errors":
+					result.Errors = []string{message}
+				case "result":
+					result.Result = message
+				case "runner":
+					errs <- errors.New(message)
+				}
+				if source != "runner" {
+					messages <- result
+				}
+				close(messages)
+				close(errs)
+				return messages, errs
+			}}
+			var terminal StreamEvent
+			before := time.Now()
+			err := client.Stream(context.Background(), &Model{ID: "sonnet", API: APIClaudeAgent, Provider: ProviderClaudeAgent}, &Context{}, func(_ context.Context, event StreamEvent) { terminal = event })
+			if err != nil {
+				t.Fatal(err)
+			}
+			streamErr, ok := terminal.(StreamError)
+			if !ok {
+				t.Fatalf("terminal = %T, want StreamError", terminal)
+			}
+			resetAt, ok := UsageLimitResetAt(fmt.Errorf("wrapped: %w", streamErr))
+			if !ok {
+				t.Fatalf("missing reset time: %v", streamErr)
+			}
+			loc, err := time.LoadLocation("America/Los_Angeles")
+			if err != nil {
+				t.Fatal(err)
+			}
+			local := resetAt.In(loc)
+			if local.Hour() != 6 || local.Minute() != 10 || !resetAt.After(before) || resetAt.Sub(before) > 25*time.Hour {
+				t.Fatalf("reset time = %v", resetAt)
+			}
+			if streamErr.Msg.StopReason != StopReasonError || !strings.Contains(streamErr.Msg.ErrorMessage, "session limit") {
+				t.Fatalf("message = %#v", streamErr.Msg)
+			}
+		})
+	}
+}
+
+func TestParseClaudeAgentUsageLimitError(t *testing.T) {
+	for _, tt := range []struct{ name, message, now, want string }{
+		{"recorded", "You've hit your session limit · resets 6:10am (America/Los_Angeles)", "2026-10-11T12:39:52Z", "2026-10-11T13:10:00Z"},
+		{"tomorrow", "You've hit your session limit · resets 6:10am (America/Los_Angeles)", "2026-10-11T14:00:00Z", "2026-10-12T13:10:00Z"},
+		{"no minutes", "You've hit your session limit · resets 12am (Asia/Tokyo)", "2026-10-11T12:00:00Z", "2026-10-11T15:00:00Z"},
+		{"noon", "You've hit your session limit · resets 12:10pm (UTC)", "2026-10-11T12:00:00Z", "2026-10-11T12:10:00Z"},
+		{"DST rollover", "You've hit your session limit · resets 6:10am (America/Los_Angeles)", "2026-10-31T14:00:00Z", "2026-11-01T14:10:00Z"},
+		{"invalid clock", "You've hit your session limit · resets 6:99am (America/Los_Angeles)", "2026-10-11T12:00:00Z", ""},
+		{"invalid zone", "You've hit your session limit · resets 6:10am (Unknown/Zone)", "2026-10-11T12:00:00Z", ""},
+		{"missing zone", "You've hit your session limit · resets 6:10am", "2026-10-11T12:00:00Z", ""},
+		{"ordinary text", "Our meeting resets 6:10am (America/Los_Angeles)", "2026-10-11T12:00:00Z", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now, err := time.Parse(time.RFC3339, tt.now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := parseClaudeAgentUsageLimitError(tt.message, now)
+			if tt.want == "" {
+				if got != nil {
+					t.Fatalf("unexpected usage limit: %v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("missing usage limit")
+			}
+			if actual := got.ResetsAt.UTC().Format(time.RFC3339); actual != tt.want {
+				t.Fatalf("reset = %s, want %s", actual, tt.want)
+			}
+		})
+	}
 }

@@ -957,6 +957,10 @@ func streamAssistantResponse(
 			}
 
 		case ai.StreamError:
+			if _, ok := ai.UsageLimitResetAt(e.Err); ok {
+				err = e.Err
+				return
+			}
 			msg := messageFromAI(&e.Msg)
 			if msg.Role == "" {
 				msg.Role = RoleAssistant
@@ -1003,7 +1007,9 @@ func streamAssistantResponse(
 	}
 
 	// Stream from the model
-	err = client.Stream(ctx, model, aiCtx, handler, streamOpts...)
+	if streamErr := client.Stream(ctx, model, aiCtx, handler, streamOpts...); streamErr != nil {
+		return nil, streamErr
+	}
 	if err != nil {
 		return nil, err
 	}

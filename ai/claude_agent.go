@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	claude "github.com/losinggeneration/claude-agent-sdk-go"
@@ -67,7 +69,9 @@ func (c *claudeAgentClient) Stream(ctx context.Context, model *Model, prompt *Co
 	if runner == nil {
 		runner = claude.Query
 	}
-	messages, errs := runner(ctx, sdkPrompt, sdkOptions)
+	runnerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	messages, errs := runner(runnerCtx, sdkPrompt, sdkOptions)
 
 	for messages != nil || errs != nil {
 		select {
@@ -91,6 +95,11 @@ func (c *claudeAgentClient) Stream(ctx context.Context, model *Model, prompt *Co
 			if ctx.Err() != nil {
 				reason = StopReasonAborted
 			}
+			if reason == StopReasonError {
+				if limitErr := parseClaudeAgentUsageLimitError(err.Error(), time.Now()); limitErr != nil {
+					err = limitErr
+				}
+			}
 			emitTerminalStreamError(ctx, handler, output, err, reason)
 			return nil
 		case <-ctx.Done():
@@ -113,6 +122,16 @@ type claudeAgentRequestState struct {
 func (c *claudeAgentClient) handleMessage(ctx context.Context, msg claude.Message, requestState claudeAgentRequestState, output *AssistantMessage, handler EventHandler) bool {
 	switch m := msg.(type) {
 	case claude.AssistantMessage:
+		if m.Error != "" {
+			for _, block := range m.Content {
+				if text, ok := block.(claude.TextBlock); ok {
+					if err := parseClaudeAgentUsageLimitError(text.Text, time.Now()); err != nil {
+						emitTerminalStreamError(ctx, handler, *output, err, StopReasonError)
+						return true
+					}
+				}
+			}
+		}
 		for _, block := range m.Content {
 			switch b := block.(type) {
 			case claude.TextBlock:
@@ -137,6 +156,18 @@ func (c *claudeAgentClient) handleMessage(ctx context.Context, msg claude.Messag
 		output.ResponseID = m.UUID
 		if isError && output.ErrorMessage == "" {
 			output.ErrorMessage = strings.Join(m.Errors, "; ")
+		}
+		if isError {
+			message := strings.Join(m.Errors, "; ") + "\n" + m.Result
+			for _, block := range output.Content {
+				if block.Type == ContentBlockText {
+					message += "\n" + block.Text
+				}
+			}
+			if err := parseClaudeAgentUsageLimitError(message, time.Now()); err != nil {
+				emitTerminalStreamError(ctx, handler, *output, err, StopReasonError)
+				return true
+			}
 		}
 		handler(ctx, Done{Reason: output.StopReason, Message: *output})
 		return true
@@ -598,4 +629,42 @@ func intFromAny(v any) int {
 	default:
 		return 0
 	}
+}
+
+// ClaudeAgentUsageLimitError carries the reset time reported by Claude Code.
+type ClaudeAgentUsageLimitError struct {
+	Message  string
+	ResetsAt time.Time
+}
+
+func (e *ClaudeAgentUsageLimitError) Error() string {
+	return fmt.Sprintf("%s: %s. Available again at %s", ProviderClaudeAgent, e.Message, e.ResetsAt.Format(time.DateTime))
+}
+
+var claudeAgentResetPattern = regexp.MustCompile(`(?i)You've hit your session limit\s*·\s*resets (\d{1,2}(?::\d{2})?[ap]m) \(([^()]+)\)`)
+
+func parseClaudeAgentUsageLimitError(message string, now time.Time) *ClaudeAgentUsageLimitError {
+	match := claudeAgentResetPattern.FindStringSubmatch(message)
+	if match == nil {
+		return nil
+	}
+	location, err := time.LoadLocation(match[2])
+	if err != nil {
+		return nil
+	}
+	layout := "3:04pm"
+	if !strings.Contains(match[1], ":") {
+		layout = "3pm"
+	}
+	clock, err := time.Parse(layout, strings.ToLower(match[1]))
+	if err != nil {
+		return nil
+	}
+	localNow := now.In(location)
+	resetAt := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), clock.Hour(), clock.Minute(), 0, 0, location)
+	if !resetAt.After(now) {
+		// Build tomorrow's wall time so a DST change doesn't shift the reset hour.
+		resetAt = time.Date(localNow.Year(), localNow.Month(), localNow.Day()+1, clock.Hour(), clock.Minute(), 0, 0, location)
+	}
+	return &ClaudeAgentUsageLimitError{Message: match[0], ResetsAt: resetAt.In(time.Local)}
 }

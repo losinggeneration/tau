@@ -2830,3 +2830,69 @@ func TestRunAgentLoopUsageLimitAbortDuringWait(t *testing.T) {
 		t.Fatalf("len(result) = %d, want user + usage-limit error", len(result))
 	}
 }
+
+func TestRunAgentLoopStreamUsageLimitWaitsAndRetries(t *testing.T) {
+	oldBuffer := usageLimitRetryBuffer
+	usageLimitRetryBuffer = time.Millisecond
+	t.Cleanup(func() { usageLimitRetryBuffer = oldBuffer })
+
+	var streamCalls int
+	client := stubClient{
+		stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+			streamCalls++
+			if streamCalls == 1 {
+				limitErr := &ai.ClaudeAgentUsageLimitError{Message: "session usage limit", ResetsAt: time.Now().Add(10 * time.Millisecond)}
+				handler(ctx, ai.StreamError{Err: limitErr, Msg: ai.AssistantMessage{Role: "assistant", StopReason: ai.StopReasonError, ErrorMessage: limitErr.Error()}})
+				return nil
+			}
+			handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: ai.AssistantMessage{
+				Role:       "assistant",
+				Timestamp:  time.Now().UnixMilli(),
+				Content:    []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "ok"}},
+				StopReason: ai.StopReasonStop,
+			}})
+			return nil
+		},
+	}
+
+	var events []string
+	result, err := RunAgentLoop(
+		context.Background(),
+		[]*Message{NewUserMessage("hi")},
+		&AgentContext{Model: &ai.Model{ID: "test", Provider: ai.ProviderOpenAI}},
+		AgentLoopConfig{
+			Model:         &ai.Model{ID: "test", Provider: ai.ProviderOpenAI},
+			ConvertToLlm:  DefaultConvertToLlm,
+			ClientFactory: func(model *ai.Model) (ai.Client, error) { return client, nil },
+		},
+		func(event Event) { events = append(events, eventLabel(event)) },
+	)
+	if err != nil {
+		t.Fatalf("RunAgentLoop: %v", err)
+	}
+	if streamCalls != 2 {
+		t.Fatalf("stream calls = %d, want 2 (initial + retry)", streamCalls)
+	}
+	if len(result) != 3 {
+		t.Fatalf("len(result) = %d, want user + usage-limit error + assistant", len(result))
+	}
+	errMsg := result[1]
+	if !errMsg.IsError || errMsg.Role != RoleAssistant {
+		t.Fatalf("result[1] = %#v, want error assistant message", errMsg)
+	}
+	if !strings.Contains(errMsg.ErrorMessage, "usage limit") {
+		t.Fatalf("error message = %q, want usage limit text", errMsg.ErrorMessage)
+	}
+	if !errMsg.ExcludeFromContext {
+		t.Fatal("error message must be excluded from provider context")
+	}
+	if result[2].IsError || messageText(result[2]) != "ok" {
+		t.Fatalf("result[2] = %#v, want successful assistant reply", result[2])
+	}
+	if strings.Count(strings.Join(events, ","), "message_end:assistant") != 2 {
+		t.Fatalf("events = %v, want two assistant message_end events (error + retry)", events)
+	}
+	if !slices.Contains(events, "usage_limit_wait") {
+		t.Fatalf("events = %v, want usage_limit_wait", events)
+	}
+}
