@@ -72,9 +72,10 @@ func defaultChatPalette() chatPalette {
 // one for text copying: a real source break, or a soft wrap that consumed
 // either nothing (character wrap) or one space (word wrap).
 type renderLine struct {
-	text string
-	st   tauui.Style
-	join chatLogJoin
+	text        string
+	st          tauui.Style
+	join        chatLogJoin
+	borderStyle *tauui.Style
 }
 
 type chatLogJoin uint8
@@ -733,6 +734,10 @@ func (c *ChatLog) Paint(d tauui.Drawer, ctx *tauui.Ctx) {
 		row := tauui.Rect{X: rect.X, Y: y, W: rect.W, H: 1}
 		d.FillRect(row, st)
 		tauui.DrawANSIText(d, tauui.Point{X: rect.X, Y: y}, ln.text, st)
+		if ln.borderStyle != nil {
+			d.DrawText(tauui.Point{X: rect.X, Y: y}, "│", *ln.borderStyle)
+			d.DrawText(tauui.Point{X: rect.X + tauui.TextWidth(ln.text) - 1, Y: y}, "│", *ln.borderStyle)
+		}
 		c.paintSelectionForLine(d, rect, i, ln, selection, st, ctx)
 	}
 }
@@ -2513,6 +2518,9 @@ func (c *ChatLog) appendBashToolExecutionChrome(ctx context.Context, out []rende
 	// bash tint. Keeping those on separate colours means the box says "this
 	// failed" without also recolouring the command you ran.
 	borderStyle := c.pal().borderStyle(toolBorderState(tool), st.BG)
+	contentLine := func(text string, style tauui.Style) renderLine {
+		return renderLine{text: border.Line(text), st: style, borderStyle: &borderStyle}
+	}
 
 	out = append(out, renderLine{text: " ", st: c.pal().spacer})
 	out = append(out, renderLine{text: border.Top(), st: borderStyle})
@@ -2526,7 +2534,7 @@ func (c *ChatLog) appendBashToolExecutionChrome(ctx context.Context, out []rende
 			if ctx.Err() != nil {
 				return out
 			}
-			line := renderLine{text: border.Line(wrappedSegment(command, row)), st: commandStyle}
+			line := contentLine(wrappedSegment(command, row), commandStyle)
 			if i > 0 {
 				line.join = joinSpace
 			}
@@ -2547,23 +2555,23 @@ func (c *ChatLog) appendBashToolExecutionChrome(ctx context.Context, out []rende
 			line := expandChatLogTabs(rawLine)
 			wrapped := tauui.WrapLines(line, tauui.WrapOptions{Width: border.InnerWidth(), Mode: tauui.WrapWord})
 			if len(wrapped) == 0 {
-				out = append(out, renderLine{text: border.Line(""), st: st})
+				out = append(out, contentLine("", st))
 				continue
 			}
 			for _, row := range wrapped {
-				out = append(out, renderLine{text: border.Line(wrappedSegment(line, row)), st: st})
+				out = append(out, contentLine(wrappedSegment(line, row), st))
 			}
 		}
 		if truncated {
-			out = append(out, renderLine{text: border.Line(bashTruncatedText), st: dimStyle})
+			out = append(out, contentLine(bashTruncatedText, dimStyle))
 		} else if limit == 0 {
-			out = append(out, renderLine{text: border.Line(collapseHintText), st: dimStyle})
+			out = append(out, contentLine(collapseHintText, dimStyle))
 		}
 	} else if tool.State == toolExecutionComplete {
 		out = append(out, renderLine{text: border.Rule(), st: borderStyle})
-		out = append(out, renderLine{text: border.Line("(no output)"), st: dimStyle})
+		out = append(out, contentLine("(no output)", dimStyle))
 	} else if tool.State == toolExecutionExecuting {
-		out = append(out, renderLine{text: border.Line("running..."), st: dimStyle})
+		out = append(out, contentLine("running...", dimStyle))
 	}
 	out = append(out, renderLine{text: border.Bottom(), st: borderStyle})
 	return out

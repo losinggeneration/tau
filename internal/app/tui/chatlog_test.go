@@ -2497,3 +2497,56 @@ func TestChatLogToolClickNotifiesExpansionHandler(t *testing.T) {
 		t.Fatalf("expansion handler observed (%q, %v), want (call-1, true)", gotID, gotExpanded)
 	}
 }
+
+func TestChatLogBashBorderColorIsUniform(t *testing.T) {
+	for _, state := range []string{"complete", "error", "running", "empty", "truncated"} {
+		t.Run(state, func(t *testing.T) {
+			conv := NewConversationModel()
+			conv.AddToolCallWithID("tool-1", "bash", `{"command":"echo a long command that wraps onto multiple rows"}`)
+			output := "output\n\nmore output"
+			switch state {
+			case "empty":
+				output = ""
+			case "truncated":
+				output = strings.Repeat("output\n", bashToolPreviewLines+2)
+			}
+			if state != "running" {
+				conv.AddToolResultWithID("tool-1", output, state == "error")
+			}
+			log := newTestChatLog(t, conv)
+			log.SetLookName("tau")
+			const width = 24
+			rows := layoutAndPaintChatLog(t, log, width)
+			buf := tauui.NewBuffer(width, len(rows))
+			base := tauui.Style{}
+			rp := tauui.NewRenderPainter(buf, tauui.Rect{W: width, H: len(rows)}, base)
+			log.Paint(tauui.NewDrawer(tauui.NewPainter(rp, base)), &tauui.Ctx{Theme: appTheme()})
+			var borderStyle tauui.Style
+			var sides int
+			for y := range rows {
+				if buf.At(0, y).R == '╭' {
+					borderStyle = buf.At(0, y).Style
+				}
+				if buf.At(0, y).R != '│' {
+					continue
+				}
+				sides++
+				for _, x := range []int{0, width - 1} {
+					cell := buf.At(x, y)
+					if cell.R != '│' || cell.Style != borderStyle {
+						t.Errorf("border at (%d,%d) = %#v, want vertical edge with style %#v", x, y, cell, borderStyle)
+					}
+				}
+				if strings.Contains(rows[y], "$ echo") {
+					want := log.pal().bashMode
+					if got := buf.At(2, y).Style.FG; got != want {
+						t.Errorf("command color = %#v, want %#v", got, want)
+					}
+				}
+			}
+			if sides == 0 {
+				t.Fatal("no side borders painted")
+			}
+		})
+	}
+}
