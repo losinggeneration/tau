@@ -9,10 +9,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -5306,4 +5309,57 @@ func TestGetForkEntries(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, gcEntries, 1)
 	assert.Equal(t, "hello", gcEntries[0].Text)
+}
+
+func TestSendZAIWeeklyLimitPreservesProviderMessage(t *testing.T) {
+	body := `{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2099-10-25 08:43:16"}}`
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write quota response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	_, spec := registerRecordingProvider(t, "unused")
+	rt, err := NewRuntime(RuntimeOptions{SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: spec})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close(t.Context())) })
+	s := sess.(*agentSession)
+	s.model = &ai.Model{ID: "glm-5.3-flash", Provider: ai.ProviderZAI, API: ai.APIOpenAICompletions, BaseURL: server.URL}
+	s.agent, err = agent.New(agent.NewConfig(agent.WithModel(s.model), agent.WithClientFactory((&ai.OpenAICompletionsProvider{}).NewClient)))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	events, err := sess.Send(ctx, Message{Text: "hi"})
+	require.NoError(t, err)
+	var collected []Event
+	for event := range events {
+		collected = append(collected, event)
+		if event.Type == "usage_limit_wait" || event.Type == "auto_retry_start" {
+			cancel()
+		}
+	}
+	assert.EqualValues(t, 1, calls.Load())
+	assert.False(t, slices.ContainsFunc(collected, func(e Event) bool { return e.Type == "auto_retry_start" }), "quota must use the reset-aware wait, not transient retries")
+	assert.True(t, slices.ContainsFunc(collected, func(e Event) bool {
+		if e.Type != "message_end" {
+			return false
+		}
+		payload, ok := e.Payload.(map[string]any)
+		return ok && strings.Contains(fmt.Sprint(payload["error_message"]), "Weekly/Monthly Limit Exhausted. Available again in")
+	}), "the TUI must receive the provider message before cancellation")
+	assert.True(t, slices.ContainsFunc(collected, func(e Event) bool { return e.Type == "usage_limit_wait" }))
+
+	files := sessionJSONLFiles(t, rt.GetSessionStorage().Dir())
+	require.Len(t, files, 1)
+	data, err := os.ReadFile(files[0])
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "Weekly/Monthly Limit Exhausted. Available again in")
 }

@@ -10,9 +10,10 @@ import (
 	"time"
 )
 
-// zaiUsageLimitCode is the error.code z.ai returns with HTTP 429 when a plan's
-// usage window is exhausted, as opposed to ordinary per-minute rate limiting.
-const zaiUsageLimitCode = "1308"
+const (
+	zaiUsageLimitCode         = "1308"
+	zaiWeeklyMonthlyLimitCode = "1310"
+)
 
 // zaiResetLocation is the timezone z.ai stamps reset times in. The message
 // carries a bare "2026-08-19 08:18:14" in Beijing time with no zone marker, so
@@ -31,7 +32,7 @@ var (
 )
 
 // ZAIUsageLimitError is returned when z.ai reports that a plan's usage limit
-// has been reached (HTTP 429 with error code 1308) and the reset time in the
+// has been reached (HTTP 429 with error code 1308 or 1310) and the reset time in the
 // message could be parsed. It restates that reset in local time so callers do
 // not have to reason about Beijing time.
 type ZAIUsageLimitError struct {
@@ -84,7 +85,9 @@ func parseZAIUsageLimitError(provider string, statusCode int, body []byte) *ZAIU
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil
 	}
-	if zaiErrorCode(parsed.Error.Code) != zaiUsageLimitCode {
+	switch zaiErrorCode(parsed.Error.Code) {
+	case zaiUsageLimitCode, zaiWeeklyMonthlyLimitCode:
+	default:
 		return nil
 	}
 

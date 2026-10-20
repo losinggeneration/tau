@@ -170,3 +170,21 @@ func TestDoOpenAIChatCompletionsKeepsUnparsableZAIBody(t *testing.T) {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
 }
+
+func TestParseZAIWeeklyMonthlyLimitError(t *testing.T) {
+	for _, code := range []string{`"1310"`, `1310`} {
+		body := fmt.Appendf(nil, `{"error":{"code":%s,"message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-10-25 08:43:16"}}`, code)
+		usageErr := parseZAIUsageLimitError(ProviderZAI, http.StatusTooManyRequests, body)
+		if usageErr == nil {
+			t.Fatalf("parseZAIUsageLimitError(%s) = nil", code)
+		}
+		if usageErr.Message != "Weekly/Monthly Limit Exhausted" {
+			t.Fatalf("Message = %q", usageErr.Message)
+		}
+		wantReset := time.Date(2026, 10, 25, 0, 43, 16, 0, time.UTC)
+		resetAt, ok := UsageLimitResetAt(usageErr)
+		if !ok || !resetAt.Equal(wantReset) {
+			t.Fatalf("UsageLimitResetAt = %v, %t, want %v, true", resetAt, ok, wantReset)
+		}
+	}
+}
