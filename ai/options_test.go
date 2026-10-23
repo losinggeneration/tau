@@ -2,12 +2,17 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWithHeadersAndResponseCallback(t *testing.T) {
@@ -87,7 +92,7 @@ func TestResolveCacheRetentionDefaults(t *testing.T) {
 }
 
 func TestSessionHeadersRespectsCacheRetention(t *testing.T) {
-	headers := sessionHeaders(&options{sessionID: "sess_123"})
+	headers := sessionHeaders(&Model{}, &options{sessionID: "sess_123"})
 	if headers["session_id"] != "sess_123" {
 		t.Fatalf("session_id = %q, want sess_123", headers["session_id"])
 	}
@@ -95,7 +100,7 @@ func TestSessionHeadersRespectsCacheRetention(t *testing.T) {
 		t.Fatalf("x-client-request-id = %q, want sess_123", headers["x-client-request-id"])
 	}
 
-	if got := sessionHeaders(&options{
+	if got := sessionHeaders(&Model{}, &options{
 		sessionID:      "sess_123",
 		cacheRetention: string(CacheRetentionNone),
 	}); got != nil {
@@ -432,7 +437,7 @@ func TestBuildBaseOptionsParityFields(t *testing.T) {
 	payloadCalled := false
 	responseCalled := false
 
-	opts := BuildBaseOptions(&Model{MaxTokens: 48000}, &SimpleStreamOptions{
+	opts := BuildBaseOptions(&Model{MaxTokens: 48000}, nil, &SimpleStreamOptions{
 		Temperature:     &temp,
 		Reasoning:       ReasoningMedium,
 		APIKey:          "runtime-key",
@@ -454,8 +459,8 @@ func TestBuildBaseOptionsParityFields(t *testing.T) {
 	if got.Temperature == nil || *got.Temperature != temp {
 		t.Fatalf("Temperature = %v, want %v", got.Temperature, temp)
 	}
-	if got.MaxTokens != 32000 {
-		t.Fatalf("MaxTokens = %d, want 32000 default clamp", got.MaxTokens)
+	if got.MaxTokens != 48000 {
+		t.Fatalf("MaxTokens = %d, want the model cap", got.MaxTokens)
 	}
 	if got.Reasoning != ReasoningMedium {
 		t.Fatalf("Reasoning = %q, want %q", got.Reasoning, ReasoningMedium)
@@ -513,5 +518,181 @@ func TestWithToolChoice(t *testing.T) {
 				t.Errorf("WithToolChoice(%q) = %q, want %q", tt.choice, opts.toolChoice, tt.choice)
 			}
 		})
+	}
+}
+
+func TestBuildBaseOptionsPreservesExplicitReasoningOff(t *testing.T) {
+	got := applyOptions(BuildBaseOptions(&Model{MaxTokens: 100}, nil, &SimpleStreamOptions{Reasoning: ReasoningOff}))
+	if got.reasoning != ReasoningOff {
+		t.Fatalf("reasoning=%q, want explicit off", got.reasoning)
+	}
+}
+
+func TestClampMaxTokensToContextUsesCharacterEstimateAndReserve(t *testing.T) {
+	prompt := &Context{SystemPrompt: strings.Repeat("s", 70), Messages: []Message{
+		{Role: "user", Content: []ContentBlock{{Type: ContentBlockText, Text: strings.Repeat("u", 35)}, {Type: ContentBlockImage}}},
+		{Role: "assistant", Content: []ContentBlock{{Type: ContentBlockThinking, Thinking: strings.Repeat("t", 7)}, {Type: ContentBlockToolCall, Name: "ab", Arguments: json.RawMessage(`{"x":1}`)}}},
+		{Role: "toolResult", Content: "ééééééé"},
+	}}
+	// system 20, user ceil(4835/3.5)=1382, assistant ceil(16/3.5)=5, tool result 2.
+	if got := EstimateContextTokens(prompt); got != 1409 {
+		t.Fatalf("estimate = %d", got)
+	}
+	model := &Model{ContextWindow: 10000, MaxTokens: 8000}
+	if got := ClampMaxTokensToContext(model, prompt, 8000); got != 10000-1409-4096 {
+		t.Fatalf("clamped = %d", got)
+	}
+	if got := ClampMaxTokensToContext(model, prompt, 100); got != 100 {
+		t.Fatalf("small request = %d", got)
+	}
+	if got := ClampMaxTokensToContext(&Model{ContextWindow: 5000}, prompt, 8000); got != 1 {
+		t.Fatalf("exhausted context = %d", got)
+	}
+	if got := ClampMaxTokensToContext(&Model{}, prompt, 0); got != 1 {
+		t.Fatalf("unknown window = %d", got)
+	}
+	if got := applyOptions(BuildBaseOptions(model, prompt, nil)).maxTokens; got != 10000-1409-4096 {
+		t.Fatalf("simple default = %d", got)
+	}
+}
+
+func TestProviderRetryOptionsPreserveExplicitZeroThroughSimpleOptions(t *testing.T) {
+	opts := []Option{WithTimeout(0), WithMaxRetries(0), WithMaxRetryDelayMs(0)}
+	simple := ExtractSimpleStreamOptions(opts)
+	require.NotNil(t, simple.Timeout)
+	require.NotNil(t, simple.MaxRetries)
+	assert.True(t, simple.MaxRetryDelaySet)
+	rebuilt := applyOptions(BuildBaseOptions(&Model{MaxTokens: 32}, &Context{}, &simple))
+	assert.True(t, rebuilt.timeoutSet)
+	assert.Zero(t, rebuilt.timeout)
+	require.NotNil(t, rebuilt.maxRetries)
+	assert.Zero(t, *rebuilt.maxRetries)
+	assert.True(t, rebuilt.maxRetryDelaySet)
+	assert.Zero(t, rebuilt.maxRetryDelayMs)
+}
+
+func TestSimpleOptionsRoundTripTransport(t *testing.T) {
+	simple := ExtractSimpleStreamOptions([]Option{WithTransport(TransportWS)})
+	assert.Equal(t, TransportWS, simple.Transport)
+	assert.Equal(t, TransportWS, applyOptions(BuildBaseOptions(&Model{MaxTokens: 32}, &Context{}, &simple)).preferredTransport)
+	assert.Empty(t, ExtractSimpleStreamOptions(nil).Transport)
+}
+
+func TestSimpleThinkingBudgetsRoundTrip(t *testing.T) {
+	budgets := &ThinkingBudgets{Low: new(0), High: new(3456)}
+	for _, level := range []ReasoningLevel{ReasoningOff, ReasoningLow, ReasoningXHigh, ReasoningMax} {
+		t.Run(string(level), func(t *testing.T) {
+			got := ExtractSimpleStreamOptions(BuildBaseOptions(&Model{MaxTokens: 16000}, nil, &SimpleStreamOptions{Reasoning: level, ThinkingBudgets: budgets}))
+			require.Equal(t, budgets, got.ThinkingBudgets)
+			require.Equal(t, level, got.Reasoning)
+		})
+	}
+	require.Nil(t, ExtractSimpleStreamOptions(nil).ThinkingBudgets)
+}
+
+func TestSessionAffinityFormatsReachTransport(t *testing.T) {
+	for _, api := range []string{APIOpenAICompletions, APIOpenAICompatible, APIOpenAIResponses, APIAzureOpenAIResponses} {
+		for _, scenario := range []struct {
+			name, format, provider, baseURL, session, retention string
+			disabled, overrides                                 bool
+		}{
+			{name: "default", session: "session"},
+			{name: "explicit openai", format: "openai", session: "session"},
+			{name: "no session", format: "openai-nosession", session: "session"},
+			{name: "openrouter", format: "openrouter", session: "session"},
+			{name: "detected provider", provider: ProviderOpenRouter, session: "session"},
+			{name: "detected URL", baseURL: "https://openrouter.ai/api/v1", session: "session"},
+			{name: "override detection", provider: ProviderOpenRouter, format: "openai-nosession", session: "session"},
+			{name: "disabled", format: "openrouter", session: "session", disabled: true},
+			{name: "none", format: "openai-nosession", session: "session", retention: "none"},
+			{name: "empty", format: "openrouter"},
+			{name: "full affinity ID", format: "openai-nosession", session: strings.Repeat("s", 70)},
+			{name: "explicit headers", format: "openai", session: "session", overrides: true},
+		} {
+			t.Run(api+"/"+scenario.name, func(t *testing.T) {
+				t.Setenv("PI_CACHE_RETENTION", "long")
+				model := &Model{ID: "test", API: api, Provider: ProviderOpenAI, BaseURL: "https://test.invalid/v1"}
+				if scenario.provider != "" {
+					model.Provider = scenario.provider
+				}
+				if scenario.baseURL != "" {
+					model.BaseURL = scenario.baseURL
+				}
+				require.NoError(t, json.Unmarshal([]byte(fmt.Sprintf(`{"sendSessionAffinityHeaders":%t,"sessionAffinityFormat":%q}`, !scenario.disabled, scenario.format)), &model.Compat))
+				want := make(map[string]string)
+				format := scenario.format
+				if format == "" {
+					format = "openai"
+					if model.Provider == ProviderOpenRouter || strings.Contains(model.BaseURL, "openrouter.ai") {
+						format = "openrouter"
+					}
+				}
+				if scenario.session != "" && scenario.retention != "none" && (!scenario.disabled || api == APIOpenAIResponses) {
+					if format == "openrouter" {
+						want["x-session-id"] = scenario.session
+					} else {
+						want["x-client-request-id"] = scenario.session
+						if format == "openai" {
+							want["session_id"] = scenario.session
+						}
+						if api == APIOpenAICompletions || api == APIOpenAICompatible {
+							want["x-session-affinity"] = scenario.session
+						}
+					}
+				}
+				opts := []Option{WithAPIKey("sk-test"), WithSessionID(scenario.session), WithCacheRetention(scenario.retention)}
+				if scenario.overrides {
+					model.Headers = map[string]string{"X-Client-Request-Id": "model-request"}
+					opts = append(opts, WithHeaders(map[string]string{"session_id": "explicit-session", "x-client-request-id": "explicit-request", "x-session-affinity": "explicit-affinity", "x-session-id": "explicit-router"}))
+					want = map[string]string{"session_id": "explicit-session", "x-client-request-id": "explicit-request", "x-session-affinity": "explicit-affinity", "x-session-id": "explicit-router"}
+				}
+				var requests, callbacks, done int
+				original := http.DefaultClient
+				t.Cleanup(func() { http.DefaultClient = original })
+				http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					requests++
+					for _, header := range []string{"session_id", "x-client-request-id", "x-session-affinity", "x-session-id"} {
+						assert.Equal(t, want[header], req.Header.Get(header), header)
+					}
+					var body map[string]any
+					require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
+					require.NotContains(t, body, "session_id")
+					if scenario.retention == "none" || scenario.session == "" {
+						require.NotContains(t, body, "prompt_cache_key")
+					} else {
+						wantKey := clampOpenAIPromptCacheKey(scenario.session)
+						assert.Equal(t, wantKey, body["prompt_cache_key"])
+					}
+					response := "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+					if api == APIOpenAICompletions || api == APIOpenAICompatible {
+						response = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response))}, nil
+				})}
+				var client Client
+				switch api {
+				case APIOpenAICompletions:
+					var err error
+					client, err = newOpenAIClient(model)
+					require.NoError(t, err)
+				case APIOpenAICompatible:
+					client = &openAICompatClient{model: model}
+				case APIOpenAIResponses:
+					client = &openAIResponsesClient{model: model}
+				case APIAzureOpenAIResponses:
+					client = &azureClient{model: model}
+					opts = append(opts, WithAzureBaseURL(model.BaseURL))
+				}
+				opts = append(opts, WithPayloadCallback(func(any) any { callbacks++; return nil }))
+				require.NoError(t, client.Stream(t.Context(), model, &Context{Messages: []Message{{Role: "user", Content: "hello"}}}, func(_ context.Context, event StreamEvent) {
+					if _, ok := event.(Done); ok {
+						done++
+					}
+				}, opts...))
+				require.Equal(t, 1, requests)
+				require.Equal(t, 1, callbacks)
+				require.Equal(t, 1, done)
+			})
+		}
 	}
 }

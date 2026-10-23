@@ -97,6 +97,7 @@ function makeUI(host: HostClient): PiUI {
 }
 
 export interface BuildContextOptions {
+	signal?: AbortSignal;
 	host: HostClient;
 	cwd: string;
 	pluginName: string;
@@ -106,7 +107,7 @@ export interface BuildContextOptions {
  * Build a per-call ExtensionContext. cwd comes from the init request
  * (session-level). The SessionManager wraps Host.SessionScan.
  */
-export function buildContext({ host, cwd }: BuildContextOptions): ExtensionContext {
+export function buildContext({ host, cwd, signal }: BuildContextOptions): ExtensionContext {
 	const ui = makeUI(host);
 	const sessionManager = new SessionManager();
 
@@ -122,7 +123,7 @@ export function buildContext({ host, cwd }: BuildContextOptions): ExtensionConte
 			return shimState.isIdle;
 		},
 		get signal(): AbortSignal | undefined {
-			return undefined;
+			return signal;
 		},
 		abort(): void {
 			warnOnce("ctx.abort", "no-op in pi-ext-shim (no AbortController wiring yet)");

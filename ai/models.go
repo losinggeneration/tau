@@ -13,6 +13,8 @@ import (
 
 func canonicalProvider(provider string) string {
 	switch provider {
+	case "azure-openai-responses":
+		return ProviderAzureOpenAI
 	case "antigravity":
 		return ProviderGoogleAntigravity
 	default:
@@ -54,7 +56,7 @@ func ResolveModelID(modelID string) (*Model, error) {
 	// If that failed and provider was empty, try to find by ID alone
 	if provider == "" {
 		for _, model := range models {
-			if model != nil && model.ID == id {
+			if model != nil && model.ID == id && (model.Type == "" || model.Type == "chat") {
 				return model, nil
 			}
 		}
@@ -88,12 +90,20 @@ func CalculateCost(model *Model, usage *Usage) Cost {
 // GetAvailableModel returns a model from the full generated registry, including
 // models that are not part of the defended public support surface.
 func GetAvailableModel(provider, id string) (*Model, error) {
-	provider = canonicalProvider(provider)
-	model, ok := models[provider+"/"+id]
-	if !ok {
-		return nil, fmt.Errorf("model not found: %s/%s", provider, id)
-	}
+	return GetOperationModel("chat", provider, id)
+}
 
+// GetOperationModel resolves a model without colliding with another operation.
+func GetOperationModel(operation, provider, id string) (*Model, error) {
+	provider = canonicalProvider(provider)
+	key := provider + "/" + id
+	if operation != "" && operation != "chat" {
+		key = operation + ":" + key
+	}
+	model, ok := models[key]
+	if !ok {
+		return nil, fmt.Errorf("%s model not found: %s/%s", operation, provider, id)
+	}
 	return model, nil
 }
 
@@ -192,7 +202,7 @@ func listModels(provider string, supportedOnly bool) []*Model {
 	var result []*Model
 
 	for _, model := range models {
-		if model == nil || model.Provider != provider {
+		if model == nil || model.Provider != provider || (model.Type != "" && model.Type != "chat") {
 			continue
 		}
 		if supportedOnly && !supportsPublicModelLookup(provider, model.ID) {
@@ -296,7 +306,13 @@ func AuthenticatedModels(ctx context.Context, credentialStore CredentialRefListe
 
 // RegisterModel registers a model. This is called by init() in provider files.
 func RegisterModel(model *Model) {
-	models[model.Provider+"/"+model.ID] = model
+	registered := *model
+	registered.Provider = canonicalProvider(registered.Provider)
+	key := registered.Provider + "/" + registered.ID
+	if registered.Type != "" && registered.Type != "chat" {
+		key = registered.Type + ":" + key
+	}
+	models[key] = &registered
 }
 
 // models is the global model registry.
@@ -305,7 +321,7 @@ var models = make(map[string]*Model)
 // ProviderAllowsNoCredential reports whether a provider can run without a tau-managed credential.
 func ProviderAllowsNoCredential(provider string) bool {
 	switch canonicalProvider(provider) {
-	case ProviderClaudeAgent, ProviderOllama, ProviderLMStudio, ProviderVLLM:
+	case ProviderClaudeAgent, ProviderOllama, ProviderLMStudio, ProviderVLLM, ProviderLlamaCpp:
 		return true
 	default:
 		return false
@@ -335,6 +351,53 @@ func init() {
 	registerClaudeAgentModels()
 }
 
+// GetSupportedThinkingLevels returns the model's available effort ladder.
+func GetSupportedThinkingLevels(model *Model) []string {
+	if model == nil || !model.Reasoning {
+		return []string{"off"}
+	}
+	var levels []string
+	for _, level := range ThinkingLevels {
+		mapped, exists := model.ThinkingLevelMap[level]
+		if exists && mapped == nil {
+			continue
+		}
+		if level == "max" && !exists {
+			continue
+		}
+		if level == "xhigh" && !exists && !SupportsXhigh(model) {
+			continue
+		}
+		levels = append(levels, level)
+	}
+	return levels
+}
+
+// ClampThinkingLevel selects an available level, preferring the next higher level.
+func ClampThinkingLevel(model *Model, level string) string {
+	levels := GetSupportedThinkingLevels(model)
+	if slices.Contains(levels, level) {
+		return level
+	}
+	index := slices.Index(ThinkingLevels, level)
+	if index >= 0 {
+		for _, candidate := range ThinkingLevels[index:] {
+			if slices.Contains(levels, candidate) {
+				return candidate
+			}
+		}
+		for i := index - 1; i >= 0; i-- {
+			if slices.Contains(levels, ThinkingLevels[i]) {
+				return ThinkingLevels[i]
+			}
+		}
+	}
+	if len(levels) > 0 {
+		return levels[0]
+	}
+	return "off"
+}
+
 // SupportsXhigh returns true if the model supports xhigh thinking level.
 // Supported today:
 //   - GPT-5.2+ model families
@@ -361,5 +424,12 @@ func ModelsAreEqual(a, b *Model) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return a.ID == b.ID && a.Provider == b.Provider
+	return a.ID == b.ID && a.Provider == b.Provider && effectiveModelType(a) == effectiveModelType(b)
+}
+
+func effectiveModelType(model *Model) string {
+	if model.Type == "" {
+		return "chat"
+	}
+	return model.Type
 }

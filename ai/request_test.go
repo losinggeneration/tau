@@ -27,11 +27,11 @@ func TestOpenAIBuildRequestIncludesMetadata(t *testing.T) {
 }
 
 func TestBuildOpenAICompatRequestBodyIncludesMetadata(t *testing.T) {
-	body := buildOpenAICompatRequestBody(&Model{ID: "grok-4", Provider: ProviderxAI}, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(&Model{ID: "grok-4", Provider: ProviderxAI}, &Context{
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	}, &options{
 		metadata: map[string]any{"trace_id": "abc123"},
-	})
+	}))
 
 	metadata, ok := body["metadata"].(map[string]any)
 	if !ok {
@@ -43,12 +43,12 @@ func TestBuildOpenAICompatRequestBodyIncludesMetadata(t *testing.T) {
 }
 
 func TestBuildCodexRequestBodyIncludesPromptCacheKeyAndMetadata(t *testing.T) {
-	body := buildCodexRequestBody(&Model{ID: "gpt-5.3-codex", Provider: ProviderOpenAICodex, API: APIOpenAICodexResponses}, &Context{
+	body := requireBody(t)(buildCodexRequestBody(&Model{ID: "gpt-5.3-codex", Provider: ProviderOpenAICodex, API: APIOpenAICodexResponses}, &Context{
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	}, &options{
 		sessionID: "sess_123",
 		metadata:  map[string]any{"trace_id": "abc123"},
-	})
+	}))
 
 	if body["prompt_cache_key"] != "sess_123" {
 		t.Fatalf("prompt_cache_key = %v, want sess_123", body["prompt_cache_key"])
@@ -99,34 +99,34 @@ func TestSessionCacheRetentionNoneSuppressesPromptCacheState(t *testing.T) {
 		t.Fatalf("openai responses prompt_cache_retention = %v, want omitted", openAIResponsesBody["prompt_cache_retention"])
 	}
 
-	azureBody := buildAzureRequestBody(&Model{ID: "gpt-4.1"}, &Context{
+	azureBody := requireBody(t)(buildAzureRequestBody(&Model{ID: "gpt-4.1"}, &Context{
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	}, &options{
 		sessionID:      "sess_123",
 		cacheRetention: string(CacheRetentionNone),
-	})
+	}))
 	if _, ok := azureBody["prompt_cache_key"]; ok {
 		t.Fatalf("azure prompt_cache_key = %v, want omitted", azureBody["prompt_cache_key"])
 	}
 
-	codexBody := buildCodexRequestBody(&Model{ID: "gpt-5.3-codex", Provider: ProviderOpenAICodex, API: APIOpenAICodexResponses}, &Context{
+	codexBody := requireBody(t)(buildCodexRequestBody(&Model{ID: "gpt-5.3-codex", Provider: ProviderOpenAICodex, API: APIOpenAICodexResponses}, &Context{
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	}, &options{
 		sessionID:      "sess_123",
 		cacheRetention: string(CacheRetentionNone),
-	})
+	}))
 	if _, ok := codexBody["prompt_cache_key"]; ok {
 		t.Fatalf("codex prompt_cache_key = %v, want omitted", codexBody["prompt_cache_key"])
 	}
 }
 
 func TestBuildAzureRequestBodyIncludesPromptCacheKeyAndMetadata(t *testing.T) {
-	body := buildAzureRequestBody(&Model{ID: "gpt-4.1"}, &Context{
+	body := requireBody(t)(buildAzureRequestBody(&Model{ID: "gpt-4.1"}, &Context{
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	}, &options{
 		sessionID: "sess_123",
 		metadata:  map[string]any{"trace_id": "abc123"},
-	})
+	}))
 
 	if body["prompt_cache_key"] != "sess_123" {
 		t.Fatalf("prompt_cache_key = %v, want sess_123", body["prompt_cache_key"])
@@ -142,14 +142,14 @@ func TestBuildAzureRequestBodyIncludesPromptCacheKeyAndMetadata(t *testing.T) {
 }
 
 func TestConvertAzureResponsesMessageProducesFunctionCallOutput(t *testing.T) {
-	converted := convertAzureResponsesMessage(&Model{Input: []InputType{InputText}}, Message{
+	converted := requireItems(t)(convertMessageForOpenAIResponses(&Model{Input: []InputType{InputText}}, Message{
 		Role:       "toolResult",
 		ToolCallID: "call_1",
 		ToolName:   "read",
 		Content: []ContentBlock{
 			{Type: ContentBlockText, Text: "output"},
 		},
-	})
+	}, 0, nil))
 
 	if len(converted) != 1 {
 		t.Fatalf("len(converted) = %d, want 1", len(converted))
@@ -201,14 +201,14 @@ func TestOpenAIBuildRequestNormalizesLegacyToolRole(t *testing.T) {
 func TestAnthropicConvertMessagesNormalizesLegacyToolRole(t *testing.T) {
 	client := &anthropicClient{}
 
-	msgs, err := client.convertMessages(&Context{
+	msgs, _, err := client.convertMessages(&Context{
 		Messages: []Message{{
 			Role:       "tool",
 			ToolCallID: "call_1",
 			ToolName:   "read",
 			Content:    []ContentBlock{{Type: ContentBlockText, Text: "output"}},
 		}},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("convertMessages: %v", err)
 	}
@@ -278,12 +278,12 @@ func TestBuildVertexRequestBodyNormalizesLegacyToolRole(t *testing.T) {
 }
 
 func TestConvertAzureResponsesMessageNormalizesLegacyToolRole(t *testing.T) {
-	converted := convertAzureResponsesMessage(&Model{Input: []InputType{InputText}}, Message{
+	converted := requireItems(t)(convertMessageForOpenAIResponses(&Model{Input: []InputType{InputText}}, Message{
 		Role:       "tool",
 		ToolCallID: "call_1",
 		ToolName:   "read",
 		Content:    []ContentBlock{{Type: ContentBlockText, Text: "output"}},
-	})
+	}, 0, nil))
 
 	if len(converted) != 1 {
 		t.Fatalf("len(converted) = %d, want 1", len(converted))

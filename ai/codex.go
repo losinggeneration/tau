@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -126,6 +127,16 @@ func (c *codexClient) Complete(ctx context.Context, model *Model, prompt *Contex
 
 // Stream implements Client.Streamer.
 func (c *codexClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	var o options
 	o.apply(opts)
 
@@ -142,7 +153,10 @@ func (c *codexClient) Stream(ctx context.Context, model *Model, prompt *Context,
 		return fmt.Errorf("openai codex: extract account id: %w", err)
 	}
 
-	body := buildCodexRequestBody(model, prompt, &o)
+	body, err := buildCodexRequestBody(model, prompt, &o)
+	if err != nil {
+		return fmt.Errorf("openai codex: %w", err)
+	}
 	if hasPayloadCallback(&o) {
 		if next := invokePayloadCallback(&o, model, body); next != nil {
 			if replacement, ok := next.(map[string]any); ok {
@@ -156,9 +170,14 @@ func (c *codexClient) Stream(ctx context.Context, model *Model, prompt *Context,
 		return fmt.Errorf("openai codex: marshal request: %w", err)
 	}
 
+	grammarInputs, err := responsesGrammarInputs(model, prompt.Tools)
+	if err != nil {
+		return err
+	}
 	streamOpts := &ResponsesStreamOptions{
 		ServiceTier:             o.serviceTier,
 		ApplyServiceTierPricing: ServiceTierPricing,
+		GrammarInputs:           grammarInputs,
 		ResolveServiceTier:      ResolveCodexServiceTier,
 	}
 
@@ -168,25 +187,25 @@ func (c *codexClient) Stream(ctx context.Context, model *Model, prompt *Context,
 	}
 
 	if transport != TransportSSE {
-		requestID := o.sessionID
-		if requestID == "" {
-			requestID = createCodexRequestID()
-		}
-
 		websocketURL, wsURLErr := resolveCodexWebSocketURL(model.BaseURL)
 		if wsURLErr == nil {
+			timeout := o.timeout
+			if !o.timeoutSet {
+				timeout = 15 * time.Second
+			}
 			payload, started, wsErr := streamCodexWebSocket(
 				ctx,
 				websocketURL,
-				buildCodexWebSocketHeaders(model.Headers, o.headers, accountID, apiKey, requestID),
+				buildCodexWebSocketHeaders(model.Headers, o.headers, accountID, apiKey, cacheSessionID(&o)),
 				body,
+				timeout,
 			)
 			if wsErr == nil {
 				return streamCodexResponse(ctx, model, strings.NewReader(payload), handler, streamOpts)
 			}
-			if started || transport == TransportWS {
+			if started || transport == TransportWS || ctx.Err() != nil {
 				reason := StopReasonError
-				if errors.Is(wsErr, context.Canceled) || errors.Is(wsErr, context.DeadlineExceeded) {
+				if ctx.Err() != nil {
 					reason = StopReasonAborted
 				}
 				emitTerminalStreamError(ctx, handler, AssistantMessage{
@@ -221,19 +240,26 @@ func doCodexSSERequest(ctx context.Context, model *Model, body []byte, apiKey, a
 	headers := buildCodexSSEHeaders(model.Headers, o.headers, accountID, apiKey, cacheSessionID(o))
 	bodyText := string(body)
 
-	for attempt := 0; attempt <= codexMaxRetries; attempt++ {
+	retries := codexMaxRetries
+	if o.maxRetries != nil {
+		retries = *o.maxRetries
+	}
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("openai codex: request: %w", err)
+		}
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(bodyText))
 		if reqErr != nil {
 			return nil, fmt.Errorf("openai codex: create request: %w", reqErr)
 		}
 		req.Header = headers.Clone()
 
-		resp, err = http.DefaultClient.Do(req)
+		resp, err = doHeaderRequest(req, o.timeout, "openai codex")
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, fmt.Errorf("openai codex: request: %w", ctx.Err())
 			}
-			if attempt < codexMaxRetries {
+			if attempt < retries {
 				if sleepErr := sleepWithContext(ctx, codexRetryDelay(attempt)); sleepErr == nil {
 					continue
 				} else {
@@ -268,8 +294,19 @@ func doCodexSSERequest(ctx context.Context, model *Model, body []byte, apiKey, a
 		if usageErr := parseCodexUsageLimitError(resp.StatusCode, respBody); usageErr != nil {
 			return nil, usageErr
 		}
-		if attempt < codexMaxRetries && isRetryableCodexError(resp.StatusCode, errorText) {
-			if sleepErr := sleepWithContext(ctx, codexRetryDelay(attempt)); sleepErr == nil {
+		if attempt < retries && isRetryableCodexError(resp.StatusCode, errorText) {
+			delay := codexRetryDelay(attempt)
+			if serverDelay, ok := retryAfterDelay(resp.Header); ok {
+				maxDelay := o.maxRetryDelayMs
+				if !o.maxRetryDelaySet {
+					maxDelay = 60000
+				}
+				if maxDelay > 0 && float64(serverDelay)/float64(time.Millisecond) > float64(maxDelay) {
+					return nil, fmt.Errorf("openai codex: server requested %s retry delay (max: %dms)", serverDelay, maxDelay)
+				}
+				delay = serverDelay
+			}
+			if sleepErr := sleepWithContext(ctx, delay); sleepErr == nil {
 				continue
 			} else {
 				return nil, fmt.Errorf("openai codex: request: %w", sleepErr)
@@ -278,12 +315,12 @@ func doCodexSSERequest(ctx context.Context, model *Model, body []byte, apiKey, a
 
 		return nil, fmt.Errorf("openai codex: status %d: %s", resp.StatusCode, errorText)
 	}
-
-	return nil, errors.New("openai codex: request failed after retries")
 }
 
 func buildBaseCodexHeaders(modelHeaders, optionHeaders map[string]string, accountID, apiKey string) http.Header {
 	headers := make(http.Header)
+	headers.Set("originator", "pi")
+	headers.Set("User-Agent", fmt.Sprintf("tau (%s %s)", runtime.GOOS, runtime.GOARCH))
 	for k, v := range modelHeaders {
 		headers.Set(k, v)
 	}
@@ -293,8 +330,6 @@ func buildBaseCodexHeaders(modelHeaders, optionHeaders map[string]string, accoun
 
 	headers.Set("Authorization", "Bearer "+apiKey)
 	headers.Set("chatgpt-account-id", accountID)
-	headers.Set("originator", "pi")
-	headers.Set("User-Agent", fmt.Sprintf("tau (%s %s)", runtime.GOOS, runtime.GOARCH))
 
 	return headers
 }
@@ -305,17 +340,22 @@ func buildCodexSSEHeaders(modelHeaders, optionHeaders map[string]string, account
 	headers.Set("Accept", "text/event-stream")
 	headers.Set("Content-Type", "application/json")
 	if sessionID != "" {
-		headers.Set("session_id", sessionID)
+		sessionID = clampOpenAIPromptCacheKey(sessionID)
+		headers.Set("session-id", sessionID)
 		headers.Set("x-client-request-id", sessionID)
 	}
 	return headers
 }
 
 func buildCodexWebSocketHeaders(modelHeaders, optionHeaders map[string]string, accountID, apiKey, requestID string) http.Header {
+	requestID = clampOpenAIPromptCacheKey(requestID)
+	if requestID == "" {
+		requestID = createCodexRequestID()
+	}
 	headers := buildBaseCodexHeaders(modelHeaders, optionHeaders, accountID, apiKey)
 	headers.Set("OpenAI-Beta", codexWebsocketBeta)
 	headers.Set("x-client-request-id", requestID)
-	headers.Set("session_id", requestID)
+	headers.Set("session-id", requestID)
 	headers.Del("Accept")
 	headers.Del("Content-Type")
 	return headers
@@ -360,24 +400,56 @@ func resolveCodexWebSocketURL(baseURL string) (string, error) {
 	return parsed.String(), nil
 }
 
-func streamCodexWebSocket(ctx context.Context, websocketURL string, headers http.Header, body map[string]any) (payload string, started bool, err error) {
-	dialer := websocket.Dialer{}
-	conn, resp, err := dialer.DialContext(ctx, websocketURL, headers)
+func streamCodexWebSocket(ctx context.Context, websocketURL string, headers http.Header, body map[string]any, timeout time.Duration) (payload string, started bool, err error) {
+	requestCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.AfterFunc(timeout, func() {
+			cancel(fmt.Errorf("openai codex: websocket response headers timed out: %w", context.DeadlineExceeded))
+		})
+		defer timer.Stop()
+	}
+	var cleanup func() error
+	defer func() {
+		if cleanup != nil {
+			if closeErr := cleanup(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				err = errors.Join(err, fmt.Errorf("openai codex: websocket close: %w", closeErr))
+			}
+		}
+		if cause := context.Cause(requestCtx); cause != nil {
+			err = errors.Join(err, cause)
+		}
+	}()
+	dialer := websocket.Dialer{NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		closed := make(chan error, 1)
+		stop := context.AfterFunc(requestCtx, func() { closed <- conn.Close() })
+		cleanup = func() error {
+			if stop() {
+				return conn.Close()
+			}
+			return <-closed
+		}
+		return conn, nil
+	}}
+	conn, resp, err := dialer.DialContext(requestCtx, websocketURL, headers)
+	if timer != nil {
+		timer.Stop()
+	}
 	if resp != nil && resp.Body != nil {
 		defer func() {
-			if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
-				err = fmt.Errorf("openai codex: close websocket handshake body: %w", closeErr)
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("openai codex: close websocket handshake body: %w", closeErr))
 			}
 		}()
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("openai codex: websocket connect: %w", err)
 	}
-	defer func() {
-		if closeErr := conn.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("openai codex: websocket close: %w", closeErr)
-		}
-	}()
 
 	request := map[string]any{"type": "response.create"}
 	for k, v := range body {
@@ -445,7 +517,7 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 }
 
 func codexRetryDelay(attempt int) time.Duration {
-	return codexBaseRetryDelay * time.Duration(1<<attempt)
+	return codexBaseRetryDelay * time.Duration(1<<min(attempt, 4))
 }
 
 func isRetryableCodexError(statusCode int, body string) bool {
@@ -487,15 +559,23 @@ func extractCodexAccountID(token string) (string, error) {
 }
 
 // buildCodexRequestBody builds the Codex API request body.
-func buildCodexRequestBody(model *Model, aiCtx *Context, o *options) map[string]any {
+func buildCodexRequestBody(model *Model, aiCtx *Context, o *options) (map[string]any, error) {
 	transformedCtx := aiCtx
 	if transformed, err := TransformContext(aiCtx, model, openAIResponsesToolCallIDNormalizer(model)); err == nil {
 		transformedCtx = transformed
 	}
 
+	grammar, err := responsesGrammarInputs(model, aiCtx.Tools)
+	if err != nil {
+		return nil, err
+	}
 	input := make([]map[string]any, 0, len(transformedCtx.Messages)+1)
 	for i, msg := range transformedCtx.Messages {
-		input = append(input, convertMessageForOpenAIResponses(model, msg, i)...)
+		items, err := convertMessageForOpenAIResponses(model, msg, i, grammar)
+		if err != nil {
+			return nil, err
+		}
+		input = append(input, items...)
 	}
 
 	body := map[string]any{
@@ -519,7 +599,7 @@ func buildCodexRequestBody(model *Model, aiCtx *Context, o *options) map[string]
 		body["top_p"] = *o.topP
 	}
 	if sessionID := cacheSessionID(o); sessionID != "" {
-		body["prompt_cache_key"] = sessionID
+		body["prompt_cache_key"] = clampOpenAIPromptCacheKey(sessionID)
 	}
 	if len(o.metadata) > 0 {
 		body["metadata"] = o.metadata
@@ -527,17 +607,30 @@ func buildCodexRequestBody(model *Model, aiCtx *Context, o *options) map[string]
 	if o.serviceTier != "" {
 		body["service_tier"] = o.serviceTier
 	}
-	if len(transformedCtx.Tools) > 0 {
-		body["tools"] = ConvertResponsesTools(transformedCtx.Tools)
+	if len(aiCtx.Tools) > 0 {
+		tools, err := responsesTools(model, aiCtx.Tools, supportsStrictMode(model, true))
+		if err != nil {
+			return nil, err
+		}
+		body["tools"] = tools
 	}
-	if o.reasoningEffort != "" || o.reasoningSummary != "" {
+	switch effort := responsesReasoningEffort(model, o); {
+	case effort == "none":
+		if off, ok := responsesOffEffort(model); ok {
+			body["reasoning"] = map[string]any{"effort": off, "summary": defaultString(o.reasoningSummary, "auto")}
+		}
+	case effort != "" || o.reasoningSummary != "":
 		body["reasoning"] = map[string]any{
-			"effort":  clampCodexReasoningEffort(model.ID, defaultString(o.reasoningEffort, "medium")),
+			"effort":  clampCodexReasoningEffort(model.ID, defaultString(effort, "medium")),
 			"summary": defaultString(o.reasoningSummary, "auto"),
+		}
+	case model.Reasoning:
+		if off, ok := responsesOffEffort(model); ok {
+			body["reasoning"] = map[string]any{"effort": off}
 		}
 	}
 
-	return body
+	return body, nil
 }
 
 func clampCodexReasoningEffort(modelID, effort string) string {

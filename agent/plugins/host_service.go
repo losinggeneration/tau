@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
@@ -219,10 +220,21 @@ func (h *HostService) GetConfig(ctx context.Context, req *proto.GetConfigRequest
 // ToolProgress implements Host.ToolProgress.
 // It forwards the event to the manager's progress channel if configured.
 func (h *HostService) ToolProgress(ctx context.Context, req *proto.ToolProgressEvent) (*proto.ToolProgressResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	var records []ai.NestedToolCall
+	if req.NestedCalls != "" {
+		if err := json.Unmarshal([]byte(req.NestedCalls), &records); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "decode nested progress: %v", err)
+		}
+		records = slices.Clone(records[max(0, len(records)-128):])
+	}
 	h.manager.broadcastToolProgress(ToolProgressEvent{
-		ToolCallID: req.ToolCallId,
-		Content:    req.Content,
-		IsError:    req.IsError,
+		NestedCalls: records,
+		ToolCallID:  req.ToolCallId,
+		Content:     req.Content,
+		IsError:     req.IsError,
 	})
 	return &proto.ToolProgressResponse{}, nil
 }
@@ -517,6 +529,30 @@ func (m *Manager) SetMessageSender(sender func(text, deliverAs string) error) {
 	m.messageSender = sender
 }
 
+// SetCompactor wires the active session's Compact for the SessionCompact
+// Host RPC.
+func (m *Manager) SetCompactor(compact func(ctx context.Context, instructions string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.compactor = compact
+}
+
+// SessionCompact implements Host.SessionCompact. Runs the active session's
+// compaction — the same path auto-compaction and /compact use.
+func (h *HostService) SessionCompact(ctx context.Context, req *proto.SessionCompactRequest) (*proto.SessionCompactResponse, error) {
+	h.manager.mu.RLock()
+	compact := h.manager.compactor
+	h.manager.mu.RUnlock()
+
+	if compact == nil {
+		return &proto.SessionCompactResponse{Error: "compactor not configured"}, status.Errorf(codes.Unavailable, "compactor not configured")
+	}
+	if err := compact(ctx, req.Instructions); err != nil {
+		return &proto.SessionCompactResponse{Ok: false, Error: err.Error()}, status.Errorf(codes.Internal, "compact: %v", err)
+	}
+	return &proto.SessionCompactResponse{Ok: true}, nil
+}
+
 func (m *Manager) currentCWD() string {
 	m.mu.RLock()
 	provider := m.sessionCWDProvider
@@ -601,4 +637,69 @@ func trimSpace(s string) string {
 		end--
 	}
 	return s[start:end]
+}
+
+// SetCustomMessageSender routes extension context to the active session.
+func (m *Manager) SetCustomMessageSender(sender func(context.Context, json.RawMessage, *bool, string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.customMessageSender = sender
+}
+
+// SessionSendCustomMessage implements extension custom-message delivery.
+func (h *HostService) SessionSendCustomMessage(ctx context.Context, req *proto.SessionSendCustomMessageRequest) (*proto.SessionSendUserMessageResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	if !json.Valid([]byte(req.MessageJson)) {
+		return nil, status.Error(codes.InvalidArgument, "invalid custom message JSON")
+	}
+	switch req.DeliverAs {
+	case "", "steer", "followUp", "nextTurn":
+	default:
+		return nil, status.Error(codes.InvalidArgument, "invalid custom delivery mode")
+	}
+	h.manager.mu.RLock()
+	sender := h.manager.customMessageSender
+	h.manager.mu.RUnlock()
+	if sender == nil {
+		return nil, status.Error(codes.Unavailable, "custom message sender not configured")
+	}
+	if err := sender(ctx, json.RawMessage(req.MessageJson), req.TriggerTurn, req.DeliverAs); err != nil {
+		return &proto.SessionSendUserMessageResponse{Error: err.Error()}, status.Errorf(codes.Internal, "send custom message: %v", err)
+	}
+	return &proto.SessionSendUserMessageResponse{Ok: true}, nil
+}
+
+// SetToolDiscovery connects plugin discovery to the active session.
+func (m *Manager) SetToolDiscovery(discover func(context.Context, *proto.ToolDiscoveryRequest) (json.RawMessage, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.toolDiscovery = discover
+}
+
+// ToolDiscovery performs cancellable discovery without holding the manager lock.
+func (h *HostService) ToolDiscovery(ctx context.Context, req *proto.ToolDiscoveryRequest) (*proto.ToolDiscoveryResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	switch req.Operation {
+	case "registered", "active", "activate", "search", "tool", "namespace":
+	default:
+		return nil, status.Error(codes.InvalidArgument, "unknown tool discovery operation")
+	}
+	h.manager.mu.RLock()
+	discover := h.manager.toolDiscovery
+	h.manager.mu.RUnlock()
+	if discover == nil {
+		return nil, status.Error(codes.Unavailable, "tool discovery not configured")
+	}
+	result, err := discover(ctx, req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "discover tools: %v", err)
+	}
+	return &proto.ToolDiscoveryResponse{ResultJson: string(result)}, nil
 }

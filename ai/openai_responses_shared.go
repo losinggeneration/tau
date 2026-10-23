@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -22,6 +23,9 @@ type ResponsesStreamOptions struct {
 	// ResolveServiceTier resolves the effective service tier from response and request tiers.
 	// If nil, defaults to using response tier or falling back to opts.ServiceTier.
 	ResolveServiceTier func(responseTier, requestTier string) string
+	// GrammarInputs maps grammar tools to the argument their raw custom tool
+	// input is stored in.
+	GrammarInputs map[string]string
 }
 
 // responsesStreamReader reads SSE data for Responses API.
@@ -44,6 +48,7 @@ type responsesEvent struct {
 	Message  string                `json:"message,omitempty"`
 	Error    responsesError        `json:"error,omitempty"`
 	Delta    string                `json:"delta,omitempty"`
+	Input    *string               `json:"input,omitempty"`
 	Response responsesResponseBody `json:"response,omitempty"`
 	Item     responsesItem         `json:"item,omitempty"`
 	Part     responsesPart         `json:"part,omitempty"`
@@ -80,11 +85,13 @@ type responsesInputTokensDetails struct {
 }
 
 type responsesItem struct {
+	Namespace *string            `json:"namespace,omitempty"`
 	Type      string             `json:"type,omitempty"`
 	ID        string             `json:"id,omitempty"`
 	CallID    string             `json:"call_id,omitempty"`
 	Name      string             `json:"name,omitempty"`
 	Arguments string             `json:"arguments,omitempty"`
+	Input     *string            `json:"input,omitempty"`
 	Content   []responsesPart    `json:"content,omitempty"`
 	Summary   []responsesSummary `json:"summary,omitempty"`
 	Status    string             `json:"status,omitempty"`
@@ -118,8 +125,13 @@ func ProcessResponsesStream(
 ) error {
 	handler(ctx, Start{Partial: *output})
 
-	var currentItem *responsesItem
-	var partialJson string
+	var (
+		currentItem *responsesItem
+		partialJson string
+		sawTerminal bool
+		// customInput is set while a custom (grammar) tool call streams.
+		customInput *grammarInputBuffer
+	)
 
 	// Track content indices for each block type
 	currentTextIndex := -1
@@ -175,12 +187,36 @@ func ProcessResponsesStream(
 					Type:      ContentBlockToolCall,
 					ID:        toolCallID(event.Item.CallID, event.Item.ID),
 					Name:      event.Item.Name,
+					Namespace: event.Item.Namespace,
 					Arguments: json.RawMessage(event.Item.Arguments),
 				})
 				currentToolIndex = len(output.Content) - 1
 				currentTextIndex = -1
 				currentThinkingIndex = -1
 				partialJson = event.Item.Arguments
+				customInput = nil
+				handler(ctx, ToolCallStart{ContentIndex: currentToolIndex, Partial: *output})
+
+			case "custom_tool_call":
+				property := "input"
+				if opts != nil && opts.GrammarInputs[event.Item.Name] != "" {
+					property = opts.GrammarInputs[event.Item.Name]
+				}
+				customInput = newGrammarInputBuffer(property)
+				arguments, err := json.Marshal(map[string]string{property: deref(event.Item.Input)})
+				if err != nil {
+					return fmt.Errorf("encode custom tool input: %w", err)
+				}
+				output.Content = append(output.Content, ContentBlock{
+					Type:      ContentBlockToolCall,
+					ID:        toolCallID(event.Item.CallID, event.Item.ID),
+					Name:      event.Item.Name,
+					Namespace: event.Item.Namespace,
+					Arguments: arguments,
+				})
+				currentToolIndex = len(output.Content) - 1
+				currentTextIndex = -1
+				currentThinkingIndex = -1
 				handler(ctx, ToolCallStart{ContentIndex: currentToolIndex, Partial: *output})
 			}
 
@@ -257,6 +293,20 @@ func ProcessResponsesStream(
 				}
 			}
 
+		case "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
+			if customInput == nil || currentToolIndex < 0 {
+				continue
+			}
+			next := customInput.input + event.Delta
+			closing := event.Type == "response.custom_tool_call_input.done"
+			if closing {
+				next = deref(event.Input)
+			}
+			if err := appendCustomToolInput(ctx, handler, output, currentToolIndex, customInput, next, closing); err != nil {
+				emitTerminalStreamError(ctx, handler, *output, fmt.Errorf("responses: %w", err), StopReasonError)
+				return nil
+			}
+
 		case "response.output_item.done":
 			item := event.Item
 			// Preserve accumulated summary for reasoning items before reassigning currentItem
@@ -328,6 +378,9 @@ func ProcessResponsesStream(
 
 			case "function_call":
 				if currentToolIndex >= 0 && currentToolIndex < len(output.Content) {
+					if item.Namespace != nil {
+						output.Content[currentToolIndex].Namespace = item.Namespace
+					}
 					if item.Arguments != "" {
 						args := mustMarshalStreamingJSON(ParseStreamingJSON(item.Arguments))
 						output.Content[currentToolIndex].Arguments = args
@@ -335,14 +388,35 @@ func ProcessResponsesStream(
 					tc := ToolCall{
 						ID:        output.Content[currentToolIndex].ID,
 						Name:      output.Content[currentToolIndex].Name,
+						Namespace: output.Content[currentToolIndex].Namespace,
 						Arguments: output.Content[currentToolIndex].Arguments,
 					}
 					handler(ctx, ToolCallEnd{ContentIndex: currentToolIndex, ToolCall: tc, Partial: *output})
 					currentToolIndex = -1
 				}
+
+			case "custom_tool_call":
+				if customInput != nil && currentToolIndex >= 0 {
+					if item.Namespace != nil {
+						output.Content[currentToolIndex].Namespace = item.Namespace
+					}
+					next := customInput.input
+					if item.Input != nil {
+						next = *item.Input
+					}
+					if err := appendCustomToolInput(ctx, handler, output, currentToolIndex, customInput, next, true); err != nil {
+						emitTerminalStreamError(ctx, handler, *output, fmt.Errorf("responses: %w", err), StopReasonError)
+						return nil
+					}
+					call := output.Content[currentToolIndex]
+					handler(ctx, ToolCallEnd{ContentIndex: currentToolIndex, ToolCall: ToolCall{ID: call.ID, Name: call.Name, Arguments: call.Arguments, Namespace: call.Namespace}, Partial: *output})
+					currentToolIndex = -1
+					customInput = nil
+				}
 			}
 			currentItem = nil
-		case "response.completed":
+		case "response.completed", "response.incomplete":
+			sawTerminal = true
 			if event.Response.ID != "" {
 				output.ResponseID = event.Response.ID
 			}
@@ -376,7 +450,7 @@ func ProcessResponsesStream(
 			}
 
 			// Map status to stop reason
-			output.StopReason = mapResponsesStopReason(event.Response.Status)
+			output.StopReason, output.ErrorMessage = mapResponsesStopReason(event.Response.Status, event.Response.Incomplete.Reason)
 			if hasToolCalls(output.Content) && output.StopReason == StopReasonStop {
 				output.StopReason = StopReasonToolUse
 			}
@@ -400,8 +474,32 @@ func ProcessResponsesStream(
 		}
 	}
 
-	handler(ctx, Done{Reason: output.StopReason, Message: *output})
+	switch {
+	case ctx.Err() != nil:
+	case !sawTerminal:
+		emitTerminalStreamError(ctx, handler, *output, errors.New("openai responses stream ended before a terminal response event"), StopReasonError)
+		return nil
+	case output.StopReason == StopReasonToolUse && currentToolIndex >= 0:
+		call := output.Content[currentToolIndex]
+		emitTerminalStreamError(ctx, handler, *output, fmt.Errorf("openai responses stream completed with an unfinished tool call: %s (%s)", call.Name, call.ID), StopReasonError)
+		return nil
+	}
+	finishStream(ctx, handler, *output, true, "")
 
+	return nil
+}
+
+// appendCustomToolInput records a custom tool call's input so far as its
+// arguments and emits the matching JSON delta.
+func appendCustomToolInput(ctx context.Context, handler EventHandler, output *AssistantMessage, index int, buffer *grammarInputBuffer, next string, closing bool) error {
+	delta, err := buffer.append(next, closing)
+	if err != nil {
+		return err
+	}
+	output.Content[index].Arguments = buffer.arguments()
+	if delta != "" {
+		handler(ctx, ToolCallDelta{ContentIndex: index, Delta: delta, Partial: *output})
+	}
 	return nil
 }
 
@@ -416,19 +514,23 @@ func toolCallID(callID, itemID string) string {
 	return callID + "|" + itemID
 }
 
-// mapResponsesStopReason maps API status to our StopReason.
-func mapResponsesStopReason(status string) StopReason {
+// mapResponsesStopReason maps a response status, and for incomplete
+// responses the provider's reason, to a stop reason and error message.
+func mapResponsesStopReason(status, incompleteReason string) (StopReason, string) {
 	switch status {
-	case "completed":
-		return StopReasonStop
 	case "incomplete":
-		return StopReasonLength
-	case "cancelled":
-		return StopReasonAborted
-	case "failed":
-		return StopReasonError
+		if incompleteReason == "max_output_tokens" {
+			return StopReasonLength, ""
+		}
+		if incompleteReason != "" {
+			return StopReasonError, "Response incomplete: " + incompleteReason
+		}
+
+		return StopReasonError, "Response incomplete without a provider reason"
+	case "failed", "cancelled":
+		return StopReasonError, ""
 	default:
-		return StopReasonStop
+		return StopReasonStop, ""
 	}
 }
 

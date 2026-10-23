@@ -4,6 +4,7 @@ package server // import "github.com/losinggeneration/tau/rpc/server"
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,15 +23,6 @@ import (
 	"github.com/losinggeneration/tau/sdk"
 	"github.com/losinggeneration/tau/ui"
 )
-
-// Re-export types from agent package for use in the interface.
-type (
-	BashRequest = agent.BashRequest
-	BashResult  = agent.BashResult
-)
-
-// defaultBashOps is the default bash operations implementation.
-var defaultBashOps = agent.NewDefaultBashOps()
 
 // Command represents a client-to-server command.
 type Command struct {
@@ -80,13 +72,15 @@ type Server struct {
 	commandRegistry commands.Registry
 	modelOverride   string
 	thinkingLevel   string
-	// bashOps handles bash execution for the bash RPC command.
-	bashOps interface {
-		Run(ctx context.Context, req BashRequest) (BashResult, error)
-	}
 	// activeBashCancel is the context cancel func for an in-progress bash command.
 	activeBashCancel context.CancelFunc
 	activeBashMu     sync.Mutex
+	// bashWG joins shell commands running outside the input loop.
+	bashWG sync.WaitGroup
+	// promptWG joins prompt event streams running outside the input loop.
+	promptWG sync.WaitGroup
+	// writeMu serializes JSONL writes from commands, shells, and session events.
+	writeMu sync.Mutex
 }
 
 // NewServer creates a new RPC server with the given runtime and optional
@@ -100,7 +94,6 @@ func NewServer(runtime sdk.Runtime, cmdRegistry commands.Registry, pluginManager
 		interrupt:       make(chan struct{}, 1),
 		shutdown:        make(chan struct{}),
 		commandRegistry: cmdRegistry,
-		bashOps:         defaultBashOps,
 	}
 	return s
 }
@@ -126,9 +119,9 @@ func (s *Server) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return s.cleanup()
+			return s.cleanup(ctx)
 		case <-s.shutdown:
-			return s.cleanup()
+			return s.cleanup(ctx)
 		case <-s.interrupt:
 			// SIGINT received from tau process - translate to interrupt event for client
 			s.emitInterruptEvent()
@@ -145,7 +138,7 @@ func (s *Server) Run(ctx context.Context) error {
 			if err == io.EOF || errors.Is(err, io.ErrClosedPipe) {
 				// Client disconnected or the transport input was closed.
 				s.emitDisconnectedSessionEnd()
-				return s.cleanup()
+				return s.cleanup(ctx)
 			}
 			if err := s.sendError("", "read_error", fmt.Sprintf("read command: %v", err)); err != nil {
 				return fmt.Errorf("send read error: %w", err)
@@ -231,6 +224,8 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleSetAutoRetry(ctx, cmd)
 	case "abort_retry":
 		return s.handleAbortRetry(ctx, cmd)
+	case "edit_context":
+		return s.handleEditContext(ctx, cmd)
 	case "get_messages":
 		return s.handleGetMessages(ctx, cmd)
 	case "get_commands":
@@ -243,11 +238,8 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleFork(ctx, cmd)
 	case "get_fork_messages":
 		return s.handleGetForkMessages(ctx, cmd)
-	case "bash":
-		return s.handleBash(ctx, cmd)
-	case "execute_bash":
-		// Pi-compatible alias for bash.
-		return s.handleBash(ctx, cmd)
+	case "bash", "execute_bash":
+		return s.startBash(ctx, cmd)
 	case "abort_bash":
 		return s.handleAbortBash(ctx, cmd)
 	case "get_available_models":
@@ -271,6 +263,31 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 	}
 }
 
+func (s *Server) handleEditContext(ctx context.Context, cmd *Command) error {
+	var args struct {
+		EntryID     string          `json:"entry_id"`
+		Replacement json.RawMessage `json:"replacement"`
+	}
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	if args.EntryID == "" || len(args.Replacement) == 0 {
+		return s.sendError(cmd.ID, "invalid_args", "entry_id and replacement are required")
+	}
+	sess, err := s.ensureSession(ctx)
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	editor, ok := sess.(sdk.ContextEditor)
+	if !ok {
+		return s.sendError(cmd.ID, "unsupported", "session does not support context edits")
+	}
+	if err := editor.EditContext(ctx, args.EntryID, args.Replacement); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	return s.sendResult(cmd.ID, map[string]any{"ok": true})
+}
+
 // handleSendMessage sends a user message and streams events.
 func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 	var args struct {
@@ -278,12 +295,21 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 		Images        []string `json:"images,omitempty"`
 		AttachFiles   []string `json:"attach_files,omitempty"`
 		AttachmentIDs []string `json:"attachment_ids,omitempty"`
+		// StreamingBehavior queues the prompt when a run is active:
+		// "steer", or "follow_up" ("followUp" also works).
+		StreamingBehavior   string `json:"streaming_behavior,omitempty"`
+		StreamingBehaviorPi string `json:"streamingBehavior,omitempty"`
 	}
 	if err := json.Unmarshal(cmd.Args, &args); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
+	behavior := cmp.Or(args.StreamingBehavior, args.StreamingBehaviorPi)
+	switch behavior {
+	case "", "steer", "follow_up", "followUp":
+	default:
+		return s.sendError(cmd.ID, "invalid_args", fmt.Sprintf("invalid streaming_behavior %q: use steer or follow_up", behavior))
+	}
 
-	// Ensure we have a session
 	sess, err := s.ensureSession(ctx)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
@@ -294,7 +320,6 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	// Create message with text and content blocks
 	msg := sdk.Message{
 		Role:          "user",
 		Text:          args.Text,
@@ -302,21 +327,82 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 		AttachmentIDs: attachmentIDs,
 	}
 
-	// Send and stream events
 	events, err := sess.Send(ctx, msg)
+	if errors.Is(err, sdk.ErrSessionBusy) {
+		if behavior == "steer" {
+			return s.queueMessage(cmd.ID, sess, "steer", msg)
+		}
+		if behavior != "" {
+			return s.queueMessage(cmd.ID, sess, "follow_up", msg)
+		}
+		err = fmt.Errorf("%w: set streaming_behavior to steer or follow_up to queue the message", err)
+	}
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	// Stream events to client
+	s.promptWG.Go(func() {
+		if err := s.streamPrompt(cmd.ID, sess.ID(), events); err != nil {
+			if sendErr := s.sendError(cmd.ID, "handler_error", fmt.Sprintf("handle command: %v", err)); sendErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "warning: send prompt error: %v\n", errors.Join(err, sendErr))
+			}
+		}
+	})
+	return nil
+}
+
+// streamPrompt answers an accepted prompt with its disposition, then streams
+// its events. The disposition is "started" once the run emits its first event
+// after session_start, and "handled" when a slash command produced the result.
+func (s *Server) streamPrompt(id, sessionID string, events <-chan sdk.Event) (err error) {
+	defer func() {
+		for range events {
+		}
+	}()
+	var (
+		pending   []sdk.Event
+		responded bool
+	)
+	respond := func(disposition string) error {
+		responded = true
+		if err := s.sendResult(id, map[string]any{"ok": true, "disposition": disposition}); err != nil {
+			return err
+		}
+		for _, event := range pending {
+			if err := s.emitEvent(event); err != nil {
+				return fmt.Errorf("emit event: %w", err)
+			}
+		}
+		pending = nil
+		return nil
+	}
 	for event := range events {
-		if err := s.emitEvent(event); err != nil {
-			return fmt.Errorf("emit event: %w", err)
+		if event.SessionID == "" {
+			event.SessionID = sessionID
+		}
+		if responded {
+			if err := s.emitEvent(event); err != nil {
+				return fmt.Errorf("emit event: %w", err)
+			}
+			continue
+		}
+		pending = append(pending, event)
+		switch event.Type {
+		case "session_start":
+		case "command_result":
+			if err := respond("handled"); err != nil {
+				return err
+			}
+		default:
+			if err := respond("started"); err != nil {
+				return err
+			}
 		}
 	}
-
-	// Send success response
-	return s.sendResult(cmd.ID, map[string]any{"ok": true})
+	if !responded {
+		return respond("handled")
+	}
+	return nil
 }
 
 // handleInterrupt cancels the in-flight assistant response.
@@ -872,7 +958,9 @@ func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, re
 				"reason":       reason,
 			},
 		})
-		_ = prev.Close(ctx)
+		if err := prev.Close(ctx); err != nil {
+			return fmt.Errorf("close previous session: %w", err)
+		}
 	}
 
 	var (
@@ -970,7 +1058,7 @@ func (s *Server) emitMeta() error {
 		return fmt.Errorf("marshal meta: %w", err)
 	}
 	data = append(data, '\n')
-	_, err = s.writer.Write(data)
+	err = s.write(data)
 	return err
 }
 
@@ -996,7 +1084,7 @@ func (s *Server) emitEvent(event sdk.Event) error {
 		return fmt.Errorf("marshal event: %w", err)
 	}
 	data = append(data, '\n')
-	_, err = s.writer.Write(data)
+	err = s.write(data)
 	return err
 }
 
@@ -1063,6 +1151,13 @@ func (s *Server) sendErrorResult(id string, err error) error {
 	return s.sendError(id, "error", err.Error())
 }
 
+func (s *Server) write(data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.writer.Write(data)
+	return err
+}
+
 // sendResponse writes a response to stdout.
 func (s *Server) sendResponse(resp Response) error {
 	data, err := json.Marshal(resp)
@@ -1070,7 +1165,7 @@ func (s *Server) sendResponse(resp Response) error {
 		return fmt.Errorf("marshal response: %w", err)
 	}
 	data = append(data, '\n')
-	_, err = s.writer.Write(data)
+	err = s.write(data)
 	return err
 }
 
@@ -1089,7 +1184,6 @@ func (s *Server) handleSteer(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	// Build content blocks
 	content := make([]ai.ContentBlock, 0, len(args.Images))
 	for _, img := range args.Images {
 		content = append(content, ai.ContentBlock{
@@ -1098,18 +1192,7 @@ func (s *Server) handleSteer(ctx context.Context, cmd *Command) error {
 			MimeType: "image/png",
 		})
 	}
-
-	if agentSess, ok := sess.(sdk.Steerer); ok {
-		if err := agentSess.Steer(sdk.Message{Role: "user", Text: args.Text, Images: content}); err != nil {
-			return s.sendErrorResult(cmd.ID, err)
-		}
-		if err := s.emitQueueUpdate(sess); err != nil {
-			return fmt.Errorf("emit queue update: %w", err)
-		}
-		return s.sendResult(cmd.ID, map[string]any{"ok": true})
-	}
-
-	return s.sendError(cmd.ID, "not_supported", "steer not supported in this session")
+	return s.queueMessage(cmd.ID, sess, "steer", sdk.Message{Role: "user", Text: args.Text, Images: content})
 }
 
 // handleFollowUp adds a follow-up message to the queue.
@@ -1127,7 +1210,6 @@ func (s *Server) handleFollowUp(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	// Build content blocks
 	content := make([]ai.ContentBlock, 0, len(args.Images))
 	for _, img := range args.Images {
 		content = append(content, ai.ContentBlock{
@@ -1136,18 +1218,34 @@ func (s *Server) handleFollowUp(ctx context.Context, cmd *Command) error {
 			MimeType: "image/png",
 		})
 	}
+	return s.queueMessage(cmd.ID, sess, "follow_up", sdk.Message{Role: "user", Text: args.Text, Images: content})
+}
 
-	if agentSess, ok := sess.(sdk.FollowUpper); ok {
-		if err := agentSess.FollowUp(sdk.Message{Role: "user", Text: args.Text, Images: content}); err != nil {
-			return s.sendErrorResult(cmd.ID, err)
+// queueMessage queues msg as a steering ("steer") or follow-up message and
+// answers with the "queued" disposition.
+func (s *Server) queueMessage(id string, sess sdk.Session, kind string, msg sdk.Message) error {
+	var err error
+	switch kind {
+	case "steer":
+		steerer, ok := sess.(sdk.Steerer)
+		if !ok {
+			return s.sendError(id, "not_supported", "steer not supported in this session")
 		}
-		if err := s.emitQueueUpdate(sess); err != nil {
-			return fmt.Errorf("emit queue update: %w", err)
+		err = steerer.Steer(msg)
+	default:
+		followUpper, ok := sess.(sdk.FollowUpper)
+		if !ok {
+			return s.sendError(id, "not_supported", "follow_up not supported in this session")
 		}
-		return s.sendResult(cmd.ID, map[string]any{"ok": true})
+		err = followUpper.FollowUp(msg)
 	}
-
-	return s.sendError(cmd.ID, "not_supported", "follow_up not supported in this session")
+	if err != nil {
+		return s.sendErrorResult(id, err)
+	}
+	if err := s.emitQueueUpdate(sess); err != nil {
+		return fmt.Errorf("emit queue update: %w", err)
+	}
+	return s.sendResult(id, map[string]any{"ok": true, "disposition": "queued"})
 }
 
 // handleCycleModel cycles to the next available model.
@@ -1467,7 +1565,7 @@ func (s *Server) handleFork(ctx context.Context, cmd *Command) error {
 			"session_id":      current.ID(),
 			"fork_from_entry": forkEntryID,
 		})
-		if blocked := s.pluginManager.DispatchEvent("session_before_fork", beforePayload, current.ID()); blocked {
+		if blocked := s.pluginManager.DispatchEvent(ctx, "session_before_fork", beforePayload, current.ID()); blocked {
 			return s.sendError(cmd.ID, "fork_blocked", "fork blocked by plugin")
 		}
 	}
@@ -1524,55 +1622,96 @@ func (s *Server) handleGetForkMessages(ctx context.Context, cmd *Command) error 
 }
 
 // handleBash executes a bash command and returns the result.
-func (s *Server) handleBash(ctx context.Context, cmd *Command) error {
+func (s *Server) handleBash(ctx context.Context, executor sdk.BashExecutor, cmd *Command) error {
+	if err := ctx.Err(); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
 	var args struct {
-		Command  string `json:"command"`
-		Dir      string `json:"dir,omitempty"`
-		TimeoutS int    `json:"timeout_s,omitempty"` // timeout in seconds
+		Command            string `json:"command"`
+		Dir                string `json:"dir,omitempty"`
+		TimeoutS           int    `json:"timeout_s,omitempty"`
+		ExcludeFromContext bool   `json:"excludeFromContext,omitempty"`
 	}
 	if err := json.Unmarshal(cmd.Args, &args); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-
 	if args.Command == "" {
 		return s.sendError(cmd.ID, "invalid_command", "command cannot be empty")
 	}
-
-	// Set up timeout
-	timeout := 0 * time.Second
-	if args.TimeoutS > 0 {
-		timeout = time.Duration(args.TimeoutS) * time.Second
+	execution, err := executor.ExecuteBash(ctx, args.Command, sdk.BashOptions{
+		ExcludeFromContext: args.ExcludeFromContext,
+		Dir:                args.Dir,
+		Timeout:            time.Duration(args.TimeoutS) * time.Second,
+		OnOutput: func(delta string) {
+			if err := s.emitEvent(sdk.Event{Type: "bash_execution_update", Payload: map[string]any{"id": cmd.ID, "delta": delta}}); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "warning: emit bash output: %v\n", err)
+			}
+		},
+	})
+	switch {
+	case errors.Is(err, sdk.ErrBashBlocked):
+		return s.sendError(cmd.ID, "blocked", err.Error())
+	case errors.Is(err, agent.ErrInvalidUserBashOverride):
+		return s.sendError(cmd.ID, "invalid_override", err.Error())
+	case err != nil:
+		return s.sendErrorResult(cmd.ID, err)
 	}
+	return s.sendResult(cmd.ID, map[string]any{
+		"output":           execution.Output,
+		"exit_code":        execution.ExitCode,
+		"cancel_reason":    execution.CancelReason,
+		"cancelled":        execution.Cancelled,
+		"truncated":        execution.Truncated,
+		"full_output_path": execution.FullOutputPath,
+	})
+}
 
-	req := BashRequest{
-		Command: args.Command,
-		Dir:     args.Dir,
-		Timeout: timeout,
-	}
-
-	// Set up cancellation for abort_bash support
-	bashCtx, cancel := context.WithCancel(ctx)
-	s.activeBashMu.Lock()
-	s.activeBashCancel = cancel
-	s.activeBashMu.Unlock()
-
-	// Run the bash command
-	result, err := s.bashOps.Run(bashCtx, req)
-
-	// Clear the active cancel func
-	s.activeBashMu.Lock()
-	s.activeBashCancel = nil
-	s.activeBashMu.Unlock()
-
+// startBash admits one shell command and runs it off the input loop so
+// abort_bash and other commands remain readable while it executes.
+func (s *Server) startBash(ctx context.Context, cmd *Command) error {
+	// The session outlives the shell, so it must not be created from the
+	// shell's cancellable context.
+	sess, err := s.ensureSession(ctx)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-
-	return s.sendResult(cmd.ID, map[string]any{
-		"output":        result.Output,
-		"exit_code":     result.ExitCode,
-		"cancel_reason": string(result.CancelReason),
+	executor, ok := sess.(sdk.BashExecutor)
+	if !ok {
+		return s.sendError(cmd.ID, "unsupported", "session does not support bash execution")
+	}
+	bashCtx, cancel := context.WithCancel(ctx)
+	s.activeBashMu.Lock()
+	if s.activeBashCancel != nil {
+		s.activeBashMu.Unlock()
+		cancel()
+		return s.sendError(cmd.ID, "busy", "a bash command is already running")
+	}
+	s.activeBashCancel = cancel
+	s.activeBashMu.Unlock()
+	s.bashWG.Go(func() {
+		defer func() {
+			s.activeBashMu.Lock()
+			s.activeBashCancel = nil
+			s.activeBashMu.Unlock()
+			cancel()
+		}()
+		if err := s.handleBash(bashCtx, executor, cmd); err != nil {
+			if sendErr := s.sendError(cmd.ID, "handler_error", fmt.Sprintf("handle command: %v", err)); sendErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "warning: send bash error: %v\n", errors.Join(err, sendErr))
+			}
+		}
 	})
+	return nil
+}
+
+// stopBash cancels any admitted shell command and waits for it to settle.
+func (s *Server) stopBash() {
+	s.activeBashMu.Lock()
+	if s.activeBashCancel != nil {
+		s.activeBashCancel()
+	}
+	s.activeBashMu.Unlock()
+	s.bashWG.Wait()
 }
 
 // handleAbortBash aborts an in-progress bash command.
@@ -1611,14 +1750,23 @@ func (s *Server) rebindSession(ctx context.Context, newSess sdk.Session) error {
 		prevCancel()
 	}
 	if prev != nil {
-		_ = prev.Close(ctx)
+		if err := prev.Close(ctx); err != nil {
+			return fmt.Errorf("close previous session: %w", err)
+		}
 	}
 
 	return nil
 }
 
+// sessionCleanupTimeout bounds session shutdown once the server loop ends,
+// since the loop's own context is usually already cancelled by then.
+const sessionCleanupTimeout = 10 * time.Second
+
 // cleanup performs graceful shutdown.
-func (s *Server) cleanup() error {
+func (s *Server) cleanup(ctx context.Context) (err error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionCleanupTimeout)
+	defer cancel()
+	s.stopBash()
 	s.sessionMu.Lock()
 	if s.sessionCancel != nil {
 		s.sessionCancel()
@@ -1626,36 +1774,41 @@ func (s *Server) cleanup() error {
 	var sessID string
 	if s.session != nil {
 		sessID = s.session.ID()
-		_ = s.session.Close(context.Background())
+		if closeErr := s.session.Close(ctx); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close RPC session: %w", closeErr))
+		}
 	}
 	s.sessionMu.Unlock()
+	s.promptWG.Wait()
 
 	// Fire `session_shutdown` on the JSON stream so transports (and
 	// tailers of the RPC event stream) observe the session tear-down.
 	// The plugin-bus side is fired inside agentSession.Close.
 	if sessID != "" {
-		_ = s.emitEvent(sdk.Event{
+		emitErr := s.emitEvent(sdk.Event{
 			Type:      "session_shutdown",
 			SessionID: sessID,
 			Payload:   map[string]any{"session_id": sessID},
 		})
+		if emitErr != nil {
+			err = errors.Join(err, fmt.Errorf("emit session shutdown: %w", emitErr))
+		}
 	}
 
 	if s.ui != nil {
-		_ = s.ui.Close()
+		if closeErr := s.ui.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close RPC UI: %w", closeErr))
+		}
 	}
 
-	return nil
+	return err
 }
 
-// SendInterrupt triggers the interrupt channel to cancel the in-flight session.
+// SendInterrupt interrupts the in-flight run and emits an interrupt event.
 // This is called when tau receives SIGINT in RPC mode, translating it into an
 // interrupt event for the connected client.
 func (s *Server) SendInterrupt() {
-	select {
-	case s.interrupt <- struct{}{}:
-	default:
-	}
+	s.emitInterruptEvent()
 }
 
 // isInterrupted returns true if an interrupt is pending and clears the flag.
@@ -1677,17 +1830,18 @@ func (s *Server) emitInterruptEvent() {
 	s.mu.Unlock()
 
 	// Cancel the in-flight session if any
+	var sessionID string
 	s.sessionMu.Lock()
 	if s.session != nil {
 		_ = s.session.Interrupt()
+		sessionID = s.session.ID()
 	}
 	s.sessionMu.Unlock()
 
-	// Emit the interrupt event
 	event := map[string]any{
 		"type": "interrupt",
 	}
-	_ = s.emitEvent(sdk.Event{Type: "interrupt", Payload: event})
+	_ = s.emitEvent(sdk.Event{Type: "interrupt", SessionID: sessionID, Payload: event})
 }
 
 // emitDisconnectedSessionEnd emits a session_end event with disconnected reason
@@ -1721,6 +1875,16 @@ func (s *Server) emitDisconnectedSessionEnd() {
 // can serve without consulting any external catalog.
 func (s *Server) handleGetAvailableModels(ctx context.Context, cmd *Command) error {
 	models := ai.ListModels("")
+	s.sessionMu.Lock()
+	sess := s.session
+	s.sessionMu.Unlock()
+	if lister, ok := sess.(sdk.ModelLister); ok {
+		var err error
+		models, err = lister.GetAvailableModels(ctx)
+		if err != nil {
+			return s.sendErrorResult(cmd.ID, err)
+		}
+	}
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
 		out = append(out, map[string]any{

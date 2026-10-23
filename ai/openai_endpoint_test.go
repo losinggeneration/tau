@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // withFastChatCompletionsRetries shrinks the backoff base so retry tests run
@@ -131,5 +133,55 @@ func TestDoOpenAIChatCompletionsReplaysRequestBody(t *testing.T) {
 	}
 	if len(bodies) != chatCompletionsMaxRetries+1 {
 		t.Fatalf("attempts = %d, want %d", len(bodies), chatCompletionsMaxRetries+1)
+	}
+}
+
+func TestChatCompletionsHeaderTimeout(t *testing.T) {
+	model := &Model{ID: "test", API: APIOpenAICompletions, Provider: ProviderOpenAI, BaseURL: "https://test.invalid"}
+	client, err := newOpenAIClient(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	t.Run("completions", func(t *testing.T) { testHTTPProviderHeaderTimeout(t, client, model, payload) })
+	t.Run("compatible", func(t *testing.T) {
+		compat := *model
+		compat.API = APIOpenAICompatible
+		testHTTPProviderHeaderTimeout(t, &openAICompatClient{model: &compat}, &compat, payload)
+	})
+}
+
+func TestChatCompletionsUseInjectedCredentialRefresh(t *testing.T) {
+	payload := "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	model := &Model{ID: "test", API: APIOpenAICompletions, Provider: ProviderOpenAI, BaseURL: "https://test.invalid"}
+	for _, name := range []string{"completions", "compatible"} {
+		t.Run(name, func(t *testing.T) {
+			var auth []string
+			previous := http.DefaultClient
+			http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				auth = append(auth, req.Header.Get("Authorization"))
+				status := http.StatusOK
+				if len(auth) == 1 {
+					status = http.StatusUnauthorized
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(payload))}, nil
+			})}
+			t.Cleanup(func() { http.DefaultClient = previous })
+			var client interface {
+				Client
+				SetTransportOption(TransportOption)
+			}
+			if name == "completions" {
+				openai, err := newOpenAIClient(model)
+				require.NoError(t, err)
+				client = openai
+			} else {
+				client = &openAICompatClient{model: model}
+			}
+			client.SetTransportOption(TransportOption{Provider: ProviderOpenAI, RefreshCreds: func(context.Context, string) (string, error) { return "new", nil }})
+			_, err := client.Complete(t.Context(), model, &Context{}, WithAPIKey("old"))
+			require.NoError(t, err)
+			require.Equal(t, []string{"Bearer old", "Bearer new"}, auth)
+		})
 	}
 }

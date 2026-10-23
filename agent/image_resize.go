@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"image"
 	"image/color"
@@ -9,6 +10,8 @@ import (
 	"image/jpeg"
 	"image/png"
 	"strings"
+
+	"github.com/losinggeneration/tau/ai"
 )
 
 // resizeResult is the outcome of attempting to resize image data. The
@@ -81,7 +84,11 @@ func decodeImagePixels(data []byte, mimeType string) (image.Image, error) {
 // encodeImage re-encodes the image at mimeType with sensible defaults.
 // JPEG uses quality 85 (standard for moderately-compressed images).
 // Other formats use their stdlib defaults.
-func encodeImage(img image.Image, mimeType string) ([]byte, error) {
+func encodeImage(img image.Image, mimeType string, quality ...int) ([]byte, error) {
+	jpegQuality := 85
+	if len(quality) > 0 && quality[0] > 0 {
+		jpegQuality = quality[0]
+	}
 	var buf bytes.Buffer
 	switch strings.ToLower(mimeType) {
 	case "image/png":
@@ -89,7 +96,7 @@ func encodeImage(img image.Image, mimeType string) ([]byte, error) {
 			return nil, err
 		}
 	case "image/jpeg":
-		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: jpegQuality}); err != nil {
 			return nil, err
 		}
 	case "image/gif":
@@ -139,7 +146,7 @@ func computeFitDimensions(srcW, srcH, maxW, maxH int) (int, int) {
 // ResizeResult.OrigW/OrigH are populated whenever the format is decodable,
 // even when no resize is performed, so the caller can include the actual
 // image dimensions in its note to the model.
-func resizeImageData(data []byte, mimeType string, maxW, maxH int) resizeResult {
+func resizeImageData(data []byte, mimeType string, maxW, maxH int, quality ...int) resizeResult {
 	if !isSupportedImageMime(mimeType) {
 		return resizeResult{}
 	}
@@ -180,7 +187,7 @@ func resizeImageData(data []byte, mimeType string, maxW, maxH int) resizeResult 
 	newW, newH := computeFitDimensions(origW, origH, maxW, maxH)
 	resized := resizeNRGBA(toNRGBA(srcImg), newW, newH)
 
-	encoded, err := encodeImage(resized, mimeType)
+	encoded, err := encodeImage(resized, mimeType, quality...)
 	if err != nil {
 		return resizeResult{
 			OrigW: origW, OrigH: origH,
@@ -308,4 +315,33 @@ func resizeNRGBA(src *image.NRGBA, dstW, dstH int) *image.NRGBA {
 		}
 	}
 	return dst
+}
+
+// ResizeImageBlock applies a model profile before an image enters persistent history.
+func ResizeImageBlock(block ai.ContentBlock, profile *ai.ModelImageResizeOptions) (ai.ContentBlock, error) {
+	if block.Type != ai.ContentBlockImage || profile == nil {
+		return block, nil
+	}
+	if profile.JPEGQuality < 0 || profile.JPEGQuality > 100 {
+		return block, fmt.Errorf("invalid JPEG quality %d", profile.JPEGQuality)
+	}
+	width, height := profile.MaxWidth, profile.MaxHeight
+	if width <= 0 {
+		width = 2000
+	}
+	if height <= 0 {
+		height = 2000
+	}
+	data, err := base64.StdEncoding.DecodeString(block.Data)
+	if err != nil {
+		return block, fmt.Errorf("decode image: %w", err)
+	}
+	resized := resizeImageData(data, block.MimeType, width, height, profile.JPEGQuality)
+	if resized.Data != nil {
+		block.Data = base64.StdEncoding.EncodeToString(resized.Data)
+	}
+	if profile.MaxBytes > 0 && len(block.Data) > profile.MaxBytes {
+		return block, fmt.Errorf("image exceeds model payload limit of %d bytes", profile.MaxBytes)
+	}
+	return block, nil
 }

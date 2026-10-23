@@ -1,14 +1,18 @@
 package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
+	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
+	"time"
 )
 
 // Note: the path /v1/messages is appended at the call site, so the base URL
@@ -72,11 +76,16 @@ func fromClaudeCodeName(name string, tools []Tool) string {
 	return name
 }
 
+func isClaude55Model(modelID string) bool {
+	id := strings.ReplaceAll(strings.ToLower(modelID), ".", "-")
+	return strings.Contains(id, "opus-5-5") || strings.Contains(id, "sonnet-5-5") || strings.Contains(id, "haiku-5-5")
+}
+
 // isAdaptiveThinkingModel checks if a model supports adaptive thinking.
 // Adaptive thinking models include Opus 4.6+, Sonnet 4.6+, and Opus 4.7+.
 func isAdaptiveThinkingModel(modelID string) bool {
 	lowerID := strings.ToLower(modelID)
-	return strings.Contains(lowerID, "opus-4-6") ||
+	return isClaude55Model(modelID) || strings.Contains(lowerID, "opus-4-6") ||
 		strings.Contains(lowerID, "opus-4.6") ||
 		strings.Contains(lowerID, "opus-4-7") ||
 		strings.Contains(lowerID, "opus-4.7") ||
@@ -99,7 +108,12 @@ func mapReasoningLevelToAnthropicEffort(level ReasoningLevel, modelID string) st
 		return "medium"
 	case ReasoningHigh:
 		return "high"
+	case ReasoningMax:
+		return "max"
 	case ReasoningXHigh:
+		if isClaude55Model(modelID) {
+			return "xhigh"
+		}
 		lower := strings.ToLower(modelID)
 		if strings.Contains(lower, "opus-4-7") || strings.Contains(lower, "opus-4.7") {
 			return "xhigh"
@@ -125,6 +139,8 @@ type anthropicClient struct {
 	interleaved   bool
 	tools         []Tool
 	transportOpts *TransportOption
+	// thinkingLevel is the managed effort stamped on streamed assistant messages.
+	thinkingLevel string
 }
 
 // SetTransportOption implements the SDK's transport option injection interface.
@@ -144,7 +160,6 @@ func newAnthropicClient(model *Model) (*anthropicClient, error) {
 		transport: NewTransport(baseURL, "", map[string][]string{
 			"Content-Type":      {"application/json"},
 			"anthropic-version": {"2023-06-01"},
-			"anthropic-dangerous-direct-password-access": {"true"},
 		}),
 	}, nil
 }
@@ -156,8 +171,31 @@ func (c *anthropicClient) Complete(ctx context.Context, model *Model, prompt *Co
 
 // Stream implements Client.
 func (c *anthropicClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, withCopilotHeaders(model, prompt, opts))
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	// Per-request state lives on a copy so a shared client can stream concurrently.
+	request := *c
+	return request.stream(ctx, model, prompt, timedEventHandler(handler), false, opts...)
+}
+
+func (c *anthropicClient) stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, fallback bool, opts ...Option) (err error) {
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	declared := providerContext(prompt).Tools
+	_, nativeToolChanges := anthropicTranscript(model, prompt)
 	var o options
 	o.apply(opts)
+	c.thinkingLevel = ""
+	if anthropicManagedEffort(model) {
+		c.thinkingLevel = anthropicEffort(model, &o)
+		if c.thinkingLevel == "" {
+			c.thinkingLevel = "high"
+		}
+	}
 
 	// Determine if this is an OAuth token
 	apiKey := o.apiKey
@@ -168,7 +206,7 @@ func (c *anthropicClient) Stream(ctx context.Context, model *Model, prompt *Cont
 
 	// Check for interleaved thinking option
 	c.interleaved = o.interleavedThinking != nil && (*o.interleavedThinking || (isAdaptiveThinkingModel(model.ID) && *o.interleavedThinking))
-	c.tools = prompt.Tools
+	c.tools = declared
 
 	// Build request
 	reqBody, err := c.buildRequest(model, prompt, &o)
@@ -184,32 +222,83 @@ func (c *anthropicClient) Stream(ctx context.Context, model *Model, prompt *Cont
 		}
 	}
 
-	if apiKey == "" {
+	hasAuth := apiKey != ""
+	for name, value := range o.headers {
+		if (strings.EqualFold(name, "authorization") || strings.EqualFold(name, "x-api-key") || strings.EqualFold(name, "cf-aig-authorization")) && strings.TrimSpace(value) != "" {
+			hasAuth = true
+		}
+	}
+	if !hasAuth {
 		return fmt.Errorf("%s: missing API key", model.Provider)
 	}
 
 	// Build headers based on auth type
-	headers := c.buildHeaders(apiKey, model, &o)
+	var betas []string
+	if anthropicManagedEffort(model) {
+		betas = append(betas, anthropicMidConversationOutputConfigBeta, anthropicThinkingBindingBeta)
+	}
+	if nativeToolChanges {
+		betas = append(betas, anthropicInlineToolsBeta)
+	}
+	headers := c.buildHeaders(apiKey, model, &o, betas...)
 
-	// Build transport with optional transport-level options (e.g., refresh callbacks)
-	var transport *HTTPTransport
-	if o.transportOpts != nil {
-		// Convert map[string]string to http.Header
-		httpHeaders := make(http.Header)
-		for k, v := range headers {
-			httpHeaders.Set(k, v)
-		}
-		transport = NewTransportWithOptions(c.transport.baseURL, apiKey, httpHeaders, TransportOptions{
-			RefreshCreds: o.transportOpts.RefreshCreds,
-			Provider:     o.transportOpts.Provider,
-		})
-	} else {
-		transport = c.transport.withHeaders(headers)
+	transport := c.transport.withHeaders(headers)
+	transport.timeout = o.timeout
+	if baseURL := requestBaseURL(model, apiKey); baseURL != "" {
+		transport.baseURL = baseURL
+	}
+	if refresh := cmp.Or(o.transportOpts, c.transportOpts); refresh != nil {
+		transport.refreshCreds, transport.provider = refresh.RefreshCreds, refresh.Provider
 	}
 
-	resp, err := transport.Do(ctx, "POST", "/v1/messages", reqBody)
+	resp, err := sendProviderRequest(ctx, &o, providerRequest{label: "anthropic", send: func() (*http.Response, error) {
+		return transport.Do(ctx, http.MethodPost, "/v1/messages", reqBody)
+	}})
+	var rejected *providerStatusError
+	if errors.As(err, &rejected) {
+		body := rejected.body
+		if !fallback && ctx.Err() == nil && rejected.status == http.StatusBadRequest && anthropicStrictLimitError(body) {
+			retryPrompt := NormalizeContext(prompt)
+			changed := false
+			for m := range retryPrompt.Messages {
+				tools := slices.Clone(retryPrompt.Messages[m].ToolsAdded)
+				retryPrompt.Messages[m].ToolsAdded = tools
+				for i, tool := range tools {
+					config, err := constrainedSampling(tool)
+					if err != nil {
+						return err
+					}
+					if config != nil && config.Type == "json_schema" && config.Strict == "prefer" {
+						_, strict, err := strictToolParameters(tool, model.Compat != nil && model.Compat.SupportsStrictTools, anthropicUnsupportedStrictKeyword)
+						if err != nil {
+							return err
+						}
+						if strict {
+							tools[i].ConstrainedSampling = nil
+							changed = true
+						}
+					}
+				}
+			}
+			if changed {
+				diagnostic := AssistantDiagnostic{Type: "anthropic_strict_tools_fallback", Timestamp: time.Now().UnixMilli(), Error: map[string]string{"message": string(body)}, Details: map[string]string{"reason": "strict_tool_limits_exceeded"}}
+				return c.stream(ctx, model, retryPrompt, func(ctx context.Context, event StreamEvent) {
+					switch e := event.(type) {
+					case Done:
+						e.Message.Diagnostics = append(e.Message.Diagnostics, diagnostic)
+						event = e
+					case StreamError:
+						e.Msg.Diagnostics = append(e.Msg.Diagnostics, diagnostic)
+						event = e
+					}
+					handler(ctx, event)
+				}, true, opts...)
+			}
+		}
+		return err
+	}
 	if err != nil {
-		return fmt.Errorf("request: %w", err)
+		return err
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
@@ -219,15 +308,6 @@ func (c *anthropicClient) Stream(ctx context.Context, model *Model, prompt *Cont
 
 	if hasResponseCallback(&o) {
 		invokeResponseCallback(&o, model, responseMetadata(resp))
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("API error: %d", resp.StatusCode)
-		}
-
-		return fmt.Errorf("API error: %d %s", resp.StatusCode, string(body))
 	}
 
 	// Check for streaming
@@ -240,19 +320,17 @@ func (c *anthropicClient) Stream(ctx context.Context, model *Model, prompt *Cont
 }
 
 // buildHeaders constructs the appropriate headers based on auth type and model.
-func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options) map[string]string {
+func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options, extraBetas ...string) map[string]string {
 	headers := make(map[string]string)
 
 	// Base headers
-	headers["x-api-key"] = apiKey
 	headers["accept"] = "application/json"
 	headers["anthropic-dangerous-direct-browser-access"] = "true"
 
 	// Build beta features list
 	var betaFeatures []string
 
-	// Fine-grained tool streaming beta - always included for non-copilot
-	if model.Provider != ProviderGitHubCopilot {
+	if len(c.tools) > 0 && model.Compat != nil && model.Compat.SupportsEagerToolInputStreaming != nil && !*model.Compat.SupportsEagerToolInputStreaming {
 		betaFeatures = append(betaFeatures, "fine-grained-tool-streaming-2025-05-14")
 	}
 
@@ -261,6 +339,7 @@ func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options) 
 	if needsInterleavedBeta {
 		betaFeatures = append(betaFeatures, "interleaved-thinking-2025-05-14")
 	}
+	betaFeatures = append(betaFeatures, extraBetas...)
 
 	// OAuth: includes claude-code and oauth betas + Claude Code identity headers
 	if c.isOAuth {
@@ -269,6 +348,7 @@ func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options) 
 			"oauth-2025-04-20",
 		}, betaFeatures...)
 
+		headers["authorization"] = "Bearer " + apiKey
 		headers["anthropic-beta"] = strings.Join(betaFeatures, ",")
 		headers["user-agent"] = "claude-cli/2.1.75"
 		headers["x-app"] = "cli"
@@ -278,23 +358,34 @@ func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options) 
 			headers["anthropic-beta"] = strings.Join(betaFeatures, ",")
 		}
 
-		// Copilot-specific headers
 		if model.Provider == ProviderGitHubCopilot {
-			// Copilot uses Bearer auth
 			headers["authorization"] = "Bearer " + apiKey
+		} else if apiKey != "" {
+			headers["x-api-key"] = apiKey
 		}
 	}
 
-	// Merge user-provided headers
-	for k, v := range o.headers {
-		headers[k] = v
+	if sessionID := cacheSessionID(o); sessionID != "" && !c.isOAuth && model.Provider != ProviderGitHubCopilot && model.Compat != nil && model.Compat.SendSessionAffinityHeaders {
+		format := model.Compat.SessionAffinityFormat
+		if format == "" && (model.Provider == ProviderOpenRouter || strings.Contains(model.BaseURL, "openrouter.ai")) {
+			format = "openrouter"
+		}
+		header := "x-session-affinity"
+		if format == "openrouter" {
+			header = "x-session-id"
+		}
+		headers[header] = sessionID
 	}
+
+	// Merge user-provided headers
+	copyConfiguredHeaders(headers, o.headers)
 
 	return headers
 }
 
 // buildRequest builds the Anthropic API request body.
 func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options) (string, error) {
+	prompt, nativeToolChanges := anthropicTranscript(model, prompt)
 	req := anthropicRequest{
 		Model:     model.ID,
 		MaxTokens: getMaxTokens(o, model),
@@ -343,141 +434,105 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 	// Determine cache control settings
 	cacheRetention := resolveCacheRetention(o.cacheRetention)
 	var cacheControl *cacheControlParam
-	if cacheRetention != "none" {
-		ttl := ""
-		if cacheRetention == "long" && !strings.Contains(model.BaseURL, "api.anthropic.com") {
-			ttl = "1h"
-		}
+	if cacheRetention != CacheRetentionNone {
 		cacheControl = &cacheControlParam{Type: "ephemeral"}
-		if ttl != "" {
-			cacheControl.TTL = ttl
+		if cacheRetention == CacheRetentionLong && (model.Compat == nil || model.Compat.SupportsLongCacheRetention == nil || *model.Compat.SupportsLongCacheRetention) {
+			cacheControl.TTL = "1h"
 		}
 	}
-
-	// Convert messages
-	msgs, err := c.convertMessages(transformedCtx, cacheControl)
-	if err != nil {
-		return "", err
+	toolCacheControl := cacheControl
+	if model.Compat != nil && model.Compat.SupportsCacheControlOnTools != nil && !*model.Compat.SupportsCacheControlOnTools {
+		toolCacheControl = nil
 	}
-
-	req.Messages = msgs
-
-	// Add system prompt
-	if prompt.SystemPrompt != "" {
-		if c.isOAuth {
-			// For OAuth tokens, include Claude Code identity in system
-			systemBlocks := []anthropicSystemBlock{
-				{Type: "text", Text: "You are Claude Code, Anthropic's official CLI for Claude."},
-				{Type: "text", Text: prompt.SystemPrompt},
-			}
-			// Add cache control to system if enabled
-			if cacheControl != nil {
-				systemBlocks[0].CacheControl = cacheControl
-				systemBlocks[1].CacheControl = cacheControl
-			}
-			req.System = systemBlocks
-		} else {
-			req.System = prompt.SystemPrompt
-		}
-	} else if c.isOAuth {
-		// OAuth without system prompt still needs Claude Code identity
-		systemBlocks := []anthropicSystemBlock{
-			{Type: "text", Text: "You are Claude Code, Anthropic's official CLI for Claude."},
-		}
-		if cacheControl != nil {
-			systemBlocks[0].CacheControl = cacheControl
-		}
-		req.System = systemBlocks
-	}
-
-	// Handle tools with cache_control on last tool
-	if len(prompt.Tools) > 0 {
-		req.Tools = make([]anthropicTool, len(prompt.Tools))
-		for i, t := range prompt.Tools {
+	convertTools := func(tools []Tool, cacheControl *cacheControlParam) ([]anthropicTool, error) {
+		converted := make([]anthropicTool, len(tools))
+		for i, t := range tools {
 			name := t.Name
 			if c.isOAuth {
 				name = toClaudeCodeName(t.Name)
 			}
-
-			tool := anthropicTool{
-				Name:        name,
-				Description: t.Description,
-				InputSchema: t.Parameters,
+			parameters, strict, err := strictToolParameters(t, model.Compat != nil && model.Compat.SupportsStrictTools, anthropicUnsupportedStrictKeyword)
+			if err != nil {
+				return nil, err
 			}
-
-			// Apply cache_control to the last tool for conversation caching
-			if i == len(prompt.Tools)-1 && cacheControl != nil {
-				tool.CacheControl = cacheControl
+			converted[i] = anthropicTool{Strict: strict, Name: name, Description: t.Description, InputSchema: parameters, EagerInputStreaming: model.Compat == nil || model.Compat.SupportsEagerToolInputStreaming == nil || *model.Compat.SupportsEagerToolInputStreaming}
+			if i == len(tools)-1 {
+				converted[i].CacheControl = cacheControl
 			}
+		}
+		return converted, nil
+	}
 
-			req.Tools[i] = tool
+	var toolDefinitions func([]Tool) ([]anthropicTool, error)
+	if nativeToolChanges {
+		toolDefinitions = func(tools []Tool) ([]anthropicTool, error) { return convertTools(tools, nil) }
+	}
+	msgs, levels, err := c.convertMessages(transformedCtx, cacheControl, toolDefinitions)
+	if err != nil {
+		return "", err
+	}
+	req.Messages = msgs
+
+	systemBlocks := make([]anthropicSystemBlock, 0, 2)
+	if c.isOAuth {
+		systemBlocks = append(systemBlocks, anthropicSystemBlock{Type: "text", Text: "You are Claude Code, Anthropic's official CLI for Claude.", CacheControl: cacheControl})
+	}
+	if prompt.SystemPrompt != "" {
+		systemBlocks = append(systemBlocks, anthropicSystemBlock{Type: "text", Text: SanitizeSurrogates(prompt.SystemPrompt), CacheControl: cacheControl})
+	}
+	if len(systemBlocks) > 0 {
+		req.System = systemBlocks
+	}
+
+	if len(prompt.Tools) > 0 {
+		tools, err := convertTools(prompt.Tools, toolCacheControl)
+		if err != nil {
+			return "", err
+		}
+		req.Tools = tools
+		if nativeToolChanges {
+			req.Tools = append(req.Tools, anthropicDeferredToolPlaceholder)
 		}
 	}
 
-	// Handle thinking
-	//
+	display := o.thinkingDisplay
+	if display == "" {
+		display = "summarized"
+	}
+	effort := anthropicEffort(model, o)
 	// hasThinking is true when the caller expressed any opinion about
-	// reasoning/thinking. The gate covers both the Anthropic-specific
-	// options (thinkingEnabled, thinkingBudgetTokens, effort) and the
-	// generic WithReasoning level. The result is reused below to suppress
-	// the temperature field, which Anthropic rejects alongside thinking.
+	// reasoning/thinking; Anthropic rejects temperature alongside thinking.
 	hasThinking := o.thinkingEnabled || o.thinkingBudgetTokens > 0 || o.effort != "" ||
 		(o.reasoning != "" && o.reasoning != ReasoningOff)
-	if hasThinking {
-		// Determine thinking type based on model capabilities
-		thinkingConfig := &anthropicThinking{
-			Enabled: true,
+	switch {
+	case anthropicManagedEffort(model):
+		// Managed effort models always think adaptively so replayed blocks whose
+		// prefix changed are dropped instead of failing the request.
+		req.Thinking = &anthropicThinking{Type: "adaptive", Display: display, BlockBinding: &anthropicBlockBinding{PrefixMismatchBehavior: "drop_block"}}
+		req.OutputConfig = &anthropicOutputConfig{Effort: "high"}
+		active := effort
+		if active == "" {
+			active = "high"
 		}
-
-		// Check if this is an adaptive thinking model (Opus 4.6+, Sonnet 4.6+)
-		isAdaptiveModel := isAdaptiveThinkingModel(model.ID)
-
-		// Resolve effort: explicit WithEffort wins; otherwise translate the
-		// generic WithReasoning level into Anthropic's effort vocabulary.
-		effort := o.effort
-		if effort == "" && o.reasoning != "" && o.reasoning != ReasoningOff {
-			effort = mapReasoningLevelToAnthropicEffort(o.reasoning, model.ID)
+		req.Messages = insertAnthropicEffortMessages(req.Messages, levels, active)
+	case hasThinking && (isAdaptiveThinkingModel(model.ID) || model.Compat != nil && model.Compat.ForceAdaptiveThinking):
+		req.Thinking = &anthropicThinking{Type: "adaptive", Display: display}
+		if effort != "" {
+			req.OutputConfig = &anthropicOutputConfig{Effort: effort}
 		}
-
-		if isAdaptiveModel {
-			// Adaptive thinking: Claude decides when and how much to think
-			thinkingConfig.Type = "adaptive"
-			// Default display to "summarized" if not specified
-			display := o.thinkingDisplay
-			if display == "" {
-				display = "summarized"
+	case hasThinking:
+		budget := o.thinkingBudgetTokens
+		if budget == 0 {
+			if o.reasoning != "" && o.reasoning != ReasoningOff {
+				budget = ThinkingBudgetForLevel(o.reasoning, o.thinkingBudgets)
+			} else {
+				budget = 1024
 			}
-			thinkingConfig.Display = display
-
-			// Set effort if either an explicit WithEffort or a translated
-			// WithReasoning produced a value.
-			if effort != "" {
-				thinkingConfig.Effort = effort
-			}
-		} else {
-			// Budget-based thinking for older models
-			thinkingConfig.Type = "enabled"
-			// Explicit WithThinkingBudgetTokens wins; otherwise derive a
-			// default from the generic reasoning level.
-			budget := o.thinkingBudgetTokens
-			if budget == 0 && o.reasoning != "" && o.reasoning != ReasoningOff {
-				budget = ThinkingBudgetForLevel(o.reasoning, nil)
-			}
-			thinkingConfig.BudgetTokens = budget
-			// Default display to "summarized" if not specified
-			display := o.thinkingDisplay
-			if display == "" {
-				display = "summarized"
-			}
-			thinkingConfig.Display = display
 		}
-
-		req.Thinking = thinkingConfig
-	} else if o.thinkingType == "disabled" {
-		req.Thinking = &anthropicThinking{
-			Enabled: false,
-			Type:    "disabled",
-		}
+		req.MaxTokens, budget = fitThinkingBudget(model, prompt, req.MaxTokens, budget)
+		req.Thinking = &anthropicThinking{Type: "enabled", BudgetTokens: budget, Display: display}
+	case o.thinkingType == "disabled":
+		req.Thinking = &anthropicThinking{Type: "disabled"}
 	}
 
 	// Handle tool choice
@@ -490,8 +545,8 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 		}
 	}
 
-	// Handle temperature (incompatible with thinking)
-	if o.temperature != nil && !hasThinking {
+	supportsTemperature := model.Compat == nil || model.Compat.SupportsTemperature == nil || *model.Compat.SupportsTemperature
+	if o.temperature != nil && !hasThinking && !anthropicManagedEffort(model) && supportsTemperature {
 		req.Temperature = o.temperature
 	}
 	if len(o.metadata) > 0 {
@@ -506,44 +561,181 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 	return string(data), nil
 }
 
-func (c *anthropicClient) convertMessages(prompt *Context, cacheControl *cacheControlParam) ([]anthropicMessage, error) {
+const (
+	anthropicMidConversationOutputConfigBeta = "mid-conversation-output-config-2026-07-01"
+	anthropicThinkingBindingBeta             = "thinking-binding-controls-2026-08-01"
+	anthropicInlineToolsBeta                 = "inline-tools-2026-09-15"
+)
+
+// anthropicDeferredToolPlaceholder anchors the fixed request tool list when later
+// tools are declared inline; Anthropic rejects a list where every tool is deferred.
+var anthropicDeferredToolPlaceholder = anthropicTool{
+	Name:         "__pi_deferred_placeholder__",
+	Description:  "Reserved placeholder. Never available. Never call this.",
+	InputSchema:  json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+	DeferLoading: true,
+}
+
+func anthropicManagedEffort(model *Model) bool {
+	return model.Compat != nil && model.Compat.SupportsMidConvoEffort
+}
+
+// anthropicEffort resolves the native effort from WithEffort or the reasoning level.
+func anthropicEffort(model *Model, o *options) string {
+	if o.effort != "" {
+		return o.effort
+	}
+	if o.reasoning == "" || o.reasoning == ReasoningOff {
+		return ""
+	}
+	if mapped := model.ThinkingLevelMap[string(o.reasoning)]; mapped != nil {
+		return *mapped
+	}
+	return mapReasoningLevelToAnthropicEffort(o.reasoning, model.ID)
+}
+
+// anthropicTranscript resolves the request prompt and tools. Models that accept later
+// system messages keep them in place after the leading one; the rest see the replayed
+// baseline. Tool changes are native when the leading message declares tools to anchor them.
+func anthropicTranscript(model *Model, prompt *Context) (*Context, bool) {
+	if model.Compat == nil || !model.Compat.SupportsMidConvoSystemMessages {
+		return providerContext(prompt), false
+	}
+	messages := NormalizeContext(prompt).Messages
+	request := &Context{Messages: messages}
+	if len(messages) > 0 && messages[0].Role == "system" {
+		request.SystemPrompt = providerContext(&Context{Messages: messages[:1]}).SystemPrompt
+		request.Tools = messages[0].ToolsAdded
+		request.Messages = messages[1:]
+	}
+	if model.Compat.SupportsMidConvoToolChanges && len(request.Tools) > 0 {
+		return request, true
+	}
+	request.Tools = providerContext(&Context{Messages: messages}).Tools
+	return request, false
+}
+
+// renderSystemMessageUpdate frames a later system message's section changes by name.
+func renderSystemMessageUpdate(message Message) string {
+	var parts []string
+	if text := transcriptText(message.Content); text != "" {
+		parts = append(parts, text)
+	}
+	names := make([]string, 0, len(message.Sections))
+	for name := range message.Sections {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if value := message.Sections[name]; value == nil {
+			parts = append(parts, fmt.Sprintf("Removed system prompt section %q.", name))
+		} else {
+			parts = append(parts, fmt.Sprintf("Updated system prompt section %q:\n\n%s", name, *value))
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func isAnthropicEffort(value string) bool {
+	switch value {
+	case "low", "medium", "high", "xhigh", "max":
+		return true
+	}
+	return false
+}
+
+// insertAnthropicEffortMessages restates each historical assistant turn's effort before it
+// and the active effort at the end, so changing effort keeps the cached prefix valid.
+func insertAnthropicEffortMessages(converted []anthropicMessage, levels map[int]string, active string) []anthropicMessage {
+	messages := make([]anthropicMessage, 0, len(converted)+len(levels)+1)
+	for i, message := range converted {
+		if level, ok := levels[i]; ok {
+			messages = append(messages, anthropicMessage{Role: "system", Content: []anthropicContentBlock{}, OutputConfig: &anthropicOutputConfig{Effort: level}})
+		}
+		messages = append(messages, message)
+	}
+	return append(messages, anthropicMessage{Role: "system", Content: []anthropicContentBlock{}, OutputConfig: &anthropicOutputConfig{Effort: active}})
+}
+
+func (c *anthropicClient) convertMessages(prompt *Context, cacheControl *cacheControlParam, toolDefinitions func([]Tool) ([]anthropicTool, error)) ([]anthropicMessage, map[int]string, error) {
 	var msgs []anthropicMessage
+	levels := make(map[int]string)
+	// Later system messages wait until the next assistant message or the end: a
+	// tool_result must directly follow its tool_use.
+	var pending []anthropicMessage
 
 	for i := 0; i < len(prompt.Messages); i++ {
 		m := prompt.Messages[i]
-		if normalizeMessageRole(m.Role) == "toolResult" {
-			// Batch consecutive tool results
-			content, next, err := c.convertToolResults(prompt.Messages, i, cacheControl)
-			if err != nil {
-				return nil, err
+		switch normalizeMessageRole(m.Role) {
+		case "system":
+			var blocks []anthropicContentBlock
+			if text := renderSystemMessageUpdate(m); text != "" {
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: SanitizeSurrogates(text)})
 			}
-			msgs = append(msgs, anthropicMessage{
-				Role:    "user",
-				Content: content,
-			})
+			if toolDefinitions != nil {
+				redefined := make(map[string]bool, len(m.ToolsAdded))
+				for _, tool := range m.ToolsAdded {
+					redefined[tool.Name] = true
+				}
+				for _, tool := range m.ToolsRemoved {
+					if redefined[tool.Name] {
+						continue
+					}
+					name := tool.Name
+					if c.isOAuth {
+						name = toClaudeCodeName(name)
+					}
+					blocks = append(blocks, anthropicContentBlock{Type: "tool_removal", Tool: map[string]any{"type": "tool_reference", "name": name}})
+				}
+				definitions, err := toolDefinitions(m.ToolsAdded)
+				if err != nil {
+					return nil, nil, err
+				}
+				for _, definition := range definitions {
+					blocks = append(blocks, anthropicContentBlock{Type: "tool_addition", Tool: map[string]any{"type": "tool_definition", "definition": definition}})
+				}
+			}
+			if len(blocks) > 0 {
+				pending = append(pending, anthropicMessage{Role: "system", Content: blocks})
+			}
+			continue
+		case "toolResult":
+			// Batch consecutive tool results
+			content, next, err := c.convertToolResults(prompt.Messages, i)
+			if err != nil {
+				return nil, nil, err
+			}
+			msgs = append(msgs, anthropicMessage{Role: "user", Content: content})
 			i = next - 1
 			continue
+		case "assistant":
+			msgs = append(msgs, pending...)
+			pending = nil
 		}
 
 		msg, err := c.convertMessage(m, cacheControl)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-
-		if msg != nil {
-			msgs = append(msgs, *msg)
+		if msg == nil {
+			continue
 		}
+		if msg.Role == "assistant" && m.API == APIAnthropicMessages && c.model != nil && m.Provider == c.model.Provider && isAnthropicEffort(m.ProviderThinkingLevel) {
+			levels[len(msgs)] = m.ProviderThinkingLevel
+		}
+		msgs = append(msgs, *msg)
 	}
+	msgs = append(msgs, pending...)
 
-	// GAP-019: Add cache_control to the last user message
+	// Cache the conversation through the last user or system message.
 	if cacheControl != nil && len(msgs) > 0 {
 		lastMsg := &msgs[len(msgs)-1]
-		if lastMsg.Role == "user" {
+		if lastMsg.Role == "user" || lastMsg.Role == "system" {
 			c.addCacheControlToLastBlock(lastMsg, cacheControl)
 		}
 	}
 
-	return msgs, nil
+	return msgs, levels, nil
 }
 
 // addCacheControlToLastBlock adds cache_control to the last content block.
@@ -563,9 +755,13 @@ func (c *anthropicClient) addCacheControlToLastBlock(msg *anthropicMessage, cach
 			// Add cache_control to last block
 			lastIdx := len(content) - 1
 			switch content[lastIdx].Type {
-			case "text", "image", "tool_result":
+			case "text", "image", "tool_result", "tool_addition", "tool_removal":
 				content[lastIdx].CacheControl = cacheControl
 			}
+		}
+	case []anthropicToolResultBlock:
+		if len(content) > 0 {
+			content[len(content)-1].CacheControl = cacheControl
 		}
 	case []any:
 		// Handle mixed array types
@@ -582,7 +778,7 @@ func (c *anthropicClient) addCacheControlToLastBlock(msg *anthropicMessage, cach
 	}
 }
 
-func (c *anthropicClient) convertToolResults(messages []Message, start int, cacheControl *cacheControlParam) ([]anthropicToolResultBlock, int, error) {
+func (c *anthropicClient) convertToolResults(messages []Message, start int) ([]anthropicToolResultBlock, int, error) {
 	var results []anthropicToolResultBlock
 
 	i := start
@@ -604,20 +800,6 @@ func (c *anthropicClient) convertToolResults(messages []Message, start int, cach
 			IsError:   msg.IsError,
 		}
 
-		// Add cache_control to the last tool result
-		if i == len(messages)-1 || (i < len(messages)-1 && normalizeMessageRole(messages[i+1].Role) != "toolResult") {
-			if cacheControl != nil {
-				// Add to the content block
-				if str, ok := result.Content.(string); ok {
-					result.Content = []anthropicContentBlock{
-						{Type: "text", Text: str, CacheControl: cacheControl},
-					}
-				} else if blocks, ok := result.Content.([]anthropicContentBlock); ok && len(blocks) > 0 {
-					blocks[len(blocks)-1].CacheControl = cacheControl
-				}
-			}
-		}
-
 		results = append(results, result)
 	}
 
@@ -625,24 +807,21 @@ func (c *anthropicClient) convertToolResults(messages []Message, start int, cach
 }
 
 func (c *anthropicClient) convertMessage(m Message, cacheControl *cacheControlParam) (*anthropicMessage, error) {
-	switch normalizeMessageRole(m.Role) {
+	var (
+		blocks []anthropicContentBlock
+		err    error
+	)
+	role := normalizeMessageRole(m.Role)
+	switch role {
 	case "user":
-		blocks, err := c.extractContent(m.Content)
-		if err != nil {
-			return nil, err
-		}
-
-		return &anthropicMessage{Role: "user", Content: blocks}, nil
-
+		blocks, err = c.extractContent(m.Content)
 	case "assistant":
-		blocks, err := c.extractContent(m.Content)
-		if err != nil {
-			return nil, err
-		}
-
-		// Handle tool uses - add tool_use blocks for any toolCall content blocks
 		if contentBlocks, ok := m.Content.([]ContentBlock); ok {
 			for _, b := range contentBlocks {
+				if b.Type == ContentBlockThinking && !b.Redacted && strings.TrimSpace(b.Thinking) != "" && strings.TrimSpace(b.ThoughtSignature) == "" && c.model != nil && c.model.Compat != nil && c.model.Compat.AllowEmptySignature {
+					blocks = append(blocks, anthropicContentBlock{Type: "thinking", Thinking: new(b.Thinking), Signature: new("")})
+					continue
+				}
 				if b.Type == "toolCall" {
 					name := b.Name
 					if c.isOAuth {
@@ -652,16 +831,19 @@ func (c *anthropicClient) convertMessage(m Message, cacheControl *cacheControlPa
 						Type:  "tool_use",
 						ID:    b.ID,
 						Name:  name,
-						Input: b.Arguments,
+						Input: anthropicToolInput(b.Arguments),
 					})
+					continue
 				}
+				content, err := c.extractContent([]ContentBlock{b})
+				if err != nil {
+					return nil, err
+				}
+				blocks = append(blocks, content...)
 			}
+		} else {
+			blocks, err = c.extractContent(m.Content)
 		}
-
-		msg := &anthropicMessage{Role: "assistant", Content: blocks}
-
-		return msg, nil
-
 	case "toolResult":
 		// This case is handled in convertMessages for batching
 		return nil, nil
@@ -669,6 +851,16 @@ func (c *anthropicClient) convertMessage(m Message, cacheControl *cacheControlPa
 	default:
 		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	blocks = slices.DeleteFunc(blocks, func(block anthropicContentBlock) bool {
+		return block.Type == "text" && strings.TrimSpace(block.Text) == ""
+	})
+	if len(blocks) == 0 {
+		return nil, nil
+	}
+	return &anthropicMessage{Role: role, Content: blocks}, nil
 }
 
 func (c *anthropicClient) toolResultContent(content any) (any, error) {
@@ -679,10 +871,18 @@ func (c *anthropicClient) toolResultContent(content any) (any, error) {
 	if len(blocks) == 0 {
 		return "", nil
 	}
-	if len(blocks) == 1 && blocks[0].Type == "text" {
-		return blocks[0].Text, nil
+	var texts []string
+	for _, block := range blocks {
+		if block.Type == "text" {
+			texts = append(texts, block.Text)
+		}
 	}
-
+	if len(texts) == len(blocks) {
+		return strings.Join(texts, "\n"), nil
+	}
+	if len(texts) == 0 && slices.ContainsFunc(blocks, func(block anthropicContentBlock) bool { return block.Type == "image" }) {
+		blocks = append([]anthropicContentBlock{{Type: "text", Text: "(see attached image)"}}, blocks...)
+	}
 	return blocks, nil
 }
 
@@ -708,7 +908,7 @@ func (c *anthropicClient) extractContent(content any) ([]anthropicContentBlock, 
 			case "image":
 				blocks = append(blocks, anthropicContentBlock{
 					Type: "image",
-					Source: anthropicImageSource{
+					Source: &anthropicImageSource{
 						Type:      "base64",
 						MediaType: b.MimeType,
 						Data:      b.Data,
@@ -723,12 +923,11 @@ func (c *anthropicClient) extractContent(content any) ([]anthropicContentBlock, 
 					})
 					continue
 				}
-				// Empty thinking content -> skip
-				if strings.TrimSpace(b.Thinking) == "" {
+				hasSignature := strings.TrimSpace(b.ThoughtSignature) != ""
+				if strings.TrimSpace(b.Thinking) == "" && !hasSignature {
 					continue
 				}
-				// If no signature, convert to text block
-				if b.ThoughtSignature == "" || strings.TrimSpace(b.ThoughtSignature) == "" {
+				if !hasSignature {
 					blocks = append(blocks, anthropicContentBlock{
 						Type: "text",
 						Text: b.Thinking,
@@ -736,9 +935,9 @@ func (c *anthropicClient) extractContent(content any) ([]anthropicContentBlock, 
 				} else {
 					// Has signature -> emit thinking block with signature
 					blocks = append(blocks, anthropicContentBlock{
-						Type: "thinking",
-						Text: b.Thinking,
-						Data: b.ThoughtSignature, // Use Data for signature
+						Type:      "thinking",
+						Thinking:  new(b.Thinking),
+						Signature: new(b.ThoughtSignature),
 					})
 				}
 			}
@@ -753,56 +952,85 @@ func (c *anthropicClient) extractContent(content any) ([]anthropicContentBlock, 
 
 func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler EventHandler) error {
 	assistant := AssistantMessage{
-		Role:      "assistant",
-		API:       APIAnthropicMessages,
-		Provider:  c.model.Provider,
-		Model:     c.model.ID,
-		Content:   []ContentBlock{},
-		Timestamp: timestamp(),
-		Usage:     Usage{},
+		Role:                  "assistant",
+		API:                   APIAnthropicMessages,
+		Provider:              c.model.Provider,
+		Model:                 c.model.ID,
+		Content:               []ContentBlock{},
+		Timestamp:             timestamp(),
+		Usage:                 Usage{},
+		ProviderThinkingLevel: c.thinkingLevel,
 	}
 	handler(ctx, Start{Partial: assistant})
 
 	blockIndexes := make(map[int]int)
 	partialToolArgs := make(map[int]string)
-	// Track partial thinking signatures for signature_delta accumulation
-	partialThinkSigs := make(map[int]string)
 
+	var sawStart, sawStop bool
+	fail := func(err error) error {
+		assistant.ErrorMessage = ""
+		if ctx.Err() != nil {
+			emitTerminalStreamError(ctx, handler, assistant, fmt.Errorf("request was aborted: %w", context.Cause(ctx)), StopReasonAborted)
+			return nil
+		}
+		emitTerminalStreamError(ctx, handler, assistant, err, StopReasonError)
+
+		return nil
+	}
+
+	reader := bufio.NewReader(body)
+	if ctx.Err() != nil {
+		return fail(nil)
+	}
+	// Peek retains short-body and read errors for normal event-reader handling.
+	if prefix, err := reader.Peek(3); err == nil && bytes.Equal(prefix, []byte("\xef\xbb\xbf")) {
+		if _, err := reader.Discard(3); err != nil {
+			return fail(err)
+		}
+	}
 	for {
-		line, err := readLine(body)
+		if ctx.Err() != nil {
+			return fail(nil)
+		}
+
+		name, data, err := readAnthropicSSEData(reader)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 
-			emitTerminalStreamError(ctx, handler, assistant, err, StopReasonError)
-			return nil
+			return fail(err)
 		}
 
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
-		}
-
-		// Parse SSE event
-		data, err := parseSSEData(line)
-		if err != nil {
+		switch name {
+		case "error":
+			return fail(errors.New(data))
+		case "", "message_start", "message_delta", "message_stop", "content_block_start", "content_block_delta", "content_block_stop":
+		default:
 			continue
 		}
 
 		var event anthropicEvent
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			continue
+			if repaired := repairAnthropicJSONStrings(data); repaired != data {
+				event = anthropicEvent{}
+				err = json.Unmarshal([]byte(repaired), &event)
+			}
+			if err != nil {
+				return fail(fmt.Errorf("could not parse anthropic SSE event: %w; data=%s", err, data))
+			}
 		}
 
 		switch event.Type {
+		case "error":
+			return fail(errors.New(data))
+
 		case "message_start":
+			sawStart = true
 			if event.Message != nil {
 				assistant.ResponseID = event.Message.ID
-				assistant.Usage.Input = event.Message.Usage.InputTokens
-				assistant.Usage.Output = event.Message.Usage.OutputTokens
-				assistant.Usage.CacheWrite = event.Message.Usage.CacheCreationInput
-				assistant.Usage.CacheRead = event.Message.Usage.CacheReadInput
+				assistant.Usage = Usage{}
+				event.Message.Usage.apply(&assistant.Usage)
 				assistant.Usage.CalculateCost(c.model.Cost)
 			}
 
@@ -811,8 +1039,11 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 				continue
 			}
 
+			if event.ContentBlock.Type == "fallback" && len(assistant.Content) > 0 {
+				return fail(errors.New("anthropic performed an unsupported mid-output model fallback"))
+			}
+
 			idx := len(assistant.Content)
-			blockIndexes[event.Index] = idx
 
 			switch event.ContentBlock.Type {
 			case "text":
@@ -824,8 +1055,8 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 			case "thinking":
 				assistant.Content = append(assistant.Content, ContentBlock{
 					Type:             "thinking",
-					Thinking:         event.ContentBlock.Text,
-					ThoughtSignature: "", // Initialize for signature_delta accumulation
+					Thinking:         deref(event.ContentBlock.Thinking),
+					ThoughtSignature: deref(event.ContentBlock.Signature),
 				})
 				handler(ctx, ThinkingStart{ContentIndex: idx, Partial: assistant})
 			case "redacted_thinking":
@@ -837,8 +1068,6 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 					Redacted:         true,
 				})
 				handler(ctx, ThinkingStart{ContentIndex: idx, Partial: assistant})
-				// Track signature for any following signature_delta events
-				partialThinkSigs[idx] = event.ContentBlock.Data
 			case "tool_use":
 				// Convert tool name from Claude Code canonical to original if OAuth
 				name := event.ContentBlock.Name
@@ -850,11 +1079,12 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 					ID:   event.ContentBlock.ID,
 					Name: name,
 				})
-				if len(event.ContentBlock.Input) > 0 && string(event.ContentBlock.Input) != "{}" {
-					assistant.Content[idx].Arguments = event.ContentBlock.Input
-				}
+				assistant.Content[idx].Arguments = anthropicToolInput(event.ContentBlock.Input)
 				handler(ctx, ToolCallStart{ContentIndex: idx, Partial: assistant})
+			default:
+				continue
 			}
+			blockIndexes[event.Index] = idx
 
 		case "content_block_delta":
 			if event.Delta == nil {
@@ -868,6 +1098,9 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 
 			switch event.Delta.Type {
 			case "text_delta":
+				if assistant.Content[idx].Type != "text" {
+					continue
+				}
 				assistant.Content[idx].Text += event.Delta.Text
 				handler(ctx, TextDelta{
 					ContentIndex: idx,
@@ -876,6 +1109,9 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 				})
 
 			case "thinking_delta":
+				if assistant.Content[idx].Type != "thinking" {
+					continue
+				}
 				assistant.Content[idx].Thinking += event.Delta.Thinking
 				handler(ctx, ThinkingDelta{
 					ContentIndex: idx,
@@ -884,8 +1120,17 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 				})
 
 			case "input_json_delta":
+				if assistant.Content[idx].Type != "toolCall" {
+					continue
+				}
 				partialToolArgs[event.Index] += event.Delta.PartialJSON
-				assistant.Content[idx].Arguments = json.RawMessage(partialToolArgs[event.Index])
+				partial := partialToolArgs[event.Index]
+				if !json.Valid([]byte(partial)) {
+					if repaired := repairAnthropicJSONStrings(partial); json.Valid([]byte(repaired)) {
+						partial = repaired
+					}
+				}
+				assistant.Content[idx].Arguments = json.RawMessage(partial)
 				handler(ctx, ToolCallDelta{
 					ContentIndex: idx,
 					Delta:        event.Delta.PartialJSON,
@@ -893,15 +1138,10 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 				})
 
 			case "signature_delta":
-				// Accumulate thinking signature from signature_delta events
-				if sig, ok := partialThinkSigs[event.Index]; ok {
-					assistant.Content[idx].ThoughtSignature = sig + event.Delta.Signature
-					partialThinkSigs[event.Index] = sig + event.Delta.Signature
-				} else {
-					// First signature_delta without prior partial
-					assistant.Content[idx].ThoughtSignature = event.Delta.Signature
-					partialThinkSigs[event.Index] = event.Delta.Signature
+				if assistant.Content[idx].Type != "thinking" {
+					continue
 				}
+				assistant.Content[idx].ThoughtSignature += event.Delta.Signature
 			}
 
 		case "content_block_stop":
@@ -916,10 +1156,6 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 			case "thinking":
 				handler(ctx, ThinkingEnd{ContentIndex: idx, Content: block.Thinking, Partial: assistant})
 			case "toolCall":
-				if partial := partialToolArgs[event.Index]; partial != "" {
-					block.Arguments = json.RawMessage(partial)
-					assistant.Content[idx].Arguments = block.Arguments
-				}
 				handler(ctx, ToolCallEnd{
 					ContentIndex: idx,
 					ToolCall: ToolCall{
@@ -931,45 +1167,61 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 				})
 			}
 
+			delete(blockIndexes, event.Index)
+			delete(partialToolArgs, event.Index)
+
 		case "message_delta":
 			if event.Delta != nil && event.Delta.StopReason != "" {
-				assistant.StopReason = anthropicStopReason(event.Delta.StopReason)
+				assistant.StopReason, assistant.ErrorMessage = anthropicStopReason(event.Delta.StopReason, event.Delta.StopDetails)
 			}
 
 			if event.Usage != nil {
-				assistant.Usage.Input = event.Usage.InputTokens
-				assistant.Usage.Output = event.Usage.OutputTokens
-				assistant.Usage.CacheWrite = event.Usage.CacheCreationInput
-				assistant.Usage.CacheRead = event.Usage.CacheReadInput
+				// Proxies may omit fields message_start already reported.
+				event.Usage.apply(&assistant.Usage)
 				assistant.Usage.CalculateCost(c.model.Cost)
 			}
 
 		case "message_stop":
-			handler(ctx, Done{
-				Reason:  assistant.StopReason,
-				Message: assistant,
-			})
+			sawStop = true
 		}
 	}
+
+	if ctx.Err() != nil {
+		return fail(nil)
+	}
+	if sawStart && !sawStop {
+		return fail(errors.New("anthropic stream ended before message_stop"))
+	}
+	finishStream(ctx, handler, assistant, assistant.StopReason != "", "anthropic stream ended without a stop reason")
 
 	return nil
 }
 
-func anthropicStopReason(reason string) StopReason {
+// anthropicStopReason maps a wire stop reason and, for errors, the message to
+// report, like upstream mapStopReason.
+func anthropicStopReason(reason string, details *anthropicStopDetails) (StopReason, string) {
 	switch reason {
-	case "end_turn":
-		return StopReasonStop
+	case "end_turn", "pause_turn", "stop_sequence":
+		return StopReasonStop, ""
 	case "max_tokens":
-		return StopReasonLength
+		return StopReasonLength, ""
 	case "tool_use":
-		return StopReasonToolUse
-	case "error":
-		return StopReasonError
-	case "aborted":
-		return StopReasonAborted
+		return StopReasonToolUse, ""
+	case "refusal":
+		if details != nil && details.Explanation != "" {
+			return StopReasonError, details.Explanation
+		}
+
+		return StopReasonError, "The model refused to complete the request"
+	case "sensitive":
+		return StopReasonError, "Provider stopped with: sensitive"
 	default:
-		return StopReason(reason)
+		return StopReasonError, "unhandled stop reason: " + reason
 	}
+}
+
+type anthropicStopDetails struct {
+	Explanation string `json:"explanation"`
 }
 
 func (c *anthropicClient) handleJSON(ctx context.Context, body io.Reader, handler EventHandler) error {
@@ -979,23 +1231,30 @@ func (c *anthropicClient) handleJSON(ctx context.Context, body io.Reader, handle
 	}
 
 	assistant := AssistantMessage{
-		Role:       "assistant",
-		Content:    c.convertResponseBlocks(resp.Content),
-		StopReason: anthropicStopReason(resp.StopReason),
-		Timestamp:  timestamp(),
-		Usage: Usage{
-			Input:  resp.Usage.InputTokens,
-			Output: resp.Usage.OutputTokens,
-		},
+		Role:                  "assistant",
+		API:                   APIAnthropicMessages,
+		Provider:              c.model.Provider,
+		Model:                 c.model.ID,
+		Content:               c.convertResponseBlocks(resp.Content),
+		Timestamp:             timestamp(),
+		ResponseID:            resp.ID,
+		ProviderThinkingLevel: c.thinkingLevel,
 	}
+	resp.Usage.apply(&assistant.Usage)
 	assistant.Usage.CalculateCost(c.model.Cost)
-
-	handler(ctx, Done{
-		Reason:  assistant.StopReason,
-		Message: assistant,
-	})
+	if ctx.Err() == nil {
+		assistant.StopReason, assistant.ErrorMessage = anthropicStopReason(resp.StopReason, resp.StopDetails)
+	}
+	finishStream(ctx, handler, assistant, true, "")
 
 	return nil
+}
+
+func anthropicToolInput(input json.RawMessage) json.RawMessage {
+	if len(input) == 0 || bytes.Equal(bytes.TrimSpace(input), []byte("null")) {
+		return json.RawMessage("{}")
+	}
+	return input
 }
 
 func (c *anthropicClient) convertResponseBlocks(blocks []anthropicResponseBlock) []ContentBlock {
@@ -1010,15 +1269,27 @@ func (c *anthropicClient) convertResponseBlocks(blocks []anthropicResponseBlock)
 			})
 		case "thinking":
 			result = append(result, ContentBlock{
-				Type:     "thinking",
-				Thinking: b.Thinking,
+				Type:             "thinking",
+				Thinking:         b.Thinking,
+				ThoughtSignature: b.Signature,
+			})
+		case "redacted_thinking":
+			result = append(result, ContentBlock{
+				Type:             "thinking",
+				Thinking:         "[Reasoning redacted]",
+				ThoughtSignature: b.Data,
+				Redacted:         true,
 			})
 		case "tool_use":
+			name := b.Name
+			if c.isOAuth {
+				name = fromClaudeCodeName(name, c.tools)
+			}
 			result = append(result, ContentBlock{
 				Type:      "toolCall",
 				ID:        b.ID,
-				Name:      b.Name,
-				Arguments: b.Input,
+				Name:      name,
+				Arguments: anthropicToolInput(b.Input),
 			})
 		}
 	}
@@ -1029,16 +1300,17 @@ func (c *anthropicClient) convertResponseBlocks(blocks []anthropicResponseBlock)
 // Anthropic API types
 
 type anthropicRequest struct {
-	Model       string             `json:"model"`
-	Messages    []anthropicMessage `json:"messages"`
-	System      any                `json:"system,omitempty"` // string or []anthropicSystemBlock
-	Tools       []anthropicTool    `json:"tools,omitempty"`
-	Thinking    *anthropicThinking `json:"thinking,omitempty"`
-	Metadata    map[string]any     `json:"metadata,omitempty"`
-	MaxTokens   int                `json:"max_tokens"`
-	Stream      bool               `json:"stream"`
-	ToolChoice  any                `json:"tool_choice,omitempty"`
-	Temperature *float64           `json:"temperature,omitempty"`
+	Model        string                 `json:"model"`
+	Messages     []anthropicMessage     `json:"messages"`
+	System       any                    `json:"system,omitempty"` // string or []anthropicSystemBlock
+	Tools        []anthropicTool        `json:"tools,omitempty"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+	Metadata     map[string]any         `json:"metadata,omitempty"`
+	MaxTokens    int                    `json:"max_tokens"`
+	Stream       bool                   `json:"stream"`
+	ToolChoice   any                    `json:"tool_choice,omitempty"`
+	Temperature  *float64               `json:"temperature,omitempty"`
 }
 
 type anthropicSystemBlock struct {
@@ -1048,19 +1320,31 @@ type anthropicSystemBlock struct {
 }
 
 type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"` // string or []anthropicContentBlock
+	Role         string                 `json:"role"`
+	Content      any                    `json:"content"` // string or []anthropicContentBlock
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort"`
+}
+
+type anthropicBlockBinding struct {
+	PrefixMismatchBehavior string `json:"prefix_mismatch_behavior"`
 }
 
 type anthropicContentBlock struct {
-	Type         string               `json:"type"`
-	Text         string               `json:"text,omitempty"`
-	Source       anthropicImageSource `json:"source,omitempty"`
-	ID           string               `json:"id,omitempty"`
-	Name         string               `json:"name,omitempty"`
-	Input        json.RawMessage      `json:"input,omitempty"`
-	Data         string               `json:"data,omitempty"` // For redacted_thinking
-	CacheControl *cacheControlParam   `json:"cache_control,omitempty"`
+	Type         string                `json:"type"`
+	Text         string                `json:"text,omitempty"`
+	Source       *anthropicImageSource `json:"source,omitempty"`
+	ID           string                `json:"id,omitempty"`
+	Name         string                `json:"name,omitempty"`
+	Input        json.RawMessage       `json:"input,omitempty"`
+	Data         string                `json:"data,omitempty"` // For redacted_thinking
+	Thinking     *string               `json:"thinking,omitempty"`
+	Signature    *string               `json:"signature,omitempty"`
+	Tool         map[string]any        `json:"tool,omitempty"` // For tool_addition and tool_removal
+	CacheControl *cacheControlParam    `json:"cache_control,omitempty"`
 }
 
 type anthropicToolResultBlock struct {
@@ -1078,10 +1362,13 @@ type anthropicImageSource struct {
 }
 
 type anthropicTool struct {
-	Name         string             `json:"name"`
-	Description  string             `json:"description"`
-	InputSchema  json.RawMessage    `json:"input_schema"`
-	CacheControl *cacheControlParam `json:"cache_control,omitempty"`
+	EagerInputStreaming bool               `json:"eager_input_streaming,omitempty"`
+	Strict              bool               `json:"strict,omitempty"`
+	Name                string             `json:"name"`
+	Description         string             `json:"description"`
+	InputSchema         json.RawMessage    `json:"input_schema"`
+	DeferLoading        bool               `json:"defer_loading,omitempty"`
+	CacheControl        *cacheControlParam `json:"cache_control,omitempty"`
 }
 
 type cacheControlParam struct {
@@ -1090,11 +1377,10 @@ type cacheControlParam struct {
 }
 
 type anthropicThinking struct {
-	Enabled      bool   `json:"enabled"`
-	Type         string `json:"type,omitempty"` // "adaptive" | "enabled" | "disabled"
-	BudgetTokens int    `json:"budget_tokens,omitempty"`
-	Display      string `json:"display,omitempty"` // "summarized" | "omitted"
-	Effort       string `json:"effort,omitempty"`  // "low" | "medium" | "high" | "xhigh" | "max"
+	Type         string                 `json:"type"` // "adaptive" | "enabled" | "disabled"
+	BudgetTokens int                    `json:"budget_tokens,omitempty"`
+	Display      string                 `json:"display,omitempty"` // "summarized" | "omitted"
+	BlockBinding *anthropicBlockBinding `json:"block_binding,omitempty"`
 }
 
 type anthropicResponse struct {
@@ -1104,22 +1390,20 @@ type anthropicResponse struct {
 	Content      []anthropicResponseBlock `json:"content"`
 	Model        string                   `json:"model"`
 	StopReason   string                   `json:"stop_reason"`
+	StopDetails  *anthropicStopDetails    `json:"stop_details"`
 	StopSequence string                   `json:"stop_sequence"`
-	Usage        anthropicUsage           `json:"usage"`
+	Usage        anthropicEventUsage      `json:"usage"`
 }
 
 type anthropicResponseBlock struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitempty"`
-	Thinking string          `json:"thinking,omitempty"`
-	ID       string          `json:"id,omitempty"`
-	Name     string          `json:"name,omitempty"`
-	Input    json.RawMessage `json:"input,omitempty"`
-}
-
-type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`
+	Signature string          `json:"signature,omitempty"`
+	Data      string          `json:"data,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
 }
 
 type anthropicEvent struct {
@@ -1138,52 +1422,141 @@ type anthropicStreamMessage struct {
 }
 
 type anthropicDelta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text,omitempty"`
-	Thinking    string `json:"thinking,omitempty"`
-	PartialJSON string `json:"partial_json,omitempty"`
-	StopReason  string `json:"stop_reason,omitempty"`
-	Signature   string `json:"signature,omitempty"`
+	Type        string                `json:"type"`
+	Text        string                `json:"text,omitempty"`
+	Thinking    string                `json:"thinking,omitempty"`
+	PartialJSON string                `json:"partial_json,omitempty"`
+	StopReason  string                `json:"stop_reason,omitempty"`
+	StopDetails *anthropicStopDetails `json:"stop_details,omitempty"`
+	Signature   string                `json:"signature,omitempty"`
 }
 
 type anthropicEventUsage struct {
-	InputTokens        int `json:"input_tokens"`
-	OutputTokens       int `json:"output_tokens"`
-	CacheCreationInput int `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInput     int `json:"cache_read_input_tokens,omitempty"`
+	InputTokens        *int `json:"input_tokens"`
+	OutputTokens       *int `json:"output_tokens"`
+	CacheCreationInput *int `json:"cache_creation_input_tokens"`
+	CacheReadInput     *int `json:"cache_read_input_tokens"`
+	CacheCreation      *struct {
+		Ephemeral1h *int `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+}
+
+// apply overwrites only the counts the event reports.
+func (u anthropicEventUsage) apply(usage *Usage) {
+	for _, field := range []struct {
+		value  *int
+		target *int
+	}{
+		{u.InputTokens, &usage.Input},
+		{u.OutputTokens, &usage.Output},
+		{u.CacheCreationInput, &usage.CacheWrite},
+		{u.CacheReadInput, &usage.CacheRead},
+	} {
+		if field.value != nil {
+			*field.target = *field.value
+		}
+	}
+	if u.CacheCreation != nil && u.CacheCreation.Ephemeral1h != nil {
+		usage.CacheWrite1h = *u.CacheCreation.Ephemeral1h
+	}
 }
 
 // SSE helpers
 
-func readLine(r io.Reader) (string, error) {
+// repairAnthropicJSONStrings escapes raw controls and invalid backslashes only
+// inside strings. Other bytes, including raw tool-input numbers, stay intact.
+func repairAnthropicJSONStrings(data string) string {
+	var repaired strings.Builder
+	var inString bool
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		switch {
+		case b == '"':
+			inString = !inString
+			repaired.WriteByte(b)
+		case inString && b == '\\':
+			repaired.WriteByte(b)
+			if i+1 < len(data) && strings.ContainsRune(`"\/bfnrtu`, rune(data[i+1])) {
+				i++
+				repaired.WriteByte(data[i])
+			} else {
+				repaired.WriteByte('\\')
+			}
+		case inString && b < 0x20:
+			const hex = "0123456789abcdef"
+			repaired.WriteString(`\u00`)
+			repaired.WriteByte(hex[b>>4])
+			repaired.WriteByte(hex[b&0xf])
+		default:
+			repaired.WriteByte(b)
+		}
+	}
+	return repaired.String()
+}
+
+func readLine(r *bufio.Reader) (string, error) {
 	var buf bytes.Buffer
 
 	for {
-		b := make([]byte, 1)
-
-		_, err := r.Read(b)
+		b, err := r.ReadByte()
 		if err != nil {
+			if errors.Is(err, io.EOF) && buf.Len() > 0 {
+				return buf.String(), nil
+			}
 			return "", err
 		}
 
-		if b[0] == '\n' {
+		if b == '\r' {
+			next, err := r.Peek(1)
+			if err != nil {
+				// CR completed the line. Peek retains its error for the next read.
+				return buf.String(), nil
+			}
+			if len(next) > 0 && next[0] == '\n' {
+				if _, err := r.ReadByte(); err != nil {
+					return "", err
+				}
+			}
+			break
+		}
+		if b == '\n' {
 			break
 		}
 
-		if b[0] != '\r' {
-			buf.Write(b)
-		}
+		buf.WriteByte(b)
 	}
 
 	return buf.String(), nil
 }
 
-func parseSSEData(line string) (string, error) {
-	if !strings.HasPrefix(line, "data:") {
-		return "", errors.New("not SSE data")
+func readAnthropicSSEData(reader *bufio.Reader) (string, string, error) {
+	var (
+		name string
+		data []string
+	)
+	for {
+		line, err := readLine(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) && (name != "" || len(data) > 0) {
+				return name, strings.Join(data, "\n"), nil
+			}
+			return "", "", err
+		}
+		if line == "" {
+			if name != "" || len(data) > 0 {
+				return name, strings.Join(data, "\n"), nil
+			}
+			continue
+		}
+		field, value, _ := strings.Cut(line, ":")
+		value = strings.TrimPrefix(value, " ")
+		switch field {
+		case "event":
+			name = value
+		case "data":
+			data = append(data, value)
+		}
 	}
-
-	return strings.TrimSpace(strings.TrimPrefix(line, "data:")), nil
 }
 
 // normalizeAnthropicToolCallIDNormalizer matches the ToolCallIDNormalizer
@@ -1223,4 +1596,25 @@ func normalizeAnthropicToolCallIDOnly(id string) string {
 
 func init() {
 	Register(APIAnthropicMessages, &AnthropicProvider{})
+}
+
+func anthropicStrictLimitError(body []byte) bool {
+	var response struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	if response.Error.Type != "invalid_request_error" {
+		return false
+	}
+	for _, message := range []string{"The compiled grammar is too large", "Too many strict tools (", "Schemas contains too many parameters with union types ("} {
+		if strings.Contains(response.Error.Message, message) {
+			return true
+		}
+	}
+	return false
 }

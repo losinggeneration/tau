@@ -1,18 +1,24 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"cmp"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"go/format"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,6 +40,10 @@ const (
 	codexBaseURL     = "https://chatgpt.com/backend-api"
 	codexContext     = 272000
 	codexMaxTokens   = 128000
+	// upstreamCatalog is the published package whose shipped catalog Tau
+	// mirrors. Bump it together with the vendored sources.
+	upstreamCatalog = "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-1.2.0.tgz"
+	upstreamDataDir = "package/dist/providers/data/"
 )
 
 var copilotStaticHeaders = map[string]string{
@@ -56,12 +66,49 @@ type modelsDevProvider struct {
 	Models map[string]modelsDevModel `json:"models"`
 }
 
+type modelsDevReasoningOption struct {
+	Type   string    `json:"type"`
+	Values []*string `json:"values"`
+}
+
+func effortThinkingLevelMap(options []modelsDevReasoningOption) map[string]*string {
+	var supported []string
+	for _, option := range options {
+		if option.Type != "effort" {
+			continue
+		}
+		for _, value := range option.Values {
+			if value != nil {
+				supported = append(supported, *value)
+			}
+		}
+	}
+	if !slices.ContainsFunc(supported, func(level string) bool {
+		return level == "none" || level != "off" && slices.Contains(tauai.ThinkingLevels, level)
+	}) {
+		return nil
+	}
+	levels := make(map[string]*string, len(tauai.ThinkingLevels))
+	for _, level := range tauai.ThinkingLevels {
+		levels[level] = nil
+		wire := level
+		if level == "off" {
+			wire = "none"
+		}
+		if slices.Contains(supported, wire) {
+			levels[level] = new(wire)
+		}
+	}
+	return levels
+}
+
 type modelsDevModel struct {
-	Name      string `json:"name"`
-	ToolCall  bool   `json:"tool_call"`
-	Reasoning bool   `json:"reasoning"`
-	Status    string `json:"status"`
-	Limit     struct {
+	ReasoningOptions []modelsDevReasoningOption `json:"reasoning_options"`
+	Name             string                     `json:"name"`
+	ToolCall         bool                       `json:"tool_call"`
+	Reasoning        bool                       `json:"reasoning"`
+	Status           string                     `json:"status"`
+	Limit            struct {
 		Context int `json:"context"`
 		Output  int `json:"output"`
 	} `json:"limit"`
@@ -162,6 +209,20 @@ func run(output string) error {
 func generateModels(ctx context.Context) ([]*tauai.Model, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 
+	upstream, err := fetchUpstreamCatalog(ctx, client)
+	if err != nil {
+		return nil, fmt.Errorf("load upstream catalog: %w", err)
+	}
+	legacy, err := generateLegacyModels(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	return mergeCatalogs(upstream, legacy), nil
+}
+
+// generateLegacyModels builds Tau's own catalog from public model lists. It
+// only supplies providers the upstream catalog does not ship.
+func generateLegacyModels(ctx context.Context, client *http.Client) ([]*tauai.Model, error) {
 	modelsDevModels, err := loadModelsDev(ctx, client)
 	if err != nil {
 		return nil, fmt.Errorf("load models.dev: %w", err)
@@ -184,14 +245,119 @@ func generateModels(ctx context.Context) ([]*tauai.Model, error) {
 	addStaticModels(&allModels, loadCodexModelIDs(ctx, client))
 	addAzureModels(&allModels)
 
-	models := dedupeModels(allModels)
-	slices.SortFunc(models, func(a, b *tauai.Model) int {
-		if c := cmp.Compare(a.Provider, b.Provider); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.ID, b.ID)
-	})
+	return dedupeModels(allModels), nil
+}
 
+// mergeCatalogs keeps every upstream entry and adds Tau's entries for
+// providers upstream does not ship. Entries are keyed by operation, so a chat
+// and an image model with the same id coexist.
+func mergeCatalogs(upstream, legacy []*tauai.Model) []*tauai.Model {
+	providers := map[string]bool{}
+	for _, model := range upstream {
+		providers[model.Provider] = true
+	}
+	models := slices.Clone(upstream)
+	for _, model := range legacy {
+		if !providers[model.Provider] {
+			models = append(models, model)
+		}
+	}
+	slices.SortFunc(models, func(a, b *tauai.Model) int {
+		return cmp.Or(cmp.Compare(a.Provider, b.Provider), cmp.Compare(a.ID, b.ID), cmp.Compare(a.Type, b.Type))
+	})
+	return models
+}
+
+func fetchUpstreamCatalog(ctx context.Context, client *http.Client) (models []*tauai.Model, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamCatalog, nil)
+	if err != nil {
+		return nil, fmt.Errorf("new request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request %s: %w", upstreamCatalog, err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close %s: %w", upstreamCatalog, closeErr))
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %s for %s", resp.Status, upstreamCatalog)
+	}
+	return loadUpstreamCatalog(resp.Body)
+}
+
+// loadUpstreamCatalog reads the shipped catalog data files from a pi-ai
+// package tarball. Every file must match the package manifest, and every
+// entry must decode without unknown fields, so catalog changes that Tau does
+// not model fail generation instead of being dropped.
+func loadUpstreamCatalog(r io.Reader) ([]*tauai.Model, error) {
+	zipped, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("open package: %w", err)
+	}
+	archive := tar.NewReader(zipped)
+	files := map[string][]byte{}
+	var manifest struct {
+		Files map[string]string `json:"files"`
+	}
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read package: %w", err)
+		}
+		name, ok := strings.CutPrefix(header.Name, upstreamDataDir)
+		if !ok || strings.Contains(name, "/") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		data, err := io.ReadAll(archive)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		if name == ".manifest.json" {
+			if err := json.Unmarshal(data, &manifest); err != nil {
+				return nil, fmt.Errorf("decode catalog manifest: %w", err)
+			}
+			continue
+		}
+		files[name] = data
+	}
+	if len(manifest.Files) == 0 {
+		return nil, errors.New("package has no catalog manifest")
+	}
+	var models []*tauai.Model
+	for _, name := range slices.Sorted(maps.Keys(manifest.Files)) {
+		data, ok := files[name]
+		if !ok {
+			return nil, fmt.Errorf("catalog file %s is missing", name)
+		}
+		if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != manifest.Files[name] {
+			return nil, fmt.Errorf("catalog file %s does not match the manifest", name)
+		}
+		var apis map[string]map[string]json.RawMessage
+		if err := json.Unmarshal(data, &apis); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", name, err)
+		}
+		for _, api := range slices.Sorted(maps.Keys(apis)) {
+			for _, key := range slices.Sorted(maps.Keys(apis[api])) {
+				decoder := json.NewDecoder(bytes.NewReader(apis[api][key]))
+				decoder.DisallowUnknownFields()
+				model := new(tauai.Model)
+				if err := decoder.Decode(model); err != nil {
+					return nil, fmt.Errorf("decode %s %s: %w", name, key, err)
+				}
+				if model.Type == "chat" {
+					model.Type = ""
+				}
+				normalizeModel(model)
+				models = append(models, model)
+			}
+		}
+	}
 	return models, nil
 }
 
@@ -213,7 +379,9 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 				continue
 			}
 
-			result = append(result, newModel(id, firstNonEmpty(model.Name, id), api, provider, baseURL, model.Reasoning, model.Modalities.Input, costProfile(model.Cost.Input, model.Cost.Output, model.Cost.CacheRead, model.Cost.CacheWrite), defaultInt(model.Limit.Context, 4096), defaultInt(model.Limit.Output, 4096)))
+			entry := newModel(id, firstNonEmpty(model.Name, id), api, provider, baseURL, model.Reasoning, model.Modalities.Input, costProfile(model.Cost.Input, model.Cost.Output, model.Cost.CacheRead, model.Cost.CacheWrite), defaultInt(model.Limit.Context, 4096), defaultInt(model.Limit.Output, 4096))
+			entry.ThinkingLevelMap = effortThinkingLevelMap(model.ReasoningOptions)
+			result = append(result, entry)
 		}
 	}
 
@@ -245,7 +413,7 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 			}
 			m := newModel(id, firstNonEmpty(model.Name, id), tauai.APIOpenAICompletions, "zai", "https://api.z.ai/api/coding/paas/v4", model.Reasoning, model.Modalities.Input, costProfile(model.Cost.Input, model.Cost.Output, model.Cost.CacheRead, model.Cost.CacheWrite), defaultInt(model.Limit.Context, 4096), defaultInt(model.Limit.Output, 4096))
 			m.Compat = &tauai.CompatibilitySettings{
-				SupportsDeveloperRole: false,
+				SupportsDeveloperRole: new(false),
 				ThinkingFormat:        tauai.ThinkingFormatZAI,
 			}
 			if _, ok := zaiToolStreamUnsupportedModels[id]; !ok {
@@ -295,7 +463,7 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 					m.Compat = &tauai.CompatibilitySettings{MaxTokensField: "max_tokens"}
 				}
 				m.Compat.ThinkingFormat = tauai.ThinkingFormatDeepSeek
-				m.Compat.SupportsReasoningEffort = false
+				m.Compat.SupportsReasoningEffort = new(false)
 			}
 			// GLM-5.3 on opencode-go always engages in thinking and cannot be
 			// disabled. Sending reasoning_effort: "" (empty) is interpreted as
@@ -306,7 +474,7 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 				if m.Compat == nil {
 					m.Compat = &tauai.CompatibilitySettings{MaxTokensField: "max_tokens"}
 				}
-				m.Compat.SupportsReasoningEffort = false
+				m.Compat.SupportsReasoningEffort = new(false)
 			}
 			result = append(result, m)
 		}
@@ -329,9 +497,9 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 			m.Headers = copyStringMap(copilotStaticHeaders)
 			if api == tauai.APIOpenAICompletions {
 				m.Compat = &tauai.CompatibilitySettings{
-					SupportsStore:           false,
-					SupportsDeveloperRole:   false,
-					SupportsReasoningEffort: false,
+					SupportsStore:           new(false),
+					SupportsDeveloperRole:   new(false),
+					SupportsReasoningEffort: new(false),
 				}
 			}
 			result = append(result, m)
@@ -458,7 +626,7 @@ func fetchCodexModelIDs(ctx context.Context, client *http.Client) ([]string, err
 		if err != nil {
 			return nil, fmt.Errorf("get openai-codex credential: %w", err)
 		}
-		token, err = store.APIKeyFromCredential(tauai.ProviderOpenAICodex, cred)
+		token, err = store.APIKeyFromCredential(ctx, tauai.ProviderOpenAICodex, cred)
 		if err != nil {
 			return nil, fmt.Errorf("get openai-codex token: %w", err)
 		}
@@ -627,16 +795,21 @@ func addAzureModels(models *[]*tauai.Model) {
 			continue
 		}
 		clones = append(clones, &tauai.Model{
-			ID:            model.ID,
-			Name:          model.Name,
-			API:           tauai.APIAzureOpenAIResponses,
-			Provider:      "azure-openai-responses",
-			Reasoning:     model.Reasoning,
-			Input:         append([]tauai.InputType(nil), model.Input...),
-			Output:        append([]tauai.OutputType(nil), model.Output...),
-			Cost:          model.Cost,
-			ContextWindow: model.ContextWindow,
-			MaxTokens:     model.MaxTokens,
+			Type:                          model.Type,
+			InputLimits:                   model.InputLimits,
+			SamplingParams:                maps.Clone(model.SamplingParams),
+			SamplingParamsByThinkingLevel: maps.Clone(model.SamplingParamsByThinkingLevel),
+			ThinkingLevelMap:              maps.Clone(model.ThinkingLevelMap),
+			ID:                            model.ID,
+			Name:                          model.Name,
+			API:                           tauai.APIAzureOpenAIResponses,
+			Provider:                      "azure",
+			Reasoning:                     model.Reasoning,
+			Input:                         append([]tauai.InputType(nil), model.Input...),
+			Output:                        append([]tauai.OutputType(nil), model.Output...),
+			Cost:                          model.Cost,
+			ContextWindow:                 model.ContextWindow,
+			MaxTokens:                     model.MaxTokens,
 		})
 	}
 	*models = append(*models, clones...)
@@ -685,9 +858,9 @@ func applyGoCompatDefaults(model *tauai.Model) {
 
 	switch model.API {
 	case tauai.APIAnthropicMessages:
-		model.Compat.SupportsDeveloperRole = true
-		model.Compat.SupportsReasoningEffort = true
-		model.Compat.SupportsUsageInStreaming = true
+		model.Compat.SupportsDeveloperRole = new(true)
+		model.Compat.SupportsReasoningEffort = new(true)
+		model.Compat.SupportsUsageInStreaming = new(true)
 		model.Compat.MaxTokensField = "max_tokens"
 		model.Compat.RequiresToolResultName = true
 		model.Compat.RequiresAssistantAfterToolResult = true
@@ -698,12 +871,12 @@ func applyGoCompatDefaults(model *tauai.Model) {
 			model.Compat.MaxTokensField = "max_tokens"
 		}
 	case tauai.APIOpenAIResponses:
-		model.Compat.SupportsReasoningEffort = true
+		model.Compat.SupportsReasoningEffort = new(true)
 	case tauai.APIAzureOpenAIResponses:
 		model.Compat.MaxTokensField = "max_completion_tokens"
-		model.Compat.SupportsReasoningEffort = true
+		model.Compat.SupportsReasoningEffort = new(true)
 	case tauai.APIOpenAICodexResponses:
-		model.Compat.SupportsReasoningEffort = true
+		model.Compat.SupportsReasoningEffort = new(true)
 	}
 
 	if model.Provider == "zai" {
@@ -716,36 +889,29 @@ func applyGoCompatDefaults(model *tauai.Model) {
 }
 
 func isEmptyCompat(compat *tauai.CompatibilitySettings) bool {
-	if compat == nil {
-		return true
-	}
-	return !compat.SupportsStore &&
-		!compat.SupportsDeveloperRole &&
-		!compat.SupportsReasoningEffort &&
-		!compat.SupportsUsageInStreaming &&
-		!compat.SupportsStrictMode &&
-		compat.MaxTokensField == "" &&
-		!compat.RequiresToolResultName &&
-		!compat.RequiresAssistantAfterToolResult &&
-		!compat.RequiresThinkingAsText &&
-		compat.ThinkingFormat == "" &&
-		!compat.ZAIToolStream
+	return compat == nil || reflect.ValueOf(*compat).IsZero()
 }
 
 func renderGo(models []*tauai.Model) ([]byte, error) {
+	var body bytes.Buffer
+	for _, model := range models {
+		writeLiteral(&body, reflect.ValueOf(model))
+		body.WriteString(",\n")
+	}
 	var buf bytes.Buffer
 	buf.WriteString("// Code generated by go generate; DO NOT EDIT.\n")
 	buf.WriteString("// Source: internal/app/genmodels\n\n")
 	buf.WriteString("package ai\n\n")
+	if bytes.Contains(body.Bytes(), []byte("json.RawMessage(")) {
+		buf.WriteString("import \"encoding/json\"\n\n")
+	}
 	buf.WriteString("func registerGeneratedModels() {\n")
 	buf.WriteString("\tfor _, model := range generatedModels {\n")
 	buf.WriteString("\t\tRegisterModel(model)\n")
 	buf.WriteString("\t}\n")
 	buf.WriteString("}\n\n")
 	buf.WriteString("var generatedModels = []*Model{\n")
-	for _, model := range models {
-		writeModel(&buf, model)
-	}
+	buf.Write(body.Bytes())
 	buf.WriteString("}\n")
 
 	formatted, err := format.Source(buf.Bytes())
@@ -756,121 +922,82 @@ func renderGo(models []*tauai.Model) ([]byte, error) {
 	return formatted, nil
 }
 
-func writeModel(buf *bytes.Buffer, model *tauai.Model) {
-	buf.WriteString("\t{\n")
-	writeStringField(buf, "ID", model.ID)
-	writeStringField(buf, "Name", model.Name)
-	writeStringField(buf, "API", model.API)
-	writeStringField(buf, "Provider", model.Provider)
-	if model.BaseURL != "" {
-		writeStringField(buf, "BaseURL", model.BaseURL)
-	}
-	if len(model.Headers) > 0 {
-		buf.WriteString("\t\tHeaders: map[string]string{\n")
-		keys := sortedKeys(model.Headers)
+// goTypeName names t as written inside package ai.
+func goTypeName(t reflect.Type) string {
+	return strings.ReplaceAll(t.String(), "ai.", "")
+}
+
+// writeLiteral writes v as a Go composite literal for package ai, omitting
+// zero struct fields. Map keys are sorted so output is stable.
+func writeLiteral(buf *bytes.Buffer, v reflect.Value) {
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			buf.WriteString("nil")
+			return
+		}
+		writeLiteral(buf, v.Elem())
+	case reflect.Pointer:
+		switch {
+		case v.IsNil():
+			buf.WriteString("nil")
+		case v.Elem().Kind() == reflect.Struct:
+			buf.WriteString("&")
+			writeLiteral(buf, v.Elem())
+		default:
+			buf.WriteString("new(")
+			writeLiteral(buf, v.Elem())
+			buf.WriteString(")")
+		}
+	case reflect.Struct:
+		buf.WriteString(goTypeName(v.Type()) + "{\n")
+		for i := range v.NumField() {
+			if v.Field(i).IsZero() {
+				continue
+			}
+			buf.WriteString(v.Type().Field(i).Name + ": ")
+			writeLiteral(buf, v.Field(i))
+			buf.WriteString(",\n")
+		}
+		buf.WriteString("}")
+	case reflect.Map:
+		buf.WriteString(goTypeName(v.Type()) + "{")
+		keys := v.MapKeys()
+		slices.SortFunc(keys, func(a, b reflect.Value) int { return cmp.Compare(a.String(), b.String()) })
 		for _, key := range keys {
-			buf.WriteString("\t\t\t" + strconv.Quote(key) + ": " + strconv.Quote(model.Headers[key]) + ",\n")
+			writeLiteral(buf, key)
+			buf.WriteString(": ")
+			writeLiteral(buf, v.MapIndex(key))
+			buf.WriteString(",")
 		}
-		buf.WriteString("\t\t},\n")
-	}
-	buf.WriteString("\t\tReasoning: " + strconv.FormatBool(model.Reasoning) + ",\n")
-	writeInputTypes(buf, model.Input)
-	writeOutputTypes(buf, model.Output)
-	buf.WriteString("\t\tCost: CostProfile{")
-	buf.WriteString("Input: " + formatFloat(model.Cost.Input) + ", ")
-	buf.WriteString("Output: " + formatFloat(model.Cost.Output) + ", ")
-	buf.WriteString("CacheRead: " + formatFloat(model.Cost.CacheRead) + ", ")
-	buf.WriteString("CacheWrite: " + formatFloat(model.Cost.CacheWrite) + "},\n")
-	buf.WriteString("\t\tContextWindow: " + strconv.Itoa(model.ContextWindow) + ",\n")
-	buf.WriteString("\t\tMaxTokens: " + strconv.Itoa(model.MaxTokens) + ",\n")
-	if model.Compat != nil {
-		writeCompat(buf, model.Compat)
-	}
-	buf.WriteString("\t},\n")
-}
-
-func writeCompat(buf *bytes.Buffer, compat *tauai.CompatibilitySettings) {
-	buf.WriteString("\t\tCompat: &CompatibilitySettings{\n")
-	if compat.SupportsStore {
-		buf.WriteString("\t\t\tSupportsStore: true,\n")
-	}
-	if compat.SupportsDeveloperRole {
-		buf.WriteString("\t\t\tSupportsDeveloperRole: true,\n")
-	}
-	if compat.SupportsReasoningEffort {
-		buf.WriteString("\t\t\tSupportsReasoningEffort: true,\n")
-	}
-	if compat.SupportsUsageInStreaming {
-		buf.WriteString("\t\t\tSupportsUsageInStreaming: true,\n")
-	}
-	if compat.SupportsStrictMode {
-		buf.WriteString("\t\t\tSupportsStrictMode: true,\n")
-	}
-	if compat.MaxTokensField != "" {
-		writeStringFieldAt(buf, "\t\t\t", "MaxTokensField", compat.MaxTokensField)
-	}
-	if compat.RequiresToolResultName {
-		buf.WriteString("\t\t\tRequiresToolResultName: true,\n")
-	}
-	if compat.RequiresAssistantAfterToolResult {
-		buf.WriteString("\t\t\tRequiresAssistantAfterToolResult: true,\n")
-	}
-	if compat.RequiresThinkingAsText {
-		buf.WriteString("\t\t\tRequiresThinkingAsText: true,\n")
-	}
-	if compat.ThinkingFormat != "" {
-		writeStringFieldAt(buf, "\t\t\t", "ThinkingFormat", compat.ThinkingFormat)
-	}
-	if compat.ZAIToolStream {
-		buf.WriteString("\t\t\tZAIToolStream: true,\n")
-	}
-	buf.WriteString("\t\t},\n")
-}
-
-func writeStringField(buf *bytes.Buffer, field, value string) {
-	writeStringFieldAt(buf, "\t\t", field, value)
-}
-
-func writeStringFieldAt(buf *bytes.Buffer, indent, field, value string) {
-	buf.WriteString(indent + field + ": " + strconv.Quote(value) + ",\n")
-}
-
-func writeInputTypes(buf *bytes.Buffer, inputs []tauai.InputType) {
-	buf.WriteString("\t\tInput: []InputType{")
-	for i, input := range inputs {
-		if i > 0 {
-			buf.WriteString(", ")
+		buf.WriteString("}")
+	case reflect.Slice:
+		if v.Type() == reflect.TypeFor[json.RawMessage]() {
+			text := string(v.Bytes())
+			quoted := "`" + text + "`"
+			if strings.Contains(text, "`") {
+				quoted = strconv.Quote(text)
+			}
+			buf.WriteString("json.RawMessage(" + quoted + ")")
+			return
 		}
-		switch input {
-		case tauai.InputText:
-			buf.WriteString("InputText")
-		case tauai.InputImage:
-			buf.WriteString("InputImage")
-		case tauai.InputAudio:
-			buf.WriteString("InputAudio")
-		default:
-			buf.WriteString("InputType(" + strconv.Quote(string(input)) + ")")
+		buf.WriteString(goTypeName(v.Type()) + "{")
+		for i := range v.Len() {
+			writeLiteral(buf, v.Index(i))
+			buf.WriteString(",")
 		}
+		buf.WriteString("}")
+	case reflect.String:
+		buf.WriteString(strconv.Quote(v.String()))
+	case reflect.Bool:
+		buf.WriteString(strconv.FormatBool(v.Bool()))
+	case reflect.Int, reflect.Int64:
+		buf.WriteString(strconv.FormatInt(v.Int(), 10))
+	case reflect.Float64:
+		buf.WriteString(formatFloat(v.Float()))
+	default:
+		panic(fmt.Sprintf("genmodels: unsupported kind %s", v.Kind()))
 	}
-	buf.WriteString("},\n")
-}
-
-func writeOutputTypes(buf *bytes.Buffer, outputs []tauai.OutputType) {
-	buf.WriteString("\t\tOutput: []OutputType{")
-	for i, output := range outputs {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		switch output {
-		case tauai.OutputText:
-			buf.WriteString("OutputText")
-		case tauai.OutputAudio:
-			buf.WriteString("OutputAudio")
-		default:
-			buf.WriteString("OutputType(" + strconv.Quote(string(output)) + ")")
-		}
-	}
-	buf.WriteString("},\n")
 }
 
 func fetchJSON(ctx context.Context, client *http.Client, url string, out any) (err error) {
@@ -1043,15 +1170,6 @@ func copyStringMap(src map[string]string) map[string]string {
 		dst[key] = value
 	}
 	return dst
-}
-
-func sortedKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	return keys
 }
 
 func formatFloat(value float64) string {

@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
+	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/paths"
 )
 
@@ -24,11 +26,62 @@ func (m *Manager) pluginDirs() []string {
 	// discoverUnlocked is only called from autoLoadLocked which holds the lock).
 	for _, extPath := range m.extensionPaths {
 		if extPath != "" {
-			dirs = append(dirs, extPath)
+			dirs = append(dirs, paths.ResourcePath(extPath, "", ""))
 		}
 	}
 
+	for _, entry := range m.settings.ResourcePaths("extensions") {
+		if !isExtensionPattern(entry) {
+			dirs = append(dirs, entry)
+		}
+	}
 	return dirs
+}
+
+func isExtensionPattern(entry string) bool {
+	return strings.HasPrefix(entry, "!") || strings.HasPrefix(entry, "+") ||
+		strings.HasPrefix(entry, "-") || strings.ContainsAny(entry, "*?")
+}
+
+func (m *Manager) filterConfiguredExtensions() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var patterns []string
+	for _, entry := range m.settings.ResourcePaths("extensions") {
+		if isExtensionPattern(entry) {
+			patterns = append(patterns, entry)
+		}
+	}
+	if len(patterns) == 0 {
+		return
+	}
+	all := make([]string, 0, len(m.binaries))
+	for path := range m.binaries {
+		all = append(all, path)
+	}
+	enabled := artifacts.ApplyFilter(all, patterns, "")
+	allowed := make(map[string]bool, len(enabled))
+	for _, path := range enabled {
+		allowed[path] = true
+	}
+	for _, path := range all {
+		if allowed[path] {
+			continue
+		}
+		explicit := false
+		for _, cliPath := range m.extensionPaths {
+			cliPath = paths.ResourcePath(cliPath, "", "")
+			rel, err := filepath.Rel(cliPath, path)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				explicit = true
+				break
+			}
+		}
+		if !explicit {
+			delete(m.binaries, path)
+			delete(m.manifestPaths, path)
+		}
+	}
 }
 
 // userExtensionDir resolves the user-global extensions directory:
@@ -61,6 +114,20 @@ func (m *Manager) projectPluginDir() string {
 
 // scanDir scans a directory for plugin binaries.
 func (m *Manager) scanDir(dir string) error {
+	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		if info.Mode()&0o111 == 0 {
+			return nil
+		}
+		hash, err := m.computeHash(dir)
+		if err != nil {
+			return fmt.Errorf("hash extension: %w", err)
+		}
+		m.mu.Lock()
+		m.binaries[dir] = hash
+		m.manifestPaths[dir] = ""
+		m.mu.Unlock()
+		return nil
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {

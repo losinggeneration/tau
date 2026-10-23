@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -65,7 +66,6 @@ func newTestHarness(t *testing.T, rt sdk.Runtime, reg commands.Registry) *testHa
 		interrupt:       make(chan struct{}, 1),
 		shutdown:        make(chan struct{}),
 		commandRegistry: reg,
-		bashOps:         defaultBashOps,
 	}
 	srv.ui = ui.NewRPCUI()
 	srv.ui.Writer = stdoutW
@@ -275,6 +275,16 @@ type mockSession struct {
 	observer      func(sdk.Event)
 	sent          []sdk.Message
 	attachments   map[string]sdk.Attachment
+	bash          func(context.Context, string, sdk.BashOptions) (sdk.BashExecution, error)
+	send          func(context.Context, sdk.Message) (<-chan sdk.Event, error)
+	interrupts    int
+}
+
+func (s *mockSession) ExecuteBash(ctx context.Context, command string, options sdk.BashOptions) (sdk.BashExecution, error) {
+	if s.bash == nil {
+		return sdk.BashExecution{}, errors.New("bash not configured")
+	}
+	return s.bash(ctx, command, options)
 }
 
 func newMockSession(id, cwd string) *mockSession {
@@ -295,7 +305,7 @@ func (s *mockSession) State() sdk.SessionState {
 }
 func (s *mockSession) IsPersisted() bool                                               { return s.persist }
 func (s *mockSession) Close(ctx context.Context) error                                 { return s.closeErr }
-func (s *mockSession) Interrupt() error                                                { return nil }
+func (s *mockSession) Interrupt() error                                                { s.interrupts++; return nil }
 func (s *mockSession) Compact(ctx context.Context, customInstructions ...string) error { return nil }
 func (s *mockSession) SlashCommands() []sdk.SlashCommandInfo                           { return nil }
 func (s *mockSession) SetModel(model string) error {
@@ -311,6 +321,9 @@ func (s *mockSession) SetThinkingLevel(level string) error {
 
 func (s *mockSession) Send(ctx context.Context, msg sdk.Message) (<-chan sdk.Event, error) {
 	s.sent = append(s.sent, msg)
+	if s.send != nil {
+		return s.send(ctx, msg)
+	}
 	ch := make(chan sdk.Event, len(s.events)+2)
 	for _, e := range s.events {
 		e.SessionID = s.id

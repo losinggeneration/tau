@@ -578,3 +578,82 @@ func TestManagerAppendLabelTargetNotFound(t *testing.T) {
 		t.Error("AppendLabel should fail for non-existent target")
 	}
 }
+
+func TestAppendContextEditValidatesTargetAndContent(t *testing.T) {
+	m := NewManager("/test")
+	id := m.AppendMessage(json.RawMessage(`{"role":"assistant","content":"original"}`), nil)
+	edit, err := m.AppendContextEdit(id, json.RawMessage(`{"content":"replacement"}`))
+	if err != nil || edit == "" {
+		t.Fatalf("edit=%q err=%v", edit, err)
+	}
+	if got := m.ContextEntries()[0].ToAgentMessage(); got.Content[0].Text != "replacement" {
+		t.Fatalf("content=%+v", got.Content)
+	}
+	for _, replacement := range []string{`{}`, `{"content":42}`, `{"content":null}`, `bad`} {
+		if _, err := m.AppendContextEdit(id, json.RawMessage(replacement)); err == nil {
+			t.Fatalf("accepted %s", replacement)
+		}
+	}
+	if _, err := m.AppendContextEdit("missing", json.RawMessage(`null`)); err == nil {
+		t.Fatal("accepted missing target")
+	}
+	if err := m.BranchTo(id); err != nil {
+		t.Fatal(err)
+	}
+	other := m.AppendMessage(json.RawMessage(`{"role":"user","content":"other"}`), nil)
+	if err := m.BranchTo(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.AppendContextEdit(other, json.RawMessage(`null`)); err == nil {
+		t.Fatal("accepted target on another branch")
+	}
+}
+
+func TestManagerLoadEntriesRestoresSelectedPosition(t *testing.T) {
+	first := NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"first"}`), nil)
+	later := NewMessageEntry(&first.ID, json.RawMessage(`{"role":"user","content":"later"}`), nil)
+	position := NewPositionChangeEntry(first.ID)
+	reader := &Reader{header: NewHeader("/test", nil, nil), entries: []Entry{first, later, position}}
+	manager := NewManager("/test")
+	manager.LoadEntries(reader)
+	if got := manager.CurrentPosition(); got != first.ID {
+		t.Fatalf("position = %q, want %q", got, first.ID)
+	}
+	if got := manager.ContextEntries(); len(got) != 1 || got[0].ID != first.ID {
+		t.Fatalf("context = %+v", got)
+	}
+	manager.LoadEntries(&Reader{header: reader.header})
+	if got := manager.CurrentPosition(); got != "" {
+		t.Fatalf("empty reload retained position %q", got)
+	}
+}
+
+func TestManagerToReaderPreservesSelectedBranch(t *testing.T) {
+	manager := NewManager("/test")
+	first := manager.AppendMessage(json.RawMessage(`{"role":"user","content":"first"}`), nil)
+	manager.AppendMessage(json.RawMessage(`{"role":"user","content":"later"}`), nil)
+	if err := manager.SetCurrentPosition(first); err != nil {
+		t.Fatal(err)
+	}
+	reader := manager.ToReader("")
+	if got := reader.CurrentPosition(); got != first {
+		t.Fatalf("reader position = %q, want %q", got, first)
+	}
+	if got := len(manager.Entries()); got != 2 {
+		t.Fatalf("reader conversion changed stored entries: %d", got)
+	}
+	manager.ResetLeaf()
+	if got := manager.ToReader("").ContextEntries(); len(got) != 0 {
+		t.Fatalf("reset leaf restored old context: %+v", got)
+	}
+}
+
+func TestManagerBranchSummaryInContext(t *testing.T) {
+	m := NewManager("/test")
+	id := m.AppendMessage(json.RawMessage(`{"role":"user","content":"hello"}`), nil)
+	summaryID := m.AppendBranchSummary(id, "decisions")
+	entries := m.ContextEntries()
+	if len(entries) != 2 || entries[1].ID != summaryID {
+		t.Fatalf("branch summary missing from context: %+v", entries)
+	}
+}

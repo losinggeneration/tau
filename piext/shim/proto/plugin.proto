@@ -28,6 +28,12 @@ service Plugin {
 
     // Cooperative shutdown: plugin drains in-flight work.
     rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+    // Asks a registered virtual model's router for one request's physical model.
+    rpc RouteModel(ModelRouteRequest) returns (ModelRouteResponse);
+
+    // Evaluates a tool's reachesTools callback for one call's arguments.
+    rpc ReachTools(ToolCall) returns (ReachToolsResponse);
 }
 
 // Host service: implemented by tau (the host), called by plugins.
@@ -69,6 +75,12 @@ service Host {
     //             "followUp" → queued after the current turn finishes.
     // Mirrors pi's pi.sendUserMessage semantics.
     rpc SessionSendUserMessage(SessionSendUserMessageRequest) returns (SessionSendUserMessageResponse);
+    rpc SessionSendCustomMessage(SessionSendCustomMessageRequest) returns (SessionSendUserMessageResponse);
+    // Compact the active session (same path as auto-compaction and /compact).
+    rpc SessionCompact(SessionCompactRequest) returns (SessionCompactResponse);
+
+    // Searches, describes, or activates tools in the active session's registry.
+    rpc ToolDiscovery(ToolDiscoveryRequest) returns (ToolDiscoveryResponse);
 }
 
 // --- Plugin service messages ---
@@ -100,12 +112,47 @@ message Registrations {
     repeated CLIFlag cli_flags = 4;
     // Optional tool prefix prepended to all tool names from this plugin.
     string tool_prefix = 5;
+    repeated VirtualModelRegistration virtual_models = 6;
+}
+
+// A catalog model whose requests are routed to physical models by the plugin.
+message VirtualModelRegistration {
+    string provider = 1;
+    string id = 2;
+    string name = 3;
+    repeated string thinking_levels = 4;
+    repeated string input = 5;
+    int64 context_window = 6;
+    int64 max_tokens = 7;
+}
+
+message ModelRouteRequest {
+    string provider = 1;
+    string model_id = 2;
+    // JSON route request: model, thinkingLevel, reason, previous, failed, state, messages.
+    string request_json = 3;
+}
+
+message ModelRouteResponse {
+    string provider = 1;
+    string model_id = 2;
+    string thinking_level = 3;
+    // JSON router state; empty keeps the current state.
+    string state_json = 4;
+    string error = 5;
 }
 
 message ToolRegistration {
     string name = 1;
     string description = 2;
     map<string, string> parameters = 3;  // JSON schema as string map
+    string exposure = 4;
+    string output_schema = 5;
+    string constrained_sampling = 6;
+    string namespace = 7;
+    optional bool default_active = 8;
+    // The plugin answers ReachTools for this tool.
+    bool has_reaches_tools = 9;
 }
 
 message CommandRegistration {
@@ -178,6 +225,14 @@ message ToolResult {
     string output = 1;
     bool is_error = 2;
     string error_message = 3;
+    // JSON structured content, usage, and content blocks; empty when absent.
+    string structured_content = 4;
+    string usage = 5;
+    string content = 6;
+    // JSON nested tool call records, bounded to the latest 128.
+    string nested_calls = 7;
+    // Why the call was rejected before or during execution.
+    string rejection = 8;
 }
 
 message CommandInvocation {
@@ -307,6 +362,7 @@ message ToolProgressEvent {
     string tool_call_id = 1;
     string content = 2;
     bool is_error = 3;
+    string nested_calls = 4;
 }
 
 message ToolProgressResponse {}
@@ -404,4 +460,38 @@ message SessionSendUserMessageRequest {
 message SessionSendUserMessageResponse {
     bool ok = 1;
     string error = 2;
+}
+
+message SessionSendCustomMessageRequest {
+    string message_json = 1;
+    optional bool trigger_turn = 2;
+    string deliver_as = 3;
+}
+
+message SessionCompactRequest {
+    // Optional focus for the summarization prompt.
+    string instructions = 1;
+}
+
+message SessionCompactResponse {
+    bool ok = 1;
+    string error = 2;
+}
+
+// Discovery is asynchronous and observes the active session's authorized registry.
+message ToolDiscoveryRequest {
+    string operation = 1; // registered, active, activate, search, tool, namespace
+    repeated string names = 2;
+    string query = 3;
+    string namespace = 4;
+    int32 limit = 5;
+}
+
+message ToolDiscoveryResponse {
+    string result_json = 1;
+}
+
+// Tool names a call may reach; ["all"] reaches every callable tool.
+message ReachToolsResponse {
+    repeated string names = 1;
 }

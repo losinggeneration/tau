@@ -111,14 +111,15 @@ func TestThinkingToggleRestoresALevelReachedByCycling(t *testing.T) {
 	a, _ := thinkingApp(t, "high")
 
 	a.cycleThinkingLevel() // high -> xhigh
-	a.cycleThinkingLevel() // xhigh -> off (wrap)
+	a.cycleThinkingLevel() // xhigh -> max
+	a.cycleThinkingLevel() // max -> off
 	if got := a.currentThinkingLevel(); got != "off" {
 		t.Fatalf("cycling past the top gave %q, want off", got)
 	}
 
 	a.toggleThinkingLevel()
-	if got := a.currentThinkingLevel(); got != "xhigh" {
-		t.Errorf("toggle gave %q, want the cycled-to xhigh rather than the default", got)
+	if got := a.currentThinkingLevel(); got != "max" {
+		t.Errorf("toggle gave %q, want the cycled-to max rather than the default", got)
 	}
 }
 

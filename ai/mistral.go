@@ -2,6 +2,7 @@ package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const (
@@ -39,6 +41,16 @@ func (c *mistralClient) Complete(ctx context.Context, model *Model, prompt *Cont
 
 // Stream implements Client.
 func (c *mistralClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	cfg := applyOptions(opts)
 	apiKey := cfg.apiKey
 	if apiKey == "" {
@@ -48,7 +60,10 @@ func (c *mistralClient) Stream(ctx context.Context, model *Model, prompt *Contex
 		return fmt.Errorf("mistral: missing API key (set MISTRAL_API_KEY)")
 	}
 
-	body := c.buildRequestBody(model, prompt, cfg)
+	body, err := c.buildRequestBody(model, prompt, cfg)
+	if err != nil {
+		return fmt.Errorf("mistral: %w", err)
+	}
 	if hasPayloadCallback(cfg) {
 		if next := invokePayloadCallback(cfg, model, body); next != nil {
 			if replacement, ok := next.(map[string]any); ok {
@@ -85,8 +100,28 @@ func (c *mistralClient) Stream(ctx context.Context, model *Model, prompt *Contex
 		req.Header.Set(k, v)
 	}
 
+	timeout := cfg.timeout
+	if !cfg.timeoutSet {
+		timeout = time.Minute
+	}
+	// The timeout covers only the wait for response headers; long streams
+	// such as extended thinking must not be cut off by a fixed deadline.
+	requestCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	req = req.WithContext(requestCtx)
+	headerTimeout := fmt.Errorf("mistral response headers timed out after %dms", timeout.Milliseconds())
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.AfterFunc(timeout, func() { cancel(headerTimeout) })
+	}
 	resp, err := http.DefaultClient.Do(req)
+	if timer != nil {
+		timer.Stop()
+	}
 	if err != nil {
+		if ctx.Err() == nil && errors.Is(context.Cause(requestCtx), headerTimeout) {
+			return headerTimeout
+		}
 		return fmt.Errorf("mistral: request: %w", err)
 	}
 	defer func() {
@@ -103,16 +138,20 @@ func (c *mistralClient) Stream(ctx context.Context, model *Model, prompt *Contex
 		// P7-MS10: Truncate error bodies to MAX_MISTRAL_ERROR_BODY_CHARS
 		respBody, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			return fmt.Errorf("mistral: status %d", resp.StatusCode)
+			return fmt.Errorf("mistral: read status %d body: %w", resp.StatusCode, readErr)
 		}
 
-		return fmt.Errorf("mistral: status %d: %s", resp.StatusCode, truncateErrorText(string(respBody), maxMistralErrorBodyChars))
+		detail := strings.TrimSpace(string(respBody))
+		if detail == "" {
+			detail = http.StatusText(resp.StatusCode)
+		}
+		return fmt.Errorf("mistral API error (%d): %s", resp.StatusCode, truncateErrorText(detail, maxMistralErrorBodyChars))
 	}
 
 	return c.streamMistralResponse(ctx, model, resp.Body, handler)
 }
 
-func (c *mistralClient) buildRequestBody(model *Model, prompt *Context, cfg *options) map[string]any {
+func (c *mistralClient) buildRequestBody(model *Model, prompt *Context, cfg *options) (map[string]any, error) {
 	// Transform messages for cross-provider compatibility
 	// This handles: same-model vs cross-model thinking, synthetic tool results,
 	// orphaned tool call handling, and errored/aborted message filtering
@@ -142,21 +181,41 @@ func (c *mistralClient) buildRequestBody(model *Model, prompt *Context, cfg *opt
 		body["tool_choice"] = c.mapToolChoice(cfg.toolChoice)
 	}
 
-	// P7-MS02: Send promptMode for reasoning-enabled models
-	if model.Reasoning && cfg.reasoning != ReasoningOff {
-		body["promptMode"] = "reasoning"
+	// Models with a thinking level map take reasoning_effort; other
+	// reasoning models take prompt_mode.
+	if model.Reasoning {
+		var level string
+		if cfg.reasoning != "" && cfg.reasoning != ReasoningOff {
+			if level = ClampThinkingLevel(model, string(cfg.reasoning)); level == "off" {
+				level = ""
+			}
+		}
+		switch {
+		case model.ThinkingLevelMap == nil:
+			if level != "" {
+				body["prompt_mode"] = "reasoning"
+			}
+		case level != "":
+			body["reasoning_effort"] = cmp.Or(deref(model.ThinkingLevelMap[level]), "high")
+		case model.ThinkingLevelMap["off"] != nil:
+			body["reasoning_effort"] = *model.ThinkingLevelMap["off"]
+		}
 	}
 
 	if len(transformedPrompt.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(transformedPrompt.Tools))
 		for _, tool := range transformedPrompt.Tools {
+			parameters, strict, err := strictToolParameters(tool, true, nil)
+			if err != nil {
+				return nil, err
+			}
 			tools = append(tools, map[string]any{
 				"type": "function",
 				"function": map[string]any{
 					"name":        tool.Name,
 					"description": tool.Description,
-					"parameters":  tool.Parameters,
-					"strict":      false,
+					"parameters":  parameters,
+					"strict":      strict,
 				},
 			})
 		}
@@ -170,7 +229,7 @@ func (c *mistralClient) buildRequestBody(model *Model, prompt *Context, cfg *opt
 		}}, messages...)
 	}
 
-	return body
+	return body, nil
 }
 
 // mapToolChoice converts a toolChoice string to the Mistral API format.
@@ -194,14 +253,13 @@ func (c *mistralClient) streamMistralResponse(ctx context.Context, model *Model,
 	reader := NewSSEReader(body)
 
 	output := &AssistantMessage{
-		Role:       "assistant",
-		API:        APIMistralConversations,
-		Provider:   model.Provider,
-		Model:      model.ID,
-		Content:    []ContentBlock{},
-		StopReason: StopReasonStop,
-		Usage:      Usage{},
-		Timestamp:  timestamp(),
+		Role:      "assistant",
+		API:       APIMistralConversations,
+		Provider:  model.Provider,
+		Model:     model.ID,
+		Content:   []ContentBlock{},
+		Usage:     Usage{},
+		Timestamp: timestamp(),
 	}
 	handler(ctx, Start{Partial: *output})
 
@@ -238,6 +296,12 @@ func (c *mistralClient) streamMistralResponse(ctx context.Context, model *Model,
 
 			if choice.FinishReason != "" && output.StopReason != StopReasonToolUse {
 				output.StopReason = mistralStopReason(choice.FinishReason)
+				if output.StopReason == StopReasonError {
+					output.ErrorMessage = "Provider stopped with: " + choice.FinishReason
+					if choice.FinishReason == "error" {
+						output.ErrorMessage += " (server error)"
+					}
+				}
 			}
 			if choice.FinishReason == "tool_calls" {
 				output.StopReason = StopReasonToolUse
@@ -255,9 +319,17 @@ func (c *mistralClient) streamMistralResponse(ctx context.Context, model *Model,
 		}
 	}
 
+	if ctx.Err() != nil {
+		emitTerminalStreamError(ctx, handler, *output, ctx.Err(), StopReasonAborted)
+		return nil
+	}
 	if err := reader.Error(); err != nil {
 		streamErr := fmt.Errorf("mistral: read: %w", err)
 		emitTerminalStreamError(ctx, handler, *output, streamErr, StopReasonError)
+		return nil
+	}
+	if output.StopReason == "" {
+		emitTerminalStreamError(ctx, handler, *output, errors.New("mistral stream ended without a finish reason"), StopReasonError)
 		return nil
 	}
 
@@ -294,7 +366,11 @@ func (c *mistralClient) streamMistralResponse(ctx context.Context, model *Model,
 		_ = key // key used for tracking, tool call already in content
 		handler(ctx, ToolCallEnd{ContentIndex: blockIndex, ToolCall: tc, Partial: *output})
 	}
-	handler(ctx, Done{Reason: output.StopReason, Message: *output})
+	if output.StopReason == StopReasonError {
+		emitTerminalStreamError(ctx, handler, *output, errors.New(output.ErrorMessage), StopReasonError)
+	} else {
+		handler(ctx, Done{Reason: output.StopReason, Message: *output})
+	}
 	return nil
 }
 
@@ -737,7 +813,7 @@ func mistralStopReason(reason string) StopReason {
 	case "error":
 		return StopReasonError
 	default:
-		return StopReasonStop
+		return StopReasonError
 	}
 }
 

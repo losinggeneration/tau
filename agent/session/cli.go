@@ -255,21 +255,33 @@ func (w *checkedWriter) Println(args ...any) {
 // Resume opens an existing session for appending, claiming ownership.
 // The caller is responsible for releasing ownership when done.
 func (c *CLI) Resume(ctx context.Context, id string) (*Writer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("resume session: %w", err)
+	}
 	return c.Storage.Resume(id)
 }
 
 // Rename changes the display name of a session.
 func (c *CLI) Rename(ctx context.Context, id, newName string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("rename session: %w", err)
+	}
 	return c.Storage.Rename(id, newName)
 }
 
 // MoveCWD rewrites a session's working directory and moves it into that CWD's scoped directory.
 func (c *CLI) MoveCWD(ctx context.Context, id, newCWD string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("move cwd for session: %w", err)
+	}
 	return c.Storage.MoveCWD(id, newCWD)
 }
 
 // Delete moves a session to the trash directory.
 func (c *CLI) Delete(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("delete session: %w", err)
+	}
 	return c.Storage.Delete(id)
 }
 
@@ -280,11 +292,17 @@ func (c *CLI) CleanupEmpty(ctx context.Context, opts CleanupEmptyOptions) (Clean
 
 // Restore moves a session from trash back to the sessions directory.
 func (c *CLI) Restore(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("restore session: %w", err)
+	}
 	return c.Storage.Restore(id)
 }
 
 // Compact triggers manual compaction for a session using model-driven summarization.
 func (c *CLI) Compact(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("compact: %w", err)
+	}
 	// Get current context for compaction trigger
 	r, err := c.Storage.Open(id)
 	if err != nil {
@@ -297,26 +315,20 @@ func (c *CLI) Compact(ctx context.Context, id string) error {
 		return errors.New("session has no entries to compact")
 	}
 
-	// Build transcript from entries
-	var transcript strings.Builder
-	for _, e := range entries {
-		if e.Type == EntryTypeMessage && e.Message != nil {
-			var msg map[string]any
-			if err := json.Unmarshal(e.Message, &msg); err == nil {
-				role, _ := msg["role"].(string)
-				content := formatContent(msg["content"])
-				fmt.Fprintf(&transcript, "[%s]: %s\n", role, content)
-			}
-		}
-	}
-
-	transcriptStr := transcript.String()
+	transcriptStr := summaryTranscript(entries)
 	var summary string
 
 	// Try model-driven summarization if model is available
 	if c.model != nil {
-		summary, err = c.callModelForSummary(ctx, transcriptStr)
+		var usage ai.Usage
+		summary, usage, err = c.completeSummary(ctx, transcriptStr)
+		if usageErr := c.recordSummaryUsage(id, usage); usageErr != nil {
+			return errors.Join(err, usageErr)
+		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			// Fallback to naive summarization on error
 			summary = buildNaiveSummary(transcriptStr)
 		}
@@ -336,44 +348,45 @@ func (c *CLI) Compact(ctx context.Context, id string) error {
 	tokensBefore := r.TotalTokens().Input
 	tokensAfter := tokensBefore / 2 // rough estimate
 
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("compact: %w", err)
+	}
 	return c.Storage.CompactWithHook(id, summary, firstKeptID, tokensBefore, tokensAfter, false)
 }
 
-// callModelForSummary calls the configured model to generate a summary.
-func (c *CLI) callModelForSummary(ctx context.Context, transcript string) (string, error) {
+// completeSummary requests a summary and returns the billed usage even when
+// the response is rejected.
+func (c *CLI) completeSummary(ctx context.Context, content string) (string, ai.Usage, error) {
 	if c.model == nil {
-		return "", errors.New("no model configured")
+		return "", ai.Usage{}, errors.New("no model configured")
 	}
-
-	// Get AI client for the model
-	client, err := c.newClient()
+	client, err := c.newClient(ctx)
 	if err != nil {
-		return "", fmt.Errorf("create AI client: %w", err)
+		return "", ai.Usage{}, fmt.Errorf("create AI client: %w", err)
 	}
-
-	// Build the summarization prompt using the compaction template
-	systemPrompt := compaction.BuildSummarizationPrompt()
-
 	prompt := &ai.Context{
-		SystemPrompt: systemPrompt,
-		Messages: []ai.Message{
-			{Role: "user", Content: transcript},
-		},
+		SystemPrompt: compaction.BuildSummarizationPrompt(),
+		Messages:     []ai.Message{{Role: "user", Content: content}},
 	}
-
 	msg, err := client.Complete(ctx, c.model, prompt)
+	var usage ai.Usage
+	if msg != nil {
+		usage = msg.Usage
+	}
 	if err != nil {
-		return "", fmt.Errorf("model completion: %w", err)
+		return "", usage, fmt.Errorf("model completion: %w", err)
 	}
+	text, err := summaryResponseText(msg)
+	return text, usage, err
+}
 
-	// Extract text content from response
-	for _, block := range msg.Content {
-		if block.Type == ai.ContentBlockText && block.Text != "" {
-			return block.Text, nil
-		}
+// recordSummaryUsage persists billed usage so session totals include it.
+func (c *CLI) recordSummaryUsage(id string, usage ai.Usage) error {
+	usage = NormalizeUsage(usage)
+	if usage.TotalTokens == 0 && usage.Cost.Total == 0 {
+		return nil
 	}
-
-	return "", errors.New("no text content in summarization response")
+	return c.Storage.AppendSummaryUsage(id, usage)
 }
 
 // buildNaiveSummary creates a fallback summary from transcript text.
@@ -398,6 +411,13 @@ func buildNaiveSummary(transcript string) string {
 
 // SummarizeBranch walks from branchTip back to divergence and persists a branch_summary entry.
 func (c *CLI) SummarizeBranch(ctx context.Context, id, branchTip string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("summarize branch: %w", err)
+	}
+	if branchTip == "" {
+		return errors.New("branch tip must not be empty")
+	}
+
 	r, err := c.Storage.Open(id)
 	if err != nil {
 		return err
@@ -411,21 +431,32 @@ func (c *CLI) SummarizeBranch(ctx context.Context, id, branchTip string) error {
 
 	// Find the branch tip entry
 	var tipEntry *Entry
-	for _, e := range r.Entries() {
-		if e.ID == branchTip || strings.HasPrefix(e.ID, branchTip) {
-			tipEntry = &e
-			break
+	if entry, ok := entriesByID[branchTip]; ok {
+		tipEntry = &entry
+	} else {
+		for _, entry := range r.Entries() {
+			if strings.HasPrefix(entry.ID, branchTip) {
+				if tipEntry != nil {
+					return fmt.Errorf("ambiguous branch tip %q matches multiple entries", branchTip)
+				}
+				tipEntry = &entry
+			}
 		}
 	}
 	if tipEntry == nil {
 		return fmt.Errorf("branch tip %q not found in session", branchTip)
 	}
 
-	// Walk back through parent IDs to collect all entries in the branch
+	selected := make(map[string]bool)
+	for _, entryID := range r.ActiveBranch() {
+		selected[entryID] = true
+	}
+
+	// Stop at the common ancestor so shared history is not summarized twice.
 	var branchEntries []Entry
 	current := tipEntry
 	visited := make(map[string]bool)
-	for current != nil && !visited[current.ID] {
+	for current != nil && !selected[current.ID] && !visited[current.ID] {
 		visited[current.ID] = true
 		branchEntries = append([]Entry{*current}, branchEntries...)
 		if current.ParentID != nil {
@@ -439,26 +470,26 @@ func (c *CLI) SummarizeBranch(ctx context.Context, id, branchTip string) error {
 		}
 	}
 
-	// Build transcript from branch entries
-	var transcript strings.Builder
-	for _, e := range branchEntries {
-		if e.Type == EntryTypeMessage && e.Message != nil {
-			var msg map[string]any
-			if err := json.Unmarshal(e.Message, &msg); err == nil {
-				role, _ := msg["role"].(string)
-				content := formatContent(msg["content"])
-				fmt.Fprintf(&transcript, "[%s]: %s\n", role, content)
-			}
-		}
+	if len(branchEntries) == 0 {
+		return nil
 	}
 
-	transcriptStr := transcript.String()
+	transcriptStr := summaryTranscript(branchEntries)
 	var summary string
 
 	// Try model-driven summarization if model is available
-	if c.model != nil {
-		summary, err = c.callModelForBranchSummary(ctx, transcriptStr)
+	if strings.TrimSpace(transcriptStr) == "" {
+		summary = "No content to summarize"
+	} else if c.model != nil {
+		var usage ai.Usage
+		summary, usage, err = c.callModelForBranchSummary(ctx, transcriptStr)
+		if usageErr := c.recordSummaryUsage(id, usage); usageErr != nil {
+			return errors.Join(err, usageErr)
+		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			// Fallback to naive summarization on error
 			summary = buildBranchNaiveSummary(branchEntries)
 		}
@@ -467,57 +498,52 @@ func (c *CLI) SummarizeBranch(ctx context.Context, id, branchTip string) error {
 		summary = buildBranchNaiveSummary(branchEntries)
 	}
 
-	return c.Storage.SummarizeBranch(id, branchTip, summary)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("summarize branch: %w", err)
+	}
+	return c.Storage.SummarizeBranch(id, tipEntry.ID, summary)
 }
 
 // callModelForBranchSummary calls the configured model to generate a branch summary.
-func (c *CLI) callModelForBranchSummary(ctx context.Context, transcript string) (string, error) {
-	if c.model == nil {
-		return "", errors.New("no model configured")
-	}
-
-	// Get AI client for the model
-	client, err := c.newClient()
-	if err != nil {
-		return "", fmt.Errorf("create AI client: %w", err)
-	}
-
-	// Build the summarization prompt
-	systemPrompt := compaction.BuildSummarizationPrompt()
-
-	prompt := &ai.Context{
-		SystemPrompt: systemPrompt,
-		Messages: []ai.Message{
-			{Role: "user", Content: "Summarize this branch's conversation. Focus on the key changes and decisions made in this branch compared to the parent.\n\n" + transcript},
-		},
-	}
-
-	msg, err := client.Complete(ctx, c.model, prompt)
-	if err != nil {
-		return "", fmt.Errorf("model completion: %w", err)
-	}
-
-	// Extract text content from response
-	for _, block := range msg.Content {
-		if block.Type == ai.ContentBlockText && block.Text != "" {
-			return block.Text, nil
-		}
-	}
-
-	return "", errors.New("no text content in summarization response")
+func (c *CLI) callModelForBranchSummary(ctx context.Context, transcript string) (string, ai.Usage, error) {
+	return c.completeSummary(ctx, "Summarize this branch's conversation. Focus on the key changes and decisions made in this branch compared to the parent.\n\n"+transcript)
 }
 
-func (c *CLI) newClient() (ai.Client, error) {
+func summaryResponseText(msg *ai.AssistantMessage) (string, error) {
+	var text strings.Builder
+	if msg != nil {
+		switch msg.StopReason {
+		case ai.StopReasonAborted:
+			return "", fmt.Errorf("summarization aborted: %s: %w", msg.ErrorMessage, context.Canceled)
+		case ai.StopReasonError:
+			return "", fmt.Errorf("summarization failed: %s", msg.ErrorMessage)
+		case ai.StopReasonLength:
+			return "", errors.New("summarization stopped at the output token limit; summary is incomplete")
+		}
+		for _, block := range msg.Content {
+			if block.Type == ai.ContentBlockToolCall {
+				return "", errors.New("summarization attempted to call a tool")
+			}
+			if block.Type == ai.ContentBlockText {
+				text.WriteString(block.Text)
+			}
+		}
+	}
+	if strings.TrimSpace(text.String()) == "" {
+		return "", errors.New("no text content in summarization response")
+	}
+	return text.String(), nil
+}
+
+func (c *CLI) newClient(ctx context.Context) (ai.Client, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("create client: %w", err)
+	}
 	if c.model == nil {
 		return nil, errors.New("no model configured")
 	}
 
-	p, ok := ai.Get(c.model.API)
-	if !ok {
-		return nil, fmt.Errorf("no provider for API: %s", c.model.API)
-	}
-
-	client, err := p.NewClient(c.model)
+	client, err := ai.GetClient(c.model)
 	if err != nil {
 		return nil, err
 	}
@@ -526,12 +552,12 @@ func (c *CLI) newClient() (ai.Client, error) {
 		return client, nil
 	}
 
-	cred, err := c.Store.Get(context.Background(), c.modelSpec.Provider)
+	cred, err := c.Store.Get(ctx, c.modelSpec.Provider)
 	if err != nil {
 		return nil, fmt.Errorf("get credentials for %s: %w", c.modelSpec.Provider, err)
 	}
 
-	apiKey, err := store.APIKeyFromCredential(c.modelSpec.Provider, cred)
+	apiKey, err := store.APIKeyFromCredential(ctx, c.modelSpec.Provider, cred)
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +580,7 @@ func (c *CLI) newClient() (ai.Client, error) {
 				if updatedCred.NeedsReauth {
 					return "", ai.ErrCredentialNeedsReauth{Provider: prov}
 				}
-				apiKey, err := store.APIKeyFromCredential(prov, updatedCred)
+				apiKey, err := store.APIKeyFromCredential(ctx, prov, updatedCred)
 				if err != nil {
 					return "", err
 				}
@@ -570,6 +596,29 @@ func (c *CLI) newClient() (ai.Client, error) {
 	return client, nil
 }
 
+func summaryTranscript(entries []Entry) string {
+	var transcript strings.Builder
+	for _, entry := range entries {
+		message := entry.ToAgentMessage()
+		if message == nil || message.ExcludeFromContext {
+			continue
+		}
+		for _, block := range message.Content {
+			switch block.Type {
+			case ai.ContentBlockText:
+				if block.Text != "" {
+					fmt.Fprintf(&transcript, "[%s]: %s\n", message.Role, block.Text)
+				}
+			case ai.ContentBlockToolCall:
+				if block.Name != "" {
+					fmt.Fprintf(&transcript, "[%s tool call]: %s(%s)\n", message.Role, block.Name, block.Arguments)
+				}
+			}
+		}
+	}
+	return transcript.String()
+}
+
 // buildBranchNaiveSummary creates a fallback summary from branch entries.
 func buildBranchNaiveSummary(entries []Entry) string {
 	var summary strings.Builder
@@ -577,20 +626,17 @@ func buildBranchNaiveSummary(entries []Entry) string {
 
 	count := 0
 	for _, e := range entries {
-		if e.Type == EntryTypeMessage && e.Message != nil {
-			var msg map[string]any
-			if err := json.Unmarshal(e.Message, &msg); err == nil {
-				role, _ := msg["role"].(string)
-				content := formatContent(msg["content"])
-				if len(content) > 150 {
-					content = content[:150] + "..."
-				}
-				fmt.Fprintf(&summary, "- [%s]: %s\n", role, content)
-				count++
-				if count >= 10 {
-					break
-				}
-			}
+		content := summaryTranscript([]Entry{e})
+		if content == "" {
+			continue
+		}
+		if len(content) > 150 {
+			content = content[:150] + "..."
+		}
+		summary.WriteString("- " + strings.TrimSuffix(content, "\n") + "\n")
+		count++
+		if count >= 10 {
+			break
 		}
 	}
 
@@ -599,6 +645,9 @@ func buildBranchNaiveSummary(entries []Entry) string {
 
 // Fork creates a new session forked from an existing one.
 func (c *CLI) Fork(ctx context.Context, id string, atEntry *string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("fork session: %w", err)
+	}
 	w, err := c.Storage.Fork(id, atEntry)
 	if err != nil {
 		return "", err
@@ -661,9 +710,10 @@ func (c *CLI) Share(ctx context.Context, id string, isPublic bool) (url string, 
 	var apiKey string
 	switch cred.Type {
 	case ai.CredentialTypeAPIKey:
-		apiKey = cred.APIKey
+		if apiKey, err = store.APIKeyFromCredential(ctx, "github", cred); err != nil {
+			return "", err
+		}
 	case ai.CredentialTypeOAuth:
-		// Get access token from OAuth credential
 		apiKey = cred.AccessToken
 	default:
 		return "", errors.New("github credential is not an API key or OAuth token")

@@ -4,6 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -91,8 +96,8 @@ func TestListProviders(t *testing.T) {
 	ResetProviders()
 
 	providers := ListProviders()
-	if len(providers) != 5 {
-		t.Fatalf("ListProviders count = %d, want 5 built-in providers", len(providers))
+	if len(providers) != 7 {
+		t.Fatalf("ListProviders count = %d, want 7 built-in providers", len(providers))
 	}
 
 	// Check that all expected providers are present
@@ -102,6 +107,8 @@ func TestListProviders(t *testing.T) {
 		ProviderGeminiCLI:         true,
 		ProviderOpenAICodex:       true,
 		ProviderGoogleAntigravity: true,
+		ProviderRadius:            true,
+		ProviderOpenRouter:        true,
 	}
 
 	for _, p := range providers {
@@ -234,8 +241,8 @@ func TestGetProviderInfoList(t *testing.T) {
 	ResetProviders()
 
 	infos := GetProviderInfoList()
-	if len(infos) != 5 {
-		t.Fatalf("GetProviderInfoList count = %d, want 5", len(infos))
+	if len(infos) != 7 {
+		t.Fatalf("GetProviderInfoList count = %d, want 7", len(infos))
 	}
 
 	for _, info := range infos {
@@ -266,6 +273,8 @@ func TestOAuthBuiltInProviderOrder(t *testing.T) {
 		ProviderGeminiCLI,
 		ProviderGoogleAntigravity,
 		ProviderOpenAICodex,
+		ProviderRadius,
+		ProviderOpenRouter,
 	}
 
 	if len(got) != len(want) {
@@ -864,5 +873,206 @@ func TestDefaultStoreRefreshOAuthCredentialsNoProvider(t *testing.T) {
 	_, err := RefreshOAuthCredentials(context.Background(), "nonexistent-provider")
 	if err == nil {
 		t.Error("RefreshOAuthCredentials should return error for unknown provider")
+	}
+}
+
+func TestCallbackServerFallsBackToLoopbackPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := listener.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	occupied := listener.Addr().(*net.TCPAddr).Port
+	server := newCallbackServer("expected-state", occupied)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := server.Stop(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if server.Port() == occupied {
+		t.Fatal("did not select a fallback port")
+	}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.AuthCallbackURL()+"?code=code&state=expected-state", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	code, state, err := server.WaitForCode(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != "code" || state != "expected-state" {
+		t.Fatalf("code=%q state=%q", code, state)
+	}
+}
+
+func TestCallbackServerRejectsStraysWithoutConsumingLogin(t *testing.T) {
+	for _, query := range []string{"code=wrong&state=stray", "error=denied&state=stray", "state=expected", "code=wrong", ""} {
+		t.Run(query, func(t *testing.T) {
+			server := newCallbackServer("expected", 0)
+			for _, method := range []string{http.MethodPost, http.MethodGet} {
+				request := httptest.NewRequest(method, "/auth/callback?"+query, nil)
+				response := httptest.NewRecorder()
+				server.handleCallback(response, request)
+				if response.Code < 400 || server.handled {
+					t.Fatalf("stray %s accepted or consumed login: status=%d handled=%v", method, response.Code, server.handled)
+				}
+			}
+			response := httptest.NewRecorder()
+			server.handleCallback(response, httptest.NewRequest(http.MethodGet, "/auth/callback?code=valid&state=expected", nil))
+			code, state, err := server.WaitForCode(t.Context())
+			if err != nil || code != "valid" || state != "expected" || response.Code != http.StatusOK {
+				t.Fatalf("valid callback: code=%q state=%q err=%v status=%d", code, state, err, response.Code)
+			}
+			response = httptest.NewRecorder()
+			server.handleCallback(response, httptest.NewRequest(http.MethodGet, "/auth/callback?code=again&state=expected", nil))
+			if response.Code != http.StatusConflict {
+				t.Fatalf("duplicate status=%d", response.Code)
+			}
+		})
+	}
+}
+
+func TestCallbackServerValidatesStateBeforeOAuthError(t *testing.T) {
+	server := newCallbackServer("expected", 0)
+	response := httptest.NewRecorder()
+	server.handleCallback(response, httptest.NewRequest(http.MethodGet, "/callback?error=denied&error_description=declined&state=expected", nil))
+	_, _, err := server.WaitForCode(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "declined") || response.Code != http.StatusBadRequest {
+		t.Fatalf("error=%v status=%d", err, response.Code)
+	}
+}
+
+func TestWaitForCallbackOrManualInputWithdrawsTheLosingSide(t *testing.T) {
+	blocked := func(started chan<- struct{}, ended chan<- error) func(context.Context) (string, error) {
+		return func(ctx context.Context) (string, error) {
+			close(started)
+			<-ctx.Done()
+			ended <- ctx.Err()
+			return "", ctx.Err()
+		}
+	}
+
+	t.Run("callback wins", func(t *testing.T) {
+		started, ended := make(chan struct{}), make(chan error, 1)
+		prompt := blocked(started, ended)
+		callbacks := &DefaultLoginCallbacks{FnManualCodeInput: prompt}
+		code, input, err := waitForCallbackOrManualInput(t.Context(), callbacks, func(context.Context) (string, error) {
+			<-started
+			return "abc", nil
+		})
+		if err != nil || code != "abc" || input != "" {
+			t.Fatalf("result = %q, %q, %v", code, input, err)
+		}
+		select {
+		case err := <-ended:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("prompt ended with %v", err)
+			}
+		default:
+			t.Fatal("prompt still pending after the callback won")
+		}
+	})
+
+	t.Run("manual wins", func(t *testing.T) {
+		started, ended := make(chan struct{}), make(chan error, 1)
+		wait := blocked(started, ended)
+		callbacks := &DefaultLoginCallbacks{FnManualCodeInput: func(context.Context) (string, error) {
+			<-started
+			return "pasted", nil
+		}}
+		code, input, err := waitForCallbackOrManualInput(t.Context(), callbacks, wait)
+		if err != nil || code != "" || input != "pasted" {
+			t.Fatalf("result = %q, %q, %v", code, input, err)
+		}
+		select {
+		case <-ended:
+		default:
+			t.Fatal("callback wait still pending after manual input won")
+		}
+	})
+
+	t.Run("unavailable prompt leaves the callback", func(t *testing.T) {
+		release := make(chan struct{})
+		callbacks := &DefaultLoginCallbacks{FnManualCodeInput: func(context.Context) (string, error) {
+			defer close(release)
+			return "", fmt.Errorf("no terminal: %w", ErrPromptUnavailable)
+		}}
+		code, _, err := waitForCallbackOrManualInput(t.Context(), callbacks, func(context.Context) (string, error) {
+			<-release
+			return "abc", nil
+		})
+		if err != nil || code != "abc" {
+			t.Fatalf("result = %q, %v", code, err)
+		}
+		unavailable := &DefaultLoginCallbacks{FnManualCodeInput: func(context.Context) (string, error) { return "", ErrPromptUnavailable }}
+		if _, _, err := waitForCallbackOrManualInput(t.Context(), unavailable, nil); !errors.Is(err, ErrPromptUnavailable) {
+			t.Fatalf("manual-only unavailable prompt err = %v", err)
+		}
+	})
+
+	t.Run("prompt failure fails the login", func(t *testing.T) {
+		promptErr := errors.New("prompt broke")
+		callbacks := &DefaultLoginCallbacks{FnManualCodeInput: func(context.Context) (string, error) { return "", promptErr }}
+		_, _, err := waitForCallbackOrManualInput(t.Context(), callbacks, func(ctx context.Context) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		})
+		if !errors.Is(err, promptErr) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		wait := func(ctx context.Context) (string, error) { <-ctx.Done(); return "", ctx.Err() }
+		callbacks := &DefaultLoginCallbacks{FnManualCodeInput: wait}
+		if _, _, err := waitForCallbackOrManualInput(ctx, callbacks, wait); !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestLineReaderCancelsAWaitWithoutLosingTheNextLine(t *testing.T) {
+	pr, pw := io.Pipe()
+	reader := &lineReader{r: pr}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := reader.read(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled read err = %v", err)
+	}
+	go func() {
+		_, err := io.WriteString(pw, "first\nsecond\n")
+		pw.CloseWithError(errors.Join(err, io.EOF))
+	}()
+	for _, want := range []string{"first", "second"} {
+		line, err := reader.read(t.Context())
+		if err != nil || line != want {
+			t.Fatalf("read = %q, %v; want %q", line, err, want)
+		}
+	}
+	for range 2 {
+		if _, err := reader.read(t.Context()); !errors.Is(err, io.EOF) {
+			t.Fatalf("read after close err = %v", err)
+		}
 	}
 }

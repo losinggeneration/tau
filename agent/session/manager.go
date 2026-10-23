@@ -230,12 +230,9 @@ func (m *Manager) LoadEntries(r *Reader) {
 		}
 	}
 
-	// Set leaf to last entry
-	if len(m.entries) > 0 {
-		last := m.entries[len(m.entries)-1]
-		if last.Type != EntryTypeSession {
-			m.leafID = &last.ID
-		}
+	m.leafID = nil
+	if position := r.CurrentPosition(); position != "" {
+		m.leafID = &position
 	}
 }
 
@@ -455,7 +452,7 @@ func (m *Manager) ContextEntries() []Entry {
 			if _, ok := byID[*e.FirstKeptID]; ok {
 				// Check if it's on the active branch
 				for _, id := range branch {
-					if id == *e.FirstKeptID || id == e.ID {
+					if id == e.ID || (e.ParentID == nil && id == *e.FirstKeptID) {
 						compactionIdx = i
 						break
 					}
@@ -473,6 +470,7 @@ func (m *Manager) ContextEntries() []Entry {
 
 	if compactionIdx >= 0 {
 		firstKeptID = *m.entries[compactionIdx].FirstKeptID
+		result = systemEntriesBefore(branch, m.entries, firstKeptID)
 		result = append(result, m.entries[compactionIdx])
 	}
 
@@ -496,12 +494,12 @@ func (m *Manager) ContextEntries() []Entry {
 		}
 
 		e := &m.entries[idx]
-		if e.Type.InContext() {
+		if e.Type.InContext() && e.Type != EntryTypeCompaction {
 			result = append(result, *e)
 		}
 	}
 
-	return result
+	return projectContextEdits(result, branch, m.entries)
 }
 
 // AppendMessage appends a message entry and returns its ID.
@@ -677,11 +675,19 @@ func (m *Manager) ToReader(path string) *Reader {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	return &Reader{
+	reader := &Reader{
 		path:    path,
 		header:  m.header,
-		entries: m.entries,
+		entries: slices.Clone(m.entries),
 	}
+	position := m.header.ID
+	if m.leafID != nil {
+		position = *m.leafID
+	}
+	if reader.CurrentPosition() != position {
+		reader.entries = append(reader.entries, NewPositionChangeEntry(position))
+	}
+	return reader
 }
 
 // LeafID returns the current leaf entry ID.
@@ -702,4 +708,37 @@ type sessionError struct {
 
 func (e *sessionError) Error() string {
 	return fmt.Sprintf(e.fmt, e.args...)
+}
+
+// AppendContextEdit appends a branch-local replacement of model-visible content.
+// A null replacement omits the target from context without deleting history.
+func (m *Manager) AppendContextEdit(targetID string, replacement json.RawMessage) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idx, ok := m.byID[targetID]
+	if !ok || idx < 0 {
+		return "", fmt.Errorf("context edit target %q not found", targetID)
+	}
+	if !slices.Contains(m.activeBranchLocked(), targetID) {
+		return "", fmt.Errorf("context edit target %q is not on active branch", targetID)
+	}
+	target := m.entries[idx]
+	var message struct {
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(target.Message, &message); err != nil {
+		return "", fmt.Errorf("parse context edit target: %w", err)
+	}
+	if target.Type != EntryTypeCustomMessage && (target.Type != EntryTypeMessage || (message.Role != "user" && message.Role != "assistant" && message.Role != "toolResult" && message.Role != "tool")) {
+		return "", fmt.Errorf("entry %q is not context-editable", targetID)
+	}
+	normalized, err := normalizeContextReplacement(replacement)
+	if err != nil {
+		return "", err
+	}
+	entry := NewEntry(EntryTypeContextEdit, m.leafID)
+	entry.TargetID = &targetID
+	entry.Replacement = normalized
+	m.appendEntry(&entry)
+	return entry.ID, nil
 }

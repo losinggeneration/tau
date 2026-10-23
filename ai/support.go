@@ -112,6 +112,10 @@ var providerSupportDefinitions = map[string]providerSupportDefinition{
 		tested:            true,
 		tier:              SupportTier1,
 	},
+	ProviderRadius: {
+		apis:              []string{APIPiMessages},
+		hasImplementation: true,
+	},
 	ProviderCerebras: {
 		apis:              []string{APIOpenAICompletions},
 		hasImplementation: true,

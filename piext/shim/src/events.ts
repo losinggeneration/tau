@@ -24,6 +24,7 @@ const HANDLED_EVENTS = new Set<string>([
 	"before_agent_start",
 	"agent_start",
 	"agent_end",
+	"agent_settled",
 	"turn_start",
 	"turn_end",
 	"message_start",

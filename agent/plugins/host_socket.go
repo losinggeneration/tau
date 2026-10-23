@@ -1,7 +1,9 @@
 package plugins
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,13 +21,18 @@ type hostSocket struct {
 	ln     net.Listener
 }
 
-// close stops the server and removes the socket file. Idempotent-safe via
-// prepareHostSocket deleting the map entry first.
-func (h *hostSocket) close() {
+// close stops the server and removes the socket file. Stopping the server
+// already closes the listener, which may also unlink the socket.
+func (h *hostSocket) close() error {
 	h.server.Stop()
-	_ = h.ln.Close()
-	// Best-effort cleanup; stale sockets are overwritten by the next prepare.
-	_ = os.Remove(h.path)
+	var err error
+	if closeErr := h.ln.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		err = fmt.Errorf("close host socket %s: %w", h.path, closeErr)
+	}
+	if removeErr := os.Remove(h.path); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+		err = errors.Join(err, fmt.Errorf("remove host socket %s: %w", h.path, removeErr))
+	}
+	return err
 }
 
 // hostSocketDir returns the directory used for Host service sockets. Prefers
@@ -51,8 +58,10 @@ func (m *Manager) prepareHostSocketLocked(pluginName string) (string, error) {
 	defer m.hostMu.Unlock()
 
 	if prev := m.hostSockets[pluginName]; prev != nil {
-		prev.close()
 		delete(m.hostSockets, pluginName)
+		if err := prev.close(); err != nil {
+			return "", err
+		}
 	}
 
 	dir := hostSocketDir()
@@ -72,9 +81,14 @@ func (m *Manager) prepareHostSocketLocked(pluginName string) (string, error) {
 	// Lock down the socket: Host RPCs expose UI prompts, session writes, and
 	// per-plugin state, so other local users must not connect.
 	if err := os.Chmod(socketPath, 0o600); err != nil {
-		_ = ln.Close()
-		_ = os.Remove(socketPath)
-		return "", fmt.Errorf("chmod host socket %s: %w", socketPath, err)
+		err = fmt.Errorf("chmod host socket %s: %w", socketPath, err)
+		if closeErr := ln.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close host socket %s: %w", socketPath, closeErr))
+		}
+		if removeErr := os.Remove(socketPath); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove host socket %s: %w", socketPath, removeErr))
+		}
+		return "", err
 	}
 
 	server := grpc.NewServer()
@@ -93,11 +107,13 @@ func (m *Manager) prepareHostSocketLocked(pluginName string) (string, error) {
 }
 
 // closeHostSocketLocked stops and removes the Host socket for a plugin.
-func (m *Manager) closeHostSocketLocked(pluginName string) {
+func (m *Manager) closeHostSocketLocked(pluginName string) error {
 	m.hostMu.Lock()
 	defer m.hostMu.Unlock()
-	if hs := m.hostSockets[pluginName]; hs != nil {
-		hs.close()
-		delete(m.hostSockets, pluginName)
+	hs := m.hostSockets[pluginName]
+	if hs == nil {
+		return nil
 	}
+	delete(m.hostSockets, pluginName)
+	return hs.close()
 }

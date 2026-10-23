@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/denormal/go-gitignore"
+	"github.com/losinggeneration/tau/paths"
 )
 
 // ignoreFiles lists the supported ignore file names.
@@ -483,7 +484,7 @@ func matchesAnyPattern(filePath string, patterns []string, baseDir string) bool 
 	}
 
 	for _, pattern := range patterns {
-		normalized := toPosixPath(pattern)
+		normalized := toPosixPath(paths.ResourcePath(pattern, "", ""))
 		if globMatch(rel, normalized) || globMatch(name, normalized) || globMatch(filePathPosix, normalized) {
 			return true
 		}
@@ -516,7 +517,7 @@ func matchesAnyExactPattern(filePath string, patterns []string, baseDir string) 
 	}
 
 	for _, pattern := range patterns {
-		normalized := toPosixPath(normalizeExactPattern(pattern))
+		normalized := toPosixPath(normalizeExactPattern(paths.ResourcePath(pattern, "", "")))
 		if normalized == rel || normalized == filePathPosix {
 			return true
 		}

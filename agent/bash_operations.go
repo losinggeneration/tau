@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -62,6 +63,9 @@ type BashRequest struct {
 	Dir     string
 	Timeout time.Duration
 	Env     []string
+	// OnOutput receives raw output chunks as they arrive. Calls are
+	// serialized and finish before Run returns.
+	OnOutput func(chunk string)
 }
 
 // BashResult is the output of a BashOperations call.
@@ -144,20 +148,27 @@ func (d *DefaultBashOps) makeCmd(req BashRequest) *exec.Cmd {
 }
 
 func (d *DefaultBashOps) Run(ctx context.Context, req BashRequest) (BashResult, error) {
-	cmd := d.makeCmd(req)
-
 	var cancel context.CancelFunc
 	if req.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
 		defer cancel()
 	}
 
+	if err := ctx.Err(); err != nil {
+		reason := BashCancelReload
+		if errors.Is(err, context.DeadlineExceeded) {
+			reason = BashCancelTimeout
+		}
+		return BashResult{CancelReason: reason}, nil
+	}
+	cmd := d.makeCmd(req)
+
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Wire output before Start — must be done before cmd.Start()
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// One comparable writer for both streams makes exec serialize writes.
+	buf := &streamingBuffer{onOutput: req.OnOutput}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
 
 	if err := cmd.Start(); err != nil {
 		return BashResult{Output: err.Error(), ExitCode: 1}, nil
@@ -174,34 +185,23 @@ func (d *DefaultBashOps) Run(ctx context.Context, req BashRequest) (BashResult, 
 	// Set up signal handling for user abort detection
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
 	var cancelledDueToTimeout bool
 	var cancelledDueToSignal bool
+	var terminateErr error
+	terminate := func(signal syscall.Signal) error { return syscall.Kill(-cmd.Process.Pid, signal) }
 	select {
 	case <-done:
-		// Process finished normally
 	case <-sigChan:
-		// User aborted — kill the process group
 		cancelledDueToSignal = true
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-		<-done // Wait for process to exit after SIGTERM
+		terminateErr = terminateBashProcess(done, d.KillGrace, terminate)
 	case <-ctx.Done():
-		// Context cancelled — check if it was a timeout
-		cancelledDueToTimeout = (ctx.Err() == context.DeadlineExceeded)
-		// Kill the process group
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-		<-done // Wait for process to exit after SIGTERM
-
-		select {
-		case <-done:
-			// Process exited after SIGTERM
-		case <-time.After(d.KillGrace):
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			<-done
-		}
+		cancelledDueToTimeout = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		terminateErr = terminateBashProcess(done, d.KillGrace, terminate)
 	}
 
-	result := BashResult{Output: buf.String(), CancelReason: BashCancelNone}
+	result := BashResult{Output: buf.buf.String(), CancelReason: BashCancelNone}
 
 	if cancelledDueToTimeout {
 		result.CancelReason = BashCancelTimeout
@@ -247,7 +247,40 @@ func (d *DefaultBashOps) Run(ctx context.Context, req BashRequest) (BashResult, 
 		result.Output = truncateOutput(output, d.OutputCap)
 	}
 
-	return result, nil
+	return result, terminateErr
+}
+
+// ponytail: holds the full output in memory before tail truncation; spill to
+// the temp file past MaxBytes if huge command output becomes a memory problem.
+type streamingBuffer struct {
+	buf      bytes.Buffer
+	onOutput func(string)
+}
+
+func (b *streamingBuffer) Write(p []byte) (int, error) {
+	if b.onOutput != nil {
+		b.onOutput(string(p))
+	}
+	return b.buf.Write(p)
+}
+
+func terminateBashProcess(done <-chan struct{}, grace time.Duration, kill func(syscall.Signal) error) error {
+	var result error
+	if err := kill(syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		result = fmt.Errorf("terminate shell process group: %w", err)
+	}
+	timer := time.NewTimer(max(0, grace))
+	defer timer.Stop()
+	select {
+	case <-done:
+		return result
+	case <-timer.C:
+		if err := kill(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			result = errors.Join(result, fmt.Errorf("kill shell process group: %w", err))
+		}
+		<-done
+		return result
+	}
 }
 
 func truncateOutput(output string, cap int64) string {

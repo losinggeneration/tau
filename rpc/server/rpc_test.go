@@ -1172,7 +1172,7 @@ func TestRPCFork_FiresSessionBeforeForkEvent(t *testing.T) {
 	var seen []string
 	var blockOnce bool
 	mgr.RegisterEventHandler("session_before_fork", plugins.EventHandler{
-		Handler: func(name string, payload json.RawMessage, sessionID string) plugins.EventResponse {
+		Handler: func(_ context.Context, name string, payload json.RawMessage, sessionID string) plugins.EventResponse {
 			seen = append(seen, "session_before_fork")
 			if blockOnce {
 				return plugins.EventResponse{Block: true}
@@ -1194,7 +1194,6 @@ func TestRPCFork_FiresSessionBeforeForkEvent(t *testing.T) {
 		interrupt:       make(chan struct{}, 1),
 		shutdown:        make(chan struct{}),
 		commandRegistry: newTestRegistry(),
-		bashOps:         defaultBashOps,
 	}
 	srv.ui = ui.NewRPCUI()
 	srv.ui.Writer = stdoutW

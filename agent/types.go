@@ -2,6 +2,7 @@ package agent // import "github.com/losinggeneration/tau/agent"
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"time"
 
@@ -9,7 +10,33 @@ import (
 )
 
 // Tool represents an agent tool.
+type ToolExposure string
+
+const (
+	ToolDirect    ToolExposure = "direct"
+	ToolModelOnly ToolExposure = "model-only"
+	ToolCodemode  ToolExposure = "codemode"
+	ToolDeferred  ToolExposure = "deferred"
+	ToolHidden    ToolExposure = "hidden"
+)
+
+type ToolNamespace struct {
+	Name         string   `json:"name"`
+	Aliases      []string `json:"aliases,omitempty"`
+	Description  string   `json:"description,omitempty"`
+	Instructions string   `json:"instructions,omitempty"`
+}
+
 type Tool struct {
+	WaitReady           func(context.Context) error
+	Namespace           *ToolNamespace
+	DefaultActive       *bool
+	ConstrainedSampling json.RawMessage
+	Exposure            ToolExposure
+	OutputSchema        map[string]any
+	ReachesTools        func(map[string]any) []string
+	ReachTools          func(context.Context, map[string]any) ([]string, error)
+
 	Name        string
 	Description string
 	Parameters  map[string]any
@@ -29,11 +56,13 @@ type ToolFunc func(ctx ToolContext) (*ToolResult, error)
 
 // ToolContext contains context for tool execution.
 type ToolContext struct {
-	Context    context.Context
-	ToolCallID string
-	Name       string
-	Args       map[string]any
-	OnUpdate   func(*ToolResult)
+	ExecuteTool func(ai.ToolCall) *ToolResult
+	Model       *ai.Model
+	Context     context.Context
+	ToolCallID  string
+	Name        string
+	Args        map[string]any
+	OnUpdate    func(*ToolResult)
 
 	// SessionCWD is the session's current working directory.
 	// All tools that touch the filesystem resolve relative paths against this.
@@ -43,12 +72,22 @@ type ToolContext struct {
 	Capabilities ai.Capabilities
 }
 
+// NestedToolCall is a bounded diagnostic record, not a copy of a nested result.
+type NestedToolCall = ai.NestedToolCall
+
 // ToolResult represents the result of tool execution.
 type ToolResult struct {
-	Content       string
-	ContentBlocks []ai.ContentBlock
-	IsError       bool
-	Details       any
+	NestedCalls []NestedToolCall `json:"nestedCalls,omitempty"`
+	// Rejection distinguishes a failed execution from a tool-returned error value.
+	Rejection         error           `json:"-"`
+	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
+	Usage             *ai.Usage
+	Terminate         bool
+	DurationMs        *float64 `json:"durationMs,omitempty"`
+	Content           string
+	ContentBlocks     []ai.ContentBlock
+	IsError           bool
+	Details           any
 	// ExcludeFromContext keeps the result in events/session history but omits it from future LLM context.
 	ExcludeFromContext bool
 	// Message is the corresponding tool result message, set after execution.
@@ -60,7 +99,7 @@ func (r *ToolResult) NormalizedContent() []ai.ContentBlock {
 	if r == nil {
 		return nil
 	}
-	if len(r.ContentBlocks) > 0 {
+	if r.ContentBlocks != nil {
 		return r.ContentBlocks
 	}
 	return []ai.ContentBlock{{Type: ai.ContentBlockText, Text: r.Content}}
@@ -86,6 +125,7 @@ const (
 	ThinkingMedium  ThinkingLevel = "medium"
 	ThinkingHigh    ThinkingLevel = "high"
 	ThinkingXHigh   ThinkingLevel = "xhigh"
+	ThinkingMax     ThinkingLevel = "max"
 )
 
 // EventDispatchResponse is a single listener's response to a dispatched
@@ -106,17 +146,35 @@ type EventDispatchResult struct {
 	Responses []EventDispatchResponse
 }
 
+// InitialState supplies transcript and model configuration without runtime-owned state.
+type InitialState struct {
+	Model         *ai.Model
+	SystemPrompt  string
+	Messages      []*Message
+	Tools         []Tool
+	ThinkingLevel ThinkingLevel
+}
+
 // Config contains agent configuration.
 type Config struct {
-	Model           *ai.Model
-	SystemPrompt    string
-	InitialMessages []*Message
-	Tools           []Tool
-	ThinkingLevel   ThinkingLevel
-	StreamHandler   StreamHandler
-	APIKeyProvider  APIKeyProvider
-	ClientFactory   ClientFactory
-	StreamFn        StreamFunc
+	// GetStartupMessages snapshots pending context before startup handlers run.
+	GetStartupMessages MessageSupplierFunc
+	// InitialState, when set, replaces Model, SystemPrompt, InitialMessages,
+	// Tools, and ThinkingLevel, including with zero values.
+	InitialState          *InitialState
+	PrepareNextTurn       PrepareNextTurnFunc
+	OnProviderStreamEvent func(context.Context, ai.StreamEvent)
+	FinishTurn            FinishTurnFunc
+	PrepareRequest        PrepareRequestFunc
+	Model                 *ai.Model
+	SystemPrompt          string
+	InitialMessages       []*Message
+	Tools                 []Tool
+	ThinkingLevel         ThinkingLevel
+	StreamHandler         StreamHandler
+	APIKeyProvider        APIKeyProvider
+	ClientFactory         ClientFactory
+	StreamFn              StreamFunc
 
 	// SystemAddendum is additional context appended to the system prompt.
 	// Used for skill content injection.
@@ -133,17 +191,18 @@ type Config struct {
 	SteeringMode     QueueMode
 	FollowUpMode     QueueMode
 	SessionID        string
+	RequestOptions   []ai.Option
 	ThinkingBudgets  *ai.ThinkingBudgets
 	Transport        ai.Transport
 	MaxRetryDelayMs  int
 
 	// EventDispatcher sends events to external listeners (e.g., plugins).
-	// The function receives the event name, optional JSON payload, and session ID.
+	// The function receives the operation context, event name, optional JSON payload, and session ID.
 	// It returns the dispatch outcome: Blocked reports a block verdict (for
 	// cancellable events such as tool_call), and Responses carries each
 	// subscribed listener's response in dispatch order for events whose
 	// responses are chained (e.g. before_agent_start system-prompt rewrites).
-	EventDispatcher func(name string, payload []byte, sessionID string) EventDispatchResult
+	EventDispatcher func(ctx context.Context, name string, payload []byte, sessionID string) EventDispatchResult
 
 	// SessionCWD is the session's current working directory.
 	// All tools that touch the filesystem resolve relative paths against this.
@@ -161,8 +220,9 @@ type BeforeToolCallFunc func(ctx context.Context, toolCtx ToolCallContext) (Befo
 
 // BeforeToolCallResult is the result of a beforeToolCall hook.
 type BeforeToolCallResult struct {
-	Block  bool
-	Reason string
+	Terminate bool
+	Block     bool
+	Reason    string
 }
 
 // AfterToolCallFunc is called after a tool finishes execution.
@@ -172,7 +232,11 @@ type AfterToolCallFunc func(ctx context.Context, toolCtx ToolCallContext, result
 
 // AfterToolCallResult is the result of an afterToolCall hook.
 type AfterToolCallResult struct {
-	// ContentBlocks overrides the result content with structured blocks.
+	StructuredContent json.RawMessage
+	// Usage replaces the complete aggregate, including nested calls, when non-nil.
+	Usage     *ai.Usage
+	Terminate *bool
+	// ContentBlocks overrides the result content when non-nil, including an empty slice.
 	ContentBlocks []ai.ContentBlock
 	// Content overrides the result content as plain text (falls back to result.Content if no blocks).
 	Content string
@@ -213,29 +277,91 @@ type TransformContextFunc func(ctx context.Context, messages []*Message) ([]*Mes
 // MessageSupplierFunc returns queued messages when the loop asks for them.
 type MessageSupplierFunc func(ctx context.Context) ([]*Message, error)
 
+// TurnDecision controls scheduling after a completed turn.
+type TurnDecision string
+
+const (
+	TurnDefault  TurnDecision = ""
+	TurnContinue TurnDecision = "continue"
+	TurnEndRun   TurnDecision = "end"
+)
+
+// AgentTurnContext contains the completed turn and its resulting transcript.
+type AgentTurnContext struct {
+	Message     *Message
+	ToolResults []*ToolResult
+	Context     *AgentContext
+	NewMessages []*Message
+}
+
+// PrepareRequestContext contains the runtime state for the next request.
+type PrepareRequestContext struct {
+	Context       *AgentContext
+	Model         *ai.Model
+	ThinkingLevel ThinkingLevel
+}
+
+// AgentTurnUpdate prepares runtime state and messages for a scheduled next turn.
+type AgentTurnUpdate struct {
+	Context       *AgentContext
+	Model         *ai.Model
+	ThinkingLevel *ThinkingLevel
+	Messages      []*Message
+}
+
+type PrepareNextTurnFunc func(context.Context, AgentTurnContext) (*AgentTurnUpdate, error)
+
+// AgentRequestUpdate replaces non-nil runtime values for this and later requests.
+type AgentRequestUpdate struct {
+	Messages      []*Message
+	Context       *AgentContext
+	Model         *ai.Model
+	ThinkingLevel *ThinkingLevel
+}
+
+type (
+	FinishTurnFunc     func(context.Context, AgentTurnContext) (TurnDecision, error)
+	PrepareRequestFunc func(context.Context, PrepareRequestContext) (*AgentRequestUpdate, error)
+)
+
 // Message represents an agent message.
 type Message struct {
-	Role               MessageRole
-	Content            []ai.ContentBlock
-	Data               any
-	ToolCallID         string
-	ToolName           string
-	IsError            bool
-	API                string
-	Provider           string
-	Model              string
-	StopReason         ai.StopReason
-	Usage              ai.Usage
-	ErrorMessage       string
-	ResponseID         string
-	ExcludeFromContext bool
-	Timestamp          time.Time
+	CustomType        string                   `json:"customType,omitempty"`
+	Display           bool                     `json:"display,omitempty"`
+	Diagnostics       []ai.AssistantDiagnostic `json:"diagnostics,omitempty"`
+	ThinkingLevel     ThinkingLevel            `json:"thinkingLevel,omitempty"`
+	Sections          map[string]*string       `json:"sections,omitempty"`
+	ToolsAdded        []ai.Tool                `json:"toolsAdded,omitempty"`
+	ToolsRemoved      []ai.ToolReference       `json:"toolsRemoved,omitempty"`
+	StructuredContent json.RawMessage          `json:"structuredContent,omitempty"`
+	NestedCalls       []NestedToolCall         `json:"nestedCalls,omitempty"`
+	ToolUsage         *ai.Usage
+	Details           any
+	DurationMs        *float64 `json:"durationMs,omitempty"`
+	Role              MessageRole
+	Content           []ai.ContentBlock
+	Data              any
+	ToolCallID        string
+	ToolName          string
+	IsError           bool
+	API               string
+	Provider          string
+	Model             string
+	StopReason        ai.StopReason
+	Usage             ai.Usage
+	ErrorMessage      string
+	ResponseID        string
+	// ProviderThinkingLevel is the native effort an assistant turn was produced with.
+	ProviderThinkingLevel string
+	ExcludeFromContext    bool
+	Timestamp             time.Time
 }
 
 // MessageRole represents the role of a message.
 type MessageRole string
 
 const (
+	RoleCustom    MessageRole = "custom"
 	RoleUser      MessageRole = "user"
 	RoleAssistant MessageRole = "assistant"
 	RoleTool      MessageRole = "tool"
@@ -454,6 +580,7 @@ type ToolExecutionUpdate = ToolUpdate
 
 // ToolEnd indicates a tool has finished.
 type ToolEnd struct {
+	DurationMs *float64 `json:"durationMs,omitempty"`
 	ToolCallID string
 	Name       string
 	Result     *ToolResult
@@ -492,6 +619,17 @@ type AgentContext struct {
 
 // AgentLoopConfig contains the configuration for the low-level agent loop.
 type AgentLoopConfig struct {
+	RequestOptions     []ai.Option
+	forcedSystemPrompt *string
+	// Stateful Agent publishes the failure lifecycle after the loop returns.
+	deferFailureEnd    bool
+	GetStartupMessages MessageSupplierFunc
+	// FlushContextMessages admits context-only messages after turn-end handlers.
+	FlushContextMessages  func()
+	PrepareNextTurn       PrepareNextTurnFunc
+	OnProviderStreamEvent func(context.Context, ai.StreamEvent)
+	FinishTurn            FinishTurnFunc
+	PrepareRequest        PrepareRequestFunc
 	// Required configuration
 	Model        *ai.Model
 	ConvertToLlm ConvertToLlmFunc
@@ -577,12 +715,12 @@ type AgentLoopConfig struct {
 	MaxRetryDelayMs int
 
 	// EventDispatcher sends events to external listeners (e.g., plugins).
-	// The function receives the event name, optional JSON payload, and session ID.
+	// The function receives the operation context, event name, optional JSON payload, and session ID.
 	// It returns the dispatch outcome: Blocked reports a block verdict (for
 	// cancellable events such as tool_call), and Responses carries each
 	// subscribed listener's response in dispatch order for events whose
 	// responses are chained (e.g. before_agent_start system-prompt rewrites).
-	EventDispatcher func(name string, payload []byte, sessionID string) EventDispatchResult
+	EventDispatcher func(ctx context.Context, name string, payload []byte, sessionID string) EventDispatchResult
 
 	// SessionCWD is the session's current working directory.
 	// All tools that touch the filesystem resolve relative paths against this.

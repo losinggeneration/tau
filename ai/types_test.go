@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -547,5 +549,252 @@ func TestDetectModelCompatGLM53OpenCodeGo(t *testing.T) {
 	}
 	if compat := other.GetCompat(); !compat.SupportsReasoningEffort {
 		t.Error("non-glm-5.3 opencode-go models should support reasoning_effort")
+	}
+}
+
+func TestCalculateCostSelectsHighestInputTier(t *testing.T) {
+	profile := CostProfile{Input: 1, Output: 2, CacheRead: 0.5, CacheWrite: 1, Tiers: []CostTier{
+		{InputTokensAbove: 200, Input: 4, Output: 8, CacheRead: 2, CacheWrite: 4},
+		{InputTokensAbove: 100, Input: 2, Output: 4, CacheRead: 1, CacheWrite: 2},
+	}}
+	for _, tt := range []struct {
+		input int
+		want  float64
+	}{{100, 0.00012}, {101, 0.000242}, {201, 0.000884}} {
+		usage := Usage{Input: tt.input, Output: 10}
+		usage.CalculateCost(profile)
+		if math.Abs(usage.Cost.Total-tt.want) > 1e-9 {
+			t.Fatalf("input=%d cost=%g want=%g", tt.input, usage.Cost.Total, tt.want)
+		}
+	}
+	usage := Usage{Input: 50, CacheRead: 50, CacheWrite: 1, Output: 10}
+	usage.CalculateCost(profile)
+	if math.Abs(usage.Cost.Total-0.000192) > 1e-9 {
+		t.Fatalf("cached input did not select tier: %+v", usage.Cost)
+	}
+	usage.CacheRead = 0
+	usage.CacheWrite = 0
+	usage.CalculateCost(profile)
+	if usage.Cost.CacheRead != 0 || usage.Cost.CacheWrite != 0 {
+		t.Fatalf("stale cache costs: %+v", usage.Cost)
+	}
+}
+
+func TestToAssistantMessagePreservesSourceMetadata(t *testing.T) {
+	msg := Message{
+		Role: "assistant", Content: []ContentBlock{{Type: ContentBlockText, Text: "ok"}},
+		Provider: ProviderAnthropic, API: APIAnthropicMessages, Model: "claude-sonnet-4",
+		StopReason: string(StopReasonStop), Timestamp: 1740000000000, DurationMs: new(12.5),
+		Diagnostics: []AssistantDiagnostic{{Type: "strict_fallback"}},
+	}
+	got, ok := msg.ToAssistantMessage()
+	want := AssistantMessage{
+		Role: msg.Role, Content: msg.ContentBlocks(), Provider: msg.Provider, API: msg.API,
+		Model: msg.Model, StopReason: StopReasonStop, Timestamp: msg.Timestamp,
+		DurationMs: msg.DurationMs, Diagnostics: msg.Diagnostics,
+	}
+	if !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ToAssistantMessage = %#v, %v; want %#v, true", got, ok, want)
+	}
+}
+
+func TestCatalogCompatExplicitFalseOverridesDetection(t *testing.T) {
+	model := &Model{ID: "m", API: APIOpenAICompletions, Provider: ProviderOpenAI, BaseURL: "https://api.openai.com/v1", Compat: &CompatibilitySettings{SupportsStore: new(false), SupportsDeveloperRole: new(false), SupportsReasoningEffort: new(false), SupportsStrictMode: new(false)}}
+	compat := model.GetCompat()
+	if compat.SupportsStore || compat.SupportsDeveloperRole || compat.SupportsReasoningEffort || compat.SupportsStrictMode {
+		t.Fatalf("explicit false lost: %+v", compat)
+	}
+	if detected := (&Model{ID: "m", API: APIOpenAICompletions, Provider: ProviderOpenAI, BaseURL: "https://api.openai.com/v1"}).GetCompat(); !detected.SupportsStore || !detected.SupportsDeveloperRole {
+		t.Fatalf("detection changed: %+v", detected)
+	}
+}
+
+func TestModelDecodesShippedCatalogMetadata(t *testing.T) {
+	entry := `{"type":"chat","id":"claude-fable-5","name":"Claude Fable 5","api":"anthropic-messages","provider":"anthropic","baseUrl":"https://api.anthropic.com","reasoning":true,"input":["text","image"],
+	"cost":{"input":10,"output":50,"cacheRead":1,"cacheWrite":12.5,"tiers":[{"inputTokensAbove":200000,"input":20,"output":75,"cacheRead":2,"cacheWrite":25}]},"contextWindow":1000000,"maxTokens":128000,
+	"compat":{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true,"supportsMidConvoToolAdditions":true,"forceAdaptiveThinking":true,"supportsStrictTools":true,"allowEmptySignature":true,"supportsLongCacheRetention":false,"supportsTemperature":false,"supportsMidConvoEffort":true,"cacheControlFormat":"anthropic","sessionAffinityFormat":"openai-nosession","supportsOpenAIGrammarTools":true,"supportsAdditionalTools":true,"supportsToolSearch":true,"supportsExplicitPromptCacheMode":true,"supportsEagerToolInputStreaming":false,"supportsCacheControlOnTools":false,"requiresReasoningContentOnAssistantMessages":true,"chatTemplateArgs":{"enable_thinking":{"$var":"thinking.enabled"}},
+	"allowedFallbackModels":[{"provider":"anthropic","model":"claude-opus-4-8","cost":{"input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25}}]},
+	"thinkingLevelMap":{"off":null,"xhigh":"xhigh"},"promptCache":{"short":300,"long":3600},
+	"inputLimits":{"maxRequestBytes":33554432,"images":{"maxPerRequest":600,"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
+	"lab":"Anthropic","enabled":true,"providers":[{"id":"fireworks","name":"Fireworks AI","credential":"radius","source":"radius"}]}`
+	decoder := json.NewDecoder(strings.NewReader(entry))
+	decoder.DisallowUnknownFields()
+	var model Model
+	if err := decoder.Decode(&model); err != nil {
+		t.Fatal(err)
+	}
+	compat := model.Compat
+	if compat == nil || !compat.ForceAdaptiveThinking || compat.SupportsLongCacheRetention == nil || *compat.SupportsLongCacheRetention || compat.SupportsTemperature == nil || len(compat.AllowedFallbackModels) != 1 || compat.AllowedFallbackModels[0].Cost.Input != 5 || string(compat.ChatTemplateArgs) == "" {
+		t.Fatalf("compat = %+v", compat)
+	}
+	if model.PromptCache == nil || model.PromptCache.Long != 3600 || model.Lab != "Anthropic" || model.Enabled == nil || !*model.Enabled || len(model.Providers) != 1 || model.Providers[0].Credential != "radius" || len(model.Cost.Tiers) != 1 {
+		t.Fatalf("model = %+v", model)
+	}
+}
+
+// streamTerminal runs a stream and returns its only terminal event's stop
+// reason and error message.
+func streamTerminal(t *testing.T, run func(EventHandler)) (StopReason, string) {
+	t.Helper()
+	var terminal []StreamEvent
+	run(func(_ context.Context, event StreamEvent) {
+		switch event.(type) {
+		case Done, StreamError:
+			terminal = append(terminal, event)
+		}
+	})
+	if len(terminal) != 1 {
+		t.Fatalf("terminal events = %#v, want exactly one", terminal)
+	}
+	if e, ok := terminal[0].(StreamError); ok {
+		return e.Msg.StopReason, e.Msg.ErrorMessage
+	}
+	done := terminal[0].(Done)
+	if done.Reason != done.Message.StopReason {
+		t.Fatalf("done reason %s, message %s", done.Reason, done.Message.StopReason)
+	}
+
+	return done.Reason, ""
+}
+
+func TestFinishStreamFailsUnstoppedErroredAndAbortedStreams(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		output  AssistantMessage
+		stopped bool
+		reason  StopReason
+		message string
+	}{
+		{name: "done", ctx: context.Background(), output: AssistantMessage{StopReason: StopReasonLength}, stopped: true, reason: StopReasonLength},
+		{name: "unstopped", ctx: context.Background(), reason: StopReasonError, message: "x ended without a stop reason"},
+		{name: "error", ctx: context.Background(), output: AssistantMessage{StopReason: StopReasonError, ErrorMessage: "boom"}, stopped: true, reason: StopReasonError, message: "boom"},
+		{name: "provider aborted", ctx: context.Background(), output: AssistantMessage{StopReason: StopReasonAborted}, stopped: true, reason: StopReasonError, message: "an unknown error occurred"},
+		{name: "canceled", ctx: canceled, output: AssistantMessage{StopReason: StopReasonStop}, stopped: true, reason: StopReasonAborted, message: "request was aborted: context canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, message := streamTerminal(t, func(handler EventHandler) {
+				finishStream(tc.ctx, handler, tc.output, tc.stopped, "x ended without a stop reason")
+			})
+			if reason != tc.reason || message != tc.message {
+				t.Fatalf("got %s %q, want %s %q", reason, message, tc.reason, tc.message)
+			}
+		})
+	}
+}
+
+func TestMessageJSONDecodesTypedContent(t *testing.T) {
+	blocks := []ContentBlock{
+		{Type: ContentBlockText, Text: "hello", TextSignature: "text-signature"},
+		{Type: ContentBlockThinking, Thinking: "reasoning", ThoughtSignature: "thought-signature"},
+		{Type: ContentBlockImage, MimeType: "image/png", Data: "aGVsbG8="},
+		{Type: ContentBlockToolCall, Namespace: new(""), ID: "call_1", Name: "read", Arguments: json.RawMessage(`{"id":9007199254740993}`)},
+	}
+	for _, role := range []string{"system", "user", "assistant", "tool", "toolResult"} {
+		t.Run(role, func(t *testing.T) {
+			original := Message{Role: role, Content: blocks, Timestamp: 1700000000000, StopReason: string(StopReasonStop)}
+			data, err := json.Marshal(&original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded Message
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(blocks, decoded.ContentBlocks()) {
+				t.Fatalf("decoded content = %#v, want typed blocks %#v", decoded.Content, blocks)
+			}
+			if decoded.Role != normalizeMessageRole(role) || decoded.Timestamp != original.Timestamp {
+				t.Fatalf("message metadata changed: %+v", decoded)
+			}
+			if role == "assistant" {
+				assistant, ok := decoded.ToAssistantMessage()
+				if !ok || decoded.IsErrorMessage() || !reflect.DeepEqual(assistant.Content, blocks) {
+					t.Fatalf("assistant classification failed: %+v, %v", assistant, ok)
+				}
+			}
+		})
+	}
+}
+
+func TestMessageJSONContentCompatibilityAndErrors(t *testing.T) {
+	for _, test := range []struct {
+		content string
+		want    any
+		invalid bool
+	}{
+		{content: `"plain text"`, want: "plain text"},
+		{content: `[]`, want: []ContentBlock{}},
+		{content: `null`},
+		{content: `false`, want: false},
+		{content: `42`, want: float64(42)},
+		{content: `{"custom":"value"}`, want: map[string]any{"custom": "value"}},
+		{content: `  [ ]  `, want: []ContentBlock{}},
+		{content: `[1]`, invalid: true},
+		{content: `[{"type":"text","text":42}]`, invalid: true},
+		{content: `[{"type":"toolCall","namespace":42}]`, invalid: true},
+	} {
+		t.Run(test.content, func(t *testing.T) {
+			decoded := Message{Role: "user", Content: "unchanged", Timestamp: 123}
+			err := json.Unmarshal([]byte(`{"role":"assistant","content":`+test.content+`,"timestamp":0}`), &decoded)
+			if test.invalid {
+				var typeError *json.UnmarshalTypeError
+				if !errors.As(err, &typeError) {
+					t.Fatalf("error = %v, want retained JSON type error", err)
+				}
+				if decoded.Role != "user" || decoded.Content != "unchanged" || decoded.Timestamp != 123 {
+					t.Fatalf("failed decode mutated receiver: %+v", decoded)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decoded.Content, test.want) {
+				t.Fatalf("content = %#v, want %#v", decoded.Content, test.want)
+			}
+		})
+	}
+	var decoded Message
+	if err := json.Unmarshal([]byte(`{"role":"user","timestamp":0}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Content != nil {
+		t.Fatalf("missing content = %#v, want nil", decoded.Content)
+	}
+}
+
+func TestCompletionsCacheCompatibilityResolution(t *testing.T) {
+	for _, scenario := range []struct {
+		provider, baseURL string
+		long              bool
+	}{
+		{provider: ProviderOpenAI, long: true},
+		{provider: ProviderTogether},
+		{baseURL: "https://api.together.ai/v1"},
+		{provider: ProviderCloudflareWorkersAI},
+		{baseURL: "https://gateway.ai.cloudflare.com/v1"},
+		{provider: ProviderNVIDIA},
+		{provider: ProviderAntLing},
+	} {
+		model := &Model{Provider: scenario.provider, BaseURL: scenario.baseURL}
+		if got := model.GetCompat().SupportsLongCacheRetention; got != scenario.long {
+			t.Fatalf("%s/%s long=%v, want %v", scenario.provider, scenario.baseURL, got, scenario.long)
+		}
+		model.Compat = &CompatibilitySettings{SupportsLongCacheRetention: new(!scenario.long), CacheControlFormat: "anthropic"}
+		compat := model.GetCompat()
+		if compat.SupportsLongCacheRetention == scenario.long || compat.CacheControlFormat != "anthropic" {
+			t.Fatalf("override lost: %+v", compat)
+		}
+	}
+	model := &Model{Provider: ProviderOpenRouter, ID: "anthropic/model:batch"}
+	if got := model.GetCompat().CacheControlFormat; got != "anthropic" {
+		t.Fatalf("detected format=%q", got)
+	}
+	model.Compat = &CompatibilitySettings{CacheControlFormat: "none"}
+	if got := model.GetCompat().CacheControlFormat; got != "none" {
+		t.Fatalf("overridden format=%q", got)
 	}
 }

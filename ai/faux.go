@@ -570,6 +570,16 @@ func (c *fauxClient) Complete(ctx context.Context, model *Model, prompt *Context
 }
 
 func (c *fauxClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) error {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	o := applyOptions(opts)
 	c.provider.state.callCount.Add(1)
 
@@ -682,6 +692,7 @@ func (c *fauxClient) streamWithDeltas(ctx context.Context, model *Model, message
 				Type:      ContentBlockToolCall,
 				ID:        block.ID,
 				Name:      block.Name,
+				Namespace: block.Namespace,
 				Arguments: json.RawMessage{},
 			})
 			handler(ctx, ToolCallStart{ContentIndex: i, Partial: partial})
@@ -706,6 +717,7 @@ func (c *fauxClient) streamWithDeltas(ctx context.Context, model *Model, message
 			handler(ctx, ToolCallEnd{ContentIndex: i, ToolCall: ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
+				Namespace: block.Namespace,
 				Arguments: mustMarshalStreamingJSON(args),
 			}, Partial: partial})
 		}

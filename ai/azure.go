@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -46,6 +48,16 @@ func (c *azureClient) Complete(ctx context.Context, model *Model, prompt *Contex
 
 // Stream implements Client.Streamer.
 func (c *azureClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	var o options
 	o.apply(opts)
 
@@ -65,7 +77,10 @@ func (c *azureClient) Stream(ctx context.Context, model *Model, prompt *Context,
 		deploymentName = model.ID
 	}
 
-	body := buildAzureRequestBody(model, prompt, &o)
+	body, err := buildAzureRequestBody(model, prompt, &o)
+	if err != nil {
+		return fmt.Errorf("azure openai: %w", err)
+	}
 	body["model"] = deploymentName
 	if hasPayloadCallback(&o) {
 		if next := invokePayloadCallback(&o, model, body); next != nil {
@@ -81,28 +96,28 @@ func (c *azureClient) Stream(ctx context.Context, model *Model, prompt *Context,
 	}
 
 	url := fmt.Sprintf("%s/responses?api-version=%s", baseURL, apiVersion)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("azure openai: create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("api-key", apiKey)
-	// pi-mono does not send session-affinity HTTP headers to Azure OpenAI
-	// (it puts the session id in the body as prompt_cache_key instead).
-	if model.GetCompat().SendSessionAffinityHeaders {
-		for k, v := range sessionHeaders(&o) {
+	resp, err := sendProviderRequest(ctx, &o, providerRequest{label: "azure openai", send: func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("api-key", apiKey)
+		// Azure OpenAI gets the session id in the body as prompt_cache_key, so
+		// session-affinity headers are opt-in.
+		if model.GetCompat().SendSessionAffinityHeaders {
+			for k, v := range sessionHeaders(model, &o) {
+				req.Header.Set(k, v)
+			}
+		}
+		for k, v := range o.headers {
 			req.Header.Set(k, v)
 		}
-	}
-	for k, v := range o.headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
+		return doHeaderRequest(req, o.timeout, "azure openai")
+	}})
 	if err != nil {
-		return fmt.Errorf("azure openai: request: %w", err)
+		return err
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
@@ -112,15 +127,6 @@ func (c *azureClient) Stream(ctx context.Context, model *Model, prompt *Context,
 
 	if hasResponseCallback(&o) {
 		invokeResponseCallback(&o, model, responseMetadata(resp))
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return fmt.Errorf("azure openai: status %d", resp.StatusCode)
-		}
-
-		return fmt.Errorf("azure openai: status %d: %s", resp.StatusCode, string(body))
 	}
 
 	output := AssistantMessage{
@@ -133,9 +139,14 @@ func (c *azureClient) Stream(ctx context.Context, model *Model, prompt *Context,
 		Usage:      Usage{},
 		Timestamp:  timestamp(),
 	}
+	grammarInputs, err := responsesGrammarInputs(model, prompt.Tools)
+	if err != nil {
+		return err
+	}
 	streamOpts := &ResponsesStreamOptions{
 		ServiceTier:             o.serviceTier,
 		ApplyServiceTierPricing: ServiceTierPricing,
+		GrammarInputs:           grammarInputs,
 	}
 
 	reader := newResponsesStreamReader(resp.Body)
@@ -168,9 +179,11 @@ func resolveAzureConfig(model *Model, o *options) (baseURL, apiVersion, deployme
 	if baseURL == "" {
 		baseURL = model.BaseURL
 	}
-	baseURL = strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
-	if baseURL == "" {
+	if strings.TrimSpace(baseURL) == "" {
 		return "", "", "", errors.New("azure openai: missing endpoint (set AZURE_OPENAI_BASE_URL, AZURE_OPENAI_RESOURCE_NAME, or model baseURL)")
+	}
+	if baseURL, err = normalizeAzureBaseURL(baseURL); err != nil {
+		return "", "", "", err
 	}
 
 	if o != nil && strings.TrimSpace(o.azureDeploymentName) != "" {
@@ -184,6 +197,28 @@ func resolveAzureConfig(model *Model, o *options) (baseURL, apiVersion, deployme
 	}
 
 	return baseURL, apiVersion, deploymentName, nil
+}
+
+// normalizeAzureBaseURL points bare Azure and Foundry resource URLs at the
+// /openai/v1 API root.
+func normalizeAzureBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Scheme == "" {
+		return "", fmt.Errorf("azure openai: invalid base URL %q", raw)
+	}
+	host := u.Hostname()
+	azureHost := strings.HasSuffix(host, ".openai.azure.com") ||
+		strings.HasSuffix(host, ".cognitiveservices.azure.com") ||
+		strings.HasSuffix(host, ".ai.azure.com")
+	switch strings.TrimRight(u.Path, "/") {
+	case "", "/openai", "/openai/v1/responses":
+		if azureHost {
+			u.Path = "/openai/v1"
+			u.RawQuery = ""
+		}
+	}
+	return strings.TrimRight(u.String(), "/"), nil
 }
 
 func parseAzureDeploymentNameMap(value string) map[string]string {
@@ -213,28 +248,19 @@ func parseAzureDeploymentNameMap(value string) map[string]string {
 }
 
 // buildAzureRequestBody builds the Azure OpenAI Responses request body.
-func buildAzureRequestBody(model *Model, aiCtx *Context, o *options) map[string]any {
-	transformedCtx := aiCtx
+func buildAzureRequestBody(model *Model, aiCtx *Context, o *options) (map[string]any, error) {
 	input, err := ConvertResponsesMessages(model, aiCtx, azureResponsesToolCallProviders, &ConvertResponsesMessagesOptions{
 		IncludeSystemPrompt: true,
 	})
 	if err != nil {
-		input = nil
-	} else {
-		transformedCtx = &Context{
-			SystemPrompt: aiCtx.SystemPrompt,
-			Messages:     nil,
-			Tools:        aiCtx.Tools,
-		}
-		if transformed, transformErr := TransformContext(aiCtx, model, openAIResponsesToolCallIDNormalizerWithProviders(model, azureResponsesToolCallProviders)); transformErr == nil {
-			transformedCtx = transformed
-		}
+		return nil, err
 	}
 
 	body := map[string]any{
 		"model":  model.ID,
 		"input":  input,
 		"stream": true,
+		"store":  false,
 	}
 
 	if o.temperature != nil {
@@ -242,7 +268,7 @@ func buildAzureRequestBody(model *Model, aiCtx *Context, o *options) map[string]
 	}
 
 	if o.maxTokens > 0 {
-		body["max_output_tokens"] = o.maxTokens
+		body["max_output_tokens"] = max(o.maxTokens, 16)
 	}
 
 	if o.topP != nil {
@@ -250,27 +276,38 @@ func buildAzureRequestBody(model *Model, aiCtx *Context, o *options) map[string]
 	}
 
 	if sessionID := cacheSessionID(o); sessionID != "" {
-		body["prompt_cache_key"] = sessionID
+		body["prompt_cache_key"] = clampOpenAIPromptCacheKey(sessionID)
 	}
 
 	if len(o.metadata) > 0 {
 		body["metadata"] = o.metadata
 	}
 
-	if len(transformedCtx.Tools) > 0 {
-		body["tools"] = ConvertResponsesTools(transformedCtx.Tools)
+	if len(aiCtx.Tools) > 0 {
+		tools, err := responsesTools(model, aiCtx.Tools, supportsStrictMode(model, true))
+		if err != nil {
+			return nil, err
+		}
+		body["tools"] = tools
 	}
 
 	if model.Reasoning {
-		reasoning := map[string]any{"effort": "none"}
-		if o.reasoning != "" && o.reasoning != ReasoningOff {
-			reasoning["effort"] = string(o.reasoning)
+		effort := responsesReasoningEffort(model, o)
+		if effort != "" || o.reasoningSummary != "" {
+			body["reasoning"] = map[string]any{
+				"effort":  defaultString(effort, "medium"),
+				"summary": defaultString(o.reasoningSummary, "auto"),
+			}
 			body["include"] = []string{"reasoning.encrypted_content"}
+		} else if off, ok := responsesOffEffort(model); ok {
+			body["reasoning"] = map[string]any{"effort": off}
 		}
-		body["reasoning"] = reasoning
 	}
 
-	return body
+	// Last so model and request sampling parameters override named fields.
+	maps.Copy(body, resolveSamplingParams(model, o))
+
+	return body, nil
 }
 
 var azureResponsesToolCallProviders = map[string]struct{}{
@@ -278,10 +315,6 @@ var azureResponsesToolCallProviders = map[string]struct{}{
 	ProviderOpenAICodex: {},
 	ProviderOpenCode:    {},
 	ProviderAzureOpenAI: {},
-}
-
-func convertAzureResponsesMessage(model *Model, msg Message) []map[string]any {
-	return convertMessageForOpenAIResponses(model, msg, 0)
 }
 
 // streamAzureResponse streams Azure Responses API SSE events.

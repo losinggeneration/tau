@@ -8,7 +8,6 @@ package proto
 
 import (
 	context "context"
-
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -27,6 +26,8 @@ const (
 	Plugin_ExecuteCommand_FullMethodName    = "/plugins.Plugin/ExecuteCommand"
 	Plugin_OnTerminalInput_FullMethodName   = "/plugins.Plugin/OnTerminalInput"
 	Plugin_Shutdown_FullMethodName          = "/plugins.Plugin/Shutdown"
+	Plugin_RouteModel_FullMethodName        = "/plugins.Plugin/RouteModel"
+	Plugin_ReachTools_FullMethodName        = "/plugins.Plugin/ReachTools"
 )
 
 // PluginClient is the client API for Plugin service.
@@ -51,6 +52,10 @@ type PluginClient interface {
 	OnTerminalInput(ctx context.Context, in *TerminalInput, opts ...grpc.CallOption) (*TerminalInputResponse, error)
 	// Cooperative shutdown: plugin drains in-flight work.
 	Shutdown(ctx context.Context, in *ShutdownRequest, opts ...grpc.CallOption) (*ShutdownResponse, error)
+	// Asks a registered virtual model's router for one request's physical model.
+	RouteModel(ctx context.Context, in *ModelRouteRequest, opts ...grpc.CallOption) (*ModelRouteResponse, error)
+	// Evaluates a tool's reachesTools callback for one call's arguments.
+	ReachTools(ctx context.Context, in *ToolCall, opts ...grpc.CallOption) (*ReachToolsResponse, error)
 }
 
 type pluginClient struct {
@@ -131,6 +136,26 @@ func (c *pluginClient) Shutdown(ctx context.Context, in *ShutdownRequest, opts .
 	return out, nil
 }
 
+func (c *pluginClient) RouteModel(ctx context.Context, in *ModelRouteRequest, opts ...grpc.CallOption) (*ModelRouteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelRouteResponse)
+	err := c.cc.Invoke(ctx, Plugin_RouteModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pluginClient) ReachTools(ctx context.Context, in *ToolCall, opts ...grpc.CallOption) (*ReachToolsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReachToolsResponse)
+	err := c.cc.Invoke(ctx, Plugin_ReachTools_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PluginServer is the server API for Plugin service.
 // All implementations must embed UnimplementedPluginServer
 // for forward compatibility.
@@ -153,6 +178,10 @@ type PluginServer interface {
 	OnTerminalInput(context.Context, *TerminalInput) (*TerminalInputResponse, error)
 	// Cooperative shutdown: plugin drains in-flight work.
 	Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error)
+	// Asks a registered virtual model's router for one request's physical model.
+	RouteModel(context.Context, *ModelRouteRequest) (*ModelRouteResponse, error)
+	// Evaluates a tool's reachesTools callback for one call's arguments.
+	ReachTools(context.Context, *ToolCall) (*ReachToolsResponse, error)
 	mustEmbedUnimplementedPluginServer()
 }
 
@@ -183,6 +212,12 @@ func (UnimplementedPluginServer) OnTerminalInput(context.Context, *TerminalInput
 }
 func (UnimplementedPluginServer) Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Shutdown not implemented")
+}
+func (UnimplementedPluginServer) RouteModel(context.Context, *ModelRouteRequest) (*ModelRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RouteModel not implemented")
+}
+func (UnimplementedPluginServer) ReachTools(context.Context, *ToolCall) (*ReachToolsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReachTools not implemented")
 }
 func (UnimplementedPluginServer) mustEmbedUnimplementedPluginServer() {}
 func (UnimplementedPluginServer) testEmbeddedByValue()                {}
@@ -331,6 +366,42 @@ func _Plugin_Shutdown_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Plugin_RouteModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ModelRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PluginServer).RouteModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Plugin_RouteModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PluginServer).RouteModel(ctx, req.(*ModelRouteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Plugin_ReachTools_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ToolCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PluginServer).ReachTools(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Plugin_ReachTools_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PluginServer).ReachTools(ctx, req.(*ToolCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Plugin_ServiceDesc is the grpc.ServiceDesc for Plugin service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -366,33 +437,44 @@ var Plugin_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Shutdown",
 			Handler:    _Plugin_Shutdown_Handler,
 		},
+		{
+			MethodName: "RouteModel",
+			Handler:    _Plugin_RouteModel_Handler,
+		},
+		{
+			MethodName: "ReachTools",
+			Handler:    _Plugin_ReachTools_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "plugin.proto",
 }
 
 const (
-	Host_UIConfirm_FullMethodName              = "/plugins.Host/UIConfirm"
-	Host_UISelect_FullMethodName               = "/plugins.Host/UISelect"
-	Host_UIInput_FullMethodName                = "/plugins.Host/UIInput"
-	Host_UINotify_FullMethodName               = "/plugins.Host/UINotify"
-	Host_UISetStatus_FullMethodName            = "/plugins.Host/UISetStatus"
-	Host_UISetWidget_FullMethodName            = "/plugins.Host/UISetWidget"
-	Host_UISetTitle_FullMethodName             = "/plugins.Host/UISetTitle"
-	Host_UISetEditorText_FullMethodName        = "/plugins.Host/UISetEditorText"
-	Host_UISetToolsExpanded_FullMethodName     = "/plugins.Host/UISetToolsExpanded"
-	Host_Log_FullMethodName                    = "/plugins.Host/Log"
-	Host_GetConfig_FullMethodName              = "/plugins.Host/GetConfig"
-	Host_ToolProgress_FullMethodName           = "/plugins.Host/ToolProgress"
-	Host_StateGet_FullMethodName               = "/plugins.Host/StateGet"
-	Host_StateSet_FullMethodName               = "/plugins.Host/StateSet"
-	Host_StateAppend_FullMethodName            = "/plugins.Host/StateAppend"
-	Host_StateDelete_FullMethodName            = "/plugins.Host/StateDelete"
-	Host_SessionAppend_FullMethodName          = "/plugins.Host/SessionAppend"
-	Host_SessionScan_FullMethodName            = "/plugins.Host/SessionScan"
-	Host_SessionSetLabel_FullMethodName        = "/plugins.Host/SessionSetLabel"
-	Host_SessionGetLabel_FullMethodName        = "/plugins.Host/SessionGetLabel"
-	Host_SessionSendUserMessage_FullMethodName = "/plugins.Host/SessionSendUserMessage"
+	Host_UIConfirm_FullMethodName                = "/plugins.Host/UIConfirm"
+	Host_UISelect_FullMethodName                 = "/plugins.Host/UISelect"
+	Host_UIInput_FullMethodName                  = "/plugins.Host/UIInput"
+	Host_UINotify_FullMethodName                 = "/plugins.Host/UINotify"
+	Host_UISetStatus_FullMethodName              = "/plugins.Host/UISetStatus"
+	Host_UISetWidget_FullMethodName              = "/plugins.Host/UISetWidget"
+	Host_UISetTitle_FullMethodName               = "/plugins.Host/UISetTitle"
+	Host_UISetEditorText_FullMethodName          = "/plugins.Host/UISetEditorText"
+	Host_UISetToolsExpanded_FullMethodName       = "/plugins.Host/UISetToolsExpanded"
+	Host_Log_FullMethodName                      = "/plugins.Host/Log"
+	Host_GetConfig_FullMethodName                = "/plugins.Host/GetConfig"
+	Host_ToolProgress_FullMethodName             = "/plugins.Host/ToolProgress"
+	Host_StateGet_FullMethodName                 = "/plugins.Host/StateGet"
+	Host_StateSet_FullMethodName                 = "/plugins.Host/StateSet"
+	Host_StateAppend_FullMethodName              = "/plugins.Host/StateAppend"
+	Host_StateDelete_FullMethodName              = "/plugins.Host/StateDelete"
+	Host_SessionAppend_FullMethodName            = "/plugins.Host/SessionAppend"
+	Host_SessionScan_FullMethodName              = "/plugins.Host/SessionScan"
+	Host_SessionSetLabel_FullMethodName          = "/plugins.Host/SessionSetLabel"
+	Host_SessionGetLabel_FullMethodName          = "/plugins.Host/SessionGetLabel"
+	Host_SessionSendUserMessage_FullMethodName   = "/plugins.Host/SessionSendUserMessage"
+	Host_SessionSendCustomMessage_FullMethodName = "/plugins.Host/SessionSendCustomMessage"
+	Host_SessionCompact_FullMethodName           = "/plugins.Host/SessionCompact"
+	Host_ToolDiscovery_FullMethodName            = "/plugins.Host/ToolDiscovery"
 )
 
 // HostClient is the client API for Host service.
@@ -435,6 +517,11 @@ type HostClient interface {
 	//
 	// Mirrors pi's pi.sendUserMessage semantics.
 	SessionSendUserMessage(ctx context.Context, in *SessionSendUserMessageRequest, opts ...grpc.CallOption) (*SessionSendUserMessageResponse, error)
+	SessionSendCustomMessage(ctx context.Context, in *SessionSendCustomMessageRequest, opts ...grpc.CallOption) (*SessionSendUserMessageResponse, error)
+	// Compact the active session (same path as auto-compaction and /compact).
+	SessionCompact(ctx context.Context, in *SessionCompactRequest, opts ...grpc.CallOption) (*SessionCompactResponse, error)
+	// Searches, describes, or activates tools in the active session's registry.
+	ToolDiscovery(ctx context.Context, in *ToolDiscoveryRequest, opts ...grpc.CallOption) (*ToolDiscoveryResponse, error)
 }
 
 type hostClient struct {
@@ -655,6 +742,36 @@ func (c *hostClient) SessionSendUserMessage(ctx context.Context, in *SessionSend
 	return out, nil
 }
 
+func (c *hostClient) SessionSendCustomMessage(ctx context.Context, in *SessionSendCustomMessageRequest, opts ...grpc.CallOption) (*SessionSendUserMessageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SessionSendUserMessageResponse)
+	err := c.cc.Invoke(ctx, Host_SessionSendCustomMessage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *hostClient) SessionCompact(ctx context.Context, in *SessionCompactRequest, opts ...grpc.CallOption) (*SessionCompactResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SessionCompactResponse)
+	err := c.cc.Invoke(ctx, Host_SessionCompact_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *hostClient) ToolDiscovery(ctx context.Context, in *ToolDiscoveryRequest, opts ...grpc.CallOption) (*ToolDiscoveryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ToolDiscoveryResponse)
+	err := c.cc.Invoke(ctx, Host_ToolDiscovery_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // HostServer is the server API for Host service.
 // All implementations must embed UnimplementedHostServer
 // for forward compatibility.
@@ -695,6 +812,11 @@ type HostServer interface {
 	//
 	// Mirrors pi's pi.sendUserMessage semantics.
 	SessionSendUserMessage(context.Context, *SessionSendUserMessageRequest) (*SessionSendUserMessageResponse, error)
+	SessionSendCustomMessage(context.Context, *SessionSendCustomMessageRequest) (*SessionSendUserMessageResponse, error)
+	// Compact the active session (same path as auto-compaction and /compact).
+	SessionCompact(context.Context, *SessionCompactRequest) (*SessionCompactResponse, error)
+	// Searches, describes, or activates tools in the active session's registry.
+	ToolDiscovery(context.Context, *ToolDiscoveryRequest) (*ToolDiscoveryResponse, error)
 	mustEmbedUnimplementedHostServer()
 }
 
@@ -767,6 +889,15 @@ func (UnimplementedHostServer) SessionGetLabel(context.Context, *SessionGetLabel
 }
 func (UnimplementedHostServer) SessionSendUserMessage(context.Context, *SessionSendUserMessageRequest) (*SessionSendUserMessageResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SessionSendUserMessage not implemented")
+}
+func (UnimplementedHostServer) SessionSendCustomMessage(context.Context, *SessionSendCustomMessageRequest) (*SessionSendUserMessageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SessionSendCustomMessage not implemented")
+}
+func (UnimplementedHostServer) SessionCompact(context.Context, *SessionCompactRequest) (*SessionCompactResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SessionCompact not implemented")
+}
+func (UnimplementedHostServer) ToolDiscovery(context.Context, *ToolDiscoveryRequest) (*ToolDiscoveryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ToolDiscovery not implemented")
 }
 func (UnimplementedHostServer) mustEmbedUnimplementedHostServer() {}
 func (UnimplementedHostServer) testEmbeddedByValue()              {}
@@ -1167,6 +1298,60 @@ func _Host_SessionSendUserMessage_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Host_SessionSendCustomMessage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SessionSendCustomMessageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostServer).SessionSendCustomMessage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Host_SessionSendCustomMessage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostServer).SessionSendCustomMessage(ctx, req.(*SessionSendCustomMessageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Host_SessionCompact_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SessionCompactRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostServer).SessionCompact(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Host_SessionCompact_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostServer).SessionCompact(ctx, req.(*SessionCompactRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Host_ToolDiscovery_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ToolDiscoveryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostServer).ToolDiscovery(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Host_ToolDiscovery_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostServer).ToolDiscovery(ctx, req.(*ToolDiscoveryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Host_ServiceDesc is the grpc.ServiceDesc for Host service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1257,6 +1442,18 @@ var Host_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SessionSendUserMessage",
 			Handler:    _Host_SessionSendUserMessage_Handler,
+		},
+		{
+			MethodName: "SessionSendCustomMessage",
+			Handler:    _Host_SessionSendCustomMessage_Handler,
+		},
+		{
+			MethodName: "SessionCompact",
+			Handler:    _Host_SessionCompact_Handler,
+		},
+		{
+			MethodName: "ToolDiscovery",
+			Handler:    _Host_ToolDiscovery_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

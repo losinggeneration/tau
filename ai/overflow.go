@@ -128,7 +128,22 @@ func IsContextOverflow(stopReason, errorMessage string, usage OverflowUsage, con
 		}
 	}
 
+	// Case 3: Length-stop overflow (Xiaomi MiMo style) - the server truncates
+	// oversized input to the window, leaving no room for output.
+	if contextWindow > 0 && stopReason == "length" && usage.Output == 0 {
+		if float64(usage.Input+usage.CacheHit) >= float64(contextWindow)*0.99 {
+			return true
+		}
+	}
+
 	return false
+}
+
+// IsRecoverableLength reports whether a length stop ended below the intended
+// output limit, which context pressure or provider truncation can cause.
+// desiredMaxOutput must be the limit before any context-based clamping.
+func IsRecoverableLength(stopReason string, output, desiredMaxOutput int) bool {
+	return stopReason == "length" && desiredMaxOutput > 0 && output < desiredMaxOutput
 }
 
 // getOverflowPatterns returns a defensive copy of overflow detection patterns for tests.

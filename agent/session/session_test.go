@@ -21,7 +21,7 @@ func TestEntryTypes(t *testing.T) {
 		{EntryTypeCompaction, true},
 		{EntryTypeCustomMessage, true},
 		{EntryTypePositionChange, false},
-		{EntryTypeBranchSummary, false},
+		{EntryTypeBranchSummary, true},
 		{EntryTypeSessionInfo, false},
 		{EntryTypeModelChange, false},
 		{EntryTypeThinkingChange, false},
@@ -2185,8 +2185,8 @@ func TestJSONLAllEntryTypesRoundTrip(t *testing.T) {
 	if EntryTypePositionChange.InContext() {
 		t.Error("EntryTypePositionChange must NOT be in LLM context")
 	}
-	if EntryTypeBranchSummary.InContext() {
-		t.Error("EntryTypeBranchSummary must NOT be in LLM context")
+	if !EntryTypeBranchSummary.InContext() {
+		t.Error("EntryTypeBranchSummary should be in LLM context")
 	}
 	if EntryTypeSessionInfo.InContext() {
 		t.Error("EntryTypeSessionInfo must NOT be in LLM context")

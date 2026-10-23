@@ -45,6 +45,16 @@ func (c *claudeAgentClient) Complete(ctx context.Context, model *Model, prompt *
 }
 
 func (c *claudeAgentClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) error {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	if model == nil {
 		return fmt.Errorf("claude agent stream: model is nil")
 	}
@@ -533,6 +543,8 @@ func claudeAgentEffort(opts *options) string {
 		return "medium"
 	case ReasoningHigh:
 		return "high"
+	case ReasoningMax:
+		return "max"
 	case ReasoningXHigh:
 		return "xhigh"
 	default:

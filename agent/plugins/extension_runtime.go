@@ -1,6 +1,11 @@
 // Package plugins implements the extension/plugin system for tau.
 package plugins
 
+import (
+	"context"
+	"slices"
+)
+
 // ProviderConfig describes a registered provider.
 type ProviderConfig struct {
 	Name   string
@@ -48,9 +53,16 @@ func (m *Manager) RegisterToolRefreshCallback(fn ToolRefreshCallback) {
 // RefreshToolRegistry rebuilds the tool registry and calls all refresh callbacks.
 func (m *Manager) RefreshToolRegistry() {
 	m.mu.Lock()
-	// Rebuild tool registry from plugin registrations
-	// Tool rebuild logic would go here — for now, just call the callbacks.
-	callbacks := m.toolRefreshCallbacks
+	clear(m.toolHandlers)
+	for name, info := range m.plugins {
+		for _, tool := range info.Registrations.Tools {
+			fullName := info.Registrations.ToolPrefix + tool.Name
+			m.toolHandlers[fullName] = func(ctx context.Context, toolName, toolCallID, arguments string) (string, bool, error) {
+				return m.executeTool(ctx, name, tool.Name, toolCallID, arguments)
+			}
+		}
+	}
+	callbacks := slices.Clone(m.toolRefreshCallbacks)
 	m.mu.Unlock()
 
 	for _, fn := range callbacks {

@@ -1,24 +1,19 @@
 package ai
 
 import (
+	"bytes"
+	"cmp"
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
-	"os/exec"
+	"regexp"
 	"strings"
-	"time"
+
+	"cloud.google.com/go/auth/credentials"
 )
 
 // VertexProvider handles Google Vertex AI API.
@@ -48,43 +43,23 @@ func (c *vertexClient) Complete(ctx context.Context, model *Model, prompt *Conte
 
 // Stream implements Client.Streamer.
 func (c *vertexClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	var o options
 	o.apply(opts)
 
-	// Get project and location
-	project := strings.TrimSpace(o.vertexProject)
-	if project == "" {
-		project = os.Getenv("GOOGLE_CLOUD_PROJECT")
-	}
-	if project == "" {
-		project = os.Getenv("GCLOUD_PROJECT")
-	}
-	if project == "" {
-		return errors.New("vertex ai: missing project (set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or use WithVertexProject)")
-	}
-
-	location := strings.TrimSpace(o.vertexLocation)
-	if location == "" {
-		location = os.Getenv("GOOGLE_CLOUD_LOCATION")
-	}
-	if location == "" {
-		return errors.New("vertex ai: missing location (set GOOGLE_CLOUD_LOCATION or use WithVertexLocation)")
-	}
-
-	// Get credentials
-	auth, err := getGoogleCloudCredentials(ctx)
+	url, auth, err := resolveVertexEndpoint(ctx, model, &o)
 	if err != nil {
-		return fmt.Errorf("vertex ai: get credentials: %w", err)
+		return err
 	}
-
-	// Build URL
-	modelID := c.model.ID
-	if modelID == "" {
-		modelID = "gemini-2.0-flash"
-	}
-
-	url := fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/%s/models/%s:streamGenerateContent?alt=sse",
-		location, project, location, "google", modelID)
 
 	// Build request body
 	body, err := buildVertexRequestBody(model, prompt, &o)
@@ -104,27 +79,24 @@ func (c *vertexClient) Stream(ctx context.Context, model *Model, prompt *Context
 		return fmt.Errorf("vertex ai: marshal request: %w", err)
 	}
 
-	// Create request
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(bodyBytes)))
+	resp, err := sendProviderRequest(ctx, &o, providerRequest{label: "vertex ai", send: func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if auth.APIKey != "" {
+			req.Header.Set("x-goog-api-key", auth.APIKey)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
+		}
+		for k, v := range o.headers {
+			req.Header.Set(k, v)
+		}
+		return doHeaderRequest(req, o.timeout, "vertex ai")
+	}})
 	if err != nil {
-		return fmt.Errorf("vertex ai: create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	if auth.APIKey != "" {
-		req.Header.Set("x-goog-api-key", auth.APIKey)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+auth.BearerToken)
-	}
-	for k, v := range o.headers {
-		req.Header.Set(k, v)
-	}
-
-	// Execute request
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("vertex ai: request: %w", err)
+		return err
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
@@ -136,275 +108,102 @@ func (c *vertexClient) Stream(ctx context.Context, model *Model, prompt *Context
 		invokeResponseCallback(&o, model, responseMetadata(resp))
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return fmt.Errorf("vertex ai: status %d", resp.StatusCode)
-		}
-
-		return fmt.Errorf("vertex ai: status %d: %s", resp.StatusCode, string(body))
-	}
-
 	// Stream response
 	return streamVertexResponse(ctx, resp.Body, model, handler)
 }
+
+const vertexCredentialsMarker = "gcp-vertex-credentials"
+
+var vertexVersionedPath = regexp.MustCompile(`(?:^|/)v\d+(?:beta\d*)?(?:/|$)`)
 
 type googleCloudAuth struct {
 	APIKey      string
 	BearerToken string
 }
 
-// getGoogleCloudCredentials gets Google Cloud auth for Vertex AI.
-// It prefers explicit API keys, then ADC/service-account based bearer tokens.
+// resolveVertexEndpoint follows upstream's @google/genai client setup: an API
+// key uses the global express endpoint without a project, credentials need a
+// project and location, and a catalog base URL without {location} is a
+// collection root that receives no project prefix.
+func resolveVertexEndpoint(ctx context.Context, model *Model, o *options) (string, googleCloudAuth, error) {
+	modelPath := "publishers/google/models/" + model.ID + ":streamGenerateContent?alt=sse"
+	baseURL := strings.TrimSpace(model.BaseURL)
+	if strings.Contains(baseURL, "{location}") {
+		baseURL = ""
+	}
+	auth := googleCloudAuth{APIKey: cmp.Or(vertexAPIKey(o.apiKey), os.Getenv("GOOGLE_CLOUD_API_KEY"), os.Getenv("VERTEXAI_API_KEY"))}
+	if auth.APIKey != "" {
+		if baseURL == "" {
+			baseURL = "https://aiplatform.googleapis.com"
+		}
+		return joinVertexURL(baseURL, modelPath), auth, nil
+	}
+
+	project := cmp.Or(strings.TrimSpace(o.vertexProject), os.Getenv("GOOGLE_CLOUD_PROJECT"), os.Getenv("GCLOUD_PROJECT"))
+	if project == "" {
+		return "", auth, errors.New("vertex ai: missing project (set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or use WithVertexProject)")
+	}
+	location := cmp.Or(strings.TrimSpace(o.vertexLocation), os.Getenv("GOOGLE_CLOUD_LOCATION"))
+	if location == "" {
+		return "", auth, errors.New("vertex ai: missing location (set GOOGLE_CLOUD_LOCATION or use WithVertexLocation)")
+	}
+	auth, err := getGoogleCloudCredentials(ctx)
+	if err != nil {
+		return "", auth, fmt.Errorf("vertex ai: get credentials: %w", err)
+	}
+	if baseURL != "" {
+		return joinVertexURL(baseURL, modelPath), auth, nil
+	}
+	switch location {
+	case "global":
+		baseURL = "https://aiplatform.googleapis.com"
+	case "us", "eu":
+		baseURL = "https://aiplatform." + location + ".rep.googleapis.com"
+	default:
+		baseURL = "https://" + location + "-aiplatform.googleapis.com"
+	}
+	return joinVertexURL(baseURL, "projects/"+project+"/locations/"+location+"/"+modelPath), auth, nil
+}
+
+func joinVertexURL(baseURL, path string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	if !vertexVersionedPath.MatchString(baseURL[strings.Index(baseURL, "//")+2:]) {
+		baseURL += "/v1"
+	}
+	return baseURL + "/" + path
+}
+
+// vertexAPIKey ignores the credential marker and placeholder keys such as
+// "<authenticated>", which only report that ambient credentials exist.
+func vertexAPIKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == vertexCredentialsMarker || (strings.HasPrefix(key, "<") && strings.HasSuffix(key, ">")) {
+		return ""
+	}
+	return key
+}
+
+// getGoogleCloudCredentials gets a Vertex AI bearer token from
+// GOOGLE_ACCESS_TOKEN or Application Default Credentials
+// (GOOGLE_APPLICATION_CREDENTIALS, the gcloud ADC file, or the metadata server).
 func getGoogleCloudCredentials(ctx context.Context) (googleCloudAuth, error) {
-	// First try environment variable
 	if token := os.Getenv("GOOGLE_ACCESS_TOKEN"); token != "" {
 		return googleCloudAuth{BearerToken: token}, nil
 	}
-
-	if apiKey := os.Getenv("GOOGLE_CLOUD_API_KEY"); apiKey != "" {
-		return googleCloudAuth{APIKey: apiKey}, nil
-	}
-
-	// Check for VERTEXAI_API_KEY (legacy explicit API key for Vertex AI)
-	if apiKey := os.Getenv("VERTEXAI_API_KEY"); apiKey != "" {
-		return googleCloudAuth{APIKey: apiKey}, nil
-	}
-
-	// Try to read from credentials file
-	credsFile := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
-	if credsFile != "" {
-		token, err := getTokenFromServiceAccount(ctx, credsFile)
-		if err != nil {
-			return googleCloudAuth{}, err
-		}
-		return googleCloudAuth{BearerToken: token}, nil
-	}
-
-	// Try gcloud CLI
-	token, err := getTokenFromGcloud(ctx)
-	if err == nil && token != "" {
-		return googleCloudAuth{BearerToken: token}, nil
-	}
-
-	// Try metadata server (for GCE, Cloud Run, etc.)
-	token, err = getTokenFromMetadata(ctx)
-	if err == nil {
-		return googleCloudAuth{BearerToken: token}, nil
-	}
-
-	// Return error with helpful message
-	return googleCloudAuth{}, fmt.Errorf("vertex ai: no valid credentials found: %w", err)
-}
-
-// getTokenFromServiceAccount reads a service account JSON file and obtains an access token.
-func getTokenFromServiceAccount(ctx context.Context, credsFile string) (string, error) {
-	data, err := os.ReadFile(credsFile)
-	if err != nil {
-		return "", fmt.Errorf("read credentials file: %w", err)
-	}
-
-	var creds struct {
-		ClientEmail string `json:"client_email"`
-		PrivateKey  string `json:"private_key"`
-		TokenURL    string `json:"token_uri"`
-	}
-
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return "", fmt.Errorf("parse credentials: %w", err)
-	}
-
-	token, err := getAccessTokenFromTokenURI(ctx, creds.TokenURL, creds.ClientEmail, creds.PrivateKey)
-	if err != nil {
-		return "", err
-	}
-
-	return token, nil
-}
-
-// getAccessTokenFromTokenURI gets an access token from the service-account token URI.
-func getAccessTokenFromTokenURI(ctx context.Context, tokenURI, clientEmail, privateKey string) (string, error) {
-	if tokenURI == "" || clientEmail == "" || privateKey == "" {
-		return "", errors.New("vertex ai: incomplete service account credentials")
-	}
-
-	keyBlock, err := base64URLDecodePEMKey(privateKey)
-	if err != nil {
-		return "", fmt.Errorf("vertex ai: parse service account key: %w", err)
-	}
-
-	assertion, err := buildServiceAccountAssertion(clientEmail, tokenURI, keyBlock)
-	if err != nil {
-		return "", fmt.Errorf("vertex ai: build service account assertion: %w", err)
-	}
-
-	form := url.Values{}
-	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
-	form.Set("assertion", assertion)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURI, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("vertex ai: token exchange status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return "", err
-	}
-	if tokenResp.AccessToken == "" {
-		return "", errors.New("vertex ai: token exchange returned empty access token")
-	}
-
-	return tokenResp.AccessToken, nil
-}
-
-func base64URLDecodePEMKey(privateKey string) (*rsa.PrivateKey, error) {
-	block, _ := pem.Decode([]byte(privateKey))
-	if block == nil {
-		return nil, errors.New("invalid PEM block")
-	}
-
-	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
-		rsaKey, ok := key.(*rsa.PrivateKey)
-		if !ok {
-			return nil, errors.New("private key is not RSA")
-		}
-		return rsaKey, nil
-	}
-
-	return x509.ParsePKCS1PrivateKey(block.Bytes)
-}
-
-func buildServiceAccountAssertion(clientEmail, tokenURI string, key *rsa.PrivateKey) (string, error) {
-	headerJSON, err := json.Marshal(map[string]string{
-		"alg": "RS256",
-		"typ": "JWT",
+	// ponytail: credentials are detected per request; cache them per client if token exchanges show up in latency.
+	creds, err := credentials.DetectDefault(&credentials.DetectOptions{
+		Scopes:          []string{"https://www.googleapis.com/auth/cloud-platform"},
+		CredentialsFile: os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+		Client:          http.DefaultClient,
 	})
 	if err != nil {
-		return "", err
+		return googleCloudAuth{}, err
 	}
-
-	now := time.Now()
-	claimsJSON, err := json.Marshal(map[string]any{
-		"iss":   clientEmail,
-		"scope": "https://www.googleapis.com/auth/cloud-platform",
-		"aud":   tokenURI,
-		"iat":   now.Unix(),
-		"exp":   now.Add(time.Hour).Unix(),
-	})
+	token, err := creds.Token(ctx)
 	if err != nil {
-		return "", err
+		return googleCloudAuth{}, err
 	}
-
-	encodedHeader := base64.RawURLEncoding.EncodeToString(headerJSON)
-	encodedClaims := base64.RawURLEncoding.EncodeToString(claimsJSON)
-	signingInput := encodedHeader + "." + encodedClaims
-
-	hash := sha256.Sum256([]byte(signingInput))
-	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash[:])
-	if err != nil {
-		return "", err
-	}
-
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature), nil
-}
-
-// getTokenFromGcloud tries to get a token using the gcloud CLI.
-// Returns the access token if gcloud is available and configured.
-func getTokenFromGcloud(ctx context.Context) (string, error) {
-	// Check if gcloud is available
-	_, err := exec.LookPath("gcloud")
-	if err != nil {
-		return "", errors.New("gcloud not found in PATH")
-	}
-
-	// Try to get access token via gcloud
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "gcloud", "auth", "application-default", "print-access-token")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("gcloud auth failed: %w", err)
-	}
-
-	token := strings.TrimSpace(string(output))
-	if token == "" {
-		return "", errors.New("gcloud returned empty token")
-	}
-
-	return token, nil
-}
-
-// getTokenFromMetadata gets a token from the GCP metadata server.
-func getTokenFromMetadata(ctx context.Context) (token string, _ error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-		nil)
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Metadata-Flavor", "Google")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("metadata server: %w", err)
-	}
-	var closeErr error
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			if closeErr == nil {
-				closeErr = err
-			}
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("metadata server status: %d", resp.StatusCode)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-
-	if err := json.Unmarshal(data, &tokenResp); err != nil {
-		return "", err
-	}
-
-	if closeErr != nil {
-		return "", closeErr
-	}
-
-	return tokenResp.AccessToken, nil
+	return googleCloudAuth{BearerToken: token.Value}, nil
 }
 
 // buildVertexRequestBody builds the Vertex AI request body.
@@ -492,14 +291,15 @@ func buildVertexRequestBody(model *Model, aiCtx *Context, o *options) (map[strin
 
 	// Add tools if present with full toolConfig support (P7-GG01)
 	if len(transformedCtx.Tools) > 0 {
-		tools := buildVertexTools(transformedCtx.Tools)
-		body["tools"] = tools
+		declarations, strict, err := googleFunctionDeclarations(model, transformedCtx.Tools, googleJSONSchemaParameters)
+		if err != nil {
+			return nil, err
+		}
+		body["tools"] = []map[string]any{{"functionDeclarations": declarations}}
 
 		// Add toolConfig for tool choice and allowed function names (P7-GG01)
-		if mode := toolChoiceMode(o.toolChoice); mode != "" {
-			functionCallingConfig := map[string]any{
-				"mode": mapToolChoice(o.toolChoice),
-			}
+		if mode := googleFunctionCallingMode(o.toolChoice, strict); mode != "" {
+			functionCallingConfig := map[string]any{"mode": mode}
 			// When the caller specifies a particular function (OpenAI-style
 			// {"type":"function","function":{"name":"..."}} or Anthropic-style
 			// {"type":"tool","name":"..."}), restrict the model to that function.
@@ -520,90 +320,24 @@ func buildVertexRequestBody(model *Model, aiCtx *Context, o *options) (map[strin
 	return body, nil
 }
 
-// addVertexThinkingConfig adds thinking configuration for Vertex AI.
-// Matches pi-mono's google-vertex.ts behavior for thinking levels and budgets.
-// P7-VX02: Build a ThinkingConfig with the full enum mapping.
-// P7-VX03: Disabled ThinkingConfig for non-reasoning models.
+// addVertexThinkingConfig adds the request's thinking control, matching
+// upstream google-vertex.
 func addVertexThinkingConfig(body map[string]any, model *Model, o *options) error {
-	// Add thinking config if explicitly enabled with budget, or if budget tokens > 0
-	// (budget tokens > 0 indicates thinking should be enabled even if thinkingEnabled is not set)
-	if (o.thinkingEnabled || o.thinkingBudgetTokens > 0) && model.Reasoning {
-		if o.googleThinkingLevel != "" {
-			body["thinkingConfig"] = map[string]any{
-				"thinkingLevel":   string(o.googleThinkingLevel),
-				"includeThoughts": true,
-			}
-		} else if isGemini3ProModel(model.ID) {
-			// Gemini 3 Pro: cannot use thinkingBudget, use thinkingLevel LOW instead
-			body["thinkingConfig"] = map[string]any{
-				"thinkingLevel":   "LOW",
-				"includeThoughts": true,
-			}
-		} else if isGemini3FlashModel(model.ID) {
-			// Gemini 3 Flash: use MINIMAL level
-			body["thinkingConfig"] = map[string]any{
-				"thinkingLevel":   "MINIMAL",
-				"includeThoughts": true,
-			}
-		} else if isGemma4Model(model.ID) {
-			// Gemma 4: use MINIMAL level
-			body["thinkingConfig"] = map[string]any{
-				"thinkingLevel":   "MINIMAL",
-				"includeThoughts": true,
-			}
-		} else {
-			// Gemini 2.x: use thinkingBudget
-			body["thinkingConfig"] = map[string]any{
-				"thinkingBudget":  o.thinkingBudgetTokens,
-				"includeThoughts": true,
-			}
-		}
-		return nil
+	thinking, ok, err := resolveGoogleThinking(model, o)
+	if err != nil || !ok {
+		return err
 	}
-
-	// If thinking is explicitly disabled (budget = 0) but model has reasoning
-	if !o.thinkingEnabled && o.thinkingBudgetTokens == 0 && model.Reasoning {
-		// For models that cannot fully disable thinking, use lowest level
-		if isGemini3ProModel(model.ID) {
-			// Gemini 3 Pro: cannot disable thinking, use LOW level
-			body["thinkingConfig"] = map[string]any{
-				"thinkingLevel": "LOW",
-			}
-		} else if isGemma4Model(model.ID) || isGemini3FlashModel(model.ID) {
-			// Gemma 4 / Gemini 3 Flash: use MINIMAL
-			body["thinkingConfig"] = map[string]any{
-				"thinkingLevel": "MINIMAL",
-			}
-		} else {
-			// Gemini 2.x: supports disabling via thinkingBudget = 0
-			body["thinkingConfig"] = map[string]any{
-				"thinkingBudget": 0,
-			}
-		}
-		return nil
+	config := map[string]any{}
+	if thinking.enabled {
+		config["includeThoughts"] = true
 	}
-
-	// Default: if model has reasoning but no explicit option, don't force thinking config
-	// This lets the model's default behavior apply
+	if thinking.level != "" {
+		config["thinkingLevel"] = string(thinking.level)
+	} else if thinking.budget != nil {
+		config["thinkingBudget"] = *thinking.budget
+	}
+	body["thinkingConfig"] = config
 	return nil
-}
-
-// buildVertexTools converts tools to Vertex format.
-func buildVertexTools(tools []Tool) []map[string]any {
-	result := make([]map[string]any, len(tools))
-	for i, tool := range tools {
-		result[i] = map[string]any{
-			"functionDeclarations": []map[string]any{
-				{
-					"name":        tool.Name,
-					"description": tool.Description,
-					"parameters":  tool.Parameters,
-				},
-			},
-		}
-	}
-
-	return result
 }
 
 // streamVertexResponse streams the SSE response.
@@ -623,8 +357,11 @@ func streamVertexResponse(ctx context.Context, body io.Reader, model *Model, han
 
 	handler(ctx, Start{Partial: *output})
 
-	var currentBlock *ContentBlock
-	var toolCallCounter int64
+	var (
+		currentBlock    *ContentBlock
+		toolCallCounter int64
+		finished        bool
+	)
 	// Track in-progress tool calls for deduplication
 	activeToolCalls := make(map[string]*struct {
 		idx   int
@@ -754,7 +491,6 @@ func streamVertexResponse(ctx context.Context, body io.Reader, model *Model, han
 
 					handler(ctx, ToolCallStart{ContentIndex: idx, Partial: *output})
 					handler(ctx, ToolCallDelta{ContentIndex: idx, Delta: string(argsJSON), Partial: *output})
-					output.StopReason = StopReasonToolUse
 
 					// If this chunk has finishReason, this is the only/last chunk for this tool call
 					if candidate.FinishReason != "" {
@@ -765,8 +501,9 @@ func streamVertexResponse(ctx context.Context, body io.Reader, model *Model, han
 			}
 
 			// Handle finish reason
-			if candidate.FinishReason != "" && output.StopReason != StopReasonToolUse {
-				output.StopReason = googleStopReason(candidate.FinishReason)
+			if candidate.FinishReason != "" {
+				finished = true
+				output.StopReason, output.ErrorMessage = googleFinish(candidate.FinishReason, output.Content)
 			}
 		}
 
@@ -788,7 +525,7 @@ func streamVertexResponse(ctx context.Context, body io.Reader, model *Model, han
 		endVertexBlock(ctx, handler, *output, len(output.Content)-1, *currentBlock)
 	}
 
-	handler(ctx, Done{Reason: output.StopReason, Message: *output})
+	finishStream(ctx, handler, *output, finished, "google vertex stream ended without a finish reason")
 
 	return nil
 }

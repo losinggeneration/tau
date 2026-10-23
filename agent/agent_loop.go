@@ -3,53 +3,30 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/losinggeneration/tau/ai"
+	"github.com/xeipuuv/gojsonschema"
 )
 
-func aiThinkingBudget(level ThinkingLevel, budgets *ai.ThinkingBudgets) int {
-	if budgets == nil {
-		return 0
-	}
-
-	switch level {
-	case ThinkingMinimal:
-		if budgets.Minimal != nil {
-			return *budgets.Minimal
-		}
-	case ThinkingLow:
-		if budgets.Low != nil {
-			return *budgets.Low
-		}
-	case ThinkingMedium:
-		if budgets.Medium != nil {
-			return *budgets.Medium
-		}
-	case ThinkingHigh:
-		if budgets.High != nil {
-			return *budgets.High
-		}
-	}
-
-	return 0
-}
-
 func buildAIOptions(config AgentLoopConfig, model *ai.Model) []ai.Option {
-	opts := []ai.Option{}
+	opts := slices.Clone(config.RequestOptions)
 	if config.SessionID != "" {
 		opts = append(opts, ai.WithSessionID(config.SessionID))
 	}
 
-	if config.ThinkingLevel != "" && config.ThinkingLevel != ThinkingOff {
+	if config.ThinkingLevel != "" {
 		opts = append(opts, ai.WithReasoning(ai.ReasoningLevel(config.ThinkingLevel)))
-		if budget := aiThinkingBudget(config.ThinkingLevel, config.ThinkingBudgets); budget > 0 {
-			opts = append(opts, ai.WithThinkingEnabled(true), ai.WithThinkingBudgetTokens(budget))
-		}
+	}
+
+	if config.ThinkingBudgets != nil {
+		opts = append(opts, ai.WithThinkingBudgets(config.ThinkingBudgets))
 	}
 
 	if config.Transport != "" {
@@ -81,7 +58,6 @@ const (
 type loopInvocation struct {
 	currentCtx   *AgentContext
 	newMessages  []*Message
-	client       ai.Client
 	systemPrompt string
 	opts         []ai.Option
 }
@@ -96,7 +72,13 @@ func (c streamFuncClient) Stream(ctx context.Context, model *ai.Model, prompt *a
 
 func (c streamFuncClient) Complete(ctx context.Context, model *ai.Model, prompt *ai.Context, opts ...ai.Option) (*ai.AssistantMessage, error) {
 	var result *ai.AssistantMessage
+	var mu sync.Mutex
 	err := c.streamFn(ctx, model, prompt, func(_ context.Context, event ai.StreamEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		if result != nil {
+			return
+		}
 		switch e := event.(type) {
 		case ai.Done:
 			msg := e.Message
@@ -167,11 +149,6 @@ func prepareLoopInvocation(
 		model = currentCtx.Model
 	}
 
-	client, err := getLoopClient(model, config)
-	if err != nil {
-		return nil, fmt.Errorf("create client: %w", err)
-	}
-
 	systemPrompt := config.SystemPrompt
 	if systemPrompt == "" {
 		systemPrompt = currentCtx.SystemPrompt
@@ -188,7 +165,6 @@ func prepareLoopInvocation(
 	return &loopInvocation{
 		currentCtx:   currentCtx,
 		newMessages:  newMessages,
-		client:       client,
 		systemPrompt: systemPrompt,
 		opts:         buildAIOptions(config, model),
 	}, nil
@@ -208,7 +184,13 @@ func prepareLoopContext(agentCtx *AgentContext, mode loopStartMode, prompts []*M
 			Capabilities:    agentCtx.Capabilities,
 		}, newMessages, nil
 	case loopStartContinue:
-		if len(agentCtx.Messages) == 0 {
+		messages := slices.DeleteFunc(slices.Clone(agentCtx.Messages), func(message *Message) bool { return message == nil })
+		snapshot := *agentCtx
+		snapshot.Messages = messages
+		agentCtx = &snapshot
+		if len(agentCtx.Messages) == 0 || !slices.ContainsFunc(agentCtx.Messages, func(message *Message) bool {
+			return message != nil && message.Role != RoleSystem
+		}) {
 			return nil, nil, ErrCannotContinueNoMessages
 		}
 
@@ -223,72 +205,164 @@ func prepareLoopContext(agentCtx *AgentContext, mode loopStartMode, prompts []*M
 	}
 }
 
+func agentInputText(message *Message) string {
+	var text strings.Builder
+	for _, block := range message.Content {
+		if block.Type == ai.ContentBlockText {
+			text.WriteString(block.Text)
+		}
+	}
+	return text.String()
+}
+
 func executeLoopInvocation(
 	ctx context.Context,
 	invocation *loopInvocation,
 	config AgentLoopConfig,
 	emit EventSink,
-) ([]*Message, error) {
-	emit = withPluginEventDispatch(config, emit)
+) (messages []*Message, runErr error) {
+	defer func() {
+		// Stateful runs join cancellation at their lifecycle boundary.
+		if runErr != nil && !config.deferFailureEnd {
+			if err := ctx.Err(); err != nil {
+				runErr = errors.Join(runErr, err, context.Cause(ctx))
+			}
+		}
+	}()
+
+	emit = withPluginEventDispatch(ctx, config, emit)
 	dispatchEvent := func(name string, payload []byte) EventDispatchResult {
 		if config.EventDispatcher != nil {
-			return config.EventDispatcher(name, payload, config.SessionID)
+			return config.EventDispatcher(ctx, name, payload, config.SessionID)
 		}
 		return EventDispatchResult{}
 	}
 
-	// before_agent_start carries the current system prompt; subscribed plugins
-	// may return response_data {"systemPrompt": "..."} to rewrite it. Rewrites
-	// chain in dispatch order: each plugin's replacement becomes the base for
-	// the next applied rewrite, and the final value drives the loop. (pi
-	// semantics; within a pi-ext shim process, chained extensions are resolved
-	// there before the single response crosses the RPC boundary.)
-	if beforePayload, err := json.Marshal(map[string]any{"systemPrompt": invocation.systemPrompt}); err == nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var startupMessages []*Message
+	if config.GetStartupMessages != nil {
+		pending, err := config.GetStartupMessages(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("prepare startup messages: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		startupMessages = append(startupMessages, pending...)
+	}
+	// Startup prompt overrides affect requests only. System-aware context hooks
+	// retain authority over the projected prompt and declarations.
+	promptContext := ai.NormalizeContext(&ai.Context{SystemPrompt: invocation.systemPrompt, Messages: ConvertMessagesToAI(invocation.currentCtx.Messages)})
+	startup := map[string]any{"systemPrompt": ai.CurrentSystemPrompt(promptContext.Messages), "messageType": "user"}
+	if len(invocation.newMessages) > 0 {
+		startup["prompt"] = agentInputText(invocation.newMessages[0])
+		if invocation.newMessages[0].Role == RoleCustom || invocation.newMessages[0].Data != nil {
+			delete(startup, "prompt")
+			startup["messageType"] = "custom"
+			startup["message"] = invocation.newMessages[0]
+		}
+	}
+	if beforePayload, err := json.Marshal(startup); err == nil {
 		result := dispatchEvent("before_agent_start", beforePayload)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for _, resp := range result.Responses {
 			var data struct {
-				SystemPrompt string `json:"systemPrompt"`
+				SystemPrompt *string    `json:"systemPrompt"`
+				Messages     []*Message `json:"messages"`
 			}
-			if len(resp.ResponseData) == 0 || json.Unmarshal(resp.ResponseData, &data) != nil {
+			if len(resp.ResponseData) == 0 {
 				continue
 			}
-			if data.SystemPrompt != "" {
-				invocation.systemPrompt = data.SystemPrompt
+			if err := json.Unmarshal(resp.ResponseData, &data); err != nil {
+				continue
+			}
+			if data.SystemPrompt != nil {
+				config.forcedSystemPrompt = data.SystemPrompt
+			}
+			if len(data.Messages) > 0 {
+				startupMessages = append(startupMessages, data.Messages...)
 			}
 		}
 	} else {
-		dispatchEvent("before_agent_start", nil)
+		return nil, fmt.Errorf("marshal startup hook: %w", err)
 	}
+	invocation.newMessages = append(invocation.newMessages, startupMessages...)
+	invocation.currentCtx.Messages = append(invocation.currentCtx.Messages, startupMessages...)
 	emit(AgentStart{})
 	dispatchEvent("agent_start", nil)
 	emit(TurnStart{})
 	dispatchEvent("turn_start", nil)
 
+	var admitted []*Message
 	for _, prompt := range invocation.newMessages {
+		if prompt.Role == RoleCustom || prompt.Data != nil {
+			admitted = append(admitted, prompt)
+			emit(MessageStart{Message: prompt})
+			emit(MessageEnd{Message: prompt})
+			continue
+		}
+		inputPayload, err := json.Marshal(map[string]any{"text": agentInputText(prompt), "source": "user"})
+		if err != nil {
+			return nil, fmt.Errorf("marshal input: %w", err)
+		}
+		response := dispatchEvent("input", inputPayload)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		handled := response.Blocked
+		for _, item := range response.Responses {
+			if len(item.ResponseData) == 0 {
+				continue
+			}
+			var result struct {
+				Action string            `json:"action"`
+				Text   string            `json:"text"`
+				Images []ai.ContentBlock `json:"images"`
+			}
+			if err := json.Unmarshal(item.ResponseData, &result); err != nil {
+				return nil, fmt.Errorf("parse input hook: %w", err)
+			}
+			switch result.Action {
+			case "handled":
+				handled = true
+			case "transform":
+				prompt.Content = append([]ai.ContentBlock{{Type: ai.ContentBlockText, Text: result.Text}}, result.Images...)
+			}
+		}
+		if handled {
+			invocation.currentCtx.Messages = slices.DeleteFunc(invocation.currentCtx.Messages, func(message *Message) bool { return message == prompt })
+			continue
+		}
+		admitted = append(admitted, prompt)
 		emit(MessageStart{Message: prompt})
 		emit(MessageEnd{Message: prompt})
-		// Fire the `input` event for plugin introspection. Plugins can
-		// block or rewrite user input here; the loop does not yet act on
-		// the block verdict, so the dispatch is informational.
-		dispatchEvent("input", eventPayloadMessage(prompt))
 	}
+	if len(invocation.newMessages) > 0 && len(admitted) == 0 {
+		emit(AgentEnd{})
+		dispatchEvent("agent_end", nil)
+		return nil, nil
+	}
+	invocation.newMessages = admitted
 
 	result, err := runLoop(
 		ctx,
 		invocation.currentCtx,
 		invocation.newMessages,
 		config,
-		invocation.client,
 		invocation.systemPrompt,
 		invocation.opts,
 		emit,
 	)
 	if err != nil {
-		// Direct loop callers still receive a complete lifecycle. Higher-level
-		// Agent methods may additionally synthesize assistant error messages, but
-		// AgentEnd must remain the final emitted loop event on this path.
-		emit(AgentEnd{Messages: result})
-		dispatchEvent("agent_end", nil)
+		if !config.deferFailureEnd {
+			emit(AgentEnd{Messages: result})
+			dispatchEvent("agent_end", nil)
+		}
 		return result, err
 	}
 
@@ -297,7 +371,7 @@ func executeLoopInvocation(
 	return result, nil
 }
 
-func withPluginEventDispatch(config AgentLoopConfig, emit EventSink) EventSink {
+func withPluginEventDispatch(ctx context.Context, config AgentLoopConfig, emit EventSink) EventSink {
 	return func(event Event) {
 		emit(event)
 		if config.EventDispatcher == nil {
@@ -311,7 +385,7 @@ func withPluginEventDispatch(config AgentLoopConfig, emit EventSink) EventSink {
 		if err != nil {
 			return
 		}
-		config.EventDispatcher(name, payload, config.SessionID)
+		config.EventDispatcher(ctx, name, payload, config.SessionID)
 	}
 }
 
@@ -335,11 +409,12 @@ func eventPayloadMessage(msg *Message) []byte {
 		Arguments json.RawMessage `json:"arguments,omitempty"`
 	}
 	type payload struct {
-		Role       string `json:"role"`
-		Content    any    `json:"content"`
-		ToolCallID string `json:"tool_call_id,omitempty"`
-		ToolName   string `json:"tool_name,omitempty"`
-		IsError    bool   `json:"is_error,omitempty"`
+		DurationMs *float64 `json:"durationMs,omitempty"`
+		Role       string   `json:"role"`
+		Content    any      `json:"content"`
+		ToolCallID string   `json:"tool_call_id,omitempty"`
+		ToolName   string   `json:"tool_name,omitempty"`
+		IsError    bool     `json:"is_error,omitempty"`
 	}
 	var content any
 	if len(msg.Content) == 1 && msg.Content[0].Type == ai.ContentBlockText {
@@ -358,6 +433,7 @@ func eventPayloadMessage(msg *Message) []byte {
 		content = blocks
 	}
 	p := payload{
+		DurationMs: msg.DurationMs,
 		Role:       string(msg.Role),
 		Content:    content,
 		ToolCallID: msg.ToolCallID,
@@ -431,6 +507,7 @@ func eventPayloadToolResult(result *ToolResult) []byte {
 		toolName = result.Message.ToolName
 	}
 	type payload struct {
+		DurationMs    *float64          `json:"durationMs,omitempty"`
 		ToolName      string            `json:"tool_name"`
 		ToolCallID    string            `json:"tool_call_id"`
 		Result        string            `json:"result"`
@@ -438,6 +515,7 @@ func eventPayloadToolResult(result *ToolResult) []byte {
 		IsError       bool              `json:"is_error"`
 	}
 	p := payload{
+		DurationMs: result.DurationMs,
 		ToolName:   toolName,
 		ToolCallID: toolCallID,
 		Result:     result.Content,
@@ -472,6 +550,15 @@ func pluginEventName(event Event) string {
 	}
 }
 
+// recordResponseModel names the model that answered when the provider left
+// it out, so sessions and routers can tell which physical model replied.
+func recordResponseModel(msg *Message, model *ai.Model) {
+	if model == nil || msg.Provider != "" || msg.Model != "" {
+		return
+	}
+	msg.API, msg.Provider, msg.Model = model.API, model.Provider, model.ID
+}
+
 func getLoopClient(model *ai.Model, config AgentLoopConfig) (ai.Client, error) {
 	if model == nil {
 		return nil, fmt.Errorf("model is required: no model configured in agent context or loop config")
@@ -492,7 +579,6 @@ func runLoop(
 	currentCtx *AgentContext,
 	newMessages []*Message,
 	config AgentLoopConfig,
-	client ai.Client,
 	systemPrompt string,
 	opts []ai.Option,
 	emit EventSink,
@@ -503,14 +589,23 @@ func runLoop(
 
 	dispatchEvent := func(name string, payload []byte) EventDispatchResult {
 		if config.EventDispatcher != nil {
-			return config.EventDispatcher(name, payload, config.SessionID)
+			return config.EventDispatcher(ctx, name, payload, config.SessionID)
 		}
 		return EventDispatchResult{}
 	}
 
+	if config.Model == nil {
+		config.Model = currentCtx.Model
+	}
+	var (
+		client      ai.Client
+		clientModel *ai.Model
+	)
+
 	firstTurn := true
-	consecutiveEmptyResponses := 0
 	msgVersion := currentCtx.MessagesVersion
+	var explicitContinuation bool
+	var lastTurn AgentTurnContext
 
 	// Get pending messages from steering at start
 	pendingMessages, err := getSteeringMessages(ctx, config)
@@ -525,6 +620,38 @@ func runLoop(
 		// Inner loop: process tool calls and steering messages
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
 			if !firstTurn {
+				if config.PrepareNextTurn != nil {
+					update, err := config.PrepareNextTurn(ctx, lastTurn)
+					if err != nil {
+						return newMessages, fmt.Errorf("prepare next turn: %w", err)
+					}
+					if err := ctx.Err(); err != nil {
+						return newMessages, err
+					}
+					if update != nil {
+						if update.Context != nil {
+							currentCtx = update.Context
+							systemPrompt = currentCtx.SystemPrompt
+						}
+						if update.Model != nil {
+							config.Model = update.Model
+						}
+						if update.ThinkingLevel != nil {
+							config.ThinkingLevel = *update.ThinkingLevel
+						}
+						opts = buildAIOptions(config, config.Model)
+						pendingMessages = append(update.Messages, pendingMessages...)
+					}
+				}
+				// Preparation can run long (compaction), so admit steering queued
+				// meanwhile. Polling only when the turn-end poll came back empty
+				// keeps one-at-a-time delivery from admitting two messages.
+				if len(pendingMessages) == 0 {
+					pendingMessages, err = getSteeringMessages(ctx, config)
+					if err != nil {
+						return newMessages, err
+					}
+				}
 				emit(TurnStart{})
 				dispatchEvent("turn_start", nil)
 			} else {
@@ -562,10 +689,58 @@ func runLoop(
 				}
 			}
 
-			// Get the model
+			if err := ctx.Err(); err != nil {
+				return newMessages, err
+			}
+			if config.PrepareRequest != nil {
+				requestContext := *currentCtx
+				requestContext.SystemPrompt = systemPrompt
+				update, err := config.PrepareRequest(ctx, PrepareRequestContext{Context: &requestContext, Model: config.Model, ThinkingLevel: config.ThinkingLevel})
+				if err != nil {
+					return newMessages, fmt.Errorf("prepare request: %w", err)
+				}
+				if err := ctx.Err(); err != nil {
+					return newMessages, err
+				}
+				if update != nil {
+					if update.Context != nil {
+						currentCtx = update.Context
+						systemPrompt = currentCtx.SystemPrompt
+					}
+					if update.Model != nil {
+						config.Model = update.Model
+					}
+					if update.ThinkingLevel != nil {
+						config.ThinkingLevel = *update.ThinkingLevel
+					}
+					for _, message := range update.Messages {
+						if message == nil {
+							continue
+						}
+						emit(MessageStart{Message: message})
+						emit(MessageEnd{Message: message})
+						currentCtx.Messages = append(currentCtx.Messages, message)
+						newMessages = append(newMessages, message)
+						if message.Role == RoleSystem {
+							dispatchEvent("message_system", eventPayloadMessage(message))
+						}
+					}
+					opts = buildAIOptions(config, config.Model)
+				}
+			}
+			if err := context.Cause(ctx); err != nil {
+				return newMessages, err
+			}
 			model := config.Model
-			if model == nil {
-				model = currentCtx.Model
+			if client == nil || clientModel != model {
+				client, err = getLoopClient(model, config)
+				if err != nil {
+					return newMessages, fmt.Errorf("create client: %w", err)
+				}
+				clientModel = model
+			}
+			if err := ctx.Err(); err != nil {
+				return newMessages, err
 			}
 			// Fire the `model_select` event so plugins can observe which
 			// model is driving the current turn.
@@ -612,6 +787,9 @@ func runLoop(
 				message, err = streamAssistantResponse(ctx, currentCtx, config, client, model, systemPrompt, opts, emit)
 			}
 			if err != nil {
+				if message != nil {
+					newMessages = append(newMessages, message)
+				}
 				return newMessages, err
 			}
 
@@ -625,25 +803,19 @@ func runLoop(
 				return newMessages, nil
 			}
 
-			if isEmptyAssistantResponse(message) {
-				consecutiveEmptyResponses++
-				if consecutiveEmptyResponses >= maxConsecutiveEmptyResponses {
-					message.IsError = true
-					message.StopReason = ai.StopReasonError
-					message.ErrorMessage = fmt.Sprintf("empty response from server (%d consecutive)", consecutiveEmptyResponses)
-				}
-			} else {
-				consecutiveEmptyResponses = 0
-			}
-
 			newMessages = append(newMessages, message)
 
 			if message.StopReason == ai.StopReasonError || message.StopReason == ai.StopReasonAborted {
-				emit(TurnEnd{
-					Message:    message,
-					ToolCalls:  nil,
-					ToolResult: nil,
-				})
+				if config.FinishTurn != nil {
+					if _, err := config.FinishTurn(ctx, AgentTurnContext{Message: message, Context: currentCtx, NewMessages: newMessages}); err != nil {
+						return newMessages, fmt.Errorf("finish turn: %w", err)
+					}
+				}
+				emit(TurnEnd{Message: message})
+				dispatchEvent("turn_end", nil)
+				if config.FlushContextMessages != nil {
+					config.FlushContextMessages()
+				}
 				return newMessages, nil
 			}
 
@@ -653,18 +825,36 @@ func runLoop(
 
 			// Dispatch tool_call events and check for blocks
 			blockedToolCalls := make(map[int]bool)
+			overriddenToolCalls := make(map[int]*ToolResult)
 			for i := range toolCalls {
+				if err := ctx.Err(); err != nil {
+					return newMessages, err
+				}
 				blocked := dispatchEvent("tool_call", eventPayloadToolCall(toolCalls[i])).Blocked
+				if err := ctx.Err(); err != nil {
+					return newMessages, err
+				}
 				blockedToolCalls[i] = blocked
 
-				// Fire the bash-specific `user_bash` plugin event for tools
-				// named "bash". Plugins can observe or transform the command.
-				// The block verdict is not yet honored; this is informational.
-				// The canonical tool_call event above remains the authoritative
-				// plugin signal for any tool, including bash.
 				if toolCalls[i].Name == "bash" {
-					dispatchEvent("user_bash", eventPayloadToolCall(toolCalls[i]))
+					result := dispatchEvent("user_bash", eventPayloadToolCall(toolCalls[i]))
+					if err := ctx.Err(); err != nil {
+						return newMessages, err
+					}
+					blockedToolCalls[i] = blockedToolCalls[i] || result.Blocked
+					for _, response := range result.Responses {
+						blockedToolCalls[i] = blockedToolCalls[i] || response.Block
+						if len(response.ResponseData) == 0 {
+							continue
+						}
+						if overriddenToolCalls[i] != nil {
+							overriddenToolCalls[i] = &ToolResult{Content: "multiple user bash overrides", IsError: true}
+							break
+						}
+						overriddenToolCalls[i] = userBashOverride(response.ResponseData)
+					}
 				}
+
 			}
 
 			// Execute non-blocked tools
@@ -673,7 +863,7 @@ func runLoop(
 				// Build list of non-blocked tool calls
 				var nonBlockedCalls []ai.ToolCall
 				for i, tc := range toolCalls {
-					if !blockedToolCalls[i] {
+					if !blockedToolCalls[i] && overriddenToolCalls[i] == nil {
 						nonBlockedCalls = append(nonBlockedCalls, tc)
 					} else {
 						// Finalize blocked result as a normal tool result.
@@ -692,11 +882,14 @@ func runLoop(
 							Content: "Tool execution was blocked by a plugin",
 							IsError: true,
 						}
+						if override := overriddenToolCalls[i]; override != nil && !blockedToolCalls[i] {
+							blockedResult = override
+						}
 						emit(ToolEnd{
 							ToolCallID: tc.ID,
 							Name:       tc.Name,
 							Result:     blockedResult,
-							IsError:    true,
+							IsError:    blockedResult.IsError,
 						})
 						toolResult := finalizeToolResultMessage(tc, blockedResult, emit)
 						currentCtx.Messages = append(currentCtx.Messages, toolResult.Message)
@@ -718,12 +911,36 @@ func runLoop(
 				}
 			}
 
+			if len(toolResults) > 0 {
+				allTerminate := true
+				for _, result := range toolResults {
+					allTerminate = allTerminate && result.Terminate
+				}
+				if allTerminate {
+					hasMoreToolCalls = false
+				}
+			}
+			lastTurn = AgentTurnContext{Message: message, ToolResults: toolResults, Context: currentCtx, NewMessages: newMessages}
+			var decision TurnDecision
+			if config.FinishTurn != nil {
+				decision, err = config.FinishTurn(ctx, AgentTurnContext{Message: message, ToolResults: toolResults, Context: currentCtx, NewMessages: newMessages})
+				if err != nil {
+					return newMessages, fmt.Errorf("finish turn: %w", err)
+				}
+			}
 			emit(TurnEnd{
 				Message:    message,
 				ToolCalls:  toolCalls,
 				ToolResult: toolResults,
 			})
 			dispatchEvent("turn_end", nil)
+			if config.FlushContextMessages != nil {
+				config.FlushContextMessages()
+			}
+			if decision == TurnEndRun {
+				return newMessages, nil
+			}
+			explicitContinuation = decision == TurnContinue
 
 			// Steering guidance is admitted at each turn boundary. Follow-ups
 			// remain completion-only and are checked after the tool-driven run
@@ -731,6 +948,9 @@ func runLoop(
 			pendingMessages, err = getSteeringMessages(ctx, config)
 			if err != nil {
 				return newMessages, err
+			}
+			if hasMoreToolCalls || len(pendingMessages) > 0 {
+				explicitContinuation = false
 			}
 		}
 
@@ -740,25 +960,63 @@ func runLoop(
 			return newMessages, err
 		}
 		if len(followUpMessages) > 0 {
+			explicitContinuation = false
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages
 
 			continue
 		}
 
-		// No more messages, exit
+		if explicitContinuation {
+			explicitContinuation = false
+			continue
+		}
+		payload, err := json.Marshal(map[string]any{"messages": currentCtx.Messages})
+		if err != nil {
+			return newMessages, fmt.Errorf("marshal settlement: %w", err)
+		}
+		settlement := dispatchEvent("agent_before_settle", payload)
+		if err := ctx.Err(); err != nil {
+			return newMessages, err
+		}
+		for _, response := range settlement.Responses {
+			if len(response.ResponseData) == 0 {
+				continue
+			}
+			var update struct {
+				Continue bool       `json:"continue"`
+				Messages []*Message `json:"messages"`
+			}
+			if err := json.Unmarshal(response.ResponseData, &update); err != nil {
+				return newMessages, fmt.Errorf("parse settlement: %w", err)
+			}
+			pendingMessages = append(pendingMessages, update.Messages...)
+			explicitContinuation = explicitContinuation || update.Continue
+		}
+		if len(pendingMessages) > 0 || explicitContinuation {
+			explicitContinuation = false
+			continue
+		}
 		break
 	}
 
 	return newMessages, nil
 }
 
-const maxConsecutiveEmptyResponses = 1
-
 // getSteeringMessages gets steering messages if configured.
 func getSteeringMessages(ctx context.Context, config AgentLoopConfig) ([]*Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if config.GetSteeringMessages != nil {
-		return config.GetSteeringMessages(ctx)
+		messages, err := config.GetSteeringMessages(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return messages, nil
 	}
 
 	return nil, nil
@@ -766,8 +1024,18 @@ func getSteeringMessages(ctx context.Context, config AgentLoopConfig) ([]*Messag
 
 // getFollowUpMessages gets follow-up messages if configured.
 func getFollowUpMessages(ctx context.Context, config AgentLoopConfig) ([]*Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if config.GetFollowUpMessages != nil {
-		return config.GetFollowUpMessages(ctx)
+		messages, err := config.GetFollowUpMessages(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return messages, nil
 	}
 
 	return nil, nil
@@ -789,6 +1057,14 @@ func sleepUntil(ctx context.Context, until time.Time) error {
 	}
 }
 
+type publishedStreamFailure struct {
+	message *Message
+	err     error
+}
+
+func (e *publishedStreamFailure) Error() string { return e.err.Error() }
+func (e *publishedStreamFailure) Unwrap() error { return e.err }
+
 // streamAssistantResponse streams an assistant response from the LLM.
 func streamAssistantResponse(
 	ctx context.Context,
@@ -800,6 +1076,9 @@ func streamAssistantResponse(
 	opts []ai.Option,
 	emit EventSink,
 ) (*Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Apply context transform if configured
 	messages := agentCtx.Messages
 
@@ -811,13 +1090,35 @@ func streamAssistantResponse(
 		}
 	}
 
-	// System messages in the transcript are contextual instructions/summaries,
-	// not ordinary chat turns. Several providers either reject or silently drop
-	// role=system entries in the message array, so lift them into the provider's
-	// dedicated system prompt before conversion. This is especially important for
-	// compaction: after /compact the live history is a single "Session Summary:"
-	// system message, and the next provider request must receive that summary.
-	requestSystemPrompt, requestMessages := liftSystemMessagesIntoPrompt(systemPrompt, dropOrphanToolResults(messages))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var plainMessages, requestMessages []*Message
+	var retainedSystem bool
+	for _, message := range dropOrphanToolResults(messages) {
+		if message == nil || message.ExcludeFromContext {
+			continue
+		}
+		if message.Role == RoleSystem && !retainedSystem && len(message.Sections)+len(message.ToolsAdded)+len(message.ToolsRemoved) == 0 {
+			plainMessages = append(plainMessages, message)
+			continue
+		}
+		requestMessages = append(requestMessages, message)
+		if message.Role == RoleSystem {
+			retainedSystem = true
+		}
+		if message.Role != RoleSystem {
+			plainMessages = append(plainMessages, message)
+		}
+	}
+	requestSystemPrompt, ordinaryMessages := liftSystemMessagesIntoPrompt(systemPrompt, plainMessages)
+
+	if len(ordinaryMessages) > 0 && ordinaryMessages[0].Role == RoleUser {
+		firstOrdinary := slices.IndexFunc(requestMessages, func(message *Message) bool { return message.Role != RoleSystem })
+		if firstOrdinary < 0 || requestMessages[firstOrdinary].Role != RoleUser {
+			requestMessages = append([]*Message{ordinaryMessages[0]}, requestMessages...)
+		}
+	}
 
 	// Convert to LLM-compatible messages
 	llmMessages, err := config.ConvertToLlm(ctx, requestMessages)
@@ -825,6 +1126,9 @@ func streamAssistantResponse(
 		return nil, fmt.Errorf("convert to llm: %w", err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Build LLM context
 	aiCtx := &ai.Context{
 		SystemPrompt: requestSystemPrompt,
@@ -834,8 +1138,11 @@ func streamAssistantResponse(
 	// Collect tools from context
 	var tools []ai.Tool
 	if len(agentCtx.Tools) > 0 {
-		tools = make([]ai.Tool, len(agentCtx.Tools))
-		for i, t := range agentCtx.Tools {
+		tools = make([]ai.Tool, 0, len(agentCtx.Tools))
+		for _, t := range agentCtx.Tools {
+			if !modelDeclarable(t) {
+				continue
+			}
 			var params json.RawMessage
 			if t.Parameters != nil {
 				data, err := json.Marshal(t.Parameters)
@@ -844,28 +1151,124 @@ func streamAssistantResponse(
 				}
 				params = data
 			}
-			tools[i] = ai.Tool{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  params,
-			}
+			tools = append(tools, ai.Tool{
+				ConstrainedSampling: t.ConstrainedSampling,
+				Name:                t.Name,
+				Description:         t.Description,
+				Parameters:          params,
+			})
 		}
 
-		aiCtx.Tools = tools
+		if !hasToolDeclarationHistory(agentCtx.Messages) {
+			initial, err := visibleToolDeclarations(agentCtx.Tools)
+			if err != nil {
+				return nil, fmt.Errorf("initial tool declarations: %w", err)
+			}
+			aiCtx.Tools = initial
+		}
+	}
+
+	if config.EventDispatcher != nil {
+		for _, name := range []string{"context", "context_with_system"} {
+			if name == "context_with_system" && config.forcedSystemPrompt != nil {
+				normalized := ai.NormalizeContext(aiCtx)
+				head := ai.Message{Role: "system", Content: *config.forcedSystemPrompt}
+				if current := ai.CurrentSystemMessage(normalized.Messages); current != nil {
+					head.ToolsAdded = current.ToolsAdded
+					head.Timestamp = current.Timestamp
+				}
+				ordinary := slices.DeleteFunc(normalized.Messages, func(message ai.Message) bool { return message.Role == "system" })
+				aiCtx = &ai.Context{Messages: append([]ai.Message{head}, ordinary...)}
+			}
+			normalized := ai.NormalizeContext(aiCtx)
+			visible := normalized.Messages
+			if name == "context" {
+				visible = nil
+				for _, message := range normalized.Messages {
+					if message.Role != "system" {
+						visible = append(visible, message)
+					}
+				}
+			}
+			payload, err := json.Marshal(map[string]any{"messages": visible})
+			if err != nil {
+				return nil, fmt.Errorf("marshal %s: %w", name, err)
+			}
+			result := config.EventDispatcher(ctx, name, payload, config.SessionID)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			for _, response := range result.Responses {
+				if len(response.ResponseData) == 0 {
+					continue
+				}
+				var update struct {
+					Messages []ai.Message `json:"messages"`
+				}
+				if err := json.Unmarshal(response.ResponseData, &update); err != nil {
+					return nil, fmt.Errorf("parse %s: %w", name, err)
+				}
+				if update.Messages != nil {
+					if name == "context_with_system" {
+						aiCtx = &ai.Context{Messages: update.Messages}
+					} else {
+						// Only context_with_system may replace system instructions or tool state.
+						ordinary := slices.DeleteFunc(slices.Clone(update.Messages), func(message ai.Message) bool { return message.Role == "system" })
+						merged := make([]ai.Message, 0, len(normalized.Messages)+len(ordinary))
+						next := 0
+						for _, message := range normalized.Messages {
+							if message.Role == "system" {
+								merged = append(merged, message)
+							} else if next < len(ordinary) {
+								merged = append(merged, ordinary[next])
+								next++
+							}
+						}
+						merged = append(merged, ordinary[next:]...)
+						aiCtx = &ai.Context{Messages: merged}
+					}
+				}
+			}
+		}
+	}
+
+	// Transcript restoration and hooks may declare tools, but cannot grant registry exposure.
+	visibleTools := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		visibleTools[tool.Name] = struct{}{}
+	}
+	aiCtx.Messages = slices.Clone(aiCtx.Messages)
+	for i := range aiCtx.Messages {
+		message := &aiCtx.Messages[i]
+		if message.Role != "system" {
+			continue
+		}
+		message.ToolsAdded = slices.DeleteFunc(slices.Clone(message.ToolsAdded), func(tool ai.Tool) bool {
+			_, visible := visibleTools[tool.Name]
+			return !visible
+		})
 	}
 
 	var (
 		mu             sync.Mutex
 		partialMessage *Message
 		finalMessage   *Message
+		settled        bool
 	)
 
 	addedPartial := false
+	started := time.Now()
 
 	// Create event handler
 	handler := func(c context.Context, event ai.StreamEvent) {
+		if config.OnProviderStreamEvent != nil {
+			config.OnProviderStreamEvent(c, event)
+		}
 		mu.Lock()
 		defer mu.Unlock()
+		if settled {
+			return
+		}
 
 		switch e := event.(type) {
 		case ai.Start:
@@ -943,8 +1346,20 @@ func streamAssistantResponse(
 			emit(MessageUpdate{Message: partialMessage, AssistantMessageEvent: e})
 
 		case ai.Done:
-			if e.Message.Content != nil {
+			settled = true
+			{
+				if e.Message.StopReason == "" {
+					e.Message.StopReason = e.Reason
+				}
 				msg := messageFromAI(&e.Message)
+				recordResponseModel(msg, model)
+				msg.ThinkingLevel = config.ThinkingLevel
+				if msg.ThinkingLevel == "" {
+					msg.ThinkingLevel = ThinkingOff
+				}
+				if msg.DurationMs == nil {
+					msg.DurationMs = new(float64(time.Since(started)) / float64(time.Millisecond))
+				}
 				finalMessage = msg
 				if addedPartial {
 					agentCtx.Messages[len(agentCtx.Messages)-1] = msg
@@ -957,20 +1372,36 @@ func streamAssistantResponse(
 			}
 
 		case ai.StreamError:
+			settled = true
 			if _, ok := ai.UsageLimitResetAt(e.Err); ok {
 				err = e.Err
 				return
 			}
+			if e.Msg.StopReason == "" {
+				e.Msg.StopReason = ai.StopReasonError
+				if errors.Is(e.Err, context.Canceled) || errors.Is(e.Err, context.DeadlineExceeded) {
+					e.Msg.StopReason = ai.StopReasonAborted
+				}
+			}
+			if e.Msg.ErrorMessage == "" && e.Err != nil {
+				e.Msg.ErrorMessage = e.Err.Error()
+			}
 			msg := messageFromAI(&e.Msg)
+			recordResponseModel(msg, model)
+			msg.ThinkingLevel = config.ThinkingLevel
+			if msg.ThinkingLevel == "" {
+				msg.ThinkingLevel = ThinkingOff
+			}
+			if msg.DurationMs == nil {
+				msg.DurationMs = new(float64(time.Since(started)) / float64(time.Millisecond))
+			}
 			if msg.Role == "" {
 				msg.Role = RoleAssistant
 			}
 			if msg.Timestamp.IsZero() {
 				msg.Timestamp = time.Now()
 			}
-			if e.Msg.StopReason == "" {
-				msg.IsError = true
-			}
+			msg.IsError = e.Msg.StopReason == ai.StopReasonError || e.Msg.StopReason == ai.StopReasonAborted
 			finalMessage = msg
 
 			if addedPartial {
@@ -1006,8 +1437,29 @@ func streamAssistantResponse(
 		streamOpts = append(append([]ai.Option(nil), opts...), ai.WithAPIKey(apiKey))
 	}
 
+	// Like upstream streamSimple, the response budget defaults to the model cap
+	// and never exceeds the room the prompt leaves in the context window.
+	if model != nil {
+		budget := ai.ExtractSimpleStreamOptions(streamOpts).MaxTokens
+		if budget <= 0 {
+			budget = model.MaxTokens
+		}
+		if budget > 0 {
+			streamOpts = append(slices.Clone(streamOpts), ai.WithMaxTokens(ai.ClampMaxTokensToContext(model, aiCtx, budget)))
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Stream from the model
+	if err := ai.ValidateContextLimits(model, aiCtx); err != nil {
+		return nil, fmt.Errorf("validate model request: %w", err)
+	}
 	if streamErr := client.Stream(ctx, model, aiCtx, handler, streamOpts...); streamErr != nil {
+		if finalMessage != nil && finalMessage.IsError {
+			return finalMessage, &publishedStreamFailure{message: finalMessage, err: streamErr}
+		}
 		return nil, streamErr
 	}
 	if err != nil {
@@ -1018,12 +1470,7 @@ func streamAssistantResponse(
 		return finalMessage, nil
 	}
 
-	// Return the last message in context
-	if len(agentCtx.Messages) > 0 {
-		return agentCtx.Messages[len(agentCtx.Messages)-1], nil
-	}
-
-	return nil, nil
+	return nil, errors.New("assistant stream ended without a terminal event")
 }
 
 // dropOrphanToolResults removes tool results whose tool call is not present
@@ -1034,7 +1481,7 @@ func dropOrphanToolResults(messages []*Message) []*Message {
 	toolCallIDs := make(map[string]bool)
 	kept := make([]*Message, 0, len(messages))
 	for _, msg := range messages {
-		if msg == nil {
+		if msg == nil || msg.ExcludeFromContext {
 			continue
 		}
 		if msg.Role == RoleAssistant {
@@ -1044,7 +1491,7 @@ func dropOrphanToolResults(messages []*Message) []*Message {
 				}
 			}
 		}
-		if msg.Role == RoleTool && !toolCallIDs[msg.ToolCallID] {
+		if (msg.Role == RoleTool || msg.Role == "toolResult") && !toolCallIDs[msg.ToolCallID] {
 			continue
 		}
 		kept = append(kept, msg)
@@ -1064,7 +1511,7 @@ func liftSystemMessagesIntoPrompt(systemPrompt string, messages []*Message) (str
 			out = append(out, msg)
 			continue
 		}
-		text := strings.TrimSpace(messageText(msg))
+		text := ai.CurrentSystemPrompt([]ai.Message{messageToAI(msg)})
 		if text == "" {
 			continue
 		}
@@ -1077,14 +1524,14 @@ func liftSystemMessagesIntoPrompt(systemPrompt string, messages []*Message) (str
 	// it). Providers reject both shapes — an empty messages array, or a first
 	// message that is not from the user (zai/GLM error 1214) — so ask the
 	// model to resume from the summary.
-	needsLeadingUser := len(out) == 0 || out[0].Role != RoleUser
+	needsLeadingUser := len(out) == 0 || (out[0].Role != RoleUser && out[0].Role != RoleCustom)
 	if len(systemParts) == 0 && !needsLeadingUser {
 		return systemPrompt, messages
 	}
 
 	parts := make([]string, 0, 1+len(systemParts))
-	if trimmed := strings.TrimSpace(systemPrompt); trimmed != "" {
-		parts = append(parts, trimmed)
+	if systemPrompt != "" {
+		parts = append(parts, systemPrompt)
 	}
 	parts = append(parts, systemParts...)
 	if needsLeadingUser {
@@ -1113,35 +1560,6 @@ func messageText(msg *Message) string {
 	return b.String()
 }
 
-func isEmptyAssistantResponse(message *Message) bool {
-	if message == nil || message.Role != RoleAssistant {
-		return false
-	}
-	if message.ErrorMessage != "" || message.StopReason == ai.StopReasonError || message.StopReason == ai.StopReasonAborted {
-		return false
-	}
-	for _, block := range message.Content {
-		switch block.Type {
-		case ai.ContentBlockText:
-			if strings.TrimSpace(block.Text) != "" {
-				return false
-			}
-		case ai.ContentBlockThinking:
-			// Thinking-only responses are not actionable for the next turn.
-			if block.Name != "" || block.ID != "" || len(block.Arguments) > 0 || block.Data != "" || block.ThoughtSignature != "" || block.Redacted || block.TextSignature != "" {
-				return false
-			}
-		case "":
-			if block.Text != "" || block.Thinking != "" || block.Name != "" || block.ID != "" || len(block.Arguments) > 0 || block.Data != "" {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 // extractToolCalls extracts tool calls from an assistant message.
 func extractToolCalls(message *Message) []ai.ToolCall {
 	var toolCalls []ai.ToolCall
@@ -1151,6 +1569,7 @@ func extractToolCalls(message *Message) []ai.ToolCall {
 			toolCalls = append(toolCalls, ai.ToolCall{
 				ID:        block.ID,
 				Name:      block.Name,
+				Namespace: block.Namespace,
 				Arguments: block.Arguments,
 			})
 		}
@@ -1223,6 +1642,7 @@ func executeSequential(
 		}
 
 		emit(ToolEnd{
+			DurationMs: result.DurationMs,
 			ToolCallID: tc.ID,
 			Name:       tc.Name,
 			Result:     result,
@@ -1231,6 +1651,9 @@ func executeSequential(
 		result = finalizeToolResultMessage(tc, result, emit)
 
 		results = append(results, result)
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
 	return results
@@ -1248,93 +1671,43 @@ func executeParallel(
 		prepared preparedToolCall
 		result   *ToolResult
 	}
-
-	type completedResult struct {
-		index  int
-		result *ToolResult
-	}
-
 	pending := make([]pendingResult, 0, len(toolCalls))
-
-	// Emit tool_execution_start for ALL tools before ANY prepare calls.
-	// This matches the TypeScript reference behavior: preflight all starts,
-	// then prepare all, then execute non-blocked tools concurrently.
-	for _, tc := range toolCalls {
+	for _, call := range toolCalls {
 		var rawArgs map[string]any
-		if tc.Arguments != nil {
-			_ = json.Unmarshal(tc.Arguments, &rawArgs)
+		if call.Arguments != nil {
+			if err := json.Unmarshal(call.Arguments, &rawArgs); err != nil {
+				rawArgs = nil
+			}
 		}
-		emit(ToolStart{
-			ToolCallID: tc.ID,
-			Name:       tc.Name,
-			Args:       rawArgs,
-		})
-	}
-
-	// Now prepare all tool calls (may be immediate for validation failures).
-	// Immediate preflight failures are emitted as soon as preparation finishes,
-	// before any runnable tool is allowed to block finalization. The result slice
-	// is still returned in assistant source order below.
-	for _, tc := range toolCalls {
-		prepared := prepareToolCall(ctx, agentCtx, assistantMsg, tc, config)
-		entry := pendingResult{prepared: prepared}
-		if prepared.immediate != nil {
-			emit(ToolEnd{
-				ToolCallID: prepared.toolCall.ID,
-				Name:       prepared.toolCall.Name,
-				Result:     prepared.immediate,
-				IsError:    prepared.immediate.IsError,
-			})
-			entry.result = finalizeToolResultMessage(prepared.toolCall, prepared.immediate, emit)
+		emit(ToolStart{ToolCallID: call.ID, Name: call.Name, Args: rawArgs})
+		prepared := prepareToolCall(ctx, agentCtx, assistantMsg, call, config)
+		entry := pendingResult{prepared: prepared, result: prepared.immediate}
+		if entry.result != nil {
+			emit(ToolEnd{ToolCallID: call.ID, Name: call.Name, Result: entry.result, IsError: entry.result.IsError})
 		}
 		pending = append(pending, entry)
+		if ctx.Err() != nil {
+			break
+		}
 	}
-
-	completed := make(chan completedResult, len(toolCalls))
-
 	var wg sync.WaitGroup
 	for i := range pending {
-		if pending[i].prepared.immediate != nil {
+		if pending[i].result != nil {
 			continue
 		}
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			result := executePreparedTool(ctx, agentCtx, assistantMsg, pending[i].prepared, config, emit)
-			pending[i].result = result
-			completed <- completedResult{index: i, result: result}
-		}(i)
+		wg.Go(func() {
+			entry := &pending[i]
+			entry.result = executePreparedTool(ctx, agentCtx, assistantMsg, entry.prepared, config, emit)
+			call := entry.prepared.toolCall
+			emit(ToolEnd{DurationMs: entry.result.DurationMs, ToolCallID: call.ID, Name: call.Name, Result: entry.result, IsError: entry.result.IsError})
+		})
 	}
-
-	go func() {
-		wg.Wait()
-		close(completed)
-	}()
-
-	for range completed {
-		// drain completion channel to ensure all goroutines finish
-	}
-
-	// Finalize runnable tools in original source order (not completion order).
-	// Immediate preflight failures were already emitted above and carry an
-	// attached message, so finalizeToolResultMessage is idempotent for them.
+	wg.Wait()
+	// Completion events precede source-ordered transcript artifacts.
 	results := make([]*ToolResult, 0, len(pending))
-	for _, p := range pending {
-		result := p.result
-		if p.prepared.immediate == nil {
-			// Emit ToolEnd in source order, then emit the tool result message.
-			// This matches TypeScript emitToolCallOutcome: tool_execution_end,
-			// then message_start/message_end for runnable tools.
-			emit(ToolEnd{
-				ToolCallID: p.prepared.toolCall.ID,
-				Name:       p.prepared.toolCall.Name,
-				Result:     result,
-				IsError:    result != nil && result.IsError,
-			})
-		}
-		results = append(results, finalizeToolResultMessage(p.prepared.toolCall, result, emit))
+	for _, entry := range pending {
+		results = append(results, finalizeToolResultMessage(entry.prepared.toolCall, entry.result, emit))
 	}
-
 	return results
 }
 
@@ -1371,12 +1744,39 @@ type preparedToolCall struct {
 	immediate *ToolResult
 }
 
-func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *Message, toolCall ai.ToolCall, config AgentLoopConfig) preparedToolCall {
-	prepared := preparedToolCall{toolCall: toolCall}
+// hasToolDeclarationHistory reports whether the transcript declares tools.
+// Legacy transcripts without tool declarations still use the registry as their loadout.
+func hasToolDeclarationHistory(messages []*Message) bool {
+	return slices.ContainsFunc(messages, func(message *Message) bool {
+		return message != nil && message.Role == RoleSystem && !message.ExcludeFromContext && (message.Timestamp.Equal(time.UnixMilli(0)) || len(message.ToolsAdded) > 0 || len(message.ToolsRemoved) > 0)
+	})
+}
 
-	for i := range agentCtx.Tools {
-		if agentCtx.Tools[i].Name == toolCall.Name {
-			prepared.tool = &agentCtx.Tools[i]
+// prepareToolCall validates a call against the model's declarations. Passing
+// authorizedTools supplies a caller-approved registry that skips those checks.
+func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *Message, toolCall ai.ToolCall, config AgentLoopConfig, authorizedTools ...[]Tool) (prepared preparedToolCall) {
+	prepared = preparedToolCall{toolCall: toolCall}
+	defer func() {
+		if prepared.immediate != nil && prepared.immediate.Rejection == nil {
+			prepared.immediate.Rejection = errors.New(prepared.immediate.Content)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		prepared.immediate = &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+		return prepared
+	}
+	if assistantMsg != nil && assistantMsg.StopReason == ai.StopReasonLength {
+		prepared.immediate = &ToolResult{Content: "Assistant output was truncated. Re-issue the tool call with complete arguments.", IsError: true}
+		return prepared
+	}
+
+	tools := agentCtx.Tools
+	if len(authorizedTools) > 0 {
+		tools = authorizedTools[0]
+	}
+	for i := range tools {
+		if tools[i].Name == toolCall.Name {
+			prepared.tool = &tools[i]
 			break
 		}
 	}
@@ -1387,6 +1787,42 @@ func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *
 			IsError: true,
 			Details: map[string]any{},
 		}
+		return prepared
+	}
+
+	declared := true
+	var declarationHistory []*Message
+	if len(authorizedTools) == 0 {
+		declarationHistory = agentCtx.Messages
+		declared = !hasToolDeclarationHistory(declarationHistory)
+	}
+	for _, message := range declarationHistory {
+		if message == nil || message.Role != RoleSystem || message.ExcludeFromContext {
+			continue
+		}
+		for _, removed := range message.ToolsRemoved {
+			if removed.Name == toolCall.Name {
+				declared = false
+			}
+		}
+		for _, added := range message.ToolsAdded {
+			if added.Name == toolCall.Name {
+				declared = true
+			}
+		}
+	}
+	if !declared {
+		prepared.immediate = &ToolResult{Content: fmt.Sprintf("Tool %s was removed from the transcript", toolCall.Name), IsError: true}
+		return prepared
+	}
+
+	if prepared.tool.Execute == nil {
+		prepared.immediate = &ToolResult{Content: fmt.Sprintf("Tool %s has no executor", toolCall.Name), IsError: true}
+		return prepared
+	}
+
+	if len(authorizedTools) == 0 && (!modelDeclarable(*prepared.tool) || ((prepared.tool.Exposure == ToolDeferred || prepared.tool.Exposure == ToolCodemode) && !hasToolDeclarationHistory(declarationHistory))) {
+		prepared.immediate = &ToolResult{Content: "Tool is not exposed to the model", IsError: true}
 		return prepared
 	}
 
@@ -1402,6 +1838,10 @@ func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *
 
 	if prepared.tool.PrepareArguments != nil {
 		args = prepared.tool.PrepareArguments(args)
+	}
+	if err := ctx.Err(); err != nil {
+		prepared.immediate = &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+		return prepared
 	}
 
 	aiTool, err := agentToolToAITool(*prepared.tool)
@@ -1427,8 +1867,9 @@ func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *
 	})
 	if err != nil {
 		prepared.immediate = &ToolResult{
-			Content: err.Error(),
-			IsError: true,
+			Content:   err.Error(),
+			Rejection: err,
+			IsError:   true,
 		}
 		return prepared
 	}
@@ -1447,9 +1888,11 @@ func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *
 			ToolCall:         toolCall,
 		})
 		if err != nil {
+			rejection := fmt.Errorf("before tool call: %w", err)
 			prepared.immediate = &ToolResult{
-				Content: fmt.Sprintf("before tool call: %v", err),
-				IsError: true,
+				Content:   rejection.Error(),
+				Rejection: errors.Join(rejection, ctx.Err(), context.Cause(ctx)),
+				IsError:   true,
 			}
 			return prepared
 		}
@@ -1459,17 +1902,153 @@ func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *
 				reason = "Tool execution was blocked"
 			}
 			prepared.immediate = &ToolResult{
-				Content: reason,
-				IsError: true,
+				Content:   reason,
+				IsError:   true,
+				Terminate: beforeResult.Terminate,
 			}
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		prepared.immediate = &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+	}
 	return prepared
 }
 
+// RunToolCall executes a nested call through validation and hooks without transcript events.
+func RunToolCall(ctx context.Context, agentCtx *AgentContext, assistant *Message, call ai.ToolCall, config AgentLoopConfig, onUpdate ...func(*ToolResult)) *ToolResult {
+	if err := ctx.Err(); err != nil {
+		return &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+	}
+	prepared := prepareToolCall(ctx, agentCtx, assistant, call, config, agentCtx.Tools)
+	if prepared.immediate != nil {
+		return prepared.immediate
+	}
+	return executePreparedTool(ctx, agentCtx, assistant, prepared, config, func(event Event) {
+		update, ok := event.(ToolExecutionUpdate)
+		if !ok {
+			return
+		}
+		for _, sink := range onUpdate {
+			if sink != nil {
+				sink(update.PartialResult)
+			}
+		}
+	})
+}
+
 func executePreparedTool(ctx context.Context, agentCtx *AgentContext, assistantMsg *Message, prepared preparedToolCall, config AgentLoopConfig, emit EventSink) *ToolResult {
+	if err := ctx.Err(); err != nil {
+		return &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+	}
+	if prepared.tool.WaitReady != nil {
+		if err := prepared.tool.WaitReady(ctx); err != nil {
+			return &ToolResult{Content: fmt.Sprintf("tool readiness: %v", err), IsError: true, Rejection: errors.Join(fmt.Errorf("tool readiness: %w", err), ctx.Err(), context.Cause(ctx))}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+	}
+	nestedContext := *agentCtx
+	var reachErr error
+	nestedContext.Tools, reachErr = ReachableToolsContext(ctx, agentCtx, *prepared.tool, prepared.args)
+	if reachErr != nil {
+		return &ToolResult{Content: reachErr.Error(), IsError: true, Rejection: errors.Join(reachErr, ctx.Err(), context.Cause(ctx))}
+	}
+	if err := ctx.Err(); err != nil {
+		return &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+	}
+	for _, tool := range nestedContext.Tools {
+		if tool.WaitReady != nil {
+			if err := tool.WaitReady(ctx); err != nil {
+				return &ToolResult{Content: fmt.Sprintf("reachable tool %s readiness: %v", tool.Name, err), IsError: true, Rejection: errors.Join(fmt.Errorf("reachable tool %s readiness: %w", tool.Name, err), ctx.Err(), context.Cause(ctx))}
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return &ToolResult{Content: err.Error(), IsError: true, Rejection: errors.Join(err, context.Cause(ctx))}
+		}
+	}
+	nestedCtx, cancelNested := context.WithCancel(ctx)
+	defer cancelNested()
+	var nestedMu sync.Mutex
+	var nestedWG sync.WaitGroup
+	nestedClosed := false
+	var nestedCalls []NestedToolCall
+	type runningCall struct {
+		sequence uint64
+		record   NestedToolCall
+	}
+	var running []runningCall
+	snapshotNested := func() []NestedToolCall {
+		records := slices.Clone(nestedCalls)
+		for _, call := range running {
+			records = append(records, call.record)
+		}
+		return slices.Clone(records[max(0, len(records)-128):])
+	}
+	var nestedUsage ai.Usage
+	var nestedCount uint64
+	started := time.Now()
+	var progressMu sync.Mutex
+	settled := false
+	var callerProgress ToolResult
+	publishNested := func() {
+		nestedMu.Lock()
+		records := snapshotNested()
+		nestedMu.Unlock()
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if settled || nestedCtx.Err() != nil {
+			return
+		}
+		partial := callerProgress
+		partial.NestedCalls = records
+		emitToolUpdate(prepared.toolCall, prepared.args, &partial, emit)
+	}
 	result, err := prepared.tool.Execute(ToolContext{
+		ExecuteTool: func(call ai.ToolCall) *ToolResult {
+			nestedMu.Lock()
+			if nestedClosed {
+				nestedMu.Unlock()
+				return &ToolResult{Content: "caller execution has ended", IsError: true, Rejection: context.Canceled}
+			}
+			nestedCount++
+			sequence := nestedCount
+			if call.ID == "" {
+				call.ID = fmt.Sprintf("%s/%d", prepared.toolCall.ID, nestedCount)
+			}
+			nestedWG.Add(1)
+			if len(running) == 128 {
+				running = slices.Delete(running, 0, 1)
+			}
+			running = append(running, runningCall{sequence: sequence, record: NestedToolCall{ID: call.ID, Name: call.Name, Status: "running"}})
+			nestedMu.Unlock()
+			publishNested()
+			defer nestedWG.Done()
+			nestedResult := RunToolCall(nestedCtx, &nestedContext, assistantMsg, call, config, func(*ToolResult) { publishNested() })
+			record := NestedToolCall{ID: call.ID, Name: call.Name, Status: "ok", DurationMs: nestedResult.DurationMs}
+			if nestedResult.IsError {
+				record.Status = "error"
+				record.Error = string([]rune(nestedResult.Content)[:min(500, len([]rune(nestedResult.Content)))])
+			}
+			if errors.Is(nestedResult.Rejection, context.Canceled) || errors.Is(nestedResult.Rejection, context.DeadlineExceeded) {
+				record.Status = "cancelled"
+			}
+			nestedMu.Lock()
+			// ponytail: retain the last 128 completions; persist full diagnostics if needed.
+			if len(nestedCalls) == 128 {
+				nestedCalls = slices.Delete(nestedCalls, 0, 1)
+			}
+			running = slices.DeleteFunc(running, func(call runningCall) bool { return call.sequence == sequence })
+			nestedCalls = append(nestedCalls, record)
+			if nestedResult.Usage != nil {
+				addToolUsage(&nestedUsage, *nestedResult.Usage)
+			}
+			nestedMu.Unlock()
+			publishNested()
+			return nestedResult
+		},
+		Model:      agentCtx.Model,
 		Context:    ctx,
 		ToolCallID: prepared.toolCall.ID,
 		Name:       prepared.toolCall.Name,
@@ -1478,19 +2057,57 @@ func executePreparedTool(ctx context.Context, agentCtx *AgentContext, assistantM
 			if partial == nil {
 				return
 			}
-			emitToolUpdate(prepared.toolCall, prepared.args, partial, emit)
+			nestedMu.Lock()
+			records := snapshotNested()
+			nestedMu.Unlock()
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			if settled || ctx.Err() != nil {
+				return
+			}
+			callerProgress = *partial
+			callerProgress.ContentBlocks = slices.Clone(partial.ContentBlocks)
+			snapshot := callerProgress
+			snapshot.NestedCalls = append(slices.Clone(partial.NestedCalls), records...)
+			emitToolUpdate(prepared.toolCall, prepared.args, &snapshot, emit)
 		},
 		SessionCWD:   agentCtx.SessionCWD,
 		Capabilities: agentCtx.Capabilities,
 	})
+	nestedMu.Lock()
+	nestedClosed = true
+	cancelNested()
+	nestedMu.Unlock()
+	nestedWG.Wait()
+	progressMu.Lock()
+	settled = true
+	progressMu.Unlock()
+	durationMs := float64(time.Since(started)) / float64(time.Millisecond)
 	if err != nil {
-		result = &ToolResult{
-			Content: err.Error(),
-			IsError: true,
+		rejected := &ToolResult{Content: err.Error(), Rejection: errors.Join(err, ctx.Err(), context.Cause(ctx)), IsError: true}
+		if result != nil {
+			rejected.Usage = result.Usage
+			rejected.NestedCalls = slices.Clone(result.NestedCalls)
 		}
+		result = rejected
 	}
 	if result == nil {
 		result = &ToolResult{Content: ""}
+	}
+
+	if len(nestedCalls) > 0 {
+		result.NestedCalls = append(result.NestedCalls, nestedCalls...)
+	}
+	if len(result.NestedCalls) > 128 {
+		result.NestedCalls = slices.Clone(result.NestedCalls[len(result.NestedCalls)-128:])
+	}
+	if nestedUsage != (ai.Usage{}) {
+		if result.Usage == nil {
+			result.Usage = new(ai.Usage)
+		} else {
+			result.Usage = new(*result.Usage)
+		}
+		addToolUsage(result.Usage, nestedUsage)
 	}
 
 	if config.AfterToolCall != nil {
@@ -1502,29 +2119,63 @@ func executePreparedTool(ctx context.Context, agentCtx *AgentContext, assistantM
 			AssistantMessage: assistantMsg,
 			ToolCall:         prepared.toolCall,
 		}, result)
-		// Apply override (matches TypeScript: content ?? result.content)
-		if len(afterResult.ContentBlocks) > 0 {
-			result.ContentBlocks = afterResult.ContentBlocks
-			result.Content = ""
-		} else if afterResult.Content != "" {
-			result.Content = afterResult.Content
-			result.ContentBlocks = nil
-		}
-		if afterResult.Details != nil {
-			result.Details = afterResult.Details
-		}
-		if afterResult.IsError != nil {
-			result.IsError = *afterResult.IsError
-		}
-		// If hook threw, override with error result
 		if afterErr != nil {
 			result = &ToolResult{
-				Content: afterErr.Error(),
-				IsError: true,
+				NestedCalls: result.NestedCalls,
+				Usage:       result.Usage,
+				Content:     afterErr.Error(),
+				Rejection:   errors.Join(afterErr, ctx.Err(), context.Cause(ctx)),
+				IsError:     true,
+			}
+		} else {
+			if afterResult.ContentBlocks != nil || afterResult.Content != "" {
+				result.StructuredContent = nil
+			}
+			if afterResult.StructuredContent != nil {
+				result.StructuredContent = afterResult.StructuredContent
+			}
+			if afterResult.Usage != nil {
+				result.Usage = afterResult.Usage
+			}
+			if afterResult.Terminate != nil {
+				result.Terminate = *afterResult.Terminate
+			}
+			// Apply override (matches TypeScript: content ?? result.content)
+			if afterResult.ContentBlocks != nil {
+				result.ContentBlocks = afterResult.ContentBlocks
+				result.Content = ""
+			} else if afterResult.Content != "" {
+				result.Content = afterResult.Content
+				result.ContentBlocks = nil
+			}
+			if afterResult.Details != nil {
+				result.Details = afterResult.Details
+			}
+			if afterResult.IsError != nil {
+				result.IsError = *afterResult.IsError
 			}
 		}
 	}
 
+	if !result.IsError && prepared.tool.OutputSchema != nil {
+		validation, err := gojsonschema.Validate(gojsonschema.NewGoLoader(prepared.tool.OutputSchema), gojsonschema.NewBytesLoader(result.StructuredContent))
+		if err != nil {
+			err = fmt.Errorf("validate tool output: %w", err)
+		} else if !validation.Valid() {
+			err = fmt.Errorf("tool output does not match schema: %v", validation.Errors())
+		}
+		if err != nil {
+			result = &ToolResult{
+				NestedCalls: result.NestedCalls,
+				Usage:       result.Usage,
+				Content:     err.Error(),
+				Rejection:   err,
+				IsError:     true,
+			}
+		}
+	}
+
+	result.DurationMs = &durationMs
 	return result
 }
 
@@ -1534,6 +2185,7 @@ func finalizeToolResult(toolCall ai.ToolCall, toolResult *ToolResult, emit Event
 	}
 
 	emit(ToolEnd{
+		DurationMs: toolResult.DurationMs,
 		ToolCallID: toolCall.ID,
 		Name:       toolCall.Name,
 		Result:     toolResult,
@@ -1554,6 +2206,11 @@ func finalizeToolResultMessage(toolCall ai.ToolCall, toolResult *ToolResult, emi
 	}
 
 	toolMsg := &Message{
+		NestedCalls:        toolResult.NestedCalls,
+		StructuredContent:  toolResult.StructuredContent,
+		ToolUsage:          toolResult.Usage,
+		Details:            toolResult.Details,
+		DurationMs:         toolResult.DurationMs,
 		Role:               RoleTool,
 		ToolCallID:         toolCall.ID,
 		ToolName:           toolCall.Name,
@@ -1576,12 +2233,13 @@ func emitToolUpdate(toolCall ai.ToolCall, args map[string]any, partial *ToolResu
 	}
 
 	partialMsg := &Message{
-		Role:       RoleTool,
-		ToolCallID: toolCall.ID,
-		ToolName:   toolCall.Name,
-		Content:    partial.NormalizedContent(),
-		IsError:    partial.IsError,
-		Timestamp:  time.Now(),
+		NestedCalls: slices.Clone(partial.NestedCalls),
+		Role:        RoleTool,
+		ToolCallID:  toolCall.ID,
+		ToolName:    toolCall.Name,
+		Content:     partial.NormalizedContent(),
+		IsError:     partial.IsError,
+		Timestamp:   time.Now(),
 	}
 	partial.Message = partialMsg
 
@@ -1604,9 +2262,10 @@ func agentToolToAITool(tool Tool) (ai.Tool, error) {
 	}
 
 	return ai.Tool{
-		Name:        tool.Name,
-		Description: tool.Description,
-		Parameters:  params,
+		ConstrainedSampling: tool.ConstrainedSampling,
+		Name:                tool.Name,
+		Description:         tool.Description,
+		Parameters:          params,
 	}, nil
 }
 
@@ -1614,17 +2273,20 @@ func agentToolToAITool(tool Tool) (ai.Tool, error) {
 func messageFromAI(msg *ai.AssistantMessage) *Message {
 	isError := msg.StopReason == ai.StopReasonError || msg.StopReason == ai.StopReasonAborted
 	return &Message{
-		Role:         RoleAssistant,
-		Content:      msg.Content,
-		IsError:      isError,
-		API:          msg.API,
-		Provider:     msg.Provider,
-		Model:        msg.Model,
-		StopReason:   msg.StopReason,
-		Usage:        msg.Usage,
-		ErrorMessage: msg.ErrorMessage,
-		ResponseID:   msg.ResponseID,
-		Timestamp:    time.UnixMilli(msg.Timestamp),
+		Diagnostics:           msg.Diagnostics,
+		DurationMs:            msg.DurationMs,
+		Role:                  RoleAssistant,
+		Content:               msg.Content,
+		IsError:               isError,
+		API:                   msg.API,
+		Provider:              msg.Provider,
+		Model:                 msg.Model,
+		StopReason:            msg.StopReason,
+		Usage:                 msg.Usage,
+		ErrorMessage:          msg.ErrorMessage,
+		ResponseID:            msg.ResponseID,
+		ProviderThinkingLevel: msg.ProviderThinkingLevel,
+		Timestamp:             time.UnixMilli(msg.Timestamp),
 	}
 }
 
@@ -1636,12 +2298,22 @@ func messageToAI(msg *Message) ai.Message {
 	}
 
 	return ai.Message{
-		Role:       role,
-		Content:    msg.Content,
-		ToolCallID: msg.ToolCallID,
-		ToolName:   msg.ToolName,
-		IsError:    msg.IsError,
-		Timestamp:  msg.Timestamp.UnixMilli(),
+		Sections:              msg.Sections,
+		ToolsAdded:            msg.ToolsAdded,
+		ToolsRemoved:          msg.ToolsRemoved,
+		Provider:              msg.Provider,
+		API:                   msg.API,
+		Model:                 msg.Model,
+		StopReason:            string(msg.StopReason),
+		ProviderThinkingLevel: msg.ProviderThinkingLevel,
+		Diagnostics:           msg.Diagnostics,
+		DurationMs:            msg.DurationMs,
+		Role:                  role,
+		Content:               msg.Content,
+		ToolCallID:            msg.ToolCallID,
+		ToolName:              msg.ToolName,
+		IsError:               msg.IsError,
+		Timestamp:             msg.Timestamp.UnixMilli(),
 	}
 }
 
@@ -1649,7 +2321,7 @@ func messageToAI(msg *Message) ai.Message {
 func ConvertMessagesToAI(messages []*Message) []ai.Message {
 	result := make([]ai.Message, 0, len(messages))
 	for _, m := range messages {
-		if m.ExcludeFromContext {
+		if m == nil || m.ExcludeFromContext {
 			continue
 		}
 		result = append(result, messageToAI(m))
@@ -1776,4 +2448,48 @@ func runEventLoop(
 		Done:   done,
 		Err:    errs,
 	}
+}
+
+func userBashOverride(raw []byte) *ToolResult {
+	result, err := ParseUserBashOverride(raw)
+	if err != nil {
+		return &ToolResult{Content: err.Error(), IsError: true}
+	}
+	return &ToolResult{Content: result.Output, IsError: result.ExitCode != 0}
+}
+
+// ErrInvalidUserBashOverride reports a user_bash response that cannot replace execution.
+var ErrInvalidUserBashOverride = errors.New("user bash override requires output and exitCode; remote operations are not supported")
+
+// ParseUserBashOverride decodes a user_bash result override. Serialized
+// operations cannot carry executable callbacks, so they are rejected rather
+// than silently falling back to local execution.
+func ParseUserBashOverride(raw []byte) (BashResult, error) {
+	var override struct {
+		Result *struct {
+			Output   *string `json:"output"`
+			ExitCode *int    `json:"exitCode"`
+		} `json:"result"`
+		Operations json.RawMessage `json:"operations"`
+	}
+	if err := json.Unmarshal(raw, &override); err != nil {
+		return BashResult{}, fmt.Errorf("parse user bash override: %w", err)
+	}
+	if override.Result == nil || override.Result.Output == nil || override.Result.ExitCode == nil || len(override.Operations) > 0 {
+		return BashResult{}, ErrInvalidUserBashOverride
+	}
+	return BashResult{Output: *override.Result.Output, ExitCode: *override.Result.ExitCode, CancelReason: BashCancelNone}, nil
+}
+
+func addToolUsage(total *ai.Usage, next ai.Usage) {
+	total.Input += next.Input
+	total.Output += next.Output
+	total.CacheRead += next.CacheRead
+	total.CacheWrite += next.CacheWrite
+	total.TotalTokens += next.TotalTokens
+	total.Cost.Input += next.Cost.Input
+	total.Cost.Output += next.Cost.Output
+	total.Cost.CacheRead += next.Cost.CacheRead
+	total.Cost.CacheWrite += next.Cost.CacheWrite
+	total.Cost.Total += next.Cost.Total
 }

@@ -14,6 +14,7 @@ import type {
 	ExtensionFactory,
 	PiAPI,
 	PiFlagOptions,
+	PiVirtualModel,
 	RegisteredCommand,
 	ToolDefinition,
 	ToolParameters,
@@ -38,6 +39,8 @@ export interface PiRegistrations {
 	commands: Map<string, RegisteredCommand>;
 	tools: Map<string, ToolDefinition>;
 	flags: Map<string, PiFlagOptions & { name: string }>;
+	/** Virtual models keyed by provider and id. */
+	virtualModels: Map<string, PiVirtualModel>;
 }
 
 /** Convert a pi JSON-schema fragment to tau's map<string,string> parameters. */
@@ -48,11 +51,12 @@ export function toolParametersToMap(parameters: ToolParameters | undefined): Rec
 		out["properties"] = "{}";
 		return out;
 	}
-	out["type"] = String(parameters["type"] ?? "object");
-	out["properties"] = JSON.stringify(parameters["properties"] ?? {});
-	if (parameters["required"]) {
-		out["required"] = JSON.stringify(parameters["required"]);
+	for (const [key, value] of Object.entries(parameters)) {
+		const encoded = JSON.stringify(value);
+		if (encoded !== undefined) out[key] = encoded;
 	}
+	out["type"] ??= JSON.stringify("object");
+	out["properties"] ??= "{}";
 	return out;
 }
 
@@ -67,8 +71,18 @@ export function buildPi({ host, router, pluginName }: BuildPiOptions): PiAPI {
 		commands: new Map(),
 		tools: new Map(),
 		flags: new Map(),
+		virtualModels: new Map(),
 	};
 
+	const loadout = {
+		ready: false,
+		staged: [] as string[][],
+		host,
+		active: [] as string[],
+		registered: [] as Array<Record<string, unknown>>,
+		pending: Promise.resolve(),
+		failure: undefined as unknown,
+	};
 	const api: PiAPI = {
 		// ---- Events ---------------------------------------------------------
 		on(event: string, handler) {
@@ -127,8 +141,18 @@ export function buildPi({ host, router, pluginName }: BuildPiOptions): PiAPI {
 		},
 
 		// ---- Actions --------------------------------------------------------
-		sendMessage(_message: Record<string, unknown>, _options?: { triggerTurn?: boolean }): void {
-			warnOnce("pi.sendMessage", "not yet implemented (Phase 1.1)");
+		// Extensions call sendMessage and sendUserMessage without awaiting, so
+		// failures are logged rather than rejected.
+		async sendMessage(
+			message: Record<string, unknown>,
+			options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		): Promise<void> {
+			try {
+				const response = await host.sessionSendCustomMessage(message, options);
+				if (!response.ok) throw new Error(response.error || "send failed");
+			} catch (e) {
+				logFailure("sendMessage", e);
+			}
 		},
 
 		async sendUserMessage(content: string, options?: { deliverAs?: "steer" | "followUp" }): Promise<void> {
@@ -141,7 +165,7 @@ export function buildPi({ host, router, pluginName }: BuildPiOptions): PiAPI {
 					throw new Error(r.error || "send failed");
 				}
 			} catch (e) {
-				throw new Error(`sendUserMessage failed: ${e instanceof Error ? e.message : String(e)}`);
+				logFailure("sendUserMessage", e);
 			}
 		},
 
@@ -152,9 +176,9 @@ export function buildPi({ host, router, pluginName }: BuildPiOptions): PiAPI {
 			// mismatch by merging the data's fields with `custom_type` at
 			// the top level — pi extensions read `entry.data.<field>` and
 			// tau stores both at the entry's data level.
-			const obj = (data && typeof data === "object" && !Array.isArray(data)
-				? Object.assign({}, data as object)
-				: { data }) as Record<string, unknown>;
+			const obj = (
+				data && typeof data === "object" && !Array.isArray(data) ? Object.assign({}, data as object) : { data }
+			) as Record<string, unknown>;
 			obj.custom_type = customType;
 			const payload = JSON.stringify(obj);
 			return host.sessionAppend("custom", payload, "").then(
@@ -211,16 +235,39 @@ export function buildPi({ host, router, pluginName }: BuildPiOptions): PiAPI {
 		},
 
 		// ---- Tool registry ---------------------------------------------------
-		getActiveTools(): string[] {
-			warnOnce("pi.getActiveTools", "not yet implemented (Phase 1.1)");
-			return [];
+		searchTools(query, options) {
+			return host.toolDiscovery("search", { query, namespace: options?.namespace, limit: options?.limit ?? 8 });
 		},
-		getAllTools(): Array<Record<string, unknown>> {
-			warnOnce("pi.getAllTools", "not yet implemented (Phase 1.1)");
-			return [];
+		describeTool(name) {
+			return host.toolDiscovery("tool", { query: name });
 		},
-		setActiveTools(_toolNames: string[]): void {
-			warnOnce("pi.setActiveTools", "not yet implemented (Phase 1.1)");
+		describeNamespace(name) {
+			return host.toolDiscovery("namespace", { query: name });
+		},
+		getActiveTools() {
+			if (!loadout.ready)
+				throw new Error("Extension runtime not initialized. Tool snapshots are available after session binding.");
+			return [...loadout.active];
+		},
+		getAllTools() {
+			if (!loadout.ready)
+				throw new Error("Extension runtime not initialized. Tool snapshots are available after session binding.");
+			return structuredClone(loadout.registered);
+		},
+		setActiveTools(names) {
+			const selected = [...names];
+			loadout.active = selected;
+			if (!loadout.ready) {
+				loadout.staged.push(selected);
+				return;
+			}
+			loadout.pending = loadout.pending
+				.then(async () => {
+					await host.toolDiscovery("activate", { names: selected });
+				})
+				.catch((error) => {
+					loadout.failure = error;
+				});
 		},
 		getCommands(): Array<{ name: string; description: string; source: string }> {
 			warnOnce("pi.getCommands", "partial: only returns this extension's commands");
@@ -252,12 +299,28 @@ export function buildPi({ host, router, pluginName }: BuildPiOptions): PiAPI {
 			warnOnce("pi.unregisterProvider", "not yet implemented (Phase 1.1)");
 		},
 
+		// ---- Virtual models ---------------------------------------------------
+		// Registrations are read at load and reload; later changes apply on reload.
+		registerVirtualModel(model: PiVirtualModel): void {
+			if (!model || !model.provider?.trim() || !model.id?.trim()) {
+				throw new Error("Virtual model provider and id must not be empty.");
+			}
+			if (typeof model.route !== "function") {
+				throw new Error(`registerVirtualModel(${model.provider}/${model.id}): route is required`);
+			}
+			registrations.virtualModels.set(virtualModelKey(model.provider, model.id), model);
+		},
+		unregisterVirtualModel(provider: string, id: string): void {
+			registrations.virtualModels.delete(virtualModelKey(provider, id));
+		},
+
 		// ---- EventBus (in-process) -------------------------------------------
 		events: router.eventBus,
 	};
 
 	// Stash for server.ts (ListRegistrations) via a symbol-free side channel.
 	registrationMap.set(api, registrations);
+	loadoutMap.set(api, loadout);
 
 	return api;
 }
@@ -267,7 +330,59 @@ export function buildPi({ host, router, pluginName }: BuildPiOptions): PiAPI {
 const registrationMap = new WeakMap<PiAPI, PiRegistrations>();
 
 export function getRegistrations(api: PiAPI): PiRegistrations {
-	return registrationMap.get(api) ?? { commands: new Map(), tools: new Map(), flags: new Map() };
+	return (
+		registrationMap.get(api) ?? { commands: new Map(), tools: new Map(), flags: new Map(), virtualModels: new Map() }
+	);
+}
+
+export function virtualModelKey(provider: string, id: string): string {
+	return `${provider}/${id}`;
 }
 
 export type { ExtensionFactory };
+
+const loadoutMap = new WeakMap<
+	PiAPI,
+	{
+		ready: boolean;
+		staged: string[][];
+		host: HostClient;
+		active: string[];
+		registered: Array<Record<string, unknown>>;
+		pending: Promise<void>;
+		failure: unknown;
+	}
+>();
+
+export async function flushToolLoadout(api: PiAPI): Promise<void> {
+	const state = loadoutMap.get(api);
+	if (!state) return;
+	await state.pending;
+	if (state.failure !== undefined) {
+		const error = state.failure;
+		state.failure = undefined;
+		throw error;
+	}
+}
+
+export async function refreshToolLoadout(api: PiAPI): Promise<void> {
+	const state = loadoutMap.get(api);
+	if (!state) return;
+	for (const names of state.staged.splice(0)) {
+		state.pending = state.pending
+			.then(async () => {
+				await state.host.toolDiscovery("activate", { names });
+			})
+			.catch((error) => {
+				state.failure = error;
+			});
+	}
+	await flushToolLoadout(api);
+	const [registered, active] = await Promise.all([
+		state.host.toolDiscovery("registered"),
+		state.host.toolDiscovery("active"),
+	]);
+	state.registered = registered as Array<Record<string, unknown>>;
+	state.active = active as string[];
+	state.ready = true;
+}

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -55,6 +56,9 @@ type InstallManager struct {
 	// PluginReloader is called after a successful install if a plugin was installed.
 	// It receives the plugin name as a parameter.
 	PluginReloader func(ctx context.Context, pluginName string) error
+	// NPMCommand replaces the npm executable with an argv prefix, such as
+	// ["mise", "exec", "node@20", "--", "npm"].
+	NPMCommand []string
 
 	npmInstall func(context.Context, string, []string) error
 	npmPack    func(context.Context, string, string) (string, error)
@@ -710,6 +714,15 @@ func resolveToLatest(ctx context.Context, repo *git.Repository) (string, error) 
 	return head.Name().String(), nil
 }
 
+// npmCommand builds an npm invocation, using command as the executable argv
+// prefix when it is set.
+func npmCommand(ctx context.Context, command []string, args ...string) *exec.Cmd {
+	if len(command) == 0 {
+		return exec.CommandContext(ctx, "npm", args...)
+	}
+	return exec.CommandContext(ctx, command[0], append(slices.Clone(command[1:]), args...)...)
+}
+
 // NpmSpec represents a parsed npm package specification.
 type NpmSpec struct {
 	Name    string // package name, e.g. "@foo/bar" or "lodash"
@@ -819,7 +832,7 @@ func (m *InstallManager) UninstallFromNPM(ctx context.Context, name string, scop
 	// from the npm registry AND remove our tracking directory
 	if scope == ScopeUser {
 		// Run npm uninstall -g to remove from global node_modules
-		cmd := exec.CommandContext(ctx, "npm", "uninstall", name, "-g")
+		cmd := npmCommand(ctx, m.NPMCommand, "uninstall", name, "-g")
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -937,7 +950,7 @@ func (m *InstallManager) installFromNPM(ctx context.Context, cfg Config) error {
 		installArgs = append(installArgs, "--prefix", installBase)
 	}
 
-	cmd := exec.CommandContext(ctx, "npm", installArgs...)
+	cmd := npmCommand(ctx, m.NPMCommand, installArgs...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

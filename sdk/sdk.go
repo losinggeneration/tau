@@ -4,12 +4,17 @@
 package sdk // import "github.com/losinggeneration/tau/sdk"
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -22,8 +27,10 @@ import (
 	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/compaction"
 	"github.com/losinggeneration/tau/agent/plugins"
+	"github.com/losinggeneration/tau/agent/plugins/proto"
 	sessionpkg "github.com/losinggeneration/tau/agent/session"
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/ai/oauth"
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/logging"
@@ -73,6 +80,17 @@ type Event struct {
 
 // Message is a message sent to a Session.
 type Message struct {
+	StructuredContent  json.RawMessage
+	NestedCalls        []ai.NestedToolCall
+	ToolUsage          *ai.Usage
+	ExcludeFromContext bool
+	// DurationMs is execution-only elapsed time, absent when execution never began.
+	DurationMs *float64
+	CustomType string
+	Display    bool
+	Details    any
+	// Data identifies extension-originated custom messages.
+	Data any
 	// Role is the message role (user, assistant, tool, system).
 	Role string
 	// Text is the text content.
@@ -343,8 +361,19 @@ type Compactor interface {
 	Compact(ctx context.Context, customInstructions ...string) error
 }
 
+// ModelLister exposes credential-scoped available models with offline fallback.
+type ModelLister interface {
+	GetAvailableModels(context.Context) ([]*ai.Model, error)
+}
+
 // MessageLister exposes the session's in-memory messages.
 type MessageLister interface{ GetMessages() []Message }
+
+// ContextEditor changes model-visible content without changing displayed history.
+// A null replacement omits the target from context.
+type ContextEditor interface {
+	EditContext(ctx context.Context, entryID string, replacement json.RawMessage) error
+}
 
 // FullMessageLister exposes the entire persisted transcript on the active
 // branch, ignoring compaction truncation: pre-compaction messages are included
@@ -467,6 +496,9 @@ type SessionStats struct {
 	Model          string  `json:"model"`
 	ThinkingLevel  string  `json:"thinking_level"`
 	AutoCompaction bool    `json:"auto_compaction"`
+	// Usage totals every billed call recorded in the session file, across all
+	// branches, including summaries.
+	Usage ai.Usage `json:"usage"`
 }
 
 // Statser exposes session statistics.
@@ -503,6 +535,8 @@ type RuntimeOptions struct {
 	CredentialStore store.CredentialStore
 	// Settings is the merged settings (user + project). Used for model resolution.
 	Settings *ai.Settings
+	// ModelRegistry supplies runtime-local models.json overrides. Nil loads the configured file.
+	ModelRegistry *ai.ModelRegistry
 	// ExplicitModel is an explicit model override, resolved via the auth chain.
 	ExplicitModel string
 	// IgnoreEnv skips environment variable credential sources.
@@ -678,19 +712,30 @@ var (
 )
 
 type agentSession struct {
-	agent         *agent.Agent
-	id            string
-	cwd           string
-	ui            ui.UI
-	model         *ai.Model
-	modelSpec     ai.ModelSpec
-	seq           int64
-	totalTokens   int
-	mu            sync.Mutex
-	cancelFn      context.CancelFunc
-	closed        bool // true after first Close call
-	sessionWriter *sessionpkg.Writer
-	parentMsgID   *string // parent ID for the next message entry
+	agent                *agent.Agent
+	id                   string
+	cwd                  string
+	ui                   ui.UI
+	model                *ai.Model
+	modelSpec            ai.ModelSpec
+	seq                  int64
+	totalTokens          int
+	usageTotals          ai.Usage
+	mu                   sync.Mutex
+	cancelFn             context.CancelFunc
+	closed               bool // true after first Close call
+	runDone              chan struct{}
+	closeMu              sync.Mutex
+	closeFinished        bool
+	closeErr             error
+	sessionWriter        *sessionpkg.Writer
+	parentMsgID          *string // parent ID for the next message entry
+	prePersistedMessage  *agent.Message
+	pendingNextTurn      []*agent.Message
+	pendingStartupCustom []*agent.Message
+	emittingSettled      bool
+	idleCustomDelivery   bool
+	deferredRuns         []deferredRun
 	// runtime back-references the owning Runtime so the session can clear
 	// the runtime's current-session pointer on Close.
 	runtime *runtime
@@ -708,7 +753,11 @@ type agentSession struct {
 	// credentialProvider resolves the active provider credential for direct SDK
 	// model calls outside the agent loop, such as compaction summarization.
 	credentialProvider func(context.Context, string) (string, error)
-	artifactLoader     ArtifactLoader
+	// credStore holds the session's stored credentials, whose metadata can
+	// limit the models an account offers.
+	credStore        store.CredentialStore
+	artifactLoader   ArtifactLoader
+	providerCatalogs map[catalogCacheKey][]*ai.Model
 
 	// sessionStartReason is the reason for session start, used in session_start events.
 	sessionStartReason string
@@ -724,7 +773,9 @@ type agentSession struct {
 	// appendSystemPrompts are appended after the resolved system prompt (CLI --append-system-prompt).
 	appendSystemPrompts []string
 	// toolAllowlist restricts the session's tool set (CLI --tools/-t). Empty means "no filter."
-	toolAllowlist []string
+	toolAllowlist    []string
+	pluginToolNames  []string
+	defaultToolNames []string
 	// toolDenylist removes tools from the session's tool set (CLI --exclude-tools/-xt).
 	toolDenylist []string
 	// approveProjectFiles pre-approves file operations within CWD (CLI --approve/-a).
@@ -736,6 +787,7 @@ type agentSession struct {
 
 	// pendingHeader defers creating brand-new persisted session files until the
 	// first user message. This avoids empty sessions from UI startup/teardown.
+	sessionInitMu sync.Mutex
 	pendingHeader *sessionpkg.Header
 	// pendingSessionDir is the storage directory used when materializing pendingHeader.
 	pendingSessionDir string
@@ -747,6 +799,7 @@ type agentSession struct {
 	pendingInitialModelProvider string
 	pendingInitialModel         string
 	pendingInitialThinking      string
+	pendingInitialTranscript    *agent.Message
 
 	// isPersistedFunc returns whether the session has a persisted backing store.
 	// This is true unless NoSession was set without EphemeralExportPath.
@@ -754,13 +807,25 @@ type agentSession struct {
 
 	// compactionConfig holds auto-compaction settings for this session.
 	compactionConfig compaction.Config
+	settings         *ai.Settings
 	// autoCompactionDefault remembers the configured auto-compaction settings when toggled off.
 	autoCompactionDefault compaction.Config
 	// autoRetryEnabled records the user's retry preference for UI/RPC state.
 	autoRetryEnabled bool
+	retryCancel      context.CancelFunc
 
 	// logger receives session diagnostics. Defaults to discard.
 	logger *slog.Logger
+
+	// routedModel is the physical model of the latest virtual-model route.
+	routedModel *ai.Model
+	// failedResponse is the failed request an automatic retry replaces.
+	failedResponse *agent.Message
+	// overflowRecoveryAttempted limits overflow recovery to one
+	// compact-and-retry until a response succeeds or a new prompt starts.
+	overflowRecoveryAttempted bool
+	// virtualStates holds router state for sessions without a session file.
+	virtualStates map[string]json.RawMessage
 }
 
 // modelIDForEvent returns the model id for the session_start event payload,
@@ -773,11 +838,30 @@ func modelIDForEvent(m *ai.Model) string {
 	return m.ID
 }
 
+type deferredRun struct {
+	message Message
+	events  chan Event
+}
+
 func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("send message: %w", err)
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("session closed")
+	}
+	if s.emittingSettled {
+		prepared, err := s.prepareMessageLocked(msg)
+		if err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		events := make(chan Event, 64)
+		s.deferredRuns = append(s.deferredRuns, deferredRun{message: prepared, events: events})
+		s.mu.Unlock()
+		return events, nil
 	}
 	// Check for slash-command invocation before processing as a normal message.
 	// If the message starts with "/" and we have a command registry, route
@@ -786,7 +870,7 @@ func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, err
 	if strings.TrimSpace(msg.Text) == "/retry" {
 		if s.cancelFn != nil {
 			s.mu.Unlock()
-			return nil, fmt.Errorf("session already processing")
+			return nil, ErrSessionBusy
 		}
 		return s.runLocked(ctx, s.agent.Continue), nil
 	}
@@ -798,7 +882,7 @@ func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, err
 			s.agent.Abort()
 		} else {
 			s.mu.Unlock()
-			return nil, fmt.Errorf("session already processing")
+			return nil, ErrSessionBusy
 		}
 	}
 	if isSlashCommand {
@@ -809,17 +893,333 @@ func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, err
 			return s.executeSlashCommand(ctx, msg.Text)
 		}
 	}
-	attachmentBlocks, err := s.attachmentBlocksLocked(msg.AttachmentIDs)
+	prepared, err := s.prepareMessageLocked(msg)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
 	}
-	msg.Images = append(msg.Images, attachmentBlocks...)
-	if err := s.validateVisionInput(msg); err != nil {
-		s.mu.Unlock()
-		return nil, err
+	return s.sendPreparedMessageLocked(ctx, prepared)
+}
+
+// ErrSessionBusy reports a prompt sent while the session is processing.
+var ErrSessionBusy = errors.New("session already processing")
+
+// CustomMessage is extension context delivered without user input processing.
+type CustomMessage struct {
+	CustomType string
+	Content    []ai.ContentBlock
+	Display    bool
+	Details    any
+	// ExcludeFromContext records the message without sending it to the model.
+	ExcludeFromContext bool
+}
+
+// CustomMessageOptions controls whether delivery starts or joins a run.
+// A nil TriggerTurn joins a busy run but does not start an idle run.
+type CustomMessageOptions struct {
+	TriggerTurn *bool
+	DeliverAs   string
+}
+
+// CustomMessageSender delivers extension messages to a session.
+type CustomMessageSender interface {
+	SendCustomMessage(context.Context, CustomMessage, CustomMessageOptions) error
+}
+
+// SendCustomMessage delivers context immediately, at a safe boundary, or with a future run.
+func (s *agentSession) SendCustomMessage(ctx context.Context, custom CustomMessage, options CustomMessageOptions) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("send custom message: %w", err)
 	}
-	return s.sendPreparedMessageLocked(ctx, msg)
+	switch options.DeliverAs {
+	case "", "steer", "followUp", "nextTurn":
+	default:
+		return fmt.Errorf("invalid custom delivery mode %q", options.DeliverAs)
+	}
+	content := slices.Clone(custom.Content)
+	if content == nil {
+		content = []ai.ContentBlock{}
+	}
+	msg := Message{Role: "custom", CustomType: custom.CustomType, Content: content, Display: custom.Display, Details: custom.Details, ExcludeFromContext: custom.ExcludeFromContext}
+	if _, err := json.Marshal(agentMessageFromSDK(msg)); err != nil {
+		return fmt.Errorf("encode custom message: %w", err)
+	}
+	s.mu.Lock()
+	prepared, err := s.prepareMessageLocked(msg)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if s.idleCustomDelivery && options.DeliverAs != "nextTurn" {
+		s.mu.Unlock()
+		return ErrSessionBusy
+	}
+	message := agentMessageFromSDK(prepared)
+	if options.DeliverAs == "nextTurn" {
+		s.pendingNextTurn = append(s.pendingNextTurn, message)
+		s.mu.Unlock()
+		return nil
+	}
+	trigger := options.TriggerTurn != nil && *options.TriggerTurn
+	if (trigger || options.TriggerTurn == nil) && s.emittingSettled {
+		s.deferredRuns = append(s.deferredRuns, deferredRun{message: prepared})
+		s.mu.Unlock()
+		return nil
+	}
+	if s.cancelFn != nil {
+		if options.TriggerTurn == nil || trigger {
+			if options.DeliverAs == "followUp" {
+				s.agent.FollowUp(message)
+			} else {
+				s.agent.Steer(message)
+			}
+			s.mu.Unlock()
+			s.recordQueueUpdate()
+			return nil
+		}
+		queued, err := s.agent.QueueCustomMessage(ctx, message)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if !queued {
+			s.pendingStartupCustom = append(s.pendingStartupCustom, message)
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	if trigger {
+		// The run outlives the caller, which may be a plugin RPC request.
+		events, err := s.sendPreparedMessageLocked(context.WithoutCancel(ctx), prepared)
+		if err != nil {
+			return err
+		}
+		go func() {
+			for range events {
+			}
+		}()
+		return nil
+	}
+	s.idleCustomDelivery = true
+	deliveryCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.cancelFn = cancel
+	s.runDone = done
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		s.cancelFn = nil
+		s.runDone = nil
+		s.idleCustomDelivery = false
+		s.mu.Unlock()
+		close(done)
+	}()
+	if _, err := s.ensureSessionWriter(); err != nil {
+		return err
+	}
+	var persistenceErr error
+	// Idle appends have no Send subscription to persist and publish their events.
+	unsubscribe := s.agent.Subscribe(func(event agent.Event, _ <-chan struct{}) {
+		switch e := event.(type) {
+		case agent.MessageStart:
+			if e.Message == message {
+				s.notify("message_start", map[string]any{"role": "custom", "message": message})
+			}
+		case agent.MessageEnd:
+			if e.Message == message {
+				persistenceErr = s.persistMessage(message)
+				s.notify("message_end", map[string]any{"role": "custom", "message": message})
+			}
+		}
+	})
+	defer unsubscribe()
+	if err := s.agent.AppendCustomMessage(deliveryCtx, message); err != nil {
+		return err
+	}
+	return persistenceErr
+}
+
+// BashExecutionCustomType tags custom messages that record user shell commands.
+const BashExecutionCustomType = "bashExecution"
+
+// ErrBashBlocked reports a user shell command vetoed by a user_bash handler.
+var ErrBashBlocked = errors.New("user bash execution was blocked")
+
+// BashOptions configures a user shell command.
+type BashOptions struct {
+	// ExcludeFromContext records the command for display without sending it
+	// to the model, as the interactive !! prefix does.
+	ExcludeFromContext bool
+	// Dir overrides the session working directory.
+	Dir string
+	// Timeout bounds execution; zero means no limit.
+	Timeout time.Duration
+	// OnOutput receives raw output chunks from local execution. Result
+	// overrides deliver their output only in the returned record.
+	OnOutput func(chunk string)
+}
+
+// BashExecution is the session record of a user shell command.
+type BashExecution struct {
+	Command            string `json:"command"`
+	Output             string `json:"output"`
+	ExitCode           int    `json:"exitCode"`
+	CancelReason       string `json:"cancelReason,omitempty"`
+	Cancelled          bool   `json:"cancelled,omitempty"`
+	Truncated          bool   `json:"truncated,omitempty"`
+	FullOutputPath     string `json:"fullOutputPath,omitempty"`
+	ExcludeFromContext bool   `json:"excludeFromContext,omitempty"`
+	// DurationMs is shell execution time, absent when a hook supplied the result.
+	DurationMs *float64 `json:"durationMs,omitempty"`
+}
+
+// BashExecutor runs user shell commands outside the model loop and records
+// them in the session.
+type BashExecutor interface {
+	ExecuteBash(ctx context.Context, command string, options BashOptions) (BashExecution, error)
+}
+
+// ExecuteBash runs a user shell command through user_bash handlers and the
+// configured shell operations, then records the result. Busy sessions receive
+// the record at the next safe turn boundary so tool calls and results stay
+// adjacent. Cancelled commands are still recorded.
+func (s *agentSession) ExecuteBash(ctx context.Context, command string, options BashOptions) (BashExecution, error) {
+	if err := ctx.Err(); err != nil {
+		return BashExecution{}, fmt.Errorf("execute bash: %w", err)
+	}
+	if strings.TrimSpace(command) == "" {
+		return BashExecution{}, errors.New("execute bash: command cannot be empty")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return BashExecution{}, errors.New("execute bash: session closed")
+	}
+	manager, id, settings, dir := s.pluginManager, s.id, s.settings, s.cwd
+	s.mu.Unlock()
+	if options.Dir != "" {
+		dir = options.Dir
+	}
+	result, durationMs, err := runUserBash(ctx, manager, id, buildToolConfig(settings), command, dir, options)
+	if err != nil {
+		return BashExecution{}, err
+	}
+	execution := BashExecution{
+		Command:            command,
+		Output:             result.Output,
+		ExitCode:           result.ExitCode,
+		Cancelled:          result.CancelReason != "" && result.CancelReason != agent.BashCancelNone,
+		Truncated:          result.Truncation != nil && result.Truncation.Truncated,
+		FullOutputPath:     result.FullOutputPath,
+		ExcludeFromContext: options.ExcludeFromContext,
+		DurationMs:         durationMs,
+	}
+	if execution.Cancelled {
+		execution.CancelReason = string(result.CancelReason)
+	}
+	err = s.SendCustomMessage(context.WithoutCancel(ctx), CustomMessage{
+		CustomType:         BashExecutionCustomType,
+		Content:            []ai.ContentBlock{{Type: ai.ContentBlockText, Text: bashExecutionText(execution)}},
+		Display:            true,
+		Details:            execution,
+		ExcludeFromContext: options.ExcludeFromContext,
+	}, CustomMessageOptions{TriggerTurn: new(false)})
+	if err != nil {
+		return execution, fmt.Errorf("record bash execution: %w", err)
+	}
+	return execution, nil
+}
+
+func runUserBash(ctx context.Context, manager *plugins.Manager, sessionID string, cfg agent.ToolConfig, command, dir string, options BashOptions) (agent.BashResult, *float64, error) {
+	if manager != nil {
+		payload, err := json.Marshal(map[string]any{"command": command, "cwd": dir, "excludeFromContext": options.ExcludeFromContext})
+		if err != nil {
+			return agent.BashResult{}, nil, fmt.Errorf("marshal user bash event: %w", err)
+		}
+		response := manager.DispatchEventResponse(ctx, "user_bash", payload, sessionID)
+		if response.Block {
+			if response.BlockReason != "" {
+				return agent.BashResult{}, nil, fmt.Errorf("%w: %s", ErrBashBlocked, response.BlockReason)
+			}
+			return agent.BashResult{}, nil, ErrBashBlocked
+		}
+		if len(response.ResponseData) > 0 {
+			result, err := agent.ParseUserBashOverride(response.ResponseData)
+			return result, nil, err
+		}
+	}
+	// Hooks may run long enough for the caller to cancel.
+	if err := ctx.Err(); err != nil {
+		return agent.BashResult{}, nil, fmt.Errorf("execute bash: %w", err)
+	}
+	started := time.Now()
+	result, err := cfg.BashOperations().Run(ctx, agent.BashRequest{Command: agent.PrefixBashCommand(cfg.CommandPrefix, command), Dir: dir, Timeout: options.Timeout, OnOutput: options.OnOutput})
+	durationMs := float64(time.Since(started)) / float64(time.Millisecond)
+	if err != nil {
+		return result, nil, fmt.Errorf("execute bash: %w", err)
+	}
+	return result, &durationMs, nil
+}
+
+// bashExecutionText is the model-facing form of a user shell command.
+func bashExecutionText(execution BashExecution) string {
+	var text strings.Builder
+	fmt.Fprintf(&text, "Ran `%s`\n", execution.Command)
+	if execution.Output != "" {
+		fmt.Fprintf(&text, "```\n%s\n```", execution.Output)
+	} else {
+		text.WriteString("(no output)")
+	}
+	if execution.Cancelled {
+		text.WriteString("\n\n(command cancelled)")
+	} else if execution.ExitCode != 0 {
+		fmt.Fprintf(&text, "\n\nCommand exited with code %d", execution.ExitCode)
+	}
+	if execution.Truncated && execution.FullOutputPath != "" {
+		fmt.Fprintf(&text, "\n\n[Output truncated. Full output: %s]", execution.FullOutputPath)
+	}
+	return text.String()
+}
+
+func (s *agentSession) prepareMessageLocked(msg Message) (Message, error) {
+	if s.closed {
+		return msg, errors.New("session closed")
+	}
+	attachmentBlocks, err := s.attachmentBlocksLocked(msg.AttachmentIDs)
+	if err != nil {
+		return msg, err
+	}
+	if msg.Content == nil {
+		msg.Content = []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msg.Text}}
+	} else {
+		msg.Content = slices.Clone(msg.Content)
+	}
+	msg.Content = append(msg.Content, msg.Images...)
+	msg.Content = append(msg.Content, attachmentBlocks...)
+	msg.Images = nil
+	if s.model != nil && s.model.InputLimits != nil && s.model.InputLimits.Images != nil {
+		limits := s.model.InputLimits.Images
+		count := 0
+		for i, block := range msg.Content {
+			if block.Type != ai.ContentBlockImage {
+				continue
+			}
+			count++
+			resized, err := agent.ResizeImageBlock(block, limits.Resize)
+			if err != nil {
+				return msg, err
+			}
+			msg.Content[i] = resized
+		}
+		if limits.MaxPerMessage > 0 && count > limits.MaxPerMessage {
+			return msg, fmt.Errorf("message exceeds model image limit %d", limits.MaxPerMessage)
+		}
+	}
+	if err := s.validateVisionInput(msg); err != nil {
+		return msg, err
+	}
+	return msg, nil
 }
 
 func (s *agentSession) attachmentBlocksLocked(ids []string) ([]ai.ContentBlock, error) {
@@ -833,7 +1233,7 @@ func (s *agentSession) attachmentBlocksLocked(ids []string) ([]ai.ContentBlock, 
 }
 
 func (s *agentSession) validateVisionInput(msg Message) error {
-	for _, block := range msg.Images {
+	for _, block := range append(slices.Clone(msg.Content), msg.Images...) {
 		if block.Type != ai.ContentBlockImage {
 			continue
 		}
@@ -851,7 +1251,7 @@ func (s *agentSession) validateVisionInput(msg Message) error {
 		if s.model.SupportsInput(ai.InputImage) {
 			return nil
 		}
-		if !s.agent.State().Capabilities.Vision {
+		if len(s.model.Input) > 0 || !s.agent.State().Capabilities.Vision {
 			return fmt.Errorf("%w: model %s", ErrVisionNotSupported, s.model.ID)
 		}
 		return nil
@@ -923,46 +1323,244 @@ func providerTriggerTokens(provider string) int {
 }
 
 func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Message) (<-chan Event, error) {
-	return s.runLocked(ctx, func(ctx context.Context) error {
-		content := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msg.Text}}
-		content = append(content, msg.Images...)
-		agentMsg := &agent.Message{
-			Role:      agent.RoleUser,
-			Content:   content,
-			Timestamp: time.Now(),
-		}
+	return s.runLocked(ctx, func(ctx context.Context) error { return s.runPreparedMessage(ctx, msg) }), nil
+}
 
-		if err := s.appendUserMessageToSession(msg); err != nil {
-			s.logger.Warn("session write failed", "error", err)
-		}
+func (s *agentSession) runPreparedMessage(ctx context.Context, msg Message) error {
+	agentMsg := agentMessageFromSDK(msg)
 
-		// Auto-compaction check: trigger if context usage exceeds threshold.
-		s.autoCompactIfDue(ctx)
+	if err := s.appendUserMessageToSession(msg); err != nil {
+		return fmt.Errorf("persist prompt: %w", err)
+	}
+	s.mu.Lock()
+	s.prePersistedMessage = agentMsg
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.prePersistedMessage = nil
+		s.mu.Unlock()
+	}()
 
-		if msg.SystemAddendum != "" {
-			return s.agent.Prompt(ctx, agentMsg, agent.WithPromptSystemAddendum(msg.SystemAddendum))
-		}
+	// Auto-compaction check: trigger if context usage exceeds threshold.
+	s.autoCompactIfDue(ctx)
 
-		return s.agent.Prompt(ctx, agentMsg)
-	}), nil
+	messages := []*agent.Message{agentMsg}
+	if msg.SystemAddendum != "" {
+		return s.agent.PromptMessages(ctx, messages, agent.WithPromptSystemAddendum(msg.SystemAddendum))
+	}
+
+	return s.agent.PromptMessages(ctx, messages)
 }
 
 // runLocked starts an agent run on a goroutine and streams its events. The
 // caller holds s.mu; runLocked releases it.
+func (s *agentSession) settingsSnapshot() *ai.Settings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settings
+}
+
+func (s *agentSession) retryPolicy() ai.RetryPolicy {
+	settings := s.settingsSnapshot()
+	resolved := settings.ResolveRetry()
+	policy := ai.RetryPolicy{MaxRetries: resolved.MaxRetries, BaseDelay: time.Duration(resolved.BaseDelayMs) * time.Millisecond, MaxDelay: time.Duration(resolved.MaxAgentDelayMs) * time.Millisecond}
+	s.mu.Lock()
+	enabled := s.autoRetryEnabled
+	s.mu.Unlock()
+	if !enabled || !resolved.Enabled {
+		policy.MaxRetries = 0
+	}
+	return policy
+}
+
+func (s *agentSession) runWithRetry(ctx context.Context, events chan<- Event, run func(context.Context) error) (runErr error) {
+	retryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.mu.Lock()
+	s.retryCancel = cancel
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.retryCancel = nil; s.mu.Unlock() }()
+	policy := s.retryPolicy()
+	retried := false
+	defer func() {
+		if retried {
+			s.emit(events, Event{Type: "auto_retry_end", Payload: map[string]any{"success": runErr == nil}})
+		}
+	}()
+	var latest *agent.Message
+	produce := func(callCtx context.Context) (*ai.AssistantMessage, error) {
+		latest = nil
+		var previousAssistant *agent.Message
+		for _, message := range slices.Backward(s.agent.Messages()) {
+			if message.Role == agent.RoleAssistant {
+				previousAssistant = message
+				break
+			}
+		}
+		if err := run(callCtx); err != nil {
+			return nil, err
+		}
+		messages := s.agent.Messages()
+		if len(messages) == 0 {
+			return &ai.AssistantMessage{StopReason: ai.StopReasonStop}, nil
+		}
+		var message *agent.Message
+		for _, candidate := range slices.Backward(messages) {
+			if candidate.Role == agent.RoleAssistant {
+				message = candidate
+				break
+			}
+		}
+		if message == nil || message == previousAssistant {
+			return &ai.AssistantMessage{StopReason: ai.StopReasonStop}, nil
+		}
+		latest = message
+		return &ai.AssistantMessage{StopReason: message.StopReason, ErrorMessage: message.ErrorMessage}, nil
+	}
+	onRetry := func(attempt int, delay time.Duration, message string) {
+		retried = true
+		if err := s.omitFailedAttempt(); err != nil {
+			s.logger.Error("persist retry omission", "error", err)
+			cancel()
+			return
+		}
+		s.emit(events, Event{Type: "auto_retry_start", Payload: map[string]any{"attempt": attempt, "maxAttempts": policy.MaxRetries, "delayMs": delay.Milliseconds(), "errorMessage": message}})
+		s.mu.Lock()
+		s.failedResponse = latestAssistant(s.agent.Messages())
+		s.mu.Unlock()
+		run = s.agent.Continue
+	}
+	result, err := ai.RetryAssistantCall(retryCtx, produce, policy, onRetry)
+	for err == nil && s.recoverFromOverflow(retryCtx, latest) {
+		run = s.agent.Continue
+		result, err = ai.RetryAssistantCall(retryCtx, produce, policy, onRetry)
+	}
+	if err == nil && result != nil {
+		switch result.StopReason {
+		case ai.StopReasonError:
+			return fmt.Errorf("provider response failed: %s", result.ErrorMessage)
+		case ai.StopReasonAborted:
+			return fmt.Errorf("provider response aborted: %w", context.Canceled)
+		}
+	}
+	return err
+}
+
+// recoverFromOverflow compacts after a response that overflowed the context
+// window, or stopped short of its output limit, and reports whether the
+// interrupted turn should be retried. Like upstream, a failed response gets one
+// compact-and-retry; a completed one is compacted without a retry.
+func (s *agentSession) recoverFromOverflow(ctx context.Context, message *agent.Message) bool {
+	model := s.limitsModel()
+	if message == nil || model == nil || s.compactionConfig.TriggerPct <= 0 {
+		return false
+	}
+	// An overflow from another model says nothing about the current window.
+	if message.Provider != model.Provider || message.Model != model.ID {
+		return false
+	}
+	stop := string(message.StopReason)
+	usage := ai.OverflowUsage{Input: message.Usage.Input, Output: message.Usage.Output, CacheHit: message.Usage.CacheRead}
+	overflow := ai.IsContextOverflow(stop, message.ErrorMessage, usage, model.ContextWindow)
+	if !overflow && !ai.IsRecoverableLength(stop, message.Usage.Output, model.MaxTokens) {
+		return false
+	}
+	trigger := compactionTrigger{reason: compactionReasonOverflow, willRetry: message.StopReason != ai.StopReasonStop}
+	if trigger.willRetry {
+		s.mu.Lock()
+		attempted := s.overflowRecoveryAttempted
+		s.overflowRecoveryAttempted = true
+		s.mu.Unlock()
+		if attempted {
+			errorMessage := "Truncated response recovery failed after one compact-and-retry attempt."
+			if overflow {
+				errorMessage = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
+			}
+			s.notify("compaction_end", map[string]any{"session_id": s.id, "reason": trigger.reason, "will_retry": false, "error_message": errorMessage})
+			return false
+		}
+		if err := s.omitFailedAttempt(); err != nil {
+			s.logger.Error("persist overflow retry omission", "error", err)
+			return false
+		}
+	}
+	if due, err := s.hasPersistedCompactionWork(model); err != nil || !due {
+		if err != nil {
+			s.logger.Warn("overflow compaction failed", "error", err)
+		}
+		return false
+	}
+	if err := s.compact(ctx, trigger, ""); err != nil {
+		s.logger.Warn("overflow compaction failed", "error", err)
+		return false
+	}
+	if trigger.willRetry {
+		s.mu.Lock()
+		s.failedResponse = message
+		s.mu.Unlock()
+	}
+	return trigger.willRetry
+}
+
+func (s *agentSession) omitFailedAttempt() error {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	parent := s.parentMsgID
+	s.mu.Unlock()
+	if writer == nil || parent == nil {
+		return nil
+	}
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	if err != nil {
+		return fmt.Errorf("read retry history: %w", err)
+	}
+	manager := sessionpkg.NewManager(reader.Header().CWD)
+	manager.LoadEntries(reader)
+	if _, err := manager.AppendContextEdit(*parent, json.RawMessage(`null`)); err != nil {
+		return fmt.Errorf("omit retry attempt: %w", err)
+	}
+	entries := manager.Entries()
+	if err := writer.Append(entries[len(entries)-1]); err != nil {
+		return fmt.Errorf("persist retry edit: %w", err)
+	}
+	id := entries[len(entries)-1].ID
+	s.mu.Lock()
+	s.parentMsgID = &id
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *agentSession) flushStartupCustom(ctx context.Context) {
+	for {
+		s.mu.Lock()
+		pending := s.pendingStartupCustom
+		s.pendingStartupCustom = nil
+		s.mu.Unlock()
+		if len(pending) == 0 {
+			return
+		}
+		// Accepted context survives cancellation of the provider run.
+		for _, message := range pending {
+			if err := s.agent.AppendCustomMessage(context.WithoutCancel(ctx), message); err != nil {
+				s.logger.Error("append startup context", "error", err)
+			}
+		}
+	}
+}
+
 func (s *agentSession) runLocked(ctx context.Context, run func(context.Context) error) <-chan Event {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelFn = cancel
+	done := make(chan struct{})
+	s.runDone = done
 	s.mu.Unlock()
 
 	events := make(chan Event, 64)
 
 	go func() {
+		defer close(done)
 		defer close(events)
-		defer func() {
-			s.mu.Lock()
-			s.cancelFn = nil
-			s.mu.Unlock()
-		}()
+		defer cancel()
 
 		s.emit(events, Event{
 			Type:      "session_start",
@@ -976,29 +1574,64 @@ func (s *agentSession) runLocked(ctx context.Context, run func(context.Context) 
 			},
 		})
 
+		currentEvents := events
 		unsubscribe := s.agent.Subscribe(func(event agent.Event, signal <-chan struct{}) {
-			s.handleAgentEvent(events, event)
+			if _, ok := event.(agent.AgentStart); ok {
+				s.flushStartupCustom(ctx)
+			}
+			s.handleAgentEvent(currentEvents, event)
 			// Tool results can push a running turn past the context-window
 			// threshold between turns. Checking on message end lets compaction
 			// fire mid-turn, and the agent loop rebases onto the replacement
 			// summary before the next model call.
-			if e, ok := event.(agent.MessageEnd); ok && e.Message != nil && e.Message.Role != agent.RoleUser {
+			// A failed or truncated response is left to overflow recovery
+			// after the run, which must omit it before compacting.
+			if e, ok := event.(agent.MessageEnd); ok && e.Message != nil && e.Message.Role != agent.RoleUser && e.Message.StopReason != ai.StopReasonError && e.Message.StopReason != ai.StopReasonLength {
 				s.autoCompactIfDue(ctx)
 			}
 		})
 		defer unsubscribe()
 
-		if err := run(ctx); err != nil {
-			s.recordProviderError(err)
-			s.emit(events, Event{
-				Type:      "error",
-				SessionID: s.id,
-				Payload: map[string]any{
-					"code":        "agent_error",
-					"message":     err.Error(),
-					"recoverable": false,
-				},
-			})
+		var runErr error
+		for {
+			runErr = s.runWithRetry(ctx, currentEvents, run)
+			if err := runErr; err != nil {
+				s.recordProviderError(err)
+				s.emit(currentEvents, Event{
+					Type:      "error",
+					SessionID: s.id,
+					Payload: map[string]any{
+						"code":        "agent_error",
+						"message":     err.Error(),
+						"recoverable": false,
+					},
+				})
+			}
+
+			s.flushStartupCustom(ctx)
+			if currentEvents != events {
+				close(currentEvents)
+				currentEvents = events
+			}
+			s.mu.Lock()
+			if runErr != nil || len(s.deferredRuns) == 0 || s.closed || ctx.Err() != nil {
+				for _, pending := range s.deferredRuns {
+					if pending.events != nil {
+						close(pending.events)
+					}
+				}
+				s.deferredRuns = nil
+				s.mu.Unlock()
+				break
+			}
+			next := s.deferredRuns[0]
+			s.deferredRuns = s.deferredRuns[1:]
+			s.mu.Unlock()
+			currentEvents = events
+			if next.events != nil {
+				currentEvents = next.events
+			}
+			run = func(ctx context.Context) error { return s.runPreparedMessage(ctx, next.message) }
 		}
 
 		s.emit(events, Event{
@@ -1006,10 +1639,24 @@ func (s *agentSession) runLocked(ctx context.Context, run func(context.Context) 
 			SessionID: s.id,
 			Payload: map[string]any{
 				"id":           s.id,
+				"aborted":      ctx.Err() != nil || errors.Is(runErr, context.Canceled),
 				"total_tokens": s.totalTokens,
 				"cost_usd":     s.calculateCost(),
 			},
 		})
+		for {
+			s.flushStartupCustom(ctx)
+			s.mu.Lock()
+			if len(s.pendingStartupCustom) != 0 {
+				s.mu.Unlock()
+				continue
+			}
+			unsubscribe()
+			s.cancelFn = nil
+			s.runDone = nil
+			s.mu.Unlock()
+			break
+		}
 	}()
 
 	return events
@@ -1031,19 +1678,63 @@ func (s *agentSession) Interrupt() error {
 }
 
 func (s *agentSession) Compact(ctx context.Context, customInstructions ...string) error {
-	instructions := ""
+	var instructions string
 	if len(customInstructions) > 0 {
 		instructions = strings.TrimSpace(customInstructions[0])
+	}
+	return s.compact(ctx, compactionTrigger{reason: compactionReasonManual}, instructions)
+}
+
+const (
+	compactionReasonManual    = "manual"
+	compactionReasonThreshold = "threshold"
+	compactionReasonOverflow  = "overflow"
+)
+
+// compactionTrigger says why a compaction runs and whether the interrupted
+// turn is retried after it.
+type compactionTrigger struct {
+	reason    string
+	willRetry bool
+}
+
+// compact runs one compaction. Once compaction_start is raised, a failure
+// still raises compaction_end, flagged aborted or carrying the error, so a
+// frontend never keeps a compaction indicator for an attempt that ended.
+func (s *agentSession) compact(ctx context.Context, trigger compactionTrigger, instructions string) (err error) {
+	reason := trigger.reason
+	var started bool
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			err = fmt.Errorf("compact: %w", errors.Join(err, ctx.Err(), context.Cause(ctx)))
+		}
+		if err == nil || !started {
+			return
+		}
+		payload := map[string]any{"session_id": s.id, "reason": reason, "will_retry": false, "custom_instructions": instructions}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			payload["aborted"] = true
+		} else {
+			payload["error_message"] = map[string]string{
+				compactionReasonOverflow:  "Context overflow recovery failed: ",
+				compactionReasonThreshold: "Auto-compaction failed: ",
+			}[reason] + err.Error()
+		}
+		s.notify("compaction_end", payload)
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	// Fire `session_before_compact` (cancellable) so plugins can observe or
 	// block the compaction attempt.
 	if s.pluginManager != nil {
 		beforePayload, _ := json.Marshal(map[string]any{
 			"session_id":          s.id,
-			"reason":              "manual",
+			"reason":              reason,
+			"will_retry":          trigger.willRetry,
 			"custom_instructions": instructions,
 		})
-		if blocked := s.pluginManager.DispatchEvent("session_before_compact", beforePayload, s.id); blocked {
+		if blocked := s.pluginManager.DispatchEvent(ctx, "session_before_compact", beforePayload, s.id); blocked {
 			return fmt.Errorf("compaction blocked by plugin")
 		}
 	}
@@ -1053,16 +1744,17 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	if s.pluginManager != nil {
 		startPayload, _ := json.Marshal(map[string]any{
 			"session_id":          s.id,
-			"reason":              "manual",
+			"reason":              reason,
 			"custom_instructions": instructions,
 		})
-		s.pluginManager.DispatchEvent("compaction_start", startPayload, s.id)
+		s.pluginManager.DispatchEvent(ctx, "compaction_start", startPayload, s.id)
 	}
 	// Frontends get the same event out of band. Raised outside the plugin-
 	// manager guard: a session with no plugins still has a UI to inform.
+	started = true
 	s.notify("compaction_start", map[string]any{
 		"session_id":          s.id,
-		"reason":              "manual",
+		"reason":              reason,
 		"custom_instructions": instructions,
 	})
 
@@ -1072,12 +1764,68 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	// instead compact the same messages the failed attempt saw.
 	state := s.agent.State()
 	compactMessages := s.compactionInputMessages(state.Messages)
+	var keptMessages []*agent.Message
+	var firstKeptID string
+	settings := s.settingsSnapshot()
+	limits, err := settings.ResolveCompaction(s.limitsModel())
+	if err != nil {
+		return err
+	}
+	{
+		s.mu.Lock()
+		writer := s.sessionWriter
+		s.mu.Unlock()
+		if writer != nil {
+			reader, err := sessionpkg.ReadFile(writer.Path())
+			if err != nil {
+				return fmt.Errorf("read compaction history: %w", err)
+			}
+			entries := reader.ContextEntriesUnwound()
+			preparation := prepareSessionCompaction(entries, limits)
+			if preparation == nil && len(entries) > 0 {
+				if branch := reader.ActiveBranch(); len(branch) > 0 {
+					if last := reader.FindByID(branch[len(branch)-1]); last != nil && last.Type == sessionpkg.EntryTypeCompaction {
+						return errors.New("already compacted")
+					}
+				}
+				return errors.New("nothing to compact (session too small)")
+			}
+			if preparation != nil {
+				firstKeptID = preparation.FirstKeptID
+				var toSummarize []*sessionpkg.Message
+				var toKeep []*sessionpkg.Message
+				keeping := false
+				for _, entry := range entries {
+					keeping = keeping || entry.ID == firstKeptID
+					if message := entry.ToAgentMessage(); message != nil {
+						if keeping {
+							toKeep = append(toKeep, message)
+						} else {
+							toSummarize = append(toSummarize, message)
+						}
+					}
+				}
+				keptMessages = sessionMessagesToAgentMessages(toKeep)
+				compactMessages = sessionMessagesToAgentMessages(toSummarize)
+			}
+		}
+	}
+	compactMessages = slices.DeleteFunc(slices.Clone(compactMessages), func(message *agent.Message) bool {
+		return message == nil || message.ExcludeFromContext
+	})
 	var transcript strings.Builder
 	for _, msg := range compactMessages {
 		role := string(msg.Role)
 		for _, block := range msg.Content {
-			if block.Type == ai.ContentBlockText && block.Text != "" {
-				fmt.Fprintf(&transcript, "[%s]: %s\n", role, block.Text)
+			switch block.Type {
+			case ai.ContentBlockText:
+				if block.Text != "" {
+					fmt.Fprintf(&transcript, "[%s]: %s\n", role, block.Text)
+				}
+			case ai.ContentBlockToolCall:
+				if block.Name != "" {
+					fmt.Fprintf(&transcript, "[%s tool call]: %s(%s)\n", role, block.Name, block.Arguments)
+				}
 			}
 		}
 	}
@@ -1092,8 +1840,8 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 		for _, msg := range compactMessages {
 			tokensBefore += int64(msg.Usage.TotalTokens)
 		}
-		result := s.pluginManager.DispatchCompactionHook(transcriptStr, tokensBefore, s.id)
-		summary = result.Summary
+		result := s.pluginManager.DispatchCompactionHook(ctx, transcriptStr, tokensBefore, s.id)
+		summary = strings.TrimSpace(result.Summary)
 	}
 	var summarizeErr error
 	if summary == "" {
@@ -1101,6 +1849,12 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 		var err error
 		summary, err = s.callModelForSummary(ctx, summarizationPrompt, transcriptStr, instructions)
 		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			// Keep the session usable with a naive summary, but never silently:
 			// the warning and the compaction_end payload both record the failure.
 			summarizeErr = err
@@ -1109,6 +1863,9 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("compact: %w", err)
+	}
 	// Counted once, before the messages are replaced: the entry, the event, and
 	// any frontend indicator all have to quote the same figure.
 	tokensBefore := 0
@@ -1122,7 +1879,12 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	parentID := s.parentMsgID
 	s.mu.Unlock()
 	if writer != nil && parentID != nil {
-		entry := sessionpkg.NewCompactionEntry(summary, *parentID, tokensBefore, 0, false)
+		keptID := *parentID
+		if firstKeptID != "" {
+			keptID = firstKeptID
+		}
+		entry := sessionpkg.NewCompactionEntry(summary, keptID, tokensBefore, 0, false)
+		entry.ParentID = parentID
 		entry.ID = sessionpkg.NewID()
 		if summarizeErr != nil {
 			// The session log must show this compaction degraded to a local
@@ -1134,6 +1896,9 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 		if err := writer.Append(entry); err != nil {
 			return fmt.Errorf("append compaction entry: %w", err)
 		}
+		s.mu.Lock()
+		s.parentMsgID = &entry.ID
+		s.mu.Unlock()
 	}
 
 	// Replace agent messages with a single summary message to simulate
@@ -1143,17 +1908,25 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 		Content:   []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "Session Summary: " + summary}},
 		Timestamp: time.Now(),
 	}
-	s.agent.ReplaceMessages([]*agent.Message{summaryMsg})
+	var replacement []*agent.Message
+	for _, message := range compactMessages {
+		if message != nil && message.Role == agent.RoleSystem && !message.ExcludeFromContext {
+			replacement = append(replacement, message)
+		}
+	}
+	replacement = append(replacement, summaryMsg)
+	s.agent.ReplaceMessages(append(replacement, keptMessages...))
 
 	// Fire `compaction_end` (informational) so plugins can observe the
 	// successful compaction outcome.
 	if s.pluginManager != nil {
 		afterPayload, _ := json.Marshal(map[string]any{
 			"session_id":          s.id,
-			"reason":              "manual",
+			"reason":              reason,
+			"will_retry":          trigger.willRetry,
 			"custom_instructions": instructions,
 		})
-		s.pluginManager.DispatchEvent("compaction_end", afterPayload, s.id)
+		s.pluginManager.DispatchEvent(ctx, "compaction_end", afterPayload, s.id)
 	}
 	// The frontend copy carries the summary and the token count: §9 has the UI
 	// commit a summary message when compaction ends, and it has no other way to
@@ -1161,7 +1934,8 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	// can show that the summary is a local fallback rather than model output.
 	endPayload := map[string]any{
 		"session_id":          s.id,
-		"reason":              "manual",
+		"reason":              reason,
+		"will_retry":          trigger.willRetry,
 		"summary":             summary,
 		"tokens_before":       tokensBefore,
 		"custom_instructions": instructions,
@@ -1189,18 +1963,61 @@ const summaryMaxOutputTokens = 8192
 // limit. Normal prompts get the same treatment implicitly by falling back to
 // the model's full MaxTokens; the compact path sets an explicit cap, so the
 // adjustment has to be explicit too.
-func (s *agentSession) summaryMaxTokens() int {
-	s.mu.Lock()
-	level := s.thinkingLevel
-	s.mu.Unlock()
-	if level == "" || level == agent.ThinkingOff || s.model == nil || !s.model.Reasoning {
+func (s *agentSession) summaryMaxTokens(model *ai.Model, level agent.ThinkingLevel) int {
+	if level == "" || level == agent.ThinkingOff || model == nil || !model.Reasoning {
 		return summaryMaxOutputTokens
 	}
-	maxTokens := summaryMaxOutputTokens + ai.ThinkingBudgetForLevel(ai.ReasoningLevel(level), nil)
-	if s.model.MaxTokens > 0 && s.model.MaxTokens < maxTokens {
-		return s.model.MaxTokens
+	maxTokens := summaryMaxOutputTokens + ai.ThinkingBudgetForLevel(ai.ReasoningLevel(level), s.settingsSnapshot().ResolveThinkingBudgets())
+	if model.MaxTokens > 0 && model.MaxTokens < maxTokens {
+		return model.MaxTokens
 	}
 	return maxTokens
+}
+
+// prepareSessionCompaction runs compaction preparation over persisted context
+// entries. It returns nil when no conversation message would be summarized.
+func prepareSessionCompaction(entries []sessionpkg.Entry, limits ai.CompactionSettings) *compaction.Preparation {
+	scanner := make([]compaction.ScannerEntry, 0, len(entries))
+	for _, entry := range entries {
+		scannerEntry := compaction.ScannerEntry{ID: entry.ID, Type: string(entry.Type), ParentID: entry.ParentID, Message: entry.Message}
+		if entry.FirstKeptID != nil {
+			scannerEntry.FirstKeptID = *entry.FirstKeptID
+		}
+		if entry.Summary != nil {
+			scannerEntry.Summary = *entry.Summary
+		}
+		scanner = append(scanner, scannerEntry)
+	}
+	preparation := compaction.PrepareCompaction(scanner, compaction.Settings{Enabled: true, ReserveTokens: limits.ReserveTokens, KeepRecentTokens: limits.KeepRecentTokens})
+	if preparation == nil || !slices.ContainsFunc(append(slices.Clone(preparation.MessagesToSummarize), preparation.TurnPrefixMessages...), func(message *compaction.AgentMessage) bool {
+		return message != nil && message.Role != compaction.MessageRole(agent.RoleSystem)
+	}) {
+		return nil
+	}
+	return preparation
+}
+
+// hasPersistedCompactionWork reports whether automatic compaction has
+// anything to summarize. Like upstream, a session whose persisted history
+// yields no preparation (for example, one that was just compacted) is
+// skipped instead of compacting its retained tail again. Sessions without a
+// file keep summarizing their live history.
+func (s *agentSession) hasPersistedCompactionWork(model *ai.Model) (bool, error) {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	s.mu.Unlock()
+	if writer == nil {
+		return true, nil
+	}
+	limits, err := s.settingsSnapshot().ResolveCompaction(model)
+	if err != nil {
+		return false, err
+	}
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	if err != nil {
+		return false, fmt.Errorf("read compaction history: %w", err)
+	}
+	return prepareSessionCompaction(reader.ContextEntriesUnwound(), limits) != nil, nil
 }
 
 // compactionInputMessages selects the message set to compact. When the
@@ -1221,7 +2038,8 @@ func (s *agentSession) compactionInputMessages(live []*agent.Message) []*agent.M
 		return live
 	}
 	entries := reader.ContextEntries()
-	if len(entries) == 0 || entries[0].Type != sessionpkg.EntryTypeCompaction || !entries[0].Fallback {
+	compactionIndex := slices.IndexFunc(entries, func(entry sessionpkg.Entry) bool { return entry.Type == sessionpkg.EntryTypeCompaction })
+	if compactionIndex < 0 || !entries[compactionIndex].Fallback {
 		return live
 	}
 	unwound := agentMessagesFromUnwoundContext(reader)
@@ -1244,13 +2062,31 @@ func agentMessagesFromUnwoundContext(reader *sessionpkg.Reader) []*agent.Message
 }
 
 // callModelForSummary calls the model to generate a summary using the compaction prompt.
-func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, transcript, customInstructions string) (string, error) {
+func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, transcript, customInstructions string) (summary string, err error) {
+	defer func() {
+		if ctx.Err() != nil {
+			summary = ""
+			err = fmt.Errorf("summarization cancelled: %w", errors.Join(err, ctx.Err(), context.Cause(ctx)))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if s.model == nil {
 		return "", fmt.Errorf("no model configured for summarization")
 	}
+	// Route a virtual model first: summaries size their input and output from
+	// the model they get.
+	model, level, err := s.directModel(ctx)
+	if err != nil {
+		return "", fmt.Errorf("summarization model: %w", err)
+	}
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	// Build the request using the AI client factory
-	client, err := s.getClient()
+	client, err := s.getClient(model)
 	if err != nil {
 		return "", fmt.Errorf("get AI client: %w", err)
 	}
@@ -1260,16 +2096,56 @@ func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, tr
 		instruction += " Additional focus: " + customInstructions
 	}
 
+	settings := s.settingsSnapshot()
+	limits, err := settings.ResolveCompaction(model)
+	if err != nil {
+		return "", err
+	}
 	prompt := &ai.Context{
 		SystemPrompt: systemPrompt,
 		Messages: []ai.Message{
 			{Role: "user", Content: instruction},
-			{Role: "user", Content: trimTranscriptForSummary(transcript, s.model.ContextWindow)},
+			{Role: "user", Content: trimTranscriptForSummaryWithReserve(transcript, model.ContextWindow, limits.ReserveTokens)},
 		},
 	}
 
-	opts := append(s.compactionCompletionOptions(ctx), ai.WithMaxTokens(s.summaryMaxTokens()))
-	msg, err := client.Complete(ctx, s.model, prompt, opts...)
+	opts, err := s.compactionCompletionOptions(ctx, model, level)
+	if err != nil {
+		return "", fmt.Errorf("summary request options: %w", err)
+	}
+	opts = append(opts, ai.WithMaxTokens(ai.ClampMaxTokensToContext(model, prompt, s.summaryMaxTokens(model, level))))
+	retryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.mu.Lock()
+	enabled := s.autoRetryEnabled
+	s.retryCancel = cancel
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.retryCancel = nil; s.mu.Unlock() }()
+	policy := s.retryPolicy()
+	if !enabled {
+		policy.MaxRetries = 0
+	}
+	retried := false
+	defer func() {
+		if retried {
+			s.notify("summarization_retry_finished", nil)
+		}
+	}()
+	msg, err := ai.RetryAssistantCall(retryCtx, func(callCtx context.Context) (*ai.AssistantMessage, error) {
+		if retried {
+			s.notify("summarization_retry_attempt_start", map[string]any{"source": "compaction"})
+		}
+		message, err := client.Complete(callCtx, model, prompt, opts...)
+		if message != nil && hasUsage(message.Usage) {
+			if usageErr := s.recordSummaryUsage(message.Usage); usageErr != nil {
+				return message, errors.Join(err, usageErr)
+			}
+		}
+		return message, err
+	}, policy, func(attempt int, delay time.Duration, message string) {
+		retried = true
+		s.notify("summarization_retry_scheduled", map[string]any{"attempt": attempt, "maxAttempts": policy.MaxRetries, "delayMs": delay.Milliseconds(), "errorMessage": message})
+	})
 	if err != nil {
 		return "", fmt.Errorf("model completion: %w", err)
 	}
@@ -1277,20 +2153,88 @@ func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, tr
 	// mid-generation. Accepting it persists a truncated fragment as the
 	// summary, which then replaces the entire session context. Treat it as a
 	// failed summarization so the caller falls back and a retry can succeed.
+	if msg == nil {
+		return "", errors.New("summarization returned no assistant message")
+	}
+	if msg.StopReason == ai.StopReasonAborted {
+		return "", fmt.Errorf("summarization aborted: %s: %w", msg.ErrorMessage, context.Canceled)
+	}
+	if msg.StopReason == ai.StopReasonError {
+		return "", fmt.Errorf("summarization failed: %s", msg.ErrorMessage)
+	}
 	if msg.StopReason == ai.StopReasonLength {
 		return "", fmt.Errorf("summarization stopped at the output token limit (finish_reason=length); the summary would be truncated")
 	}
 
 	var b strings.Builder
 	for _, block := range msg.Content {
+		if block.Type == ai.ContentBlockToolCall {
+			return "", errors.New("summarization attempted to call a tool")
+		}
 		if block.Type == ai.ContentBlockText {
 			b.WriteString(block.Text)
 		}
 	}
-	if b.Len() == 0 {
+	if strings.TrimSpace(b.String()) == "" {
 		return "", fmt.Errorf("no text content in summarization response")
 	}
 	return b.String(), nil
+}
+
+func (s *agentSession) recordSummaryUsage(usage ai.Usage) error {
+	usage = sessionpkg.NormalizeUsage(usage)
+	s.mu.Lock()
+	s.totalTokens += usage.TotalTokens
+	addUsage(&s.usageTotals, usage)
+	parentID := s.parentMsgID
+	s.mu.Unlock()
+	s.logUsage(usage, s.model.ID)
+	writer, err := s.ensureSessionWriter()
+	if err != nil {
+		return fmt.Errorf("persist summary usage: %w", err)
+	}
+	if writer == nil {
+		return nil
+	}
+	entry, err := sessionpkg.NewSummaryUsageEntry(parentID, usage)
+	if err != nil {
+		return err
+	}
+	if err := writer.Append(entry); err != nil {
+		return fmt.Errorf("append summary usage: %w", err)
+	}
+	return nil
+}
+
+func recordedSessionUsage(reader *sessionpkg.Reader) (ai.Usage, error) {
+	var total ai.Usage
+	for _, entry := range reader.Entries() {
+		var usage ai.Usage
+		if message := entry.ToAgentMessage(); message != nil {
+			usage = message.Usage
+		} else if entry.Type == sessionpkg.EntryTypeCustom && entry.CustomType != nil && *entry.CustomType == sessionpkg.SummaryUsageType {
+			if err := json.Unmarshal(entry.Data, &usage); err != nil {
+				return total, fmt.Errorf("decode summary usage entry %s: %w", entry.ID, err)
+			}
+		}
+		addUsage(&total, usage)
+	}
+	return total, nil
+}
+
+func addUsage(total *ai.Usage, usage ai.Usage) {
+	usage = sessionpkg.NormalizeUsage(usage)
+	total.Input += usage.Input
+	total.Output += usage.Output
+	total.CacheRead += usage.CacheRead
+	total.CacheWrite += usage.CacheWrite
+	total.CacheWrite1h += usage.CacheWrite1h
+	total.TotalTokens += usage.TotalTokens
+	total.Cost.Input += usage.Cost.Input
+	total.Cost.Output += usage.Cost.Output
+	total.Cost.CacheRead += usage.Cost.CacheRead
+	total.Cost.CacheWrite += usage.Cost.CacheWrite
+	total.Cost.Total += usage.Cost.Total
 }
 
 // trimTranscriptForSummary keeps the most recent transcript characters that
@@ -1300,11 +2244,11 @@ func (s *agentSession) callModelForSummary(ctx context.Context, systemPrompt, tr
 // summary silently degrades to the naive fallback.
 // ponytail: tail-only trim drops the oldest history; chunked iterative
 // summarization (pi-style) is the upgrade path if that loss matters.
-func trimTranscriptForSummary(transcript string, contextWindow int) string {
+func trimTranscriptForSummaryWithReserve(transcript string, contextWindow, reserve int) string {
 	if contextWindow <= 0 {
 		return transcript
 	}
-	budgetTokens := contextWindow - compaction.DefaultSettings.ReserveTokens
+	budgetTokens := contextWindow - reserve
 	if budgetTokens < 1024 {
 		budgetTokens = 1024
 	}
@@ -1327,53 +2271,48 @@ func trimTranscriptForSummary(transcript string, contextWindow int) string {
 // directly rather than going through Agent.Prompt, so without this path real
 // providers see an unauthenticated summary request, fail immediately, and the
 // caller falls back to the naive instant summary.
-func (s *agentSession) compactionCompletionOptions(ctx context.Context) []ai.Option {
-	opts := []ai.Option{ai.WithSessionID(s.id)}
+func (s *agentSession) compactionCompletionOptions(ctx context.Context, model *ai.Model, level agent.ThinkingLevel) ([]ai.Option, error) {
+	opts := append(s.settingsSnapshot().ResolveRetry().Provider.RequestOptions(), ai.WithSessionID(s.id))
 	// Mirror buildAIOptions: with no level set, the OpenAI-compat layer sends
 	// enable_thinking:false, which always-thinking models (zai glm-5.3) reject
 	// (error 1210) — so forward the session's level like a normal prompt does.
-	s.mu.Lock()
-	level := s.thinkingLevel
-	s.mu.Unlock()
 	if level != "" && level != agent.ThinkingOff {
 		opts = append(opts, ai.WithReasoning(ai.ReasoningLevel(level)))
 	}
-	if s.model == nil || s.credentialProvider == nil {
-		return opts
+	if budgets := s.settingsSnapshot().ResolveThinkingBudgets(); budgets != nil {
+		opts = append(opts, ai.WithThinkingBudgets(budgets))
 	}
-	providerKey := s.model.Provider
+	if model == nil || s.credentialProvider == nil {
+		return opts, nil
+	}
+	providerKey := model.Provider
 	if providerKey == "" {
 		providerKey = s.modelSpec.Provider
 	}
 	if providerKey == "" {
-		return opts
+		return opts, nil
 	}
 	apiKey, err := s.credentialProvider(ctx, providerKey)
 	if err != nil {
-		return opts
+		return nil, fmt.Errorf("summary credentials for %s: %w", providerKey, err)
 	}
 	if apiKey != "" {
 		opts = append(opts, ai.WithAPIKey(apiKey))
 	}
-	return opts
+	return opts, nil
 }
 
 // getClient returns an AI client for the current model.
-func (s *agentSession) getClient() (ai.Client, error) {
-	if s.model == nil {
+func (s *agentSession) getClient(model *ai.Model) (ai.Client, error) {
+	if model == nil {
 		return nil, fmt.Errorf("no model configured")
 	}
 
 	if s.clientFactory != nil {
-		return s.clientFactory(s.model)
+		return s.clientFactory(model)
 	}
 
-	p, ok := ai.Get(s.model.API)
-	if !ok {
-		return nil, fmt.Errorf("no provider for API: %s", s.model.API)
-	}
-
-	return p.NewClient(s.model)
+	return ai.GetClient(model)
 }
 
 // buildNaiveSummary creates a fallback summary when model-driven summarization is not available.
@@ -1420,6 +2359,9 @@ func preservedSessionSummaries(messages []*agent.Message) []string {
 			continue
 		}
 		text := strings.TrimSpace(agentMessageText(msg))
+		if !strings.HasPrefix(text, "Session Summary:") {
+			continue
+		}
 		text = strings.TrimPrefix(text, "Session Summary:")
 		text = strings.TrimSpace(text)
 		if text == "" || seen[text] {
@@ -1474,18 +2416,36 @@ func truncateText(text string, maxRunes int) string {
 // and after mid-turn message events, because a tool result can push a
 // running turn past the window between turns.
 func (s *agentSession) autoCompactIfDue(ctx context.Context) {
-	if s.compactionConfig.TriggerPct <= 0 || s.model == nil {
+	model := s.limitsModel()
+	if s.compactionConfig.TriggerPct <= 0 || model == nil {
 		return
 	}
 	cfg := s.compactionConfig
-	if t := providerTriggerTokens(s.model.Provider); t > 0 {
+	if t := providerTriggerTokens(model.Provider); t > 0 {
 		cfg.TriggerTokens = t
 	}
+	if settings := s.settingsSnapshot(); settings != nil {
+		limits, err := settings.ResolveCompaction(model)
+		if err != nil {
+			s.logger.Warn("invalid compaction settings", "error", err)
+			return
+		}
+		if limits.ReserveTokens != 16384 || len(settings.Compaction.ModelOverrides) > 0 {
+			cfg.TriggerTokens = max(1, model.ContextWindow-limits.ReserveTokens)
+			cfg.TriggerPct = 100
+		}
+	}
 	estimatedTokens := s.estimateSessionTokens(s.agent.State())
-	if !compaction.ShouldCompact(estimatedTokens, s.model.ContextWindow, cfg) {
+	if !compaction.ShouldCompact(estimatedTokens, model.ContextWindow, cfg) {
 		return
 	}
-	if err := s.Compact(ctx); err != nil {
+	if due, err := s.hasPersistedCompactionWork(model); err != nil || !due {
+		if err != nil {
+			s.logger.Warn("auto-compaction failed", "error", err)
+		}
+		return
+	}
+	if err := s.compact(ctx, compactionTrigger{reason: compactionReasonThreshold}, ""); err != nil {
 		s.logger.Warn("auto-compaction failed", "error", err)
 	}
 }
@@ -1499,12 +2459,13 @@ func (s *agentSession) estimateSessionTokens(state agent.State) int {
 func estimateContextTokens(messages []*agent.Message) int {
 	compactionMessages := make([]*compaction.AgentMessage, 0, len(messages))
 	for _, msg := range messages {
-		if msg == nil {
+		if msg == nil || msg.ExcludeFromContext {
 			continue
 		}
 		compactionMessages = append(compactionMessages, &compaction.AgentMessage{
 			Role:       compaction.MessageRole(msg.Role),
 			Content:    msg.Content,
+			Sections:   msg.Sections,
 			Usage:      msg.Usage,
 			StopReason: msg.StopReason,
 		})
@@ -1515,6 +2476,7 @@ func estimateContextTokens(messages []*agent.Message) int {
 func (s *agentSession) State() SessionState {
 	s.mu.Lock()
 	state := s.agent.State()
+	processing := state.IsStreaming || s.runDone != nil
 	// s.model may be nil when the session was created with no configured
 	// model (the TUI recovery path where the user picks a model via /model
 	// before sending). Treat it as an empty string in the public state.
@@ -1547,7 +2509,7 @@ func (s *agentSession) State() SessionState {
 		model:       modelID,
 		cwd:         s.cwd,
 		dataDir:     dataDir,
-		isStreaming: state.IsStreaming,
+		isStreaming: processing,
 		totalTokens: s.totalTokens,
 		position:    position,
 	}
@@ -1558,23 +2520,56 @@ func (s *agentSession) ID() string {
 	return s.id
 }
 
-func (s *agentSession) Close(_ context.Context) error {
+func (s *agentSession) Close(ctx context.Context) error {
+	return s.close(ctx, 2*time.Second)
+}
+
+func (s *agentSession) close(ctx context.Context, cleanupGrace time.Duration) error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
 	s.mu.Lock()
-	if s.closed {
+	if s.closeFinished {
+		err := s.closeErr
 		s.mu.Unlock()
-		return nil
+		return err
 	}
 	s.closed = true
+	cancel := s.cancelFn
+	done := s.runDone
 	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	var waitErr error
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// Keep the writer owned until admitted work has stopped using it.
+			waitCtx, cancelWait := context.WithTimeout(context.WithoutCancel(ctx), cleanupGrace)
+			defer cancelWait()
+			select {
+			case <-done:
+			case <-waitCtx.Done():
+				return fmt.Errorf("session run still running: %w", errors.Join(context.Cause(ctx), waitCtx.Err()))
+			}
+		}
+		if ctx.Err() != nil {
+			waitErr = fmt.Errorf("wait for session shutdown: %w", context.Cause(ctx))
+		}
+	}
 
 	// Fire `session_shutdown` on the plugin bus so extensions can observe
 	// the session being torn down. The JSON stream counterpart is emitted
 	// by the RPC server (or other transport) since Close is channel-agnostic.
+	var err error
 	if s.pluginManager != nil {
-		shutdownPayload, _ := json.Marshal(map[string]any{
-			"session_id": s.id,
-		})
-		s.pluginManager.DispatchEvent("session_shutdown", shutdownPayload, s.id)
+		shutdownPayload, marshalErr := json.Marshal(map[string]any{"session_id": s.id})
+		if marshalErr != nil {
+			err = fmt.Errorf("encode session shutdown: %w", marshalErr)
+		} else {
+			s.pluginManager.DispatchEvent(ctx, "session_shutdown", shutdownPayload, s.id)
+		}
 	}
 
 	// Clear the runtime's active-session pointer so subsequent plugin
@@ -1587,33 +2582,33 @@ func (s *agentSession) Close(_ context.Context) error {
 		s.runtime.mu.Unlock()
 	}
 
-	// Cancel any in-flight send
-	if s.cancelFn != nil {
-		s.cancelFn()
-	}
-
 	// Close the session writer and release ownership.
 	// This allows other processes to resume the session.
-	s.closeWriter()
+	err = errors.Join(err, s.closeWriter())
 	if s.runtime != nil {
 		s.runtime.releaseOpenSession(s.id)
+		s.runtime.forgetLiveSession(s)
 	}
-	s.removeUnsentDataDir()
-
-	return nil
+	err = errors.Join(err, s.removeUnsentDataDir())
+	s.mu.Lock()
+	s.closeFinished = true
+	s.closeErr = err
+	s.mu.Unlock()
+	return errors.Join(waitErr, err)
 }
 
-func (s *agentSession) removeUnsentDataDir() {
+func (s *agentSession) removeUnsentDataDir() error {
 	s.mu.Lock()
 	unsent := s.pendingHeader != nil && s.sessionWriter == nil
 	dir := s.sessionDataDir
 	s.mu.Unlock()
 	if !unsent || dir == "" {
-		return
+		return nil
 	}
 	if err := os.RemoveAll(dir); err != nil {
-		s.logger.Warn("session data cleanup failed", "error", err)
+		return fmt.Errorf("remove unsent session data: %w", err)
 	}
+	return nil
 }
 
 // IsPersisted returns whether the session has a persisted backing store.
@@ -1626,6 +2621,282 @@ func (s *agentSession) IsPersisted() bool {
 	// Default: a session is persisted if it has, or will lazily create, a
 	// session writer (i.e., it was not created with NoSession and no export path).
 	return s.sessionWriter != nil || s.pendingHeader != nil
+}
+
+func pluginAgentTool(mgr *plugins.Manager, pt plugins.ToolHandlerDesc) agent.Tool {
+	var outputSchema map[string]any
+	var namespace *agent.ToolNamespace
+	var namespaceErr error
+	if len(pt.Namespace) > 0 {
+		namespaceErr = json.Unmarshal(pt.Namespace, &namespace)
+	}
+	var schemaErr error
+	if len(pt.OutputSchema) > 0 {
+		schemaErr = json.Unmarshal(pt.OutputSchema, &outputSchema)
+	}
+	var reach func(context.Context, map[string]any) ([]string, error)
+	if pt.HasReachesTools {
+		reach = func(ctx context.Context, args map[string]any) ([]string, error) {
+			return mgr.ReachPluginTools(ctx, pt.Name, args)
+		}
+	}
+	return agent.Tool{
+		ReachTools:          reach,
+		Namespace:           namespace,
+		DefaultActive:       pt.DefaultActive,
+		OutputSchema:        outputSchema,
+		Exposure:            agent.ToolExposure(pt.Exposure),
+		ConstrainedSampling: pt.ConstrainedSampling,
+		Name:                pt.Name,
+		Description:         pt.Description,
+		Parameters:          pt.Parameters,
+		Execute: func(ctx agent.ToolContext) (*agent.ToolResult, error) {
+			switch agent.ToolExposure(pt.Exposure) {
+			case "", agent.ToolDirect, agent.ToolModelOnly, agent.ToolCodemode, agent.ToolDeferred, agent.ToolHidden:
+			default:
+				return nil, fmt.Errorf("invalid plugin tool exposure %q", pt.Exposure)
+			}
+			if namespaceErr != nil {
+				return nil, fmt.Errorf("invalid plugin namespace: %w", namespaceErr)
+			}
+			if schemaErr != nil {
+				return nil, fmt.Errorf("invalid plugin output schema: %w", schemaErr)
+			}
+			progressCh := make(chan plugins.ToolProgressEvent, 16)
+			done := make(chan struct{})
+			workerDone := make(chan struct{})
+			mgr.RegisterToolProgressSubscriber(ctx.ToolCallID, progressCh)
+			defer func() {
+				mgr.UnregisterToolProgressSubscriber(ctx.ToolCallID, progressCh)
+				close(done)
+				<-workerDone
+			}()
+
+			go func() {
+				defer close(workerDone)
+				publish := func(event plugins.ToolProgressEvent) {
+					if ctx.Context.Err() == nil && ctx.OnUpdate != nil {
+						ctx.OnUpdate(&agent.ToolResult{
+							Content:     event.Content,
+							NestedCalls: slices.Clone(event.NestedCalls),
+							IsError:     event.IsError,
+						})
+					}
+				}
+				for {
+					select {
+					case event := <-progressCh:
+						publish(event)
+					case <-done:
+						for {
+							select {
+							case event := <-progressCh:
+								publish(event)
+							default:
+								return
+							}
+						}
+					}
+				}
+			}()
+
+			// Serialize arguments to JSON for the plugin handler
+			argsJSON, err := json.Marshal(ctx.Args)
+			if err != nil {
+				return nil, fmt.Errorf("marshal plugin args: %w", err)
+			}
+			result, err := mgr.ExecutePluginToolResult(ctx.Context, pt.Name, ctx.ToolCallID, string(argsJSON))
+			if err != nil {
+				return nil, fmt.Errorf("plugin tool error: %w", err)
+			}
+			return decodePluginToolResult(result)
+		},
+	}
+}
+
+func decodePluginToolResult(result *proto.ToolResult) (*agent.ToolResult, error) {
+	converted := &agent.ToolResult{Content: result.Output, IsError: result.IsError}
+	if result.NestedCalls != "" {
+		if err := json.Unmarshal([]byte(result.NestedCalls), &converted.NestedCalls); err != nil {
+			return nil, fmt.Errorf("decode plugin nested calls: %w", err)
+		}
+		if len(converted.NestedCalls) > 128 {
+			converted.NestedCalls = slices.Clone(converted.NestedCalls[len(converted.NestedCalls)-128:])
+		}
+	}
+	if result.Usage != "" {
+		if err := json.Unmarshal([]byte(result.Usage), &converted.Usage); err != nil {
+			return nil, fmt.Errorf("decode plugin usage: %w", err)
+		}
+	}
+	if result.Rejection != "" {
+		converted.Content = result.Rejection
+		converted.IsError = true
+		converted.Rejection = errors.New(result.Rejection)
+	} else {
+		if result.Content != "" {
+			var content []ai.ContentBlock
+			if err := json.Unmarshal([]byte(result.Content), &content); err != nil {
+				return nil, fmt.Errorf("decode plugin content: %w", err)
+			}
+			converted.ContentBlocks = content
+		}
+		if result.StructuredContent != "" {
+			if !json.Valid([]byte(result.StructuredContent)) {
+				return nil, fmt.Errorf("invalid plugin structured content")
+			}
+			converted.StructuredContent = json.RawMessage(result.StructuredContent)
+		}
+	}
+	return converted, nil
+}
+
+// ToolRegistryReloader refreshes extension tool registrations on an idle session.
+type ToolRegistryReloader interface {
+	ReloadToolRegistry(context.Context) error
+}
+
+func (s *agentSession) ReloadToolRegistry(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("session closed")
+	}
+	if s.runDone != nil || s.agent.State().IsStreaming {
+		return errors.New("cannot reload tools while session is processing")
+	}
+	if s.pluginManager == nil || s.runtime.noTools {
+		return nil
+	}
+	tools := slices.DeleteFunc(slices.Clone(s.agent.State().Tools), func(tool agent.Tool) bool {
+		return slices.Contains(s.pluginToolNames, tool.Name)
+	})
+	var nextNames []string
+	for _, registered := range s.pluginManager.Tools() {
+		nextNames = append(nextNames, registered.Name)
+		candidate := pluginAgentTool(s.pluginManager, registered)
+		selected := selectSessionTools([]agent.Tool{candidate}, s.toolAllowlist, s.toolDenylist)
+		for _, tool := range selected {
+			if index := slices.IndexFunc(tools, func(existing agent.Tool) bool { return existing.Name == tool.Name }); index >= 0 {
+				tools[index] = tool
+			} else {
+				tools = append(tools, tool)
+			}
+		}
+	}
+	s.pluginToolNames = nextNames
+	s.agent.SetTools(tools...)
+	s.runtime.syncPluginVirtualModels()
+	return nil
+}
+
+// SettingsReloader updates an idle session after settings files are reloaded.
+type SettingsReloader interface {
+	ReloadSettings(context.Context, *ai.Settings) error
+}
+
+// SettingsProvider reports the settings a session currently applies.
+type SettingsProvider interface {
+	Settings() *ai.Settings
+}
+
+// Settings returns the settings the session last applied.
+func (s *agentSession) Settings() *ai.Settings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settings
+}
+
+// ReloadSettings activates newly added defaults without undoing session tool changes.
+func (s *agentSession) ReloadSettings(ctx context.Context, settings *ai.Settings) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("session closed")
+	}
+	if s.runDone != nil || s.agent.State().IsStreaming {
+		return errors.New("cannot reload settings while session is processing")
+	}
+	limits, err := settings.ResolveCompaction(s.model)
+	if err != nil {
+		return err
+	}
+	previousLimits, err := s.settings.ResolveCompaction(s.model)
+	if err != nil {
+		return err
+	}
+	steering, followUp, err := settingsQueueModes(settings)
+	if err != nil {
+		return err
+	}
+	transport, err := settings.ResolveTransport()
+	if err != nil {
+		return err
+	}
+	if s.settings == nil || settings == nil || s.settings.SteeringMode != settings.SteeringMode {
+		s.agent.SetSteeringMode(steering)
+	}
+	if s.settings == nil || settings == nil || s.settings.FollowUpMode != settings.FollowUpMode {
+		s.agent.SetFollowUpMode(followUp)
+	}
+	s.settings = settings
+	s.runtime.replaceSettings(settings)
+	if s.pluginManager != nil {
+		s.pluginManager.SetSettings(settings)
+	}
+	s.agent.SetThinkingBudgets(settings.ResolveThinkingBudgets())
+	s.agent.SetRequestOptions(settings.ResolveRetry().Provider.RequestOptions()...)
+	s.agent.SetTransport(transport)
+	if !s.runtime.noTools && !s.runtime.noBuiltinTools {
+		tools := s.agent.State().Tools
+		for _, builtin := range agent.BuiltInToolsWithConfig(buildToolConfig(settings)) {
+			if slices.Contains(s.pluginToolNames, builtin.Name) {
+				continue
+			}
+			if index := slices.IndexFunc(tools, func(tool agent.Tool) bool { return tool.Name == builtin.Name }); index >= 0 {
+				tools[index] = builtin
+			}
+		}
+		s.agent.SetTools(tools...)
+	}
+	if limits.Enabled != previousLimits.Enabled {
+		if limits.Enabled {
+			s.compactionConfig = s.autoCompactionDefault
+			if s.compactionConfig.TriggerPct <= 0 {
+				s.compactionConfig = compaction.DefaultConfig()
+			}
+		} else {
+			s.compactionConfig.TriggerPct = 0
+		}
+	}
+	next := resolveDefaultToolSelection(settings)
+	previous := s.defaultToolNames
+	s.defaultToolNames = slices.Clone(next)
+	if s.toolAllowlist != nil && !toolSelectionHasModifiers(s.toolAllowlist) {
+		return nil
+	}
+	if s.runtime.noTools || s.runtime.noBuiltinTools {
+		return nil
+	}
+	next = applyToolModifiers(next, s.toolAllowlist)
+	previous = applyToolModifiers(previous, s.toolAllowlist)
+	if len(next) == 0 {
+		return nil
+	}
+	tools := s.agent.State().Tools
+	for _, tool := range filterToolsByName(agent.BuiltInToolsWithConfig(buildToolConfig(settings)), next, s.toolDenylist) {
+		if !slices.Contains(previous, tool.Name) && !slices.ContainsFunc(tools, func(t agent.Tool) bool { return t.Name == tool.Name }) {
+			tools = append(tools, tool)
+		}
+	}
+	s.agent.SetTools(tools...)
+	return nil
 }
 
 // SetThinkingLevel changes the thinking level mid-session.
@@ -1649,13 +2920,14 @@ func (s *agentSession) SetModel(model string) error {
 	if model == "" {
 		return fmt.Errorf("session: SetModel: empty model id")
 	}
-	m, ok := ai.Models()[model]
-	if !ok {
-		return fmt.Errorf("session: SetModel: unknown model %q", model)
+	m, err := s.runtime.resolveChatModel(model)
+	if err != nil {
+		return fmt.Errorf("session: SetModel: %w", err)
 	}
 
 	s.mu.Lock()
 	s.model = m
+	s.routedModel = nil
 	s.modelSpec = ai.ModelSpec{Provider: m.Provider, Model: m.ID}
 	s.pendingInitialModelProvider = m.Provider
 	s.pendingInitialModel = m.ID
@@ -1699,18 +2971,36 @@ func (s *agentSession) SlashCommands() []SlashCommandInfo {
 }
 
 func agentMessageFromSDK(msg Message) *agent.Message {
-	content := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msg.Text}}
+	content := slices.Clone(msg.Content)
+	if content == nil {
+		content = []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msg.Text}}
+	}
 	content = append(content, msg.Images...)
-	return &agent.Message{Role: agent.RoleUser, Content: content, Timestamp: time.Now()}
+	role := agent.RoleUser
+	if msg.Role == string(agent.RoleCustom) {
+		role = agent.RoleCustom
+	}
+	return &agent.Message{CustomType: msg.CustomType, Display: msg.Display, Details: msg.Details, ExcludeFromContext: msg.ExcludeFromContext, Role: role, Data: msg.Data, Content: content, Timestamp: time.Now()}
 }
 
 func sdkMessageFromAgent(msg *agent.Message) Message {
 	out := Message{
+		ExcludeFromContext: msg.ExcludeFromContext, CustomType: msg.CustomType, Display: msg.Display, Details: msg.Details,
+		Data:       msg.Data,
 		Role:       string(msg.Role),
 		Content:    append([]ai.ContentBlock(nil), msg.Content...),
 		ToolCallID: msg.ToolCallID,
 		ToolName:   msg.ToolName,
 		IsError:    msg.IsError,
+	}
+	out.StructuredContent = slices.Clone(msg.StructuredContent)
+	out.NestedCalls = slices.Clone(msg.NestedCalls)
+	if msg.ToolUsage != nil {
+		out.ToolUsage = new(*msg.ToolUsage)
+	}
+
+	if msg.DurationMs != nil {
+		out.DurationMs = new(*msg.DurationMs)
 	}
 	for _, block := range msg.Content {
 		switch block.Type {
@@ -1727,6 +3017,27 @@ func sdkMessageFromAgent(msg *agent.Message) Message {
 	return out
 }
 
+func settingsQueueModes(settings *ai.Settings) (agent.QueueMode, agent.QueueMode, error) {
+	steering, followUp := agent.QueueModeOneAtATime, agent.QueueModeOneAtATime
+	if settings == nil {
+		return steering, followUp, nil
+	}
+	var err error
+	if settings.SteeringMode != "" {
+		steering, err = parseQueueMode(settings.SteeringMode)
+		if err != nil {
+			return "", "", fmt.Errorf("steering mode: %w", err)
+		}
+	}
+	if settings.FollowUpMode != "" {
+		followUp, err = parseQueueMode(settings.FollowUpMode)
+		if err != nil {
+			return "", "", fmt.Errorf("follow-up mode: %w", err)
+		}
+	}
+	return steering, followUp, nil
+}
+
 func parseQueueMode(mode string) (agent.QueueMode, error) {
 	switch agent.QueueMode(mode) {
 	case agent.QueueModeOneAtATime, agent.QueueModeAll:
@@ -1737,27 +3048,29 @@ func parseQueueMode(mode string) (agent.QueueMode, error) {
 }
 
 func (s *agentSession) Steer(msg Message) error {
-	if len(msg.AttachmentIDs) > 0 {
-		blocks, err := s.attachments.ContentBlocks(msg.AttachmentIDs)
-		if err != nil {
-			return err
-		}
-		msg.Images = append(msg.Images, blocks...)
+	s.mu.Lock()
+	prepared, err := s.prepareMessageLocked(msg)
+	if err == nil {
+		s.agent.Steer(agentMessageFromSDK(prepared))
 	}
-	s.agent.Steer(agentMessageFromSDK(msg))
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	s.recordQueueUpdate()
 	return nil
 }
 
 func (s *agentSession) FollowUp(msg Message) error {
-	if len(msg.AttachmentIDs) > 0 {
-		blocks, err := s.attachments.ContentBlocks(msg.AttachmentIDs)
-		if err != nil {
-			return err
-		}
-		msg.Images = append(msg.Images, blocks...)
+	s.mu.Lock()
+	prepared, err := s.prepareMessageLocked(msg)
+	if err == nil {
+		s.agent.FollowUp(agentMessageFromSDK(prepared))
 	}
-	s.agent.FollowUp(agentMessageFromSDK(msg))
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	s.recordQueueUpdate()
 	return nil
 }
@@ -1793,40 +3106,226 @@ func (s *agentSession) QueueSizes() (steering, followUp int) {
 	return s.agent.QueueSizes()
 }
 
-func (s *agentSession) CycleModel() (*ai.Model, error) {
+func (s *agentSession) GetAvailableModels(ctx context.Context) ([]*ai.Model, error) {
+	models, err := s.runtime.modelRegistry.Models()
+	if err != nil {
+		return nil, fmt.Errorf("list local model catalog: %w", err)
+	}
+	// Sessions converse with chat models; image and classifier entries are
+	// for operation-specific calls.
+	models = slices.DeleteFunc(models, func(model *ai.Model) bool { return model.Type != "" && model.Type != "chat" })
+	if models, err = s.filterCopilotModels(ctx, models); err != nil {
+		return nil, err
+	}
+	if s.credentialProvider == nil {
+		return models, nil
+	}
+	for _, provider := range []string{ai.ProviderOpenRouter, ai.ProviderRadius} {
+		key, err := s.credentialProvider(ctx, provider)
+		if err != nil {
+			return nil, fmt.Errorf("%s catalog credential: %w", provider, err)
+		}
+		if key == "" {
+			continue
+		}
+		fetch := func(ctx context.Context, catalog []*ai.Model, baseURL string) ([]*ai.Model, error) {
+			return ai.PersonalizeOpenRouterCatalog(ctx, http.DefaultClient, catalog, baseURL, key)
+		}
+		if provider == ai.ProviderRadius {
+			// Radius org owners can disable models, so the account catalog
+			// replaces the shipped Radius entries; those only cover the time
+			// before any catalog has been fetched or cached.
+			fetch = func(ctx context.Context, _ []*ai.Model, baseURL string) ([]*ai.Model, error) {
+				return ai.FetchRadiusCatalog(ctx, http.DefaultClient, baseURL, key)
+			}
+		}
+		if models, err = s.personalizeCatalog(ctx, models, provider, key, s.catalogBaseURL(provider), fetch); err != nil {
+			return nil, err
+		}
+	}
+	// llama.cpp models exist only on a configured server, which may need no key.
+	server := s.catalogBaseURL(ai.ProviderLlamaCpp)
+	if server == "" {
+		server = os.Getenv("LLAMA_BASE_URL")
+	}
+	if strings.TrimSpace(server) == "" {
+		return models, nil
+	}
+	key, err := s.credentialProvider(ctx, ai.ProviderLlamaCpp)
+	if err != nil {
+		return nil, fmt.Errorf("%s catalog credential: %w", ai.ProviderLlamaCpp, err)
+	}
+	models, err = s.personalizeCatalog(ctx, models, ai.ProviderLlamaCpp, key, server, func(ctx context.Context, _ []*ai.Model, baseURL string) ([]*ai.Model, error) {
+		return ai.FetchLlamaCatalog(ctx, http.DefaultClient, baseURL, key)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(models, func(model *ai.Model) bool { return model.Type != "" && model.Type != "chat" }), nil
+}
+
+// filterCopilotModels keeps only the GitHub Copilot models the signed-in
+// account recorded as available at sign-in or refresh.
+func (s *agentSession) filterCopilotModels(ctx context.Context, models []*ai.Model) ([]*ai.Model, error) {
+	if s.credStore == nil {
+		return models, nil
+	}
+	cred, err := s.credStore.Get(ctx, ai.ProviderGitHubCopilot)
+	if errors.Is(err, ai.ErrCredentialNotFound) {
+		return models, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s catalog credential: %w", ai.ProviderGitHubCopilot, err)
+	}
+	available, ok := oauth.CopilotAvailableModels(cred.Extra)
+	if cred.Type != ai.CredentialTypeOAuth || !ok {
+		return models, nil
+	}
+	return slices.DeleteFunc(models, func(model *ai.Model) bool {
+		return model.Provider == ai.ProviderGitHubCopilot && !slices.Contains(available, model.ID)
+	}), nil
+}
+
+// catalogBaseURL is the endpoint whose catalog applies to provider: the
+// session model's when it belongs to provider, otherwise the configured one.
+func (s *agentSession) catalogBaseURL(provider string) string {
+	var baseURL string
+	if registered, ok := s.runtime.modelRegistry.Provider(provider); ok {
+		baseURL = registered.BaseURL
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.model != nil && s.model.Provider == provider && s.model.BaseURL != "" {
+		baseURL = s.model.BaseURL
+	}
+	return baseURL
+}
 
-	// Nothing to cycle through when no model is active yet. Callers
-	// (the TUI's model-rotate shortcut) should open the /model picker
-	// instead; CycleModel is a no-op in the degraded state.
+type catalogCacheKey struct {
+	provider string
+	hash     [32]byte
+}
+
+// personalizeCatalog replaces provider's entries in models with the catalog
+// fetch returns for the session's key and endpoint. A failed fetch falls back
+// to the last catalog for the same key and endpoint, in memory or on disk,
+// and then to the shipped entries.
+func (s *agentSession) personalizeCatalog(ctx context.Context, models []*ai.Model, provider, key, baseURL string, fetch func(context.Context, []*ai.Model, string) ([]*ai.Model, error)) ([]*ai.Model, error) {
+	var catalog []*ai.Model
+	var others []*ai.Model
+	for _, model := range models {
+		if model.Provider == provider {
+			catalog = append(catalog, model)
+		} else {
+			others = append(others, model)
+		}
+	}
+	cacheKey := catalogCacheKey{provider: provider, hash: sha256.Sum256([]byte(baseURL + "\x00" + key))}
+	personalized, err := fetch(ctx, catalog, baseURL)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		s.logger.Warn(provider+" catalog unavailable; using offline catalog", "error", err)
+		s.mu.Lock()
+		cached, ok := s.providerCatalogs[cacheKey]
+		s.mu.Unlock()
+		if !ok {
+			data, readErr := os.ReadFile(catalogCachePath(cacheKey))
+			if readErr == nil {
+				readErr = json.Unmarshal(data, &cached)
+				ok = readErr == nil && cached != nil && !slices.ContainsFunc(cached, func(model *ai.Model) bool { return model == nil || model.Provider != provider })
+			}
+			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+				s.logger.Warn("read offline "+provider+" catalog", "error", readErr)
+			}
+		}
+		if ok {
+			return append(others, slices.Clone(cached)...), nil
+		}
+		return models, nil
+	}
+	s.mu.Lock()
+	if s.providerCatalogs == nil {
+		s.providerCatalogs = map[catalogCacheKey][]*ai.Model{}
+	}
+	s.providerCatalogs[cacheKey] = slices.Clone(personalized)
+	s.mu.Unlock()
+	if err := saveCatalog(cacheKey, personalized); err != nil {
+		s.logger.Warn("save offline "+provider+" catalog", "error", err)
+	}
+	return append(others, personalized...), nil
+}
+
+func catalogCachePath(key catalogCacheKey) string {
+	return filepath.Join(paths.ConfigDir(), "cache", key.provider, fmt.Sprintf("%x.json", key.hash))
+}
+
+func saveCatalog(key catalogCacheKey, models []*ai.Model) (err error) {
+	data, err := json.Marshal(models)
+	if err != nil {
+		return fmt.Errorf("encode catalog: %w", err)
+	}
+	path := catalogCachePath(key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create catalog cache: %w", err)
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".catalog-*")
+	if err != nil {
+		return fmt.Errorf("create catalog file: %w", err)
+	}
+	defer func() {
+		if removeErr := os.Remove(file.Name()); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove catalog temporary file: %w", removeErr))
+		}
+	}()
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return fmt.Errorf("write catalog: %w", err)
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		return fmt.Errorf("replace catalog cache: %w", err)
+	}
+	return nil
+}
+
+func (s *agentSession) CycleModel() (*ai.Model, error) {
+	s.mu.Lock()
 	if s.model == nil {
+		s.mu.Unlock()
 		return nil, nil
 	}
-
-	models := ai.ListSupportedModels(s.model.Provider)
-	if len(models) == 0 {
-		models = ai.ListModels(s.model.Provider)
+	current := *s.model
+	s.mu.Unlock()
+	catalog, err := s.runtime.modelRegistry.Models()
+	if err != nil {
+		return nil, fmt.Errorf("cycle model catalog: %w", err)
 	}
+	models := slices.DeleteFunc(catalog, func(model *ai.Model) bool {
+		return model.Provider != current.Provider || (model.Type != "" && model.Type != "chat")
+	})
 	if len(models) == 0 {
 		return nil, nil
 	}
-	idx := 0
-	for i, m := range models {
-		if m.ID == s.model.ID {
-			idx = (i + 1) % len(models)
+	index := 0
+	for i, model := range models {
+		if model.ID == current.ID {
+			index = (i + 1) % len(models)
 			break
 		}
 	}
-	s.model = models[idx]
-	s.agent.SetModel(s.model)
-	return s.model, nil
+	next := models[index]
+	if err := s.SetModel(next.Provider + "/" + next.ID); err != nil {
+		return nil, err
+	}
+	return next, nil
 }
 
 func (s *agentSession) CycleThinkingLevel() string {
-	levels := []agent.ThinkingLevel{agent.ThinkingOff, agent.ThinkingMinimal, agent.ThinkingLow, agent.ThinkingMedium, agent.ThinkingHigh, agent.ThinkingXHigh}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	levels := ai.GetSupportedThinkingLevels(s.model)
 	idx := 0
 	for i, level := range levels {
 		if s.thinkingLevel == level {
@@ -1876,12 +3375,26 @@ func (s *agentSession) SetAutoRetryEnabled(enabled bool) {
 	s.autoRetryEnabled = enabled
 }
 
-func (s *agentSession) AbortRetry() {}
+func (s *agentSession) AbortRetry() {
+	s.mu.Lock()
+	cancel := s.retryCancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func isInitialSystemBaseline(message *agent.Message) bool {
+	return message != nil && message.Role == agent.RoleSystem && message.Timestamp.Equal(time.UnixMilli(0))
+}
 
 func (s *agentSession) GetMessages() []Message {
 	state := s.agent.State()
 	messages := make([]Message, 0, len(state.Messages))
 	for _, msg := range state.Messages {
+		if isInitialSystemBaseline(msg) {
+			continue
+		}
 		messages = append(messages, sdkMessageFromAgent(msg))
 	}
 	return messages
@@ -1904,6 +3417,9 @@ func (s *agentSession) GetAllMessages() []Message {
 	msgs := sessionMessagesToAgentMessages(reader.AllMessages())
 	out := make([]Message, 0, len(msgs))
 	for _, msg := range msgs {
+		if isInitialSystemBaseline(msg) {
+			continue
+		}
 		out = append(out, sdkMessageFromAgent(msg))
 	}
 	return out
@@ -2020,13 +3536,68 @@ func (s *agentSession) Forget(entryID string) error {
 	if err != nil {
 		return err
 	}
-	s.agent.ReplaceMessages(messages)
+	if s.runtime != nil && !s.runtime.noTools && !s.runtime.noBuiltinTools {
+		tools := restoreDeclaredBuiltinTools(s.agent.State().Tools, messages, s.settings, s.toolAllowlist, s.toolDenylist)
+		s.agent.SetTools(tools...)
+	}
+	s.agent.RestoreMessages(messages)
 	s.mu.Lock()
 	s.parentMsgID = nil
 	if pos := reader.CurrentPosition(); pos != "" {
 		s.parentMsgID = &pos
 	}
 	s.mu.Unlock()
+	return nil
+}
+
+// EditContext appends a validated, branch-local context replacement.
+func (s *agentSession) EditContext(ctx context.Context, entryID string, replacement json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return fmt.Errorf("session closed")
+	}
+	if s.cancelFn != nil || s.agent.State().IsStreaming {
+		return fmt.Errorf("cannot edit context while the agent is running")
+	}
+	if s.sessionWriter == nil {
+		return fmt.Errorf("session is not persisted")
+	}
+	reader, err := sessionpkg.ReadFile(s.sessionWriter.Path())
+	if err != nil {
+		return fmt.Errorf("read session: %w", err)
+	}
+	manager := sessionpkg.NewManager(reader.Header().CWD)
+	manager.LoadEntries(reader)
+	id, err := manager.AppendContextEdit(entryID, replacement)
+	if err != nil {
+		return fmt.Errorf("edit context: %w", err)
+	}
+	entries := manager.Entries()
+	entry := entries[len(entries)-1]
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.sessionWriter.Append(entry); err != nil {
+		return fmt.Errorf("append context edit: %w", err)
+	}
+	reader, err = sessionpkg.ReadFile(s.sessionWriter.Path())
+	if err != nil {
+		return fmt.Errorf("reload context: %w", err)
+	}
+	messages, err := agentMessagesFromSessionReader(reader, "")
+	if err != nil {
+		return fmt.Errorf("restore context: %w", err)
+	}
+	if s.runtime != nil && !s.runtime.noTools && !s.runtime.noBuiltinTools {
+		tools := restoreDeclaredBuiltinTools(s.agent.State().Tools, messages, s.settings, s.toolAllowlist, s.toolDenylist)
+		s.agent.SetTools(tools...)
+	}
+	s.agent.RestoreMessages(messages)
+	s.parentMsgID = &id
 	return nil
 }
 
@@ -2076,8 +3647,8 @@ func (s *agentSession) Stats() SessionStats {
 	state := s.State()
 	messages := s.GetMessages()
 	contextWindow := 0
-	if s.model != nil {
-		contextWindow = s.model.ContextWindow
+	if model := s.limitsModel(); model != nil {
+		contextWindow = model.ContextWindow
 	}
 	contextTokens := estimateContextTokens(s.agent.State().Messages)
 	usedPct := 0.0
@@ -2087,6 +3658,7 @@ func (s *agentSession) Stats() SessionStats {
 	s.mu.Lock()
 	thinkingLevel := string(s.thinkingLevel)
 	autoCompaction := s.compactionConfig.TriggerPct > 0
+	usage := s.usageTotals
 	s.mu.Unlock()
 	return SessionStats{
 		SessionID:      state.SessionID(),
@@ -2097,23 +3669,24 @@ func (s *agentSession) Stats() SessionStats {
 		Model:          state.Model(),
 		ThinkingLevel:  thinkingLevel,
 		AutoCompaction: autoCompaction,
+		Usage:          usage,
 	}
 }
 
 // closeWriter closes the session writer and releases the owner file.
 // Callers must NOT hold s.mu; this method takes it to serialize against
 // concurrent send/append paths that snapshot the writer pointer.
-func (s *agentSession) closeWriter() {
+func (s *agentSession) closeWriter() error {
 	s.mu.Lock()
 	writer := s.sessionWriter
 	s.sessionWriter = nil
 	s.mu.Unlock()
 	if writer != nil {
-		_ = writer.Close()
-		if err := sessionpkg.ReleaseOwner(writer.Path()); err != nil {
-			s.logger.Warn("session owner release failed", "error", err)
+		if err := writer.Close(); err != nil {
+			return fmt.Errorf("close session writer: %w", err)
 		}
 	}
+	return nil
 }
 
 // EmitDisconnectedSessionEnd emits a session_end event with disconnected reason.
@@ -2176,6 +3749,8 @@ func (s *agentSession) notify(eventType string, payload any) {
 }
 
 func (s *agentSession) ensureSessionWriter() (*sessionpkg.Writer, error) {
+	s.sessionInitMu.Lock()
+	defer s.sessionInitMu.Unlock()
 	s.mu.Lock()
 	writer := s.sessionWriter
 	pendingHeader := s.pendingHeader
@@ -2205,9 +3780,8 @@ func (s *agentSession) ensureSessionWriter() (*sessionpkg.Writer, error) {
 		return nil, nil
 	}
 	if pendingHeader == nil {
-		return writer, nil
+		return writer, s.persistInitialTranscript()
 	}
-
 	if pendingModelProvider != "" || pendingModel != "" {
 		if err := writer.Append(sessionpkg.NewModelChangeEntry(pendingModelProvider, pendingModel)); err != nil {
 			return nil, fmt.Errorf("append initial model change: %w", err)
@@ -2226,7 +3800,23 @@ func (s *agentSession) ensureSessionWriter() (*sessionpkg.Writer, error) {
 	}
 	s.mu.Unlock()
 
-	return writer, nil
+	return writer, s.persistInitialTranscript()
+}
+
+func (s *agentSession) persistInitialTranscript() error {
+	s.mu.Lock()
+	baseline := s.pendingInitialTranscript
+	s.mu.Unlock()
+	if baseline == nil {
+		return nil
+	}
+	if err := s.persistMessage(baseline); err != nil {
+		return fmt.Errorf("persist initial transcript: %w", err)
+	}
+	s.mu.Lock()
+	s.pendingInitialTranscript = nil
+	s.mu.Unlock()
+	return nil
 }
 
 // recordProviderError appends an error entry to the session log when a
@@ -2290,7 +3880,7 @@ func errorRequestSummary(messages []*agent.Message, systemPrompt string) map[str
 		if i >= maxMessages {
 			break
 		}
-		if msg == nil {
+		if msg == nil || msg.Role == agent.RoleSystem {
 			continue
 		}
 		m := map[string]any{"role": string(msg.Role)}
@@ -2334,19 +3924,25 @@ func errorRequestSummary(messages []*agent.Message, systemPrompt string) map[str
 
 // appendMessageToSession writes a message to the session file.
 func (s *agentSession) appendMessageToSession(msg *agent.Message) {
+	if err := s.persistMessage(msg); err != nil {
+		s.logger.Error("session write failed", "error", err)
+	}
+}
+
+func (s *agentSession) persistMessage(msg *agent.Message) error {
 	s.mu.Lock()
 	writer := s.sessionWriter
 	parentID := s.parentMsgID
 	s.mu.Unlock()
 	if writer == nil {
-		return
+		return nil
 	}
 
 	// Always marshal the envelope to ensure valid {role, content} structure.
 	// Even if content is nil, we need the role field present.
 	content, err := marshalSessionMessageEnvelope(msg)
 	if err != nil {
-		content = []byte{}
+		return fmt.Errorf("marshal message: %w", err)
 	}
 
 	var tokens *sessionpkg.TokenCounts
@@ -2360,20 +3956,32 @@ func (s *agentSession) appendMessageToSession(msg *agent.Message) {
 
 	entry := sessionpkg.NewMessageEntry(parentID, content, tokens)
 	if err := writer.Append(entry); err != nil {
-		s.logger.Warn("session write failed", "error", err)
+		return fmt.Errorf("append message: %w", err)
 	}
 	s.mu.Lock()
 	if s.sessionWriter != nil {
 		s.parentMsgID = &entry.ID
 	}
 	s.mu.Unlock()
+	return nil
 }
 
 func marshalSessionMessageEnvelope(msg *agent.Message) ([]byte, error) {
 	envelope := map[string]any{
-		"role":    msg.Role,
-		"content": msg.Content,
+		"customType": msg.CustomType, "display": msg.Display, "details": msg.Details, "timestamp": msg.Timestamp,
+		"thinkingLevel": msg.ThinkingLevel,
+		"data":          msg.Data,
+		"toolUsage":     msg.ToolUsage, "nestedCalls": msg.NestedCalls,
+		"sections": msg.Sections, "toolsAdded": msg.ToolsAdded, "toolsRemoved": msg.ToolsRemoved,
+		"excludeFromContext": msg.ExcludeFromContext,
+		"role":               msg.Role,
+		"content":            msg.Content,
+		"usage":              msg.Usage,
 	}
+	if len(msg.StructuredContent) > 0 {
+		envelope["structuredContent"] = msg.StructuredContent
+	}
+
 	if msg.ToolCallID != "" {
 		envelope["toolCallId"] = msg.ToolCallID
 		envelope["tool_call_id"] = msg.ToolCallID
@@ -2407,7 +4015,16 @@ func marshalSessionMessageEnvelope(msg *agent.Message) ([]byte, error) {
 		envelope["responseId"] = msg.ResponseID
 		envelope["response_id"] = msg.ResponseID
 	}
+	if msg.ProviderThinkingLevel != "" {
+		envelope["providerThinkingLevel"] = msg.ProviderThinkingLevel
+	}
 
+	if len(msg.Diagnostics) > 0 {
+		envelope["diagnostics"] = msg.Diagnostics
+	}
+	if msg.DurationMs != nil {
+		envelope["durationMs"] = *msg.DurationMs
+	}
 	return json.Marshal(envelope)
 }
 
@@ -2416,6 +4033,7 @@ func (s *agentSession) appendUserMessageToSession(msg Message) error {
 	writer, err := s.ensureSessionWriter()
 	s.mu.Lock()
 	parentID := s.parentMsgID
+	isFirstMessage := s.sessionFileBeforeRename != ""
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("ensure session writer: %w", err)
@@ -2424,18 +4042,7 @@ func (s *agentSession) appendUserMessageToSession(msg Message) error {
 		return nil
 	}
 
-	isFirstMessage := parentID == nil
-
-	content := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: msg.Text}}
-	content = append(content, msg.Images...)
-
-	// Wrap content in {role, content} envelope to match session reader/exporter contract.
-	envelope := map[string]any{
-		"role":    agent.RoleUser,
-		"content": content,
-	}
-
-	rawContent, err := json.Marshal(envelope)
+	rawContent, err := marshalSessionMessageEnvelope(agentMessageFromSDK(msg))
 	if err != nil {
 		return fmt.Errorf("marshal user message content: %w", err)
 	}
@@ -2589,7 +4196,7 @@ func (s *agentSession) logUsage(usage ai.Usage, model string) {
 	// Extract provider from the model spec if available
 	provider := ""
 	if s.model != nil {
-		provider = s.model.API
+		provider = s.model.Provider
 	}
 
 	entry := sessionpkg.UsageEntry{
@@ -2599,7 +4206,7 @@ func (s *agentSession) logUsage(usage ai.Usage, model string) {
 		Model:        model,
 		InputTokens:  usage.Input,
 		OutputTokens: usage.Output,
-		CostUSD:      0.0, // Cost calculation deferred - would need provider-specific pricing
+		CostUSD:      usage.Cost.Total,
 	}
 
 	if err := s.usageLogger.Log(entry); err != nil {
@@ -2607,27 +4214,11 @@ func (s *agentSession) logUsage(usage ai.Usage, model string) {
 	}
 }
 
-// calculateCost returns an estimate of the session cost based on accumulated usage.
-// This is a simplified calculation - real cost would need provider-specific pricing.
+// calculateCost totals recorded provider costs without repricing previous turns.
 func (s *agentSession) calculateCost() float64 {
-	// Simple estimate using average pricing
-	// In production, this would use provider-specific pricing from settings
-	if s.model == nil {
-		return 0.0
-	}
-
-	// Get usage from the agent's message history
-	state := s.agent.State()
-	var inputTokens, outputTokens int
-	for _, msg := range state.Messages {
-		inputTokens += msg.Usage.Input
-		outputTokens += msg.Usage.Output
-	}
-
-	// Rough cost estimate (would be provider/model specific in production)
-	// Using approximate Claude pricing as a placeholder
-	estimatedCost := float64(inputTokens)*0.000003 + float64(outputTokens)*0.000015
-	return estimatedCost
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.usageTotals.Cost.Total
 }
 
 func agentMessageText(msg *agent.Message) string {
@@ -2644,17 +4235,8 @@ func agentMessageText(msg *agent.Message) string {
 }
 
 func hasUsage(usage ai.Usage) bool {
-	return usage.TotalTokens > 0 || usage.Input > 0 || usage.Output > 0 || usage.CacheRead > 0 || usage.CacheWrite > 0
-}
-
-func normalizeSessionUsage(usage ai.Usage) ai.Usage {
-	if usage.TotalTokens == 0 {
-		usage.TotalTokens = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
-	}
-	if usage.Cost.Total == 0 {
-		usage.Cost.Total = usage.Cost.Input + usage.Cost.Output + usage.Cost.CacheRead + usage.Cost.CacheWrite
-	}
-	return usage
+	return usage.TotalTokens > 0 || usage.Input > 0 || usage.Output > 0 || usage.CacheRead > 0 || usage.CacheWrite > 0 ||
+		usage.Cost.Total > 0 || usage.Cost.Input > 0 || usage.Cost.Output > 0 || usage.Cost.CacheRead > 0 || usage.Cost.CacheWrite > 0
 }
 
 func usagePayload(usage ai.Usage) map[string]any {
@@ -2762,18 +4344,25 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 			})
 		}
 	case agent.MessageEnd:
+		s.mu.Lock()
+		if e.Message != nil && (e.Message.Role == agent.RoleUser || (e.Message.Role == agent.RoleAssistant && e.Message.StopReason != ai.StopReasonError && e.Message.StopReason != ai.StopReasonLength)) {
+			s.overflowRecoveryAttempted = false
+		}
+		s.pendingNextTurn = slices.DeleteFunc(s.pendingNextTurn, func(pending *agent.Message) bool { return pending == e.Message })
+		s.mu.Unlock()
 		if e.Message != nil {
 			msgID := s.getCurrentMessageID()
 			var tokens int
 			var usage map[string]any
 			if hasUsage(e.Message.Usage) {
-				usageValue := normalizeSessionUsage(e.Message.Usage)
+				usageValue := sessionpkg.NormalizeUsage(e.Message.Usage)
 				tokens = usageValue.TotalTokens
 				usage = usagePayload(usageValue)
 
 				// Update total tokens for session
 				s.mu.Lock()
 				s.totalTokens += usageValue.TotalTokens
+				addUsage(&s.usageTotals, usageValue)
 				s.mu.Unlock()
 
 				// Log usage to the usage log
@@ -2789,6 +4378,7 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 					"tokens":        tokens,
 					"finish_reason": string(e.Message.StopReason),
 					"error_message": e.Message.ErrorMessage,
+					"durationMs":    e.Message.DurationMs,
 				},
 			})
 			if usage != nil {
@@ -2805,10 +4395,12 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 				})
 			}
 
-			// User prompts are persisted before entering the agent loop so the
-			// session file records them even if provider setup fails. The loop also
-			// emits message_end for those prompts; do not append them a second time.
-			if e.Message.Role != agent.RoleUser {
+			// Only the triggering prompt is persisted before admission. Consumed
+			// steering and follow-up messages must be written at their boundary.
+			s.mu.Lock()
+			prePersisted := e.Message == s.prePersistedMessage
+			s.mu.Unlock()
+			if !prePersisted {
 				s.appendMessageToSession(e.Message)
 			}
 		}
@@ -2827,8 +4419,10 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 	case agent.ToolUpdate:
 		// Emit tool_progress for partial results
 		chunk := ""
+		var nestedCalls []agent.NestedToolCall
 		if e.PartialResult != nil {
 			chunk = e.PartialResult.Content
+			nestedCalls = slices.Clone(e.PartialResult.NestedCalls)
 		}
 		s.emit(ch, Event{
 			Type:      "tool_progress",
@@ -2836,25 +4430,45 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 			Payload: map[string]any{
 				"tool_call_id": e.ToolCallID,
 				"chunk":        chunk,
+				"nestedCalls":  nestedCalls,
 			},
 		})
 	case agent.ToolEnd:
 		output := ""
 		isErr := false
 		details := any(nil)
+		var nestedCalls []agent.NestedToolCall
+		var toolUsage *ai.Usage
 		if e.Result != nil {
 			output = e.Result.Content
 			isErr = e.IsError
 			details = e.Result.Details
+			nestedCalls = slices.Clone(e.Result.NestedCalls)
+			if e.Result.Usage != nil {
+				toolUsage = new(*e.Result.Usage)
+			}
 		}
+		var content []ai.ContentBlock
+		var structuredContent json.RawMessage
+		if e.Result != nil {
+			content = slices.Clone(e.Result.NormalizedContent())
+			structuredContent = slices.Clone(e.Result.StructuredContent)
+		}
+
 		s.emit(ch, Event{
 			Type:      "tool_result",
 			SessionID: s.id,
 			Payload: map[string]any{
-				"tool_call_id": e.ToolCallID,
-				"output":       output,
-				"is_error":     isErr,
-				"details":      details,
+				"tool_call_id":       e.ToolCallID,
+				"content":            content,
+				"structuredContent":  structuredContent,
+				"output":             output,
+				"is_error":           isErr,
+				"details":            details,
+				"durationMs":         e.DurationMs,
+				"excludeFromContext": e.Result != nil && e.Result.ExcludeFromContext,
+				"nestedCalls":        nestedCalls,
+				"toolUsage":          toolUsage,
 			},
 		})
 	}
@@ -3008,14 +4622,22 @@ func commandResultToToolResult(result commands.Result, err error) (content strin
 
 // runtime implements Runtime.
 type runtime struct {
-	ui              ui.UI
-	sessionsDir     string
-	credStore       store.CredentialStore
-	settings        *ai.Settings
-	resolver        *ai.ModelResolver
-	explicitModel   string
-	pluginManager   *plugins.Manager
-	commandRegistry commands.Registry
+	// pluginVirtualModels are the virtual models plugins last registered.
+	pluginVirtualMu     sync.Mutex
+	pluginVirtualModels []ai.VirtualModelDefinition
+	ui                  ui.UI
+	sessionsDir         string
+	credStore           store.CredentialStore
+	// settingsMu guards settings, resolver, and compactionConfig, which an
+	// idle session's settings reload replaces for later sessions.
+	settingsMu        sync.RWMutex
+	settings          *ai.Settings
+	resolver          *ai.ModelResolver
+	compactionOptions *CompactionSettings
+	modelRegistry     *ai.ModelRegistry
+	explicitModel     string
+	pluginManager     *plugins.Manager
+	commandRegistry   commands.Registry
 	// artifactLoader provides skills and context for session injection.
 	artifactLoader ArtifactLoader
 	// telemetry controls whether telemetry is reported.
@@ -3025,6 +4647,9 @@ type runtime struct {
 	activeModel *ai.Model
 	// activeModelSpec is the resolved model spec for display/debugging.
 	activeModelSpec ai.ModelSpec
+	// activeThinkingLevel is the ":level" suffix of the enabledModels
+	// pattern that chose activeModel, if any.
+	activeThinkingLevel string
 	// currentSessionID is the ID of the currently active session.
 	// Used by the plugin system to route Host.SessionAppend/SessionScan RPCs to the correct session.
 	currentSessionID  string
@@ -3035,6 +4660,10 @@ type runtime struct {
 	// a single live instance per process: a second open would interleave two
 	// writers into one JSONL file and duplicate message IDs.
 	openSessions map[string]struct{}
+	// liveSessions holds every session NewSession returned that has not
+	// closed, so Close can shut them down before the plugins they use.
+	liveSessions map[*agentSession]struct{}
+	closed       bool
 	mu           sync.Mutex
 	// noTools disables all tools including built-in tools.
 	noTools bool
@@ -3088,6 +4717,25 @@ func (r *runtime) releaseOpenSession(id string) {
 	r.mu.Unlock()
 }
 
+func (r *runtime) trackLiveSession(s *agentSession) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return errors.New("runtime is closed")
+	}
+	if r.liveSessions == nil {
+		r.liveSessions = make(map[*agentSession]struct{})
+	}
+	r.liveSessions[s] = struct{}{}
+	return nil
+}
+
+func (r *runtime) forgetLiveSession(s *agentSession) {
+	r.mu.Lock()
+	delete(r.liveSessions, s)
+	r.mu.Unlock()
+}
+
 // ArtifactLoader is the optional artifact loader that the SDK exposes.
 // It is nil unless initialized by cmd/tau during its lifecycle setup.
 // When non-nil, Runtime.NewSession can use it to inject skills/prompts/themes.
@@ -3111,6 +4759,14 @@ var GlobalArtifactLoader ArtifactLoader
 // - CredentialStore: file backend at ~/.tau/agent/auth.json
 // - Settings: loaded from ~/.tau/agent/settings.json + project .tau/settings.json
 func NewRuntime(opts RuntimeOptions) (Runtime, error) {
+	registry := opts.ModelRegistry
+	if registry == nil {
+		var err error
+		registry, err = ai.LoadModelRegistry(filepath.Join(paths.ConfigDir(), "models.json"))
+		if err != nil {
+			return nil, fmt.Errorf("load model registry: %w", err)
+		}
+	}
 	u := opts.UI
 	if u == nil {
 		u = ui.NewNoOpUI()
@@ -3124,11 +4780,14 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 	if settings == nil {
 		userSettingsPath := filepath.Join(paths.ConfigDir(), "settings.json")
 		userSettings, err := ai.LoadSettings(userSettingsPath)
-		if err == nil && userSettings != nil {
-			// Also try to load project settings from .tau/settings.json
-			projectSettings, _ := ai.LoadSettings(".tau/settings.json")
-			settings = ai.MergeSettings(userSettings, projectSettings)
+		if err != nil {
+			return nil, fmt.Errorf("load user settings: %w", err)
 		}
+		projectSettings, err := ai.LoadSettings(".tau/settings.json")
+		if err != nil {
+			return nil, fmt.Errorf("load project settings: %w", err)
+		}
+		settings = ai.MergeSettings(userSettings, projectSettings)
 	}
 
 	// Sessions default: TAU_SESSION_DIR, then sessionDir from settings, then
@@ -3156,6 +4815,7 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 		sessionsDir:      sessionsDir,
 		credStore:        credStore,
 		settings:         settings,
+		modelRegistry:    registry,
 		explicitModel:    opts.ExplicitModel,
 		pluginManager:    opts.PluginManager,
 		commandRegistry:  opts.CommandRegistry,
@@ -3173,18 +4833,35 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 		openSessions:     make(map[string]struct{}),
 	}
 
-	// Build compaction config from settings and runtime options.
-	r.compactionConfig = r.buildCompactionConfig(opts.Compaction)
+	r.compactionOptions = opts.Compaction
+	r.replaceSettings(settings)
 
 	// Register default providers (but defer model resolution to NewSession)
 	r.setupDefaultsForRuntime()
 
-	// Initialize model resolver if settings available
-	if r.settings != nil {
-		r.resolver = ai.NewModelResolver(r.settings)
-	}
-
 	return r, nil
+}
+
+// replaceSettings installs settings for sessions created afterwards.
+func (r *runtime) replaceSettings(settings *ai.Settings) {
+	compactionConfig := r.buildCompactionConfig(settings, r.compactionOptions)
+	var resolver *ai.ModelResolver
+	if settings != nil {
+		resolver = ai.NewModelResolver(settings)
+	}
+	r.settingsMu.Lock()
+	defer r.settingsMu.Unlock()
+	r.settings = settings
+	r.resolver = resolver
+	r.compactionConfig = compactionConfig
+}
+
+// settingsState returns the settings, model resolver, and compaction
+// configuration new sessions start from.
+func (r *runtime) settingsState() (*ai.Settings, *ai.ModelResolver, compaction.Config) {
+	r.settingsMu.RLock()
+	defer r.settingsMu.RUnlock()
+	return r.settings, r.resolver, r.compactionConfig
 }
 
 // setupDefaults resolves and stores the active model from settings/defaults/env.
@@ -3196,20 +4873,22 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 // TUI's `/model` slash command before sending. The first Send will then fail
 // with the agent loop's "model is required" error if the user hasn't picked
 // a model yet.
-func (r *runtime) setupDefaults() error {
+func (r *runtime) setupDefaults(ctx context.Context) error {
 	ai.Init() // Register default providers
 
-	resolved, err := r.ResolveModel()
+	resolved, err := r.resolveModel(ctx)
 	if err != nil {
 		if errors.Is(err, ErrNoModelConfigured) {
 			r.activeModel = nil
 			r.activeModelSpec = ai.ModelSpec{}
+			r.activeThinkingLevel = ""
 			return nil
 		}
 		return err
 	}
 	r.activeModel = resolved.Model
 	r.activeModelSpec = resolved.Spec
+	r.activeThinkingLevel = resolved.ThinkingLevel
 	return nil
 }
 
@@ -3229,8 +4908,14 @@ func (r *runtime) setupDefaultsForRuntime() {
 // The runtime SDK CompactionSettings still uses TriggerPct/PreserveRecent
 // (the percentage-based auto-compaction policy) for explicit runtime
 // overrides; user-level settings.json only carries the Pi-style fields.
-func (r *runtime) buildCompactionConfig(opts *CompactionSettings) compaction.Config {
+func (r *runtime) buildCompactionConfig(settings *ai.Settings, opts *CompactionSettings) compaction.Config {
 	cfg := compaction.DefaultConfig()
+	limits, err := settings.ResolveCompaction(nil)
+	if err != nil {
+		r.logger.Warn("invalid compaction settings", "error", err)
+	} else if !limits.Enabled {
+		cfg.TriggerPct = 0
+	}
 
 	// Runtime options override defaults.
 	if opts != nil {
@@ -3252,6 +4937,9 @@ func (r *runtime) buildCompactionConfig(opts *CompactionSettings) compaction.Con
 type ResolvedModel struct {
 	Model *ai.Model
 	Spec  ai.ModelSpec
+	// ThinkingLevel is the ":level" suffix of the enabledModels pattern that
+	// selected the model, or empty.
+	ThinkingLevel string
 }
 
 // ErrNoModelConfigured is returned by ResolveModel when no model can be
@@ -3266,7 +4954,11 @@ var ErrNoModelConfigured = errors.New("no model configured: use /model to pick a
 // 3. Env-var fallback (ANTHROPIC_API_KEY or OPENAI_API_KEY)
 // 4. ErrNoModelConfigured if no model can be resolved
 func (r *runtime) ResolveModel() (*ResolvedModel, error) {
-	var modelID, providerKey string
+	return r.resolveModel(context.Background())
+}
+
+func (r *runtime) resolveModel(ctx context.Context) (*ResolvedModel, error) {
+	var modelID, providerKey, thinkingLevel string
 
 	// 1. Explicit override
 	if r.explicitModel != "" {
@@ -3276,9 +4968,17 @@ func (r *runtime) ResolveModel() (*ResolvedModel, error) {
 		}
 		modelID = spec.Model
 		providerKey = spec.Provider
-	} else if r.resolver != nil {
-		// 2. Settings default (resolve through ModelResolver)
-		spec := r.resolver.ResolveDefaultModel()
+	} else if settings, resolver, _ := r.settingsState(); resolver != nil {
+		// 2. Settings default (resolve through ModelResolver), limited to
+		// enabledModels when that scope is set.
+		spec := resolver.ResolveDefaultModel()
+		scoped, err := r.scopedStartupModel(ctx, settings, spec)
+		if err != nil {
+			return nil, err
+		}
+		if scoped != nil {
+			spec, thinkingLevel = scoped.Model, scoped.ThinkingLevel
+		}
 		if spec.Provider != "" && spec.Model != "" {
 			if providerKey == "" {
 				providerKey = spec.Provider
@@ -3307,29 +5007,85 @@ func (r *runtime) ResolveModel() (*ResolvedModel, error) {
 	}
 
 	// Resolve the model from registry
-	model, err := ai.ResolveModelID(providerKey + "/" + modelID)
+	model, err := r.resolveChatModel(providerKey + "/" + modelID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve model %s/%s: %w", providerKey, modelID, err)
 	}
 
-	// Get the API type for client creation
-	api := model.API
-
-	// Get provider for client factory
-	p, ok := ai.Get(api)
-	if !ok {
-		return nil, fmt.Errorf("provider %q not registered for API %q", providerKey, api)
-	}
-
-	// Verify provider implements the correct API
-	if p.API() != api {
-		return nil, fmt.Errorf("provider %q API mismatch: expected %q, got %q", providerKey, api, p.API())
+	if err := checkModelProvider(model, providerKey); err != nil {
+		return nil, err
 	}
 
 	return &ResolvedModel{
-		Model: model,
-		Spec:  ai.ModelSpec{Provider: providerKey, Model: modelID},
+		Model:         model,
+		Spec:          ai.ModelSpec{Provider: providerKey, Model: modelID},
+		ThinkingLevel: thinkingLevel,
 	}, nil
+}
+
+// scopedStartupModel picks the startup model from enabledModels as upstream
+// does: the saved default when it is in scope, otherwise the first scoped
+// model with credentials. It returns nil when no scope applies.
+func (r *runtime) scopedStartupModel(ctx context.Context, settings *ai.Settings, saved ai.ModelSpec) (*ai.ScopedModel, error) {
+	if settings == nil || len(settings.EnabledModels) == 0 {
+		return nil, nil
+	}
+	models, err := r.modelRegistry.Models()
+	if err != nil {
+		return nil, fmt.Errorf("list models for enabledModels: %w", err)
+	}
+	authenticated := map[string]bool{}
+	var keys []string
+	for _, model := range models {
+		if model.Type != "" && model.Type != "chat" {
+			continue
+		}
+		ok, seen := authenticated[model.Provider]
+		if !seen {
+			ok = r.restoredModelCredentialAvailable(ctx, model.Provider, r.credStore)
+			authenticated[model.Provider] = ok
+		}
+		if ok {
+			keys = append(keys, model.Provider+"/"+model.ID)
+		}
+	}
+	scope := ai.ExpandModelScope(settings.EnabledModels, keys)
+	if len(scope) == 0 {
+		return nil, nil
+	}
+	for _, scoped := range scope {
+		if scoped.Model == saved {
+			return &scoped, nil
+		}
+	}
+	return &scope[0], nil
+}
+
+// checkModelProvider verifies a physical model has a provider for its API.
+// Virtual models are routed to a physical model per request instead.
+func checkModelProvider(model *ai.Model, providerKey string) error {
+	if ai.IsVirtualModel(model) {
+		return nil
+	}
+	p, ok := ai.Get(model.API)
+	if !ok {
+		return fmt.Errorf("provider %q not registered for API %q", providerKey, model.API)
+	}
+	if p.API() != model.API {
+		return fmt.Errorf("provider %q API mismatch: expected %q, got %q", providerKey, model.API, p.API())
+	}
+	return nil
+}
+
+func (r *runtime) resolveChatModel(spec string) (*ai.Model, error) {
+	model, err := r.modelRegistry.ResolveModel(spec)
+	if err != nil {
+		return nil, fmt.Errorf("resolve chat model: %w", err)
+	}
+	if model.Type != "" && model.Type != "chat" {
+		return nil, fmt.Errorf("model %s is %s, not chat", spec, model.Type)
+	}
+	return model, nil
 }
 
 // resolveModelWithOverride resolves a specific model string, ignoring runtime defaults.
@@ -3345,8 +5101,8 @@ func (r *runtime) resolveModelWithOverride(modelSpec string) (*ResolvedModel, er
 
 	// If model wasn't specified (empty), try resolver or env fallback
 	if modelID == "" {
-		if r.resolver != nil {
-			spec := r.resolver.ResolveDefaultModel()
+		if _, resolver, _ := r.settingsState(); resolver != nil {
+			spec := resolver.ResolveDefaultModel()
 			if spec.Provider != "" && spec.Model != "" {
 				if providerKey == "" {
 					providerKey = spec.Provider
@@ -3371,20 +5127,13 @@ func (r *runtime) resolveModelWithOverride(modelSpec string) (*ResolvedModel, er
 	}
 
 	// Resolve the model from registry
-	model, err := ai.ResolveModelID(providerKey + "/" + modelID)
+	model, err := r.resolveChatModel(providerKey + "/" + modelID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve model %s/%s: %w", providerKey, modelID, err)
 	}
 
-	api := model.API
-
-	p, ok := ai.Get(api)
-	if !ok {
-		return nil, fmt.Errorf("provider %q not registered for API %q", providerKey, api)
-	}
-
-	if p.API() != api {
-		return nil, fmt.Errorf("provider %q API mismatch: expected %q, got %q", providerKey, api, p.API())
+	if err := checkModelProvider(model, providerKey); err != nil {
+		return nil, err
 	}
 
 	return &ResolvedModel{
@@ -3393,24 +5142,32 @@ func (r *runtime) resolveModelWithOverride(modelSpec string) (*ResolvedModel, er
 	}, nil
 }
 
-func (r *runtime) restoreSessionModelAndThinking(opts SessionOptions) (modelSpec string, thinkingLevel string) {
+// restoreSessionModelAndThinking returns the recorded selection, the model
+// of the latest response after it, and the thinking level. A virtual
+// selection that is no longer registered falls back to the answering model.
+func (r *runtime) restoreSessionModelAndThinking(opts SessionOptions) (modelSpec, answeredSpec, thinkingLevel string) {
 	if opts.SessionID == "" || opts.Model != "" || r.sessionsDir == "" {
-		return "", ""
+		return "", "", ""
 	}
 	storage, err := sessionpkg.NewStorageAt(r.sessionsDir)
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	reader, err := storage.Open(opts.SessionID)
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	for _, entry := range reader.Entries() {
 		switch entry.Type {
+		case sessionpkg.EntryTypeMessage:
+			if message := entry.ToAgentMessage(); message != nil && message.Role == "assistant" && message.Provider != "" && message.Model != "" && message.API != ai.VirtualModelAPI {
+				answeredSpec = ai.ModelSpec{Provider: message.Provider, Model: message.Model}.String()
+			}
 		case sessionpkg.EntryTypeModelChange:
 			provider, model := stringPtrValue(entry.Provider), stringPtrValue(entry.Model)
 			if provider != "" && model != "" {
 				modelSpec = ai.ModelSpec{Provider: provider, Model: model}.String()
+				answeredSpec = ""
 			}
 		case sessionpkg.EntryTypeThinkingChange:
 			if level := stringPtrValue(entry.Level); level != "" {
@@ -3418,7 +5175,7 @@ func (r *runtime) restoreSessionModelAndThinking(opts SessionOptions) (modelSpec
 			}
 		}
 	}
-	return modelSpec, thinkingLevel
+	return modelSpec, answeredSpec, thinkingLevel
 }
 
 func (r *runtime) restoredModelCredentialAvailable(ctx context.Context, providerKey string, credStore store.CredentialStore) bool {
@@ -3428,11 +5185,17 @@ func (r *runtime) restoredModelCredentialAvailable(ctx context.Context, provider
 	if credStore != nil {
 		cred, err := credStore.Get(ctx, providerKey)
 		if err == nil && !cred.NeedsReauth {
-			apiKey, keyErr := store.APIKeyFromCredential(providerKey, cred)
+			if cred.Type == ai.CredentialTypeAPIKey {
+				return cred.APIKey != ""
+			}
+			apiKey, keyErr := store.APIKeyFromCredential(ctx, providerKey, cred)
 			if keyErr == nil && apiKey != "" {
 				return true
 			}
 		}
+	}
+	if provider, ok := r.modelRegistry.Provider(providerKey); ok && provider.APIKey != "" {
+		return true
 	}
 	return !r.noEnvCredentials && ai.GetEnvAPIKey(providerKey) != ""
 }
@@ -3451,12 +5214,20 @@ func stringPtrValue(ptr *string) string {
 // history is loaded and appended to the agent's transcript.
 // Session options (Store, Settings, UI) override runtime defaults when provided.
 func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Session, err error) {
-	restoredModelSpec, restoredThinkingLevel := r.restoreSessionModelAndThinking(opts)
+	settings, _, compactionCfg := r.settingsState()
+	if err := ValidateToolSelection(opts.ToolAllowlist); err != nil {
+		return nil, fmt.Errorf("invalid tools option: %w", err)
+	}
+	r.syncPluginVirtualModels()
+	restoredModelSpec, answeredModelSpec, restoredThinkingLevel := r.restoreSessionModelAndThinking(opts)
 
 	// Honor SessionOptions.Model override if provided.
 	// This allows per-session model selection without modifying runtime defaults.
-	var activeModel *ai.Model
-	var activeModelSpec ai.ModelSpec
+	var (
+		activeModel     *ai.Model
+		activeModelSpec ai.ModelSpec
+		fromDefaults    bool
+	)
 
 	if opts.Model != "" {
 		// Resolve the explicitly specified model for this session
@@ -3468,6 +5239,9 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		activeModelSpec = resolved.Spec
 	} else if restoredModelSpec != "" {
 		resolved, err := r.resolveModelWithOverride(restoredModelSpec)
+		if err != nil && answeredModelSpec != "" {
+			resolved, err = r.resolveModelWithOverride(answeredModelSpec)
+		}
 		if err == nil {
 			activeModel = resolved.Model
 			activeModelSpec = resolved.Spec
@@ -3483,13 +5257,13 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		credStore = r.credStore
 	}
 
-	if activeModelSpec.Provider != "" && restoredModelSpec != "" && opts.Model == "" && !r.restoredModelCredentialAvailable(ctx, activeModelSpec.Provider, credStore) {
+	if activeModelSpec.Provider != "" && restoredModelSpec != "" && opts.Model == "" && !ai.IsVirtualModel(activeModel) && !r.restoredModelCredentialAvailable(ctx, activeModelSpec.Provider, credStore) {
 		activeModel = nil
 	}
 	if activeModel == nil {
 		// Ensure model is resolved from runtime defaults
 		if r.activeModel == nil {
-			if err := r.setupDefaults(); err != nil {
+			if err := r.setupDefaults(ctx); err != nil {
 				// Surface real errors; ignore the "no model configured" sentinel
 				// so the TUI can boot and prompt the user to /model.
 				if !errors.Is(err, ErrNoModelConfigured) {
@@ -3499,6 +5273,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		}
 		activeModel = r.activeModel
 		activeModelSpec = r.activeModelSpec
+		fromDefaults = true
 	}
 
 	// Use session-specific UI or fall back to runtime UI
@@ -3529,8 +5304,6 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 
 	// Create a client factory that uses the credential store for API keys
 	// and resolves them per request (including refresh-on-read).
-	// Uses a background context for credential reads to ensure refresh-on-read
-	// operations are not canceled by the session/request context.
 	sessionModel := activeModel
 	sessionProviderKey := activeModelSpec.Provider
 	// RuntimeOptions.Provider pins the credential provider when the model
@@ -3541,6 +5314,9 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	}
 
 	credentialProvider := func(ctx context.Context, provider string) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		providerKey := provider
 		if providerKey == "" {
 			providerKey = sessionProviderKey
@@ -3549,7 +5325,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 			return "", nil
 		}
 
-		// Precedence: CLI --api-key (r.apiKey) > credential store > env var.
+		// Precedence: explicit key > stored API key or OAuth > models.json > environment.
 		if r.apiKey != "" {
 			return r.apiKey, nil
 		}
@@ -3563,7 +5339,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 				if cred.NeedsReauth {
 					return "", ai.ErrCredentialNeedsReauth{Provider: providerKey}
 				}
-				apiKey, err := store.APIKeyFromCredential(providerKey, cred)
+				apiKey, err := store.APIKeyFromCredential(ctx, providerKey, cred)
 				if err != nil {
 					return "", err
 				}
@@ -3571,6 +5347,12 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 					return apiKey, nil
 				}
 			}
+		}
+
+		if key, err := r.modelRegistry.ResolveAPIKey(ctx, providerKey); err != nil {
+			return "", err
+		} else if key != "" {
+			return key, nil
 		}
 
 		if !r.noEnvCredentials {
@@ -3589,14 +5371,10 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		if m == nil {
 			return nil, fmt.Errorf("%w", ErrNoModelConfigured)
 		}
-		// Get provider for this model's API
-		p, ok := ai.Get(m.API)
-		if !ok {
-			return nil, fmt.Errorf("no provider for API type: %s", m.API)
+		if ai.IsVirtualModel(m) {
+			return unroutedClient{model: m}, nil
 		}
-
-		// Build client with credentials
-		client, err := p.NewClient(m)
+		client, err := ai.GetClient(m)
 		if err != nil {
 			return nil, err
 		}
@@ -3607,11 +5385,6 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		providerKey := m.Provider
 		if providerKey == "" {
 			providerKey = sessionProviderKey
-		}
-		if apiKey, err := credentialProvider(context.Background(), providerKey); err == nil && apiKey != "" {
-			if sc, ok := client.(APIKeySetter); ok {
-				sc.SetAPIKey(apiKey)
-			}
 		}
 
 		// Pass transport-level options for 401 retry and credential refresh.
@@ -3627,8 +5400,21 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		return client, nil
 	}
 
+	steeringMode, followUpMode, err := settingsQueueModes(settings)
+	if err != nil {
+		return nil, err
+	}
+	transport, err := settings.ResolveTransport()
+	if err != nil {
+		return nil, err
+	}
 	agentCfg := agent.NewConfig(
+		agent.WithSteeringMode(steeringMode),
+		agent.WithFollowUpMode(followUpMode),
 		agent.WithModel(sessionModel),
+		agent.WithThinkingBudgets(settings.ResolveThinkingBudgets()),
+		agent.WithRequestOptions(settings.ResolveRetry().Provider.RequestOptions()...),
+		agent.WithTransport(transport),
 		agent.WithClientFactory(clientFactory),
 		agent.WithAPIKeyProvider(credentialProvider),
 	)
@@ -3644,11 +5430,14 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	if sessionThinkingLevel == "" && r.thinkingLevel != "" {
 		sessionThinkingLevel = r.thinkingLevel
 	}
+	if sessionThinkingLevel == "" && fromDefaults {
+		sessionThinkingLevel = r.activeThinkingLevel
+	}
 	if sessionThinkingLevel == "" {
 		// Per-model override from settings, then the global defaultThinkingLevel.
 		// Only fresh sessions reach here: opts/explicit/CLI overrides won above,
 		// and resumes keep the level recorded in the session file.
-		sessionThinkingLevel = r.settings.ThinkingLevelFor(activeModelSpec.String())
+		sessionThinkingLevel = settings.ThinkingLevelFor(activeModelSpec.String())
 	}
 	if sessionThinkingLevel == "" {
 		sessionThinkingLevel = string(agent.ThinkingMedium)
@@ -3670,8 +5459,27 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	// These are the core file tools: read, write, edit, bash, grep, find, ls.
 	// They are attached on the normal session path for parity with the spec.
 	if !r.noTools && !r.noBuiltinTools {
-		toolCfg := buildToolConfig(r.settings)
-		agentCfg.Tools = append(agentCfg.Tools, defaultCodingAgentTools(toolCfg)...)
+		toolCfg := buildToolConfig(settings)
+		selection := resolveDefaultToolSelection(settings)
+		if opts.ToolAllowlist != nil {
+			if toolSelectionHasModifiers(opts.ToolAllowlist) {
+				selection = applyToolModifiers(selection, opts.ToolAllowlist)
+			} else {
+				selection = opts.ToolAllowlist
+			}
+		}
+		var tools []agent.Tool
+		if len(selection) > 0 {
+			all := agent.BuiltInToolsWithConfig(toolCfg)
+			for _, name := range selection {
+				for _, tool := range filterToolsByName(all, []string{name}, nil) {
+					if !slices.ContainsFunc(tools, func(t agent.Tool) bool { return t.Name == tool.Name }) {
+						tools = append(tools, tool)
+					}
+				}
+			}
+		}
+		agentCfg.Tools = append(agentCfg.Tools, tools...)
 	}
 
 	loader := r.artifactLoader
@@ -3682,7 +5490,11 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	var addendumParts []string
 	addendumParts = append(addendumParts, fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd))
 	if !r.noContextFiles {
-		if contextAddendum, err := buildContextFileAddendum(cwd); err == nil && contextAddendum != "" {
+		contextAddendum, err := buildContextFileAddendum(paths.ConfigDir(), cwd)
+		if err != nil {
+			sessionLogger.Warn("context files", "error", err)
+		}
+		if contextAddendum != "" {
 			addendumParts = append(addendumParts, contextAddendum)
 		}
 	}
@@ -3764,12 +5576,30 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	}
 	agentCfg.SessionID = sessionID
 
+	var hookSession *agentSession
+	agentCfg.PrepareRequest = func(ctx context.Context, request agent.PrepareRequestContext) (*agent.AgentRequestUpdate, error) {
+		return hookSession.prepareVirtualRequest(ctx, request)
+	}
+	agentCfg.GetStartupMessages = func(ctx context.Context) ([]*agent.Message, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		hookSession.mu.Lock()
+		defer hookSession.mu.Unlock()
+		return slices.Clone(hookSession.pendingNextTurn), nil
+	}
 	// Wire plugin manager as EventDispatcher if available.
 	// This dispatches agent events to all subscribed plugins per the extension spec.
 	if r.pluginManager != nil {
 		mgr := r.pluginManager
-		agentCfg.EventDispatcher = func(name string, payload []byte, sessID string) agent.EventDispatchResult {
-			responses := mgr.DispatchEventCollect(name, json.RawMessage(payload), sessID)
+		agentCfg.EventDispatcher = func(ctx context.Context, name string, payload []byte, sessID string) agent.EventDispatchResult {
+			if name == "agent_settled" && hookSession != nil {
+				hookSession.mu.Lock()
+				hookSession.emittingSettled = true
+				hookSession.mu.Unlock()
+				defer func() { hookSession.mu.Lock(); hookSession.emittingSettled = false; hookSession.mu.Unlock() }()
+			}
+			responses := mgr.DispatchEventCollect(ctx, name, json.RawMessage(payload), sessID)
 			result := agent.EventDispatchResult{}
 			for _, resp := range responses {
 				result.Responses = append(result.Responses, agent.EventDispatchResponse{
@@ -3791,57 +5621,13 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		if !r.noTools {
 			pluginTools := mgr.Tools()
 			for _, pt := range pluginTools {
-				tool := agent.Tool{
-					Name:        pt.Name,
-					Description: pt.Description,
-					Parameters:  pt.Parameters,
-					Execute: func(ctx agent.ToolContext) (*agent.ToolResult, error) {
-						progressCh := make(chan plugins.ToolProgressEvent, 16)
-						done := make(chan struct{})
-						mgr.RegisterToolProgressSubscriber(ctx.ToolCallID, progressCh)
-						defer func() {
-							mgr.UnregisterToolProgressSubscriber(ctx.ToolCallID, progressCh)
-							close(done)
-						}()
-
-						go func() {
-							for {
-								select {
-								case event := <-progressCh:
-									if ctx.OnUpdate != nil {
-										ctx.OnUpdate(&agent.ToolResult{
-											Content: event.Content,
-											IsError: event.IsError,
-										})
-									}
-								case <-done:
-									return
-								}
-							}
-						}()
-
-						// Serialize arguments to JSON for the plugin handler
-						argsJSON, err := json.Marshal(ctx.Args)
-						if err != nil {
-							return &agent.ToolResult{Content: fmt.Sprintf("error marshaling args: %v", err), IsError: true}, nil
-						}
-						result, isErr, err := mgr.ExecutePluginTool(ctx.Context, pt.Name, ctx.ToolCallID, string(argsJSON))
-						if err != nil {
-							return &agent.ToolResult{Content: fmt.Sprintf("plugin tool error: %v", err), IsError: true}, nil
-						}
-						return &agent.ToolResult{Content: result, IsError: isErr}, nil
-					},
-				}
+				tool := pluginAgentTool(mgr, pt)
 				agentCfg.Tools = append(agentCfg.Tools, tool)
 			}
 		}
 	}
 
-	// Apply tool allow/deny filters (CLI --tools/-t and --exclude-tools/-xt).
-	// Deny wins on conflict; an allowlist with no matches yields zero tools.
-	if len(opts.ToolAllowlist) > 0 || len(opts.ToolDenylist) > 0 {
-		agentCfg.Tools = filterToolsByName(agentCfg.Tools, opts.ToolAllowlist, opts.ToolDenylist)
-	}
+	agentCfg.Tools = selectSessionTools(agentCfg.Tools, opts.ToolAllowlist, opts.ToolDenylist)
 
 	// Load session history if resuming or forking
 	if opts.SessionID != "" && r.sessionsDir != "" {
@@ -3880,12 +5666,19 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	// This is needed because totalTokens starts at 0 and only increases during
 	// message processing, so we must restore the persisted count on resume.
 	var loadedTotalTokens int
+	var loadedUsage ai.Usage
 	if opts.SessionID != "" && r.sessionsDir != "" {
 		storage, err := sessionpkg.NewStorageAt(r.sessionsDir)
 		if err == nil {
 			reader, err := storage.Open(opts.SessionID)
 			if err == nil {
 				loadedTotalTokens = reader.TotalTokens().Total()
+				usage, err := recordedSessionUsage(reader)
+				if err != nil {
+					return nil, err
+				}
+				loadedUsage = usage
+				loadedTotalTokens = max(loadedTotalTokens, usage.TotalTokens)
 			}
 		}
 	}
@@ -3931,10 +5724,16 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 			// new messages onto the copied branch's last entry.
 			sessionWriter, err = storage.Fork(opts.ForkFrom, atEntry)
 			if err != nil {
-				// Fork failed - continue without session writing
-				sessionWriter = nil
+				return nil, fmt.Errorf("fork session %q: %w", opts.ForkFrom, err)
 			} else {
 				if reader, posErr := sessionpkg.ReadFile(sessionWriter.Path()); posErr == nil {
+					loadedTotalTokens = reader.TotalTokens().Total()
+					usage, err := recordedSessionUsage(reader)
+					if err != nil {
+						return nil, errors.Join(err, sessionWriter.Close())
+					}
+					loadedUsage = usage
+					loadedTotalTokens = max(loadedTotalTokens, usage.TotalTokens)
 					if pos := reader.CurrentPosition(); pos != "" {
 						resumedParentMsgID = &pos
 					}
@@ -3961,7 +5760,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		storage, err := sessionpkg.NewStorageAt(r.sessionsDir)
 		if err == nil {
 			history, historyPosition, err := loadSessionHistoryWithPosition(storage, sessionID)
-			if err == nil && len(history) > 0 {
+			if err == nil {
 				initialMessages = history
 				if historyPosition != "" {
 					resumedParentMsgID = &historyPosition
@@ -4028,6 +5827,19 @@ agentCreation:
 	// the model is resolved.
 	agentCfg.Capabilities = capabilities
 
+	if len(agentCfg.InitialMessages) == 0 || agentCfg.InitialMessages[0] == nil || agentCfg.InitialMessages[0].Role != agent.RoleSystem || agentCfg.InitialMessages[0].ExcludeFromContext {
+		if agentCfg.SystemAddendum != "" {
+			if agentCfg.SystemPrompt != "" {
+				agentCfg.SystemPrompt += "\n\n"
+			}
+			agentCfg.SystemPrompt += agentCfg.SystemAddendum
+		}
+	}
+	agentCfg.SystemAddendum = ""
+	if !r.noTools && !r.noBuiltinTools {
+		agentCfg.Tools = restoreDeclaredBuiltinTools(agentCfg.Tools, agentCfg.InitialMessages, settings, opts.ToolAllowlist, opts.ToolDenylist)
+	}
+
 	a, err := agent.New(agentCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create agent: %w", err)
@@ -4041,6 +5853,57 @@ agentCreation:
 	if r.pluginManager != nil {
 		r.pluginManager.SetSessionIDProvider(func() string { return r.currentSessionID })
 		r.pluginManager.SetSessionCWDProvider(func() string { return r.currentSessionCWD })
+		r.pluginManager.SetCompactor(func(ctx context.Context, instructions string) error {
+			r.mu.Lock()
+			sess := r.currentSession
+			r.mu.Unlock()
+			if sess == nil {
+				return fmt.Errorf("no active session")
+			}
+			if instructions == "" {
+				return sess.Compact(ctx)
+			}
+			return sess.Compact(ctx, instructions)
+		})
+		r.pluginManager.SetToolDiscovery(func(ctx context.Context, req *proto.ToolDiscoveryRequest) (json.RawMessage, error) {
+			r.mu.Lock()
+			sess := r.currentSession
+			r.mu.Unlock()
+			loadout, ok := sess.(ToolLoadout)
+			if !ok {
+				return nil, errors.New("no active tool session")
+			}
+			return discoverSessionTools(ctx, loadout, req)
+		})
+		r.pluginManager.SetCustomMessageSender(func(ctx context.Context, raw json.RawMessage, trigger *bool, deliverAs string) error {
+			var wire struct {
+				CustomType string          `json:"customType"`
+				Content    json.RawMessage `json:"content"`
+				Display    bool            `json:"display"`
+				Details    any             `json:"details"`
+			}
+			if err := json.Unmarshal(raw, &wire); err != nil {
+				return fmt.Errorf("decode custom message: %w", err)
+			}
+			var content []ai.ContentBlock
+			if len(wire.Content) > 0 && string(wire.Content) != "null" {
+				if err := json.Unmarshal(wire.Content, &content); err != nil {
+					var text string
+					if err := json.Unmarshal(wire.Content, &text); err != nil {
+						return fmt.Errorf("decode custom content: %w", err)
+					}
+					content = []ai.ContentBlock{{Type: ai.ContentBlockText, Text: text}}
+				}
+			}
+			r.mu.Lock()
+			sess := r.currentSession
+			r.mu.Unlock()
+			sender, ok := sess.(CustomMessageSender)
+			if !ok {
+				return errors.New("no active custom message session")
+			}
+			return sender.SendCustomMessage(ctx, CustomMessage{CustomType: wire.CustomType, Content: content, Display: wire.Display, Details: wire.Details}, CustomMessageOptions{TriggerTurn: trigger, DeliverAs: deliverAs})
+		})
 		r.pluginManager.SetMessageSender(func(text, deliverAs string) error {
 			r.mu.Lock()
 			sess := r.currentSession
@@ -4061,6 +5924,12 @@ agentCreation:
 				// Fire-and-forget: Send returns an event channel; drain in
 				// a goroutine so plugin calls don't block until the turn
 				// completes. Errors are returned synchronously.
+				as.mu.Lock()
+				busy := as.cancelFn != nil
+				as.mu.Unlock()
+				if busy {
+					return fmt.Errorf("deliver_as is required while the session is busy")
+				}
 				ctx := context.Background()
 				events, err := as.Send(ctx, Message{Role: "user", Text: text})
 				if err != nil {
@@ -4119,13 +5988,15 @@ agentCreation:
 		runtime:                     r,
 		clientFactory:               clientFactory,
 		credentialProvider:          credentialProvider,
+		credStore:                   credStore,
 		artifactLoader:              loader,
 		sessionStartReason:          sessionStartReason,
 		previousSessionFile:         previousSessionFile,
 		thinkingLevel:               agent.ThinkingLevel(sessionThinkingLevel),
 		systemPromptOverride:        opts.SystemPrompt,
 		appendSystemPrompts:         opts.AppendSystemPrompts,
-		toolAllowlist:               opts.ToolAllowlist,
+		toolAllowlist:               slices.Clone(opts.ToolAllowlist),
+		defaultToolNames:            resolveDefaultToolSelection(settings),
 		toolDenylist:                opts.ToolDenylist,
 		approveProjectFiles:         opts.ApproveProjectFiles,
 		sessionFileBeforeRename:     newSessionFilePath,
@@ -4136,12 +6007,28 @@ agentCreation:
 		pendingInitialModelProvider: activeModelSpec.Provider,
 		pendingInitialModel:         activeModelSpec.Model,
 		pendingInitialThinking:      sessionThinkingLevel,
-		compactionConfig:            r.compactionConfig,
-		autoCompactionDefault:       r.compactionConfig,
+		settings:                    settings,
+		compactionConfig:            compactionCfg,
+		autoCompactionDefault:       compactionCfg,
 		autoRetryEnabled:            true,
 		totalTokens:                 loadedTotalTokens,
+		usageTotals:                 loadedUsage,
 		isPersistedFunc:             opts.IsPersisted,
 		logger:                      sessionLogger,
+	}
+
+	if resumedParentMsgID == nil && len(initialMessages) == 0 {
+		messages := a.Messages()
+		if len(messages) > 0 && messages[0].Role == agent.RoleSystem {
+			s.pendingInitialTranscript = messages[0]
+		}
+	}
+
+	hookSession = s
+	if r.pluginManager != nil {
+		for _, registered := range r.pluginManager.Tools() {
+			s.pluginToolNames = append(s.pluginToolNames, registered.Name)
+		}
 	}
 
 	// Expose the new session to the plugin system before session_start so Host
@@ -4165,10 +6052,70 @@ agentCreation:
 			"reason":              sessionStartReason,
 			"previousSessionFile": previousSessionFile,
 		})
-		r.pluginManager.DispatchEventCollect("session_start", startPayload, sessionID)
+		r.pluginManager.DispatchEventCollect(ctx, "session_start", startPayload, sessionID)
+	}
+	if err := r.trackLiveSession(s); err != nil {
+		return nil, errors.Join(err, s.Close(ctx))
 	}
 
 	return s, nil
+}
+
+func restoreDeclaredBuiltinTools(tools []agent.Tool, messages []*agent.Message, settings *ai.Settings, allow, deny []string) []agent.Tool {
+	baseline := ai.CurrentSystemMessage(agent.ConvertMessagesToAI(messages))
+	if baseline == nil {
+		return tools
+	}
+	candidates := filterToolsByName(agent.BuiltInToolsWithConfig(buildToolConfig(settings)), allow, deny)
+	for _, declaration := range baseline.ToolsAdded {
+		if slices.ContainsFunc(tools, func(tool agent.Tool) bool { return tool.Name == declaration.Name }) {
+			continue
+		}
+		for _, candidate := range candidates {
+			if candidate.Name == declaration.Name {
+				tools = append(tools, candidate)
+				break
+			}
+		}
+	}
+	return tools
+}
+
+func selectSessionTools(tools []agent.Tool, selection, exclusions []string) []agent.Tool {
+	allow := selection
+	deny := slices.Clone(exclusions)
+	if toolSelectionHasModifiers(allow) {
+		// Modifiers change initial activation, not which extension tools may register.
+		for _, entry := range allow {
+			if name, ok := strings.CutPrefix(entry, "-"); ok {
+				deny = append(deny, name)
+			}
+			if name, ok := strings.CutPrefix(entry, "+"); ok {
+				deny = slices.DeleteFunc(deny, func(n string) bool { return n == name && !slices.Contains(exclusions, n) })
+			}
+		}
+		allow = nil
+	}
+	if allow != nil || len(deny) > 0 {
+		tools = filterToolsByName(tools, allow, deny)
+		if allow != nil && len(allow) == 0 {
+			tools = nil
+		}
+	}
+
+	if toolSelectionHasModifiers(selection) {
+		for _, selection := range selection {
+			if name, ok := strings.CutPrefix(selection, "+"); ok {
+				for i, tool := range tools {
+					if matchesToolName(tool.Name, map[string]struct{}{name: {}}) {
+						tools[i].DefaultActive = new(true)
+					}
+				}
+			}
+		}
+	}
+
+	return tools
 }
 
 // filterToolsByName restricts tools to the allowlist (when non-empty) and
@@ -4182,18 +6129,42 @@ func filterToolsByName(tools []agent.Tool, allow, deny []string) []agent.Tool {
 	for _, name := range deny {
 		denySet[name] = struct{}{}
 	}
-	allowSet := make(map[string]struct{}, len(allow))
+	allowSet := make(map[string]struct{})
+	hasExplicit := false
 	for _, name := range allow {
-		allowSet[name] = struct{}{}
+		if !strings.HasPrefix(name, "+") && !strings.HasPrefix(name, "-") {
+			hasExplicit = true
+		}
 	}
+	if !hasExplicit {
+		for _, tool := range tools {
+			allowSet[tool.Name] = struct{}{}
+		}
+	}
+	for _, name := range allow {
+		if removed, ok := strings.CutPrefix(name, "-"); ok {
+			delete(allowSet, removed)
+		} else {
+			allowSet[strings.TrimPrefix(name, "+")] = struct{}{}
+		}
+	}
+
 	out := make([]agent.Tool, 0, len(tools))
 	for _, t := range tools {
-		if _, blocked := denySet[t.Name]; blocked {
+		if matchesToolName(t.Name, denySet) {
 			continue
 		}
-		if len(allowSet) > 0 {
-			if _, ok := allowSet[t.Name]; !ok {
+		if len(allow) > 0 {
+			if !matchesToolName(t.Name, allowSet) {
 				continue
+			}
+		}
+		for _, selection := range allow {
+			if strings.HasPrefix(selection, "-") {
+				continue
+			}
+			if matchesToolName(t.Name, map[string]struct{}{strings.TrimPrefix(selection, "+"): {}}) {
+				t.DefaultActive = new(true)
 			}
 		}
 		out = append(out, t)
@@ -4201,67 +6172,208 @@ func filterToolsByName(tools []agent.Tool, allow, deny []string) []agent.Tool {
 	return out
 }
 
-func defaultCodingAgentTools(toolCfg agent.ToolConfig) []agent.Tool {
-	all := agent.BuiltInToolsWithConfig(toolCfg)
-	byName := make(map[string]agent.Tool, len(all))
-	for _, tool := range all {
-		byName[tool.Name] = tool
+// ValidateToolSelection checks SDK and CLI tool lists. Settings may mix names and modifiers.
+func ValidateToolSelection(entries []string) error {
+	if !toolSelectionHasModifiers(entries) {
+		return nil
 	}
-	tools := make([]agent.Tool, 0, 4)
-	for _, name := range []string{"read", "bash", "edit", "write"} {
-		if tool, ok := byName[name]; ok {
-			tools = append(tools, tool)
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry, "+") && !strings.HasPrefix(entry, "-") {
+			return errors.New("tool names cannot be mixed with +name or -name entries")
+		}
+		if strings.Contains(entry, "*") {
+			return fmt.Errorf("+name and -name entries take exact tool names, not patterns: %s", entry)
+		}
+	}
+	return nil
+}
+
+func toolSelectionHasModifiers(entries []string) bool {
+	return slices.ContainsFunc(entries, func(entry string) bool { return strings.HasPrefix(entry, "+") || strings.HasPrefix(entry, "-") })
+}
+
+func applyToolModifiers(base, entries []string) []string {
+	tools := slices.Clone(base)
+	for _, entry := range entries {
+		if name, ok := strings.CutPrefix(entry, "-"); ok {
+			tools = slices.DeleteFunc(tools, func(n string) bool { return n == name })
+		} else if name, ok := strings.CutPrefix(entry, "+"); ok && name != "" && !slices.Contains(tools, name) {
+			tools = append(tools, name)
 		}
 	}
 	return tools
 }
 
-func buildContextFileAddendum(cwd string) (string, error) {
-	root, err := findContextWalkRoot(cwd)
+func resolveDefaultToolSelection(settings *ai.Settings) []string {
+	defaults := []string{"read", "bash", "edit", "write"}
+	if settings == nil || settings.DefaultTools == nil {
+		return defaults
+	}
+	entries := settings.DefaultTools
+	plain := []string{}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry, "+") && !strings.HasPrefix(entry, "-") {
+			plain = append(plain, entry)
+		}
+	}
+	if len(entries) > 0 && len(plain) == 0 {
+		plain = defaults
+	}
+	return applyToolModifiers(plain, entries)
+}
+
+func matchesToolName(name string, patterns map[string]struct{}) bool {
+	for pattern := range patterns {
+		if pattern == name {
+			return true
+		}
+		// A malformed glob matches nothing, like a name that is not registered.
+		if matched, err := path.Match(pattern, name); err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+// buildContextFileAddendum follows upstream loadProjectContextFiles: the agent
+// directory's context file, then one file per directory from the filesystem
+// root down to cwd. Unreadable files are skipped and reported in err.
+func buildContextFileAddendum(agentDir, cwd string) (addendum string, err error) {
+	if cwd == "" {
+		cwd = "."
+	}
+	cwd, err = filepath.Abs(cwd)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolve cwd: %w", err)
 	}
 
-	var dirs []string
-	for dir := cwd; ; dir = filepath.Dir(dir) {
-		dirs = append(dirs, dir)
-		if dir == root {
-			break
+	var (
+		files    []contextFile
+		ancestor []contextFile
+		errs     []error
+		seen     = map[string]bool{}
+	)
+	if agentDir != "" {
+		if file, ok := loadContextFileFromDir(agentDir, &errs); ok {
+			files = append(files, file)
+			seen[file.path] = true
+		}
+	}
+	shadowed := findShadowedContextFile(cwd, &errs)
+	for dir := cwd; ; {
+		file, ok := loadContextFileFromDir(dir, &errs)
+		isShadowed := ok && shadowed != "" && filepath.Join(canonicalPath(dir), filepath.Base(file.path)) == shadowed
+		if ok && !isShadowed && !seen[file.path] {
+			ancestor = append(ancestor, file)
+			seen[file.path] = true
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			break
 		}
+		dir = parent
 	}
-	slices.Reverse(dirs)
+	slices.Reverse(ancestor)
+	files = append(files, ancestor...)
 
-	var paths []string
-	for _, dir := range dirs {
-		// Per Pi spec: AGENTS.md wins over CLAUDE.md within each directory.
-		agentsPath := filepath.Join(dir, "AGENTS.md")
-		if _, err := os.Stat(agentsPath); err == nil {
-			paths = append(paths, agentsPath)
+	sections := make([]string, 0, len(files))
+	for _, file := range files {
+		sections = append(sections, fmt.Sprintf("## Context: %s\n\n%s", file.path, strings.TrimSpace(file.content)))
+	}
+	return strings.Join(sections, "\n\n"), errors.Join(errs...)
+}
+
+type contextFile struct{ path, content string }
+
+func loadContextFileFromDir(dir string, errs *[]error) (contextFile, bool) {
+	for _, name := range []string{"AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"} {
+		path := filepath.Join(dir, name)
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		claudePath := filepath.Join(dir, "CLAUDE.md")
-		if _, err := os.Stat(claudePath); err == nil {
-			paths = append(paths, claudePath)
-		}
-	}
-	if len(paths) == 0 {
-		return "", nil
-	}
-
-	var sections []string
-	for _, path := range paths {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return "", fmt.Errorf("read context file %s: %w", path, err)
+			*errs = append(*errs, fmt.Errorf("read context file %s: %w", path, err))
+			continue
 		}
-		sections = append(sections, fmt.Sprintf("## Context: %s\n\n%s", path, strings.TrimSpace(string(data))))
+		return contextFile{path: path, content: strings.TrimPrefix(string(data), "\ufeff")}, true
 	}
+	return contextFile{}, false
+}
 
-	return strings.Join(sections, "\n\n"), nil
+// findShadowedContextFile returns the main repository's context file that a
+// linked worktree nested inside it shadows, canonicalized, or "" when none is.
+func findShadowedContextFile(cwd string, errs *[]error) string {
+	repoDir, commonGitDir, ok := findGitPaths(cwd, errs)
+	if !ok {
+		return ""
+	}
+	commonGitDir = canonicalPath(commonGitDir)
+	worktreeRoot := canonicalPath(repoDir)
+	mainRoot := filepath.Dir(commonGitDir)
+	if !strings.HasPrefix(worktreeRoot, mainRoot+string(filepath.Separator)) || canonicalPath(filepath.Join(mainRoot, ".git")) != commonGitDir {
+		return ""
+	}
+	file, ok := loadContextFileFromDir(worktreeRoot, errs)
+	if !ok {
+		return ""
+	}
+	return filepath.Join(mainRoot, filepath.Base(file.path))
+}
+
+// findGitPaths mirrors upstream's footer helper: the nearest repository or
+// worktree root and its common git directory.
+func findGitPaths(cwd string, errs *[]error) (repoDir, commonGitDir string, ok bool) {
+	for dir := cwd; ; {
+		gitPath := filepath.Join(dir, ".git")
+		if info, err := os.Stat(gitPath); err == nil {
+			if info.IsDir() {
+				return dir, gitPath, pathExists(filepath.Join(gitPath, "HEAD"))
+			}
+			data, err := os.ReadFile(gitPath)
+			if err != nil {
+				*errs = append(*errs, fmt.Errorf("read %s: %w", gitPath, err))
+				return "", "", false
+			}
+			target, found := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir: ")
+			if !found {
+				return "", "", false
+			}
+			gitDir := target
+			if !filepath.IsAbs(gitDir) {
+				gitDir = filepath.Join(dir, gitDir)
+			}
+			if !pathExists(filepath.Join(gitDir, "HEAD")) {
+				return "", "", false
+			}
+			commonGitDir = gitDir
+			if common, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+				commonGitDir = strings.TrimSpace(string(common))
+				if !filepath.IsAbs(commonGitDir) {
+					commonGitDir = filepath.Join(gitDir, commonGitDir)
+				}
+			}
+			return dir, commonGitDir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", "", false
+		}
+		dir = parent
+	}
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func canonicalPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }
 
 // loadSystemPrompt reads SYSTEM.md from <cwd>/.tau first, then
@@ -4309,28 +6421,6 @@ func loadAppendSystemPrompt(homeDir, cwd string) (string, error) {
 	return "", nil
 }
 
-func findContextWalkRoot(cwd string) (string, error) {
-	if cwd == "" {
-		cwd = "."
-	}
-	absCWD, err := filepath.Abs(cwd)
-	if err != nil {
-		return "", fmt.Errorf("resolve cwd: %w", err)
-	}
-
-	for dir := absCWD; ; dir = filepath.Dir(dir) {
-		if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			if info.IsDir() || info.Mode().IsRegular() {
-				return dir, nil
-			}
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return dir, nil
-		}
-	}
-}
-
 // loadSessionHistory loads messages from a session file for re-injection into the agent.
 func loadSessionHistory(storage *sessionpkg.Storage, sessionID string) ([]*agent.Message, error) {
 	messages, _, err := loadSessionHistoryWithPosition(storage, sessionID)
@@ -4362,14 +6452,12 @@ func agentMessagesFromSessionReader(reader *sessionpkg.Reader, atEntry string) (
 	if atEntry == "" {
 		sessionMsgs = reader.ToAgentMessages()
 	} else {
-		branchEntries := entriesTo(sessionEntries(reader), atEntry)
-		if len(branchEntries) == 0 {
-			return nil, fmt.Errorf("fork entry %q not found in session %q", atEntry, reader.Header().ID)
+		manager := sessionpkg.NewManager(reader.Header().CWD)
+		manager.LoadEntries(reader)
+		if err := manager.SetCurrentPosition(atEntry); err != nil {
+			return nil, fmt.Errorf("select session position: %w", err)
 		}
-		for _, entry := range branchEntries {
-			if !entry.Type.InContext() {
-				continue
-			}
+		for _, entry := range manager.ContextEntries() {
 			if msg := entry.ToAgentMessage(); msg != nil {
 				sessionMsgs = append(sessionMsgs, msg)
 			}
@@ -4382,18 +6470,28 @@ func sessionMessagesToAgentMessages(sessionMsgs []*sessionpkg.Message) []*agent.
 	messages := make([]*agent.Message, 0, len(sessionMsgs))
 	for _, sm := range sessionMsgs {
 		messages = append(messages, &agent.Message{
-			Role:         agent.MessageRole(sm.Role),
-			Content:      sm.Content,
-			ToolCallID:   sm.ToolCallID,
-			ToolName:     sm.ToolName,
-			IsError:      sm.IsError,
-			Provider:     sm.Provider,
-			API:          sm.API,
-			Model:        sm.Model,
-			StopReason:   ai.StopReason(sm.StopReason),
-			ErrorMessage: sm.ErrorMessage,
-			ResponseID:   sm.ResponseID,
-			Timestamp:    sm.Timestamp,
+			CustomType: sm.CustomType, Display: sm.Display, Details: sm.Details,
+			Sections: sm.Sections, ToolsAdded: sm.ToolsAdded, ToolsRemoved: sm.ToolsRemoved,
+			Data:              sm.Data,
+			StructuredContent: sm.StructuredContent, ToolUsage: sm.ToolUsage, NestedCalls: sm.NestedCalls,
+			ExcludeFromContext:    sm.ExcludeFromContext,
+			Role:                  agent.MessageRole(sm.Role),
+			Usage:                 sm.Usage,
+			Content:               sm.Content,
+			ToolCallID:            sm.ToolCallID,
+			ToolName:              sm.ToolName,
+			IsError:               sm.IsError,
+			Provider:              sm.Provider,
+			API:                   sm.API,
+			Model:                 sm.Model,
+			StopReason:            ai.StopReason(sm.StopReason),
+			ErrorMessage:          sm.ErrorMessage,
+			ResponseID:            sm.ResponseID,
+			ProviderThinkingLevel: sm.ProviderThinkingLevel,
+			Diagnostics:           sm.Diagnostics,
+			DurationMs:            sm.DurationMs,
+			ThinkingLevel:         sm.ThinkingLevel,
+			Timestamp:             sm.Timestamp,
 		})
 	}
 	return messages
@@ -4436,12 +6534,23 @@ func entriesTo(entries []sessionpkg.Entry, entryID string) []sessionpkg.Entry {
 	return reversed
 }
 
-// Close releases runtime resources.
-func (r *runtime) Close(_ context.Context) error {
-	if r.pluginManager != nil {
-		return r.pluginManager.Shutdown(context.Background())
+// Close closes every open session, then shuts down plugins. Later NewSession
+// calls fail.
+func (r *runtime) Close(ctx context.Context) error {
+	r.mu.Lock()
+	r.closed = true
+	sessions := slices.Collect(maps.Keys(r.liveSessions))
+	r.mu.Unlock()
+	var err error
+	for _, s := range sessions {
+		if closeErr := s.Close(ctx); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close session %s: %w", s.id, closeErr))
+		}
 	}
-	return nil
+	if r.pluginManager != nil {
+		err = errors.Join(err, r.pluginManager.Shutdown(ctx))
+	}
+	return err
 }
 
 // SessionID returns the current active session ID, or empty string if no session is active.
@@ -4493,7 +6602,10 @@ func (r *runtime) ListSessions(_ context.Context) ([]SessionInfo, error) {
 	return infos, nil
 }
 
-func (r *runtime) PinSession(_ context.Context, id string) error {
+func (r *runtime) PinSession(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("pin session: %w", err)
+	}
 	storage, err := sessionpkg.NewStorageAt(r.sessionsDir)
 	if err != nil {
 		return fmt.Errorf("open session storage: %w", err)
@@ -4501,7 +6613,10 @@ func (r *runtime) PinSession(_ context.Context, id string) error {
 	return storage.SetPinned(id, true)
 }
 
-func (r *runtime) UnpinSession(_ context.Context, id string) error {
+func (r *runtime) UnpinSession(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("unpin session: %w", err)
+	}
 	storage, err := sessionpkg.NewStorageAt(r.sessionsDir)
 	if err != nil {
 		return fmt.Errorf("open session storage: %w", err)
@@ -4517,7 +6632,7 @@ func (r *runtime) ResumeSession(ctx context.Context, id string, opts SessionOpti
 
 // setupDefaults resolves and stores the active model. Exposed for capability checking.
 func (r *runtime) SetupDefaults() error {
-	return r.setupDefaults()
+	return r.setupDefaults(context.Background())
 }
 
 // ActiveModel returns the resolved active model, or nil if not yet resolved.
@@ -4566,9 +6681,7 @@ func buildToolConfig(settings *ai.Settings) agent.ToolConfig {
 	if settings == nil {
 		return cfg
 	}
-	if settings.Bash.Shell != "" {
-		cfg.BashShell = settings.Bash.Shell
-	}
+	cfg.BashShell = cmp.Or(settings.Bash.Shell, expandShellPath(settings.ShellPath))
 	if settings.Bash.OutputCap > 0 {
 		cfg.BashOutputCap = settings.Bash.OutputCap
 	}
@@ -4578,9 +6691,7 @@ func buildToolConfig(settings *ai.Settings) agent.ToolConfig {
 	if len(settings.Bash.EnvExtra) > 0 {
 		cfg.BashEnvExtra = settings.Bash.EnvExtra
 	}
-	if settings.Bash.CommandPrefix != "" {
-		cfg.CommandPrefix = settings.Bash.CommandPrefix
-	}
+	cfg.CommandPrefix = cmp.Or(settings.Bash.CommandPrefix, settings.ShellCommandPrefix)
 	if settings.Bash.StreamWindowMs > 0 {
 		cfg.BashStreamWindow = time.Duration(settings.Bash.StreamWindowMs) * time.Millisecond
 	}
@@ -4602,4 +6713,98 @@ func buildToolConfig(settings *ai.Settings) agent.ToolConfig {
 	}
 	cfg.BlockImages = settings.Images.BlockImages
 	return cfg
+}
+
+// expandShellPath expands a leading ~ in the shellPath setting.
+func expandShellPath(shell string) string {
+	if shell != "~" && !strings.HasPrefix(shell, "~/") && !strings.HasPrefix(shell, `~\`) {
+		return shell
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return shell
+	}
+	return filepath.Join(home, shell[1:])
+}
+
+// ToolLoadout exposes registered metadata, activation, and cancellable discovery.
+type ToolLoadout interface {
+	RegisteredTools() []agent.Tool
+	ActiveTools() []string
+	SetActiveTools(context.Context, ...string) error
+	SearchTools(context.Context, string, string, int) ([]agent.Tool, error)
+	DescribeTool(string) *agent.Tool
+	DescribeNamespace(string) *agent.ToolNamespace
+}
+
+func (s *agentSession) RegisteredTools() []agent.Tool { return s.agent.State().Tools }
+func (s *agentSession) ActiveTools() []string         { return s.agent.ActiveTools() }
+func (s *agentSession) SetActiveTools(ctx context.Context, names ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("session closed")
+	}
+	return s.agent.SetActiveTools(names...)
+}
+
+func (s *agentSession) SearchTools(ctx context.Context, query, namespace string, limit int) ([]agent.Tool, error) {
+	return agent.SearchTools(ctx, s.RegisteredTools(), query, namespace, limit)
+}
+
+func (s *agentSession) DescribeTool(name string) *agent.Tool {
+	return agent.DescribeTool(s.RegisteredTools(), name)
+}
+
+func (s *agentSession) DescribeNamespace(name string) *agent.ToolNamespace {
+	return agent.DescribeNamespace(s.RegisteredTools(), name)
+}
+
+func discoverSessionTools(ctx context.Context, loadout ToolLoadout, req *proto.ToolDiscoveryRequest) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	describe := func(tool agent.Tool) map[string]any {
+		return map[string]any{"name": tool.Name, "description": tool.Description, "parameters": tool.Parameters, "outputSchema": tool.OutputSchema, "exposure": tool.Exposure, "namespace": tool.Namespace, "defaultActive": tool.DefaultActive}
+	}
+	var result any
+	switch req.Operation {
+	case "registered", "search":
+		tools := loadout.RegisteredTools()
+		if req.Operation == "search" {
+			var err error
+			tools, err = loadout.SearchTools(ctx, req.Query, req.Namespace, int(req.Limit))
+			if err != nil {
+				return nil, err
+			}
+		}
+		descriptions := make([]map[string]any, 0, len(tools))
+		for _, tool := range tools {
+			descriptions = append(descriptions, describe(tool))
+		}
+		result = descriptions
+	case "active":
+		result = loadout.ActiveTools()
+	case "activate":
+		if err := loadout.SetActiveTools(ctx, req.Names...); err != nil {
+			return nil, err
+		}
+		result = loadout.ActiveTools()
+	case "tool":
+		if tool := loadout.DescribeTool(req.Query); tool != nil {
+			result = describe(*tool)
+		}
+	case "namespace":
+		result = loadout.DescribeNamespace(req.Query)
+	default:
+		return nil, errors.New("unknown tool discovery operation")
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("encode tool discovery: %w", err)
+	}
+	return data, nil
 }

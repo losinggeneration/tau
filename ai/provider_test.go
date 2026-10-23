@@ -1,8 +1,17 @@
 package ai
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetClientSupportsEveryOfficiallySupportedProviderFamily(t *testing.T) {
@@ -162,34 +171,16 @@ func TestAliasProvidersReturnIsAliasTrue(t *testing.T) {
 	}
 }
 
-// TestGetClientRejectsAPIMismatch verifies that GetClient returns an error when
-// the resolved provider's declared API does not match the model's API. This
-// guards against silent mis-routing where a model claims one API type but the
-// registry resolves it to a provider that declares a different API.
-// Currently no APIs are mismatched — all are dedicated implementations.
 func TestGetClientRejectsAPIMismatch(t *testing.T) {
-	// No API mismatch cases currently exist. Both google-gemini-cli and
-	// openai-responses are now dedicated providers, so they pass through.
-	mismatchCases := []struct {
-		api   string
-		model *Model
-	}{}
-
-	for _, tc := range mismatchCases {
-		t.Run(tc.api, func(t *testing.T) {
-			client, err := GetClient(tc.model)
-			if err == nil {
-				t.Fatalf("GetClient(%q) expected error, got client %T", tc.model.API, client)
-			}
-			if !strings.Contains(err.Error(), "api mismatch") {
-				t.Errorf("error = %q, want it to contain %q", err.Error(), "api mismatch")
-			}
-			// The error message should name both the model API and the provider API.
-			if !strings.Contains(err.Error(), tc.model.API) {
-				t.Errorf("error = %q, want it to contain model API %q", err.Error(), tc.model.API)
-			}
-		})
-	}
+	provider := &testProvider{api: "declared-routing-api"}
+	const registeredAPI = "incorrect-routing-api"
+	Register(registeredAPI, provider)
+	t.Cleanup(func() { Unregister(registeredAPI) })
+	client, err := GetClient(&Model{ID: "model", API: registeredAPI})
+	require.Nil(t, client)
+	require.ErrorContains(t, err, "api mismatch")
+	require.ErrorContains(t, err, registeredAPI)
+	require.ErrorContains(t, err, provider.API())
 }
 
 // TestGetClientPassesForDedicatedProviders verifies that GetClient succeeds for
@@ -446,5 +437,269 @@ func TestResetAPIProvidersIsAlias(t *testing.T) {
 	}
 	if _, ok := Get(APIOpenAICompletions); !ok {
 		t.Fatal("ResetAPIProviders did not restore built-ins")
+	}
+}
+
+func TestTransportExpandsCloudflarePlaceholders(t *testing.T) {
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+	}))
+	defer server.Close()
+
+	transport := NewTransport(server.URL+"/accounts/{CLOUDFLARE_ACCOUNT_ID}/gw/{CLOUDFLARE_GATEWAY_ID}", "", nil)
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	if _, err := transport.Do(t.Context(), http.MethodPost, "/run", "{}"); err == nil || !strings.Contains(err.Error(), "CLOUDFLARE_ACCOUNT_ID") {
+		t.Fatalf("missing account id error = %v", err)
+	}
+
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "gw1")
+	resp, err := transport.Do(t.Context(), http.MethodPost, "/run", "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if path != "/accounts/acct/gw/gw1/run" {
+		t.Fatalf("path = %q", path)
+	}
+}
+
+func TestGetClientRejectsNonChatModels(t *testing.T) {
+	for _, kind := range []string{"image", "classifier"} {
+		if _, err := GetClient(&Model{ID: "m", Type: kind, API: APIOpenAICompletions, Provider: ProviderOpenAI}); err == nil || !strings.Contains(err.Error(), kind) {
+			t.Fatalf("%s model streamed: %v", kind, err)
+		}
+	}
+	if _, err := GetClient(&Model{ID: "m", Type: "chat", API: APIOpenAICompletions, Provider: ProviderOpenAI}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testHTTPProviderHeaderTimeout(t *testing.T, client Client, model *Model, payload string) {
+	t.Helper()
+	for _, refresh := range []bool{false, true} {
+		for _, phase := range []string{"headers", "disabled", "success body", "error body", "read failure", "cancel body"} {
+			t.Run(fmt.Sprintf("%s/refresh=%v", phase, refresh), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				defer cancel()
+				timeout := time.Millisecond
+				if phase == "disabled" {
+					timeout = 0
+				}
+				var body *codexTestBody
+				readErr, closeErr := errors.New("read failed"), errors.New("close failed")
+				previous := http.DefaultClient
+				http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if phase == "headers" {
+						<-req.Context().Done()
+						return nil, req.Context().Err()
+					}
+					if phase == "disabled" {
+						require.NoError(t, sleepWithContext(req.Context(), 5*time.Millisecond))
+					}
+					body = &codexTestBody{Reader: strings.NewReader(payload), ctx: req.Context(), delay: 5 * time.Millisecond}
+					status := http.StatusOK
+					if phase == "error body" {
+						status = http.StatusBadRequest
+						body.Reader = strings.NewReader("rejected")
+					}
+					if phase == "read failure" {
+						status = http.StatusBadRequest
+						body.readErr, body.closeErr = readErr, closeErr
+					}
+					if phase == "cancel body" {
+						status = http.StatusBadRequest
+						body.delay, body.closeErr = time.Hour, closeErr
+						cancel()
+					}
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: body}, nil
+				})}
+				t.Cleanup(func() { http.DefaultClient = previous })
+				// Clients constructed before the test retain their own transport client.
+				switch c := client.(type) {
+				case *openAIClient:
+					c.transport.httpClient = http.DefaultClient
+				case *anthropicClient:
+					c.transport.httpClient = http.DefaultClient
+				}
+				opts := []Option{WithAPIKey("test-key"), WithTimeout(timeout)}
+				if refresh {
+					opts = append(opts, WithTransportOption(TransportOption{Provider: model.Provider, RefreshCreds: func(context.Context, string) (string, error) {
+						t.Fatal("unexpected credential refresh")
+						return "", nil
+					}}))
+				}
+				err := client.Stream(ctx, model, &Context{}, func(context.Context, StreamEvent) {}, opts...)
+				switch phase {
+				case "headers":
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+					require.ErrorContains(t, err, "response headers timed out")
+					require.NoError(t, ctx.Err())
+					return
+				case "error body":
+					require.ErrorContains(t, err, "rejected")
+					require.NoError(t, ctx.Err())
+				case "read failure":
+					require.ErrorIs(t, err, readErr)
+					require.ErrorIs(t, err, closeErr)
+				case "cancel body":
+					require.ErrorIs(t, err, context.Canceled)
+					require.ErrorIs(t, err, closeErr)
+				default:
+					require.NoError(t, err)
+				}
+				require.NotNil(t, body)
+				require.True(t, body.closed)
+				if timeout > 0 {
+					require.ErrorIs(t, body.ctx.Err(), context.Canceled)
+				}
+			})
+		}
+	}
+}
+
+func TestHTTPTransportHeaderTimeoutRefresh(t *testing.T) {
+	for _, phase := range []string{"success", "retry headers", "close failure", "refresh cancellation"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+			var bodies []*codexTestBody
+			var requests []*http.Request
+			closeErr := errors.New("close unauthorized failed")
+			calls, refreshes := 0, 0
+			transport := NewTransportWithOptions("https://test.invalid", "old", nil, TransportOptions{
+				Provider: "test", RefreshCreds: func(refreshCtx context.Context, provider string) (string, error) {
+					refreshes++
+					require.Equal(t, "test", provider)
+					require.True(t, bodies[0].closed)
+					require.ErrorIs(t, requests[0].Context().Err(), context.Canceled)
+					require.NoError(t, refreshCtx.Err())
+					if phase == "refresh cancellation" {
+						cancel()
+						return "", refreshCtx.Err()
+					}
+					return "new", nil
+				},
+			})
+			transport.httpClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				requests = append(requests, req)
+				require.NoError(t, req.Context().Err())
+				require.Equal(t, "kept", req.Header.Get("X-Test"))
+				data, err := io.ReadAll(req.Body)
+				require.NoError(t, err)
+				require.Equal(t, `{"request":true}`, string(data))
+				if calls == 2 && phase == "retry headers" {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				}
+				body := &codexTestBody{Reader: strings.NewReader("ok"), ctx: req.Context(), delay: 5 * time.Millisecond}
+				bodies = append(bodies, body)
+				status := http.StatusOK
+				if calls == 1 {
+					status = http.StatusUnauthorized
+					require.Equal(t, "Bearer old", req.Header.Get("Authorization"))
+					if phase == "close failure" {
+						body.closeErr = closeErr
+					}
+				} else {
+					require.Equal(t, "Bearer new", req.Header.Get("Authorization"))
+				}
+				return &http.Response{StatusCode: status, Header: make(http.Header), Body: body}, nil
+			})}
+			model := &Model{Provider: "test"}
+			transport = transport.withRequestOptions(model, applyOptions([]Option{WithAPIKey("old"), WithTimeout(time.Millisecond), WithHeaders(map[string]string{"X-Test": "kept"})}))
+			resp, err := transport.Do(ctx, http.MethodPost, "/test", `{"request":true}`)
+			switch phase {
+			case "success":
+				require.NoError(t, err)
+				data, readErr := io.ReadAll(resp.Body)
+				require.NoError(t, readErr)
+				require.Equal(t, "ok", string(data))
+				require.NoError(t, resp.Body.Close())
+				require.ErrorIs(t, requests[1].Context().Err(), context.Canceled)
+			case "retry headers":
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				require.ErrorContains(t, err, "response headers timed out")
+				require.NoError(t, ctx.Err())
+			case "close failure":
+				require.ErrorIs(t, err, closeErr)
+				require.Equal(t, 1, calls)
+				require.Zero(t, refreshes)
+			case "refresh cancellation":
+				require.ErrorIs(t, err, context.Canceled)
+				require.Equal(t, 1, calls)
+			}
+			for _, body := range bodies {
+				require.True(t, body.closed)
+			}
+		})
+	}
+}
+
+func TestStreamingProvidersConsumeProviderRetries(t *testing.T) {
+	t.Setenv("GOOGLE_ACCESS_TOKEN", "test-token")
+	completions := "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	model := func(api, provider string) *Model {
+		return &Model{ID: "test", API: api, Provider: provider, BaseURL: "https://test.invalid"}
+	}
+	for _, tc := range []struct {
+		name         string
+		model        *Model
+		client       func(*Model) (Client, error)
+		opts         []Option
+		payload      string
+		defaultCalls int
+	}{
+		{name: "openai completions", model: model(APIOpenAICompletions, ProviderOpenAI), client: func(m *Model) (Client, error) { return newOpenAIClient(m) }, payload: completions, defaultCalls: 2},
+		{name: "openai compatible", model: model(APIOpenAICompatible, ProviderOpenAI), client: func(m *Model) (Client, error) { return &openAICompatClient{model: m}, nil }, payload: completions, defaultCalls: 2},
+		{name: "anthropic", model: model(APIAnthropicMessages, ProviderAnthropic), client: func(m *Model) (Client, error) { return newAnthropicClient(m) }, payload: `{"content":[],"stop_reason":"end_turn"}`, defaultCalls: 1},
+		{name: "openai responses", model: model(APIOpenAIResponses, ProviderOpenAI), client: func(*Model) (Client, error) { return &openAIResponsesClient{}, nil }, defaultCalls: 1},
+		{name: "azure", model: model(APIAzureOpenAIResponses, ProviderAzureOpenAI), client: func(m *Model) (Client, error) { return &azureClient{model: m}, nil }, opts: []Option{WithAzureBaseURL("https://test.invalid")}, defaultCalls: 1},
+		{name: "vertex", model: model(APIGoogleVertex, ProviderGoogleVertex), client: func(m *Model) (Client, error) { return &vertexClient{model: m}, nil }, opts: []Option{WithVertexProject("test"), WithVertexLocation("test")}, defaultCalls: 1},
+	} {
+		for _, retries := range []*int{nil, new(1)} {
+			t.Run(fmt.Sprintf("%s/retries=%v", tc.name, retries != nil), func(t *testing.T) {
+				calls := 0
+				previous := http.DefaultClient
+				http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					if calls == 1 {
+						return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{"Retry-After-Ms": {"0"}}, Body: io.NopCloser(strings.NewReader("busy"))}, nil
+					}
+					header := http.Header{"Content-Type": {"application/json"}}
+					if tc.payload == completions {
+						header.Set("Content-Type", "text/event-stream")
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(tc.payload))}, nil
+				})}
+				t.Cleanup(func() { http.DefaultClient = previous })
+				client, err := tc.client(tc.model)
+				require.NoError(t, err)
+				opts := append([]Option{WithAPIKey("key")}, tc.opts...)
+				want := tc.defaultCalls
+				if retries != nil {
+					opts, want = append(opts, WithMaxRetries(*retries)), 2
+				}
+				if tc.payload == completions {
+					withFastChatCompletionsRetries(t)
+				}
+				_, err = client.Complete(t.Context(), tc.model, &Context{}, opts...)
+				require.Equal(t, want, calls)
+				if want == 1 {
+					require.ErrorContains(t, err, "503")
+					return
+				}
+				if err != nil {
+					require.NotContains(t, err.Error(), "503")
+				}
+				if tc.payload != "" {
+					require.NoError(t, err)
+				}
+			})
+		}
 	}
 }

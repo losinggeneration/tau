@@ -21,13 +21,39 @@ export interface ToolParameters {
 }
 
 export interface ToolDefinition {
+	reachesTools?: (
+		args: Record<string, unknown>,
+		options?: { signal: AbortSignal },
+	) => "all" | string[] | Promise<"all" | string[]>;
+	namespace?: { name: string; aliases?: string[]; description?: string; instructions?: string };
+	defaultActive?: boolean;
 	name: string;
 	description?: string;
 	parameters?: ToolParameters;
-	execute: (args: Record<string, unknown>, ctx: ExtensionContext) => Promise<ToolExecuteResult | void> | ToolExecuteResult | void;
+	exposure?: "direct" | "model-only" | "codemode" | "deferred" | "hidden";
+	outputSchema?: Record<string, unknown>;
+	constrainedSampling?:
+		| false
+		| { type: "json_schema"; strict: "prefer" | "require" }
+		| { type: "grammar"; variants: Record<string, string> };
+	execute: (
+		args: Record<string, unknown>,
+		ctx: ExtensionContext,
+	) => Promise<ToolExecuteResult | void> | ToolExecuteResult | void;
+}
+
+export interface NestedToolCall {
+	id: string;
+	name: string;
+	status: "running" | "ok" | "error" | "cancelled";
+	durationMs?: number;
+	error?: string;
 }
 
 export interface ToolExecuteResult {
+	nestedCalls?: NestedToolCall[];
+	structuredContent?: unknown;
+	usage?: Record<string, unknown>;
 	content?: Array<{ type: string; text?: string } | Record<string, unknown>>;
 	isError?: boolean;
 	details?: unknown;
@@ -170,6 +196,7 @@ export interface PiModel {
 }
 
 export interface ExtensionContext {
+	onUpdate?: (partial: ToolExecuteResult) => Promise<void>;
 	ui: PiUI;
 	hasUI: boolean;
 	cwd: string;
@@ -195,6 +222,26 @@ export interface PiFlagOptions {
 	default?: boolean | string;
 }
 
+/** Physical model and thinking level a virtual model's router picked. */
+export interface PiModelRoute {
+	model: { provider: string; id: string };
+	thinkingLevel: string;
+	state?: unknown;
+}
+
+/** Virtual model registered via pi.registerVirtualModel(). */
+export interface PiVirtualModel {
+	provider: string;
+	id: string;
+	name: string;
+	thinkingLevels?: readonly string[];
+	contextWindow?: number;
+	maxTokens?: number;
+	input?: ("text" | "image")[];
+	// biome-ignore lint/suspicious/noExplicitAny: the request mirrors pi's ModelRouteRequest.
+	route: (request: any, ctx: unknown) => PiModelRoute | Promise<PiModelRoute>;
+}
+
 export interface PiAPI {
 	on: (event: string, handler: PiEventHandler) => () => void;
 	registerTool: (tool: ToolDefinition) => void;
@@ -203,13 +250,19 @@ export interface PiAPI {
 	registerFlag: (name: string, options: PiFlagOptions) => void;
 	getFlag: (name: string) => string | boolean | undefined;
 	registerMessageRenderer: (customType: string, renderer: unknown) => void;
-	sendMessage: (message: Record<string, unknown>, options?: { triggerTurn?: boolean }) => void;
+	sendMessage: (
+		message: Record<string, unknown>,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	) => Promise<void>;
 	sendUserMessage: (content: string, options?: { deliverAs?: "steer" | "followUp" }) => Promise<void>;
 	appendEntry: (customType: string, data?: unknown) => Promise<void>;
 	setSessionName: (name: string) => void;
 	getSessionName: () => string | undefined;
 	setLabel: (entryId: string, label: string | undefined) => Promise<void>;
 	exec: (command: string, args: string[], options?: ExecOptions) => Promise<ExecResult>;
+	searchTools: (query: string, options?: { namespace?: string; limit?: number }) => Promise<unknown>;
+	describeTool: (name: string) => Promise<unknown>;
+	describeNamespace: (name: string) => Promise<unknown>;
 	getActiveTools: () => string[];
 	getAllTools: () => Array<Record<string, unknown>>;
 	setActiveTools: (toolNames: string[]) => void;
@@ -218,6 +271,8 @@ export interface PiAPI {
 	getThinkingLevel: () => undefined;
 	setThinkingLevel: (level: unknown) => void;
 	registerProvider: (name: string, config: Record<string, unknown>) => void;
+	registerVirtualModel: (model: PiVirtualModel) => void;
+	unregisterVirtualModel: (provider: string, id: string) => void;
 	unregisterProvider: (name: string) => void;
 	readonly events: NodeJS.EventEmitter;
 }

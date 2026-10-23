@@ -8,10 +8,13 @@ import type { LogRequest as _plugins_LogRequest, LogRequest__Output as _plugins_
 import type { LogResponse as _plugins_LogResponse, LogResponse__Output as _plugins_LogResponse__Output } from '../plugins/LogResponse.ts';
 import type { SessionAppendRequest as _plugins_SessionAppendRequest, SessionAppendRequest__Output as _plugins_SessionAppendRequest__Output } from '../plugins/SessionAppendRequest.ts';
 import type { SessionAppendResponse as _plugins_SessionAppendResponse, SessionAppendResponse__Output as _plugins_SessionAppendResponse__Output } from '../plugins/SessionAppendResponse.ts';
+import type { SessionCompactRequest as _plugins_SessionCompactRequest, SessionCompactRequest__Output as _plugins_SessionCompactRequest__Output } from '../plugins/SessionCompactRequest.ts';
+import type { SessionCompactResponse as _plugins_SessionCompactResponse, SessionCompactResponse__Output as _plugins_SessionCompactResponse__Output } from '../plugins/SessionCompactResponse.ts';
 import type { SessionGetLabelRequest as _plugins_SessionGetLabelRequest, SessionGetLabelRequest__Output as _plugins_SessionGetLabelRequest__Output } from '../plugins/SessionGetLabelRequest.ts';
 import type { SessionGetLabelResponse as _plugins_SessionGetLabelResponse, SessionGetLabelResponse__Output as _plugins_SessionGetLabelResponse__Output } from '../plugins/SessionGetLabelResponse.ts';
 import type { SessionScanRequest as _plugins_SessionScanRequest, SessionScanRequest__Output as _plugins_SessionScanRequest__Output } from '../plugins/SessionScanRequest.ts';
 import type { SessionScanResponse as _plugins_SessionScanResponse, SessionScanResponse__Output as _plugins_SessionScanResponse__Output } from '../plugins/SessionScanResponse.ts';
+import type { SessionSendCustomMessageRequest as _plugins_SessionSendCustomMessageRequest, SessionSendCustomMessageRequest__Output as _plugins_SessionSendCustomMessageRequest__Output } from '../plugins/SessionSendCustomMessageRequest.ts';
 import type { SessionSendUserMessageRequest as _plugins_SessionSendUserMessageRequest, SessionSendUserMessageRequest__Output as _plugins_SessionSendUserMessageRequest__Output } from '../plugins/SessionSendUserMessageRequest.ts';
 import type { SessionSendUserMessageResponse as _plugins_SessionSendUserMessageResponse, SessionSendUserMessageResponse__Output as _plugins_SessionSendUserMessageResponse__Output } from '../plugins/SessionSendUserMessageResponse.ts';
 import type { SessionSetLabelRequest as _plugins_SessionSetLabelRequest, SessionSetLabelRequest__Output as _plugins_SessionSetLabelRequest__Output } from '../plugins/SessionSetLabelRequest.ts';
@@ -24,6 +27,8 @@ import type { StateGetRequest as _plugins_StateGetRequest, StateGetRequest__Outp
 import type { StateGetResponse as _plugins_StateGetResponse, StateGetResponse__Output as _plugins_StateGetResponse__Output } from '../plugins/StateGetResponse.ts';
 import type { StateSetRequest as _plugins_StateSetRequest, StateSetRequest__Output as _plugins_StateSetRequest__Output } from '../plugins/StateSetRequest.ts';
 import type { StateSetResponse as _plugins_StateSetResponse, StateSetResponse__Output as _plugins_StateSetResponse__Output } from '../plugins/StateSetResponse.ts';
+import type { ToolDiscoveryRequest as _plugins_ToolDiscoveryRequest, ToolDiscoveryRequest__Output as _plugins_ToolDiscoveryRequest__Output } from '../plugins/ToolDiscoveryRequest.ts';
+import type { ToolDiscoveryResponse as _plugins_ToolDiscoveryResponse, ToolDiscoveryResponse__Output as _plugins_ToolDiscoveryResponse__Output } from '../plugins/ToolDiscoveryResponse.ts';
 import type { ToolProgressEvent as _plugins_ToolProgressEvent, ToolProgressEvent__Output as _plugins_ToolProgressEvent__Output } from '../plugins/ToolProgressEvent.ts';
 import type { ToolProgressResponse as _plugins_ToolProgressResponse, ToolProgressResponse__Output as _plugins_ToolProgressResponse__Output } from '../plugins/ToolProgressResponse.ts';
 import type { UIConfirmRequest as _plugins_UIConfirmRequest, UIConfirmRequest__Output as _plugins_UIConfirmRequest__Output } from '../plugins/UIConfirmRequest.ts';
@@ -73,6 +78,15 @@ export interface HostClient extends grpc.Client {
   sessionAppend(argument: _plugins_SessionAppendRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionAppendResponse__Output>): grpc.ClientUnaryCall;
   sessionAppend(argument: _plugins_SessionAppendRequest, callback: grpc.requestCallback<_plugins_SessionAppendResponse__Output>): grpc.ClientUnaryCall;
   
+  SessionCompact(argument: _plugins_SessionCompactRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  SessionCompact(argument: _plugins_SessionCompactRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  SessionCompact(argument: _plugins_SessionCompactRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  SessionCompact(argument: _plugins_SessionCompactRequest, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  sessionCompact(argument: _plugins_SessionCompactRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  sessionCompact(argument: _plugins_SessionCompactRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  sessionCompact(argument: _plugins_SessionCompactRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  sessionCompact(argument: _plugins_SessionCompactRequest, callback: grpc.requestCallback<_plugins_SessionCompactResponse__Output>): grpc.ClientUnaryCall;
+  
   SessionGetLabel(argument: _plugins_SessionGetLabelRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionGetLabelResponse__Output>): grpc.ClientUnaryCall;
   SessionGetLabel(argument: _plugins_SessionGetLabelRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_SessionGetLabelResponse__Output>): grpc.ClientUnaryCall;
   SessionGetLabel(argument: _plugins_SessionGetLabelRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionGetLabelResponse__Output>): grpc.ClientUnaryCall;
@@ -90,6 +104,15 @@ export interface HostClient extends grpc.Client {
   sessionScan(argument: _plugins_SessionScanRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_SessionScanResponse__Output>): grpc.ClientUnaryCall;
   sessionScan(argument: _plugins_SessionScanRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionScanResponse__Output>): grpc.ClientUnaryCall;
   sessionScan(argument: _plugins_SessionScanRequest, callback: grpc.requestCallback<_plugins_SessionScanResponse__Output>): grpc.ClientUnaryCall;
+  
+  SessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
+  SessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
+  SessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
+  SessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
+  sessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
+  sessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
+  sessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
+  sessionSendCustomMessage(argument: _plugins_SessionSendCustomMessageRequest, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
   
   SessionSendUserMessage(argument: _plugins_SessionSendUserMessageRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
   SessionSendUserMessage(argument: _plugins_SessionSendUserMessageRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_SessionSendUserMessageResponse__Output>): grpc.ClientUnaryCall;
@@ -144,6 +167,15 @@ export interface HostClient extends grpc.Client {
   stateSet(argument: _plugins_StateSetRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_StateSetResponse__Output>): grpc.ClientUnaryCall;
   stateSet(argument: _plugins_StateSetRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_StateSetResponse__Output>): grpc.ClientUnaryCall;
   stateSet(argument: _plugins_StateSetRequest, callback: grpc.requestCallback<_plugins_StateSetResponse__Output>): grpc.ClientUnaryCall;
+  
+  ToolDiscovery(argument: _plugins_ToolDiscoveryRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
+  ToolDiscovery(argument: _plugins_ToolDiscoveryRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
+  ToolDiscovery(argument: _plugins_ToolDiscoveryRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
+  ToolDiscovery(argument: _plugins_ToolDiscoveryRequest, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
+  toolDiscovery(argument: _plugins_ToolDiscoveryRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
+  toolDiscovery(argument: _plugins_ToolDiscoveryRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
+  toolDiscovery(argument: _plugins_ToolDiscoveryRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
+  toolDiscovery(argument: _plugins_ToolDiscoveryRequest, callback: grpc.requestCallback<_plugins_ToolDiscoveryResponse__Output>): grpc.ClientUnaryCall;
   
   ToolProgress(argument: _plugins_ToolProgressEvent, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ToolProgressResponse__Output>): grpc.ClientUnaryCall;
   ToolProgress(argument: _plugins_ToolProgressEvent, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ToolProgressResponse__Output>): grpc.ClientUnaryCall;
@@ -244,9 +276,13 @@ export interface HostHandlers extends grpc.UntypedServiceImplementation {
   
   SessionAppend: grpc.handleUnaryCall<_plugins_SessionAppendRequest__Output, _plugins_SessionAppendResponse>;
   
+  SessionCompact: grpc.handleUnaryCall<_plugins_SessionCompactRequest__Output, _plugins_SessionCompactResponse>;
+  
   SessionGetLabel: grpc.handleUnaryCall<_plugins_SessionGetLabelRequest__Output, _plugins_SessionGetLabelResponse>;
   
   SessionScan: grpc.handleUnaryCall<_plugins_SessionScanRequest__Output, _plugins_SessionScanResponse>;
+  
+  SessionSendCustomMessage: grpc.handleUnaryCall<_plugins_SessionSendCustomMessageRequest__Output, _plugins_SessionSendUserMessageResponse>;
   
   SessionSendUserMessage: grpc.handleUnaryCall<_plugins_SessionSendUserMessageRequest__Output, _plugins_SessionSendUserMessageResponse>;
   
@@ -259,6 +295,8 @@ export interface HostHandlers extends grpc.UntypedServiceImplementation {
   StateGet: grpc.handleUnaryCall<_plugins_StateGetRequest__Output, _plugins_StateGetResponse>;
   
   StateSet: grpc.handleUnaryCall<_plugins_StateSetRequest__Output, _plugins_StateSetResponse>;
+  
+  ToolDiscovery: grpc.handleUnaryCall<_plugins_ToolDiscoveryRequest__Output, _plugins_ToolDiscoveryResponse>;
   
   ToolProgress: grpc.handleUnaryCall<_plugins_ToolProgressEvent__Output, _plugins_ToolProgressResponse>;
   
@@ -286,14 +324,17 @@ export interface HostDefinition extends grpc.ServiceDefinition {
   GetConfig: MethodDefinition<_plugins_GetConfigRequest, _plugins_GetConfigResponse, _plugins_GetConfigRequest__Output, _plugins_GetConfigResponse__Output>
   Log: MethodDefinition<_plugins_LogRequest, _plugins_LogResponse, _plugins_LogRequest__Output, _plugins_LogResponse__Output>
   SessionAppend: MethodDefinition<_plugins_SessionAppendRequest, _plugins_SessionAppendResponse, _plugins_SessionAppendRequest__Output, _plugins_SessionAppendResponse__Output>
+  SessionCompact: MethodDefinition<_plugins_SessionCompactRequest, _plugins_SessionCompactResponse, _plugins_SessionCompactRequest__Output, _plugins_SessionCompactResponse__Output>
   SessionGetLabel: MethodDefinition<_plugins_SessionGetLabelRequest, _plugins_SessionGetLabelResponse, _plugins_SessionGetLabelRequest__Output, _plugins_SessionGetLabelResponse__Output>
   SessionScan: MethodDefinition<_plugins_SessionScanRequest, _plugins_SessionScanResponse, _plugins_SessionScanRequest__Output, _plugins_SessionScanResponse__Output>
+  SessionSendCustomMessage: MethodDefinition<_plugins_SessionSendCustomMessageRequest, _plugins_SessionSendUserMessageResponse, _plugins_SessionSendCustomMessageRequest__Output, _plugins_SessionSendUserMessageResponse__Output>
   SessionSendUserMessage: MethodDefinition<_plugins_SessionSendUserMessageRequest, _plugins_SessionSendUserMessageResponse, _plugins_SessionSendUserMessageRequest__Output, _plugins_SessionSendUserMessageResponse__Output>
   SessionSetLabel: MethodDefinition<_plugins_SessionSetLabelRequest, _plugins_SessionSetLabelResponse, _plugins_SessionSetLabelRequest__Output, _plugins_SessionSetLabelResponse__Output>
   StateAppend: MethodDefinition<_plugins_StateAppendRequest, _plugins_StateAppendResponse, _plugins_StateAppendRequest__Output, _plugins_StateAppendResponse__Output>
   StateDelete: MethodDefinition<_plugins_StateDeleteRequest, _plugins_StateDeleteResponse, _plugins_StateDeleteRequest__Output, _plugins_StateDeleteResponse__Output>
   StateGet: MethodDefinition<_plugins_StateGetRequest, _plugins_StateGetResponse, _plugins_StateGetRequest__Output, _plugins_StateGetResponse__Output>
   StateSet: MethodDefinition<_plugins_StateSetRequest, _plugins_StateSetResponse, _plugins_StateSetRequest__Output, _plugins_StateSetResponse__Output>
+  ToolDiscovery: MethodDefinition<_plugins_ToolDiscoveryRequest, _plugins_ToolDiscoveryResponse, _plugins_ToolDiscoveryRequest__Output, _plugins_ToolDiscoveryResponse__Output>
   ToolProgress: MethodDefinition<_plugins_ToolProgressEvent, _plugins_ToolProgressResponse, _plugins_ToolProgressEvent__Output, _plugins_ToolProgressResponse__Output>
   UIConfirm: MethodDefinition<_plugins_UIConfirmRequest, _plugins_UIConfirmResponse, _plugins_UIConfirmRequest__Output, _plugins_UIConfirmResponse__Output>
   UIInput: MethodDefinition<_plugins_UIInputRequest, _plugins_UIInputResponse, _plugins_UIInputRequest__Output, _plugins_UIInputResponse__Output>

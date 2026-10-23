@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Provider creates clients for specific API types.
@@ -246,6 +249,7 @@ func DefaultProviders() []Provider {
 		&AzureProvider{},
 		&VertexProvider{},
 		&CodexProvider{},
+		&PiMessagesProvider{},
 	}
 }
 
@@ -479,6 +483,9 @@ func (p *BedrockProvider) Capabilities() Capabilities {
 
 // GetClient retrieves a client for a model.
 func GetClient(model *Model) (Client, error) {
+	if model.Type != "" && model.Type != "chat" {
+		return nil, fmt.Errorf("%s model %s cannot stream a conversation", model.Type, model.ID)
+	}
 	p, ok := Get(model.API)
 	if !ok {
 		return nil, fmt.Errorf("no provider for API type: %s", model.API)
@@ -509,6 +516,8 @@ type HTTPTransport struct {
 	apiKey       string
 	refreshCreds func(ctx context.Context, provider string) (string, error)
 	provider     string
+	// timeout bounds each attempt's wait for response headers; zero disables it.
+	timeout time.Duration
 }
 
 // TransportOptions configures an HTTPTransport.
@@ -545,24 +554,16 @@ func NewTransportWithOptions(baseURL string, apiKey string, headers http.Header,
 }
 
 func (t *HTTPTransport) withHeaders(extra map[string]string) *HTTPTransport {
-	if len(extra) == 0 {
-		return t
+	clone := *t
+	clone.headers = t.headers.Clone()
+	if clone.headers == nil {
+		clone.headers = make(http.Header)
 	}
-
-	clone := &HTTPTransport{
-		httpClient:   t.httpClient,
-		baseURL:      t.baseURL,
-		headers:      t.headers.Clone(),
-		apiKey:       t.apiKey,
-		refreshCreds: t.refreshCreds,
-		provider:     t.provider,
-	}
-
 	for k, v := range extra {
 		clone.headers.Set(k, v)
 	}
 
-	return clone
+	return &clone
 }
 
 func (t *HTTPTransport) withAPIKey(apiKey string) *HTTPTransport {
@@ -570,14 +571,11 @@ func (t *HTTPTransport) withAPIKey(apiKey string) *HTTPTransport {
 		return t
 	}
 
-	return &HTTPTransport{
-		httpClient:   t.httpClient,
-		baseURL:      t.baseURL,
-		headers:      t.headers.Clone(),
-		apiKey:       apiKey,
-		refreshCreds: t.refreshCreds,
-		provider:     t.provider,
-	}
+	clone := *t
+	clone.headers = t.headers.Clone()
+	clone.apiKey = apiKey
+
+	return &clone
 }
 
 // Do makes an HTTP request with proper headers and authentication.
@@ -593,9 +591,12 @@ func (t *HTTPTransport) Do(ctx context.Context, method, path string, body any) (
 		}
 	}
 
-	url := t.baseURL + path
+	baseURL, err := expandBaseURL(t.baseURL)
+	if err != nil {
+		return nil, err
+	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -615,7 +616,7 @@ func (t *HTTPTransport) Do(ctx context.Context, method, path string, body any) (
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := t.httpClient.Do(req)
+	resp, err := doClientHeaderRequest(t.httpClient, req, t.timeout, "http")
 	if err != nil {
 		return nil, err
 	}
@@ -631,23 +632,20 @@ func (t *HTTPTransport) Do(ctx context.Context, method, path string, body any) (
 			return nil, fmt.Errorf("401 received, credential refresh failed: %w", refreshErr)
 		}
 
-		// Update transport with new credentials
-		t.apiKey = newKey
-		req.Header.Set("Authorization", "Bearer "+newKey)
-
-		// Re-create body reader for retry
-		var retryBody *strings.Reader
-		if body != nil {
-			if s, ok := body.(string); ok {
-				retryBody = strings.NewReader(s)
-			}
+		retry := req.Clone(ctx)
+		if t.headers.Get("x-api-key") != "" {
+			t.headers.Set("x-api-key", newKey)
+			retry.Header.Set("x-api-key", newKey)
+		} else {
+			t.apiKey = newKey
+			retry.Header.Set("Authorization", "Bearer "+newKey)
 		}
-		req.Body = nil
-		if retryBody != nil {
-			req.Body = io.NopCloser(retryBody)
+		retry.Body = nil
+		if bodyReader != nil {
+			retry.Body = io.NopCloser(strings.NewReader(body.(string)))
 		}
 
-		return t.httpClient.Do(req)
+		return doClientHeaderRequest(t.httpClient, retry, t.timeout, "http")
 	}
 
 	return resp, nil
@@ -666,4 +664,21 @@ func responseMetadata(resp *http.Response) ProviderResponse {
 		Status:  resp.StatusCode,
 		Headers: headers,
 	}
+}
+
+// expandBaseURL fills the Cloudflare account and gateway placeholders that
+// catalog base URLs carry from the environment.
+func expandBaseURL(baseURL string) (string, error) {
+	for _, name := range []string{"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"} {
+		placeholder := "{" + name + "}"
+		if !strings.Contains(baseURL, placeholder) {
+			continue
+		}
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			return "", fmt.Errorf("base URL %s requires %s", baseURL, name)
+		}
+		baseURL = strings.ReplaceAll(baseURL, placeholder, url.PathEscape(value))
+	}
+	return baseURL, nil
 }

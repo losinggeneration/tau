@@ -1,37 +1,53 @@
 package plugins
 
 import (
-	"runtime/debug"
-	"time"
+	"context"
+	"errors"
+	"fmt"
 )
 
-const cleanupReturnGrace = 10 * time.Millisecond
-
-// pluginCleanup invokes go-plugin cleanup/kill hooks without letting a
-// wedged subprocess block tau's foreground CLI/TUI path. Cleanup hooks must be
-// idempotent; go-plugin Client.Kill is safe to call multiple times.
-//
-// Most cleanup hooks return immediately. Waiting briefly for those fast paths
-// makes lifecycle operations deterministic for callers while still bounding the
-// time spent on a wedged cleanup hook.
-func pluginCleanup(cleanup func()) {
+// runCleanup invokes a go-plugin cleanup/kill hook and waits until it returns
+// or the manager's cleanup grace elapses. Caller cancellation does not shorten
+// the wait, so a cancelled shutdown still reaps the plugin process. A hook that
+// outlives the wait keeps running and is joined by Shutdown. Cleanup hooks must be idempotent;
+// go-plugin Client.Kill is safe to call multiple times.
+func (m *Manager) runCleanup(ctx context.Context, name string, cleanup func()) error {
 	if cleanup == nil {
-		return
+		return nil
 	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
+	done := make(chan error, 1)
+	m.cleanups.Go(func() {
 		defer func() {
-			if recover() != nil {
-				_ = debug.Stack()
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("cleanup plugin %s: panic: %v", name, r)
 			}
 		}()
 		cleanup()
-	}()
+		done <- nil
+	})
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.cleanupGrace)
+	defer cancel()
+	select {
+	case err := <-done:
+		return err
+	case <-waitCtx.Done():
+		return fmt.Errorf("cleanup plugin %s: %w", name, waitCtx.Err())
+	}
+}
 
+// waitCleanups joins cleanup hooks that outlived their callers' waits.
+func (m *Manager) waitCleanups(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		m.cleanups.Wait()
+		close(done)
+	}()
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.cleanupGrace)
+	defer cancel()
 	select {
 	case <-done:
-	case <-time.After(cleanupReturnGrace):
+		return nil
+	case <-waitCtx.Done():
+		return errors.Join(errors.New("plugin cleanup still running"), waitCtx.Err())
 	}
 }

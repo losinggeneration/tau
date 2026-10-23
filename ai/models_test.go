@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -760,5 +761,68 @@ func BenchmarkReferenceRegistryParsing(b *testing.B) {
 		if err != nil && !os.IsNotExist(err) {
 			b.Fatalf("parse error: %v", err)
 		}
+	}
+}
+
+func TestAzureProviderAliasPreservesAPIIdentifier(t *testing.T) {
+	if ProviderAzureOpenAI != "azure" || APIAzureOpenAIResponses != "azure-openai-responses" {
+		t.Fatal("Azure provider and API identifiers must differ")
+	}
+	model := &Model{ID: "alias-test", Provider: "azure-openai-responses", API: APIAzureOpenAIResponses}
+	RegisterModel(model)
+	t.Cleanup(func() { delete(models, "azure/alias-test") })
+	for _, provider := range []string{"azure", "azure-openai-responses"} {
+		got, err := GetAvailableModel(provider, "alias-test")
+		if err != nil || got.Provider != "azure" || got.API != APIAzureOpenAIResponses {
+			t.Fatalf("provider=%s model=%+v err=%v", provider, got, err)
+		}
+	}
+}
+
+func TestSupportedThinkingLevelsUsesModelMap(t *testing.T) {
+	model := &Model{Reasoning: true, ThinkingLevelMap: map[string]*string{"minimal": nil, "xhigh": new("xhigh"), "max": new("max")}}
+	if got := GetSupportedThinkingLevels(model); !slices.Equal(got, []string{"off", "low", "medium", "high", "xhigh", "max"}) {
+		t.Fatalf("levels: %v", got)
+	}
+	if got := ClampThinkingLevel(model, "minimal"); got != "low" {
+		t.Fatalf("clamp: %s", got)
+	}
+	if got := GetSupportedThinkingLevels(&Model{}); !slices.Equal(got, []string{"off"}) {
+		t.Fatalf("non-reasoning: %v", got)
+	}
+}
+
+func TestRegisterModelOperationsDoNotReplaceChat(t *testing.T) {
+	chat := &Model{Provider: "operation-isolation-test", ID: "same-id", API: APIOpenAIResponses}
+	RegisterModel(chat)
+	RegisterModel(&Model{Type: "classifier", Provider: chat.Provider, ID: chat.ID, API: APIOpenAIDecisions})
+	got, err := GetModel(chat.Provider, chat.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != "" && got.Type != "chat" {
+		t.Fatalf("chat was replaced by %s", got.Type)
+	}
+}
+
+func TestOperationModelLookupRetainsIndependentDefinitions(t *testing.T) {
+	provider := "operation-lookup-test"
+	for _, operation := range []string{"chat", "classifier", "image"} {
+		RegisterModel(&Model{Type: operation, Provider: provider, ID: "same"})
+	}
+	for _, operation := range []string{"chat", "classifier", "image"} {
+		got, err := GetOperationModel(operation, provider, "same")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Type != operation {
+			t.Fatalf("got %s for %s", got.Type, operation)
+		}
+	}
+	if got := ListAvailableModels(provider); len(got) != 1 || got[0].Type != "chat" {
+		t.Fatalf("chat list: %+v", got)
+	}
+	if _, err := NewModelRegistry().Models(); err != nil {
+		t.Fatal(err)
 	}
 }

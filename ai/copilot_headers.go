@@ -1,5 +1,10 @@
 package ai
 
+import (
+	"slices"
+	"strings"
+)
+
 // InferCopilotInitiator returns "user" when the last message is a user
 // message, otherwise "agent".
 func InferCopilotInitiator(messages []Message) string {
@@ -57,4 +62,41 @@ func BuildCopilotDynamicHeadersWithParams(params CopilotDynamicHeaderParams) map
 		headers["Copilot-Vision-Request"] = "true"
 	}
 	return headers
+}
+
+// CopilotBaseURL returns the API endpoint a GitHub Copilot token names in its
+// proxy-ep field, or "" when the token names none.
+func CopilotBaseURL(token string) string {
+	_, rest, ok := strings.Cut(token, "proxy-ep=")
+	if !ok {
+		return ""
+	}
+	host, _, _ := strings.Cut(rest, ";")
+	if host == "" {
+		return ""
+	}
+	if after, ok := strings.CutPrefix(host, "proxy."); ok {
+		host = "api." + after
+	}
+	return "https://" + host
+}
+
+// requestBaseURL returns the endpoint a request's credential selects, or ""
+// to keep the model's. GitHub Copilot tokens name their account's endpoint.
+func requestBaseURL(model *Model, apiKey string) string {
+	if model == nil || model.Provider != ProviderGitHubCopilot {
+		return ""
+	}
+	return CopilotBaseURL(apiKey)
+}
+
+// withCopilotHeaders adds the dynamic GitHub Copilot headers for prompt ahead
+// of the caller's headers, which still win.
+func withCopilotHeaders(model *Model, prompt *Context, opts []Option) []Option {
+	if model == nil || model.Provider != ProviderGitHubCopilot || prompt == nil {
+		return opts
+	}
+	headers := BuildCopilotDynamicHeaders(prompt.Messages)
+	copyConfiguredHeaders(headers, applyOptions(opts).headers)
+	return append(slices.Clone(opts), WithHeaders(headers))
 }

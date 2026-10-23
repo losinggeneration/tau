@@ -8,6 +8,8 @@ package ai // import "github.com/losinggeneration/tau/ai"
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"strings"
 )
@@ -30,7 +32,7 @@ const (
 	ProviderxAI               = "xai"
 	ProviderOpenRouter        = "openrouter"
 	ProviderVercelGateway     = "vercel-ai-gateway"
-	ProviderAzureOpenAI       = "azure-openai-responses"
+	ProviderAzureOpenAI       = "azure"
 	ProviderAmazonBedrock     = "amazon-bedrock"
 	ProviderOllama            = "ollama"
 	ProviderLMStudio          = "lm-studio"
@@ -51,6 +53,7 @@ const (
 	ProviderDeepSeek            = "deepseek"
 	ProviderFireworks           = "fireworks"
 	ProviderXiaomi              = "xiaomi"
+	ProviderRadius              = "radius"
 	ProviderAntLing             = "ant-ling"
 	ProviderNVIDIA              = "nvidia"
 	ProviderTogether            = "together"
@@ -70,18 +73,23 @@ const (
 
 // API type identifiers
 const (
-	APIAnthropicMessages     = "anthropic-messages"
-	APIClaudeAgent           = "claude-agent"
-	APIGoogleGenerativeAI    = "google-generative-ai"
-	APIGoogleVertex          = "google-vertex"
-	APIGoogleGeminiCLI       = "google-gemini-cli"
-	APIMistralConversations  = "mistral-conversations"
-	APIOpenAICompletions     = "openai-completions"
-	APIOpenAIResponses       = "openai-responses"
-	APIOpenAICompatible      = "openai-compatible"
-	APIOpenAICodexResponses  = "openai-codex-responses"
-	APIAzureOpenAIResponses  = "azure-openai-responses"
-	APIBedrockConverseStream = "bedrock-converse-stream"
+	APIOpenAIDecisions              = "openai-decisions"
+	APIPiMessages                   = "pi-messages"
+	APIOpenRouterImages             = "openrouter-images"
+	APITypesafeSystemOne            = "typesafe-system-one"
+	APICloudflareWorkersAISystemOne = "cloudflare-workers-ai-system-one"
+	APIAnthropicMessages            = "anthropic-messages"
+	APIClaudeAgent                  = "claude-agent"
+	APIGoogleGenerativeAI           = "google-generative-ai"
+	APIGoogleVertex                 = "google-vertex"
+	APIGoogleGeminiCLI              = "google-gemini-cli"
+	APIMistralConversations         = "mistral-conversations"
+	APIOpenAICompletions            = "openai-completions"
+	APIOpenAIResponses              = "openai-responses"
+	APIOpenAICompatible             = "openai-compatible"
+	APIOpenAICodexResponses         = "openai-codex-responses"
+	APIAzureOpenAIResponses         = "azure-openai-responses"
+	APIBedrockConverseStream        = "bedrock-converse-stream"
 )
 
 // ThinkingFormat represents the format of thinking/reasoning content.
@@ -93,6 +101,11 @@ const (
 	ThinkingFormatOpenRouter   = "openrouter"         // OpenRouter reasoning: { effort }
 	ThinkingFormatNative       = "native"             // Provider's native thinking support
 	ThinkingFormatDeepSeek     = "deepseek"           // DeepSeek-style thinking: { type: "enabled"|"disabled" }
+	ThinkingFormatTogether     = "together"           // Together: reasoning.enabled plus reasoning_effort
+	ThinkingFormatBaseten      = "baseten"            // Baseten: configurable chat_template_args plus reasoning_effort
+	ThinkingFormatChatTemplate = "chat-template"      // Configurable chat_template_kwargs
+	ThinkingFormatString       = "string-thinking"    // Top-level thinking string
+	ThinkingFormatAntLing      = "ant-ling"           // reasoning.effort only for mapped levels
 )
 
 // InputType represents the modalities a model can accept as input.
@@ -125,10 +138,20 @@ const (
 
 // CostProfile defines the pricing for a model per million tokens.
 type CostProfile struct {
-	Input      float64 `json:"input"`
-	Output     float64 `json:"output"`
-	CacheRead  float64 `json:"cacheRead,omitempty"`
-	CacheWrite float64 `json:"cacheWrite,omitempty"`
+	Tiers      []CostTier `json:"tiers,omitempty"`
+	Input      float64    `json:"input"`
+	Output     float64    `json:"output"`
+	CacheRead  float64    `json:"cacheRead,omitempty"`
+	CacheWrite float64    `json:"cacheWrite,omitempty"`
+}
+
+// CostTier applies to the whole request when total input exceeds its threshold.
+type CostTier struct {
+	InputTokensAbove int     `json:"inputTokensAbove"`
+	Input            float64 `json:"input"`
+	Output           float64 `json:"output"`
+	CacheRead        float64 `json:"cacheRead"`
+	CacheWrite       float64 `json:"cacheWrite"`
 }
 
 // SupportsInput reports whether the model supports the given input type.
@@ -187,22 +210,71 @@ type VercelGatewayRouting struct {
 }
 
 // CompatibilitySettings defines provider-specific compatibility flags.
+// Pointer flags keep an explicit false from the catalog, which overrides
+// detection; plain flags are only ever set to true.
 type CompatibilitySettings struct {
-	SupportsStore                    bool                  `json:"supportsStore,omitempty"`
-	SupportsDeveloperRole            bool                  `json:"supportsDeveloperRole,omitempty"`
-	SupportsReasoningEffort          bool                  `json:"supportsReasoningEffort,omitempty"`
-	SupportsUsageInStreaming         bool                  `json:"supportsUsageInStreaming,omitempty"`
-	SupportsStrictMode               bool                  `json:"supportsStrictMode,omitempty"`
-	MaxTokensField                   string                `json:"maxTokensField,omitempty"`
-	RequiresToolResultName           bool                  `json:"requiresToolResultName,omitempty"`
-	RequiresAssistantAfterToolResult bool                  `json:"requiresAssistantAfterToolResult,omitempty"`
-	RequiresThinkingAsText           bool                  `json:"requiresThinkingAsText,omitempty"`
-	ThinkingFormat                   string                `json:"thinkingFormat,omitempty"`
-	ZAIToolStream                    bool                  `json:"zaiToolStream,omitempty"`
-	SendSessionAffinityHeaders       bool                  `json:"sendSessionAffinityHeaders,omitempty"`
-	ReasoningEffortMap               map[string]string     `json:"reasoningEffortMap,omitempty"`
-	OpenRouterRouting                *OpenRouterRouting    `json:"openRouterRouting,omitempty"`
-	VercelGatewayRouting             *VercelGatewayRouting `json:"vercelGatewayRouting,omitempty"`
+	SupportsStore                               *bool                 `json:"supportsStore,omitempty"`
+	SupportsDeveloperRole                       *bool                 `json:"supportsDeveloperRole,omitempty"`
+	SupportsReasoningEffort                     *bool                 `json:"supportsReasoningEffort,omitempty"`
+	SupportsUsageInStreaming                    *bool                 `json:"supportsUsageInStreaming,omitempty"`
+	SupportsFinishReason                        *bool                 `json:"supportsFinishReason,omitempty"`
+	SupportsStrictMode                          *bool                 `json:"supportsStrictMode,omitempty"`
+	SupportsMaxOutputTokens                     *bool                 `json:"supportsMaxOutputTokens,omitempty"`
+	SupportsLongCacheRetention                  *bool                 `json:"supportsLongCacheRetention,omitempty"`
+	SupportsTemperature                         *bool                 `json:"supportsTemperature,omitempty"`
+	SupportsEagerToolInputStreaming             *bool                 `json:"supportsEagerToolInputStreaming,omitempty"`
+	SupportsCacheControlOnTools                 *bool                 `json:"supportsCacheControlOnTools,omitempty"`
+	ReasoningEffortMap                          map[string]string     `json:"reasoningEffortMap,omitempty"`
+	OpenRouterRouting                           *OpenRouterRouting    `json:"openRouterRouting,omitempty"`
+	VercelGatewayRouting                        *VercelGatewayRouting `json:"vercelGatewayRouting,omitempty"`
+	ChatTemplateArgs                            json.RawMessage       `json:"chatTemplateArgs,omitempty"`
+	ChatTemplateKwargs                          json.RawMessage       `json:"chatTemplateKwargs,omitempty"`
+	ThinkingTokenBudgetField                    string                `json:"thinkingTokenBudgetField,omitempty"`
+	SupportsThinkingTokenBudget                 bool                  `json:"supportsThinkingTokenBudget,omitempty"`
+	AllowedFallbackModels                       []FallbackModel       `json:"allowedFallbackModels,omitempty"`
+	MaxTokensField                              string                `json:"maxTokensField,omitempty"`
+	ThinkingFormat                              string                `json:"thinkingFormat,omitempty"`
+	CacheControlFormat                          string                `json:"cacheControlFormat,omitempty"`
+	SessionAffinityFormat                       string                `json:"sessionAffinityFormat,omitempty"`
+	SupportsStrictTools                         bool                  `json:"supportsStrictTools,omitempty"`
+	RequiresToolResultName                      bool                  `json:"requiresToolResultName,omitempty"`
+	RequiresAssistantAfterToolResult            bool                  `json:"requiresAssistantAfterToolResult,omitempty"`
+	RequiresThinkingAsText                      bool                  `json:"requiresThinkingAsText,omitempty"`
+	RequiresReasoningContentOnAssistantMessages bool                  `json:"requiresReasoningContentOnAssistantMessages,omitempty"`
+	ZAIToolStream                               bool                  `json:"zaiToolStream,omitempty"`
+	SendSessionAffinityHeaders                  bool                  `json:"sendSessionAffinityHeaders,omitempty"`
+	AllowEmptySignature                         bool                  `json:"allowEmptySignature,omitempty"`
+	ForceAdaptiveThinking                       bool                  `json:"forceAdaptiveThinking,omitempty"`
+	SupportsMidConvoEffort                      bool                  `json:"supportsMidConvoEffort,omitempty"`
+	SupportsMidConvoSystemMessages              bool                  `json:"supportsMidConvoSystemMessages,omitempty"`
+	SupportsMidConvoToolAdditions               bool                  `json:"supportsMidConvoToolAdditions,omitempty"`
+	SupportsMidConvoToolChanges                 bool                  `json:"supportsMidConvoToolChanges,omitempty"`
+	SupportsOpenAIGrammarTools                  bool                  `json:"supportsOpenAIGrammarTools,omitempty"`
+	SupportsAdditionalTools                     bool                  `json:"supportsAdditionalTools,omitempty"`
+	SupportsToolSearch                          bool                  `json:"supportsToolSearch,omitempty"`
+	SupportsExplicitPromptCacheMode             bool                  `json:"supportsExplicitPromptCacheMode,omitempty"`
+}
+
+// FallbackModel is a model a provider may answer with instead of the
+// requested one, with its own pricing.
+type FallbackModel struct {
+	Provider string      `json:"provider"`
+	Model    string      `json:"model"`
+	Cost     CostProfile `json:"cost"`
+}
+
+// PromptCacheTTL lists a provider's prompt cache lifetimes in seconds.
+type PromptCacheTTL struct {
+	Short int `json:"short"`
+	Long  int `json:"long"`
+}
+
+// ModelServingProvider is an upstream provider a catalog model can be served by.
+type ModelServingProvider struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Credential string `json:"credential,omitempty"`
+	Source     string `json:"source,omitempty"`
 }
 
 // OpenAIResponsesCompat mirrors the pi-mono OpenAIResponsesCompat interface
@@ -212,6 +284,8 @@ type OpenAIResponsesCompat struct{}
 // OpenAICompletionsCompat mirrors the pi-mono OpenAICompletionsCompat interface
 // for OpenAI-compatible completions APIs.
 type OpenAICompletionsCompat struct {
+	CacheControlFormat         string
+	SupportsLongCacheRetention bool
 	// ReasoningDetails: whether reasoning_details/thought_signature is enabled
 	// P7-OC01: When enabled, we get reasoning_content in stream chunks
 	ReasoningDetails bool
@@ -232,6 +306,9 @@ type OpenAICompletionsCompat struct {
 	ReasoningEffortMap map[string]string
 	// SupportsUsageInStreaming: whether stream_options include_usage is supported
 	SupportsUsageInStreaming bool
+	// SupportsFinishReason: whether streams report finish_reason; when false a
+	// missing one is inferred from the content.
+	SupportsFinishReason bool
 	// MaxTokensField: which field to use for max tokens ("max_completion_tokens" or "max_tokens")
 	MaxTokensField string
 	// RequiresToolResultName: whether tool results require the name field
@@ -244,6 +321,9 @@ type OpenAICompletionsCompat struct {
 	ThinkingFormat string
 	// ZAIToolStream: whether z.ai supports tool_stream: true
 	ZAIToolStream bool
+	// RequiresReasoningContentOnAssistantMessages: whether replayed assistant
+	// messages need a reasoning_content field, empty if nothing streamed.
+	RequiresReasoningContentOnAssistantMessages bool
 	// SendSessionAffinityHeaders: whether to send the session_id,
 	// x-client-request-id, and x-session-affinity HTTP headers from the
 	// session id when cache retention is enabled. Default false — matches
@@ -251,6 +331,9 @@ type OpenAICompletionsCompat struct {
 	// headers (e.g., opencode.ai/zen/go returns HTTP 500 with the session_id
 	// header present) must keep this false.
 	SendSessionAffinityHeaders bool
+	// SupportsOpenAIGrammarTools: whether grammar-constrained tools are sent
+	// as OpenAI custom tools.
+	SupportsOpenAIGrammarTools bool
 	// SupportsStrictMode: whether the provider supports strict field in tool definitions
 	SupportsStrictMode bool
 	// OpenRouterRouting: OpenRouter-specific provider routing preferences
@@ -269,10 +352,10 @@ func (c *OpenAICompletionsCompat) Init(settings *CompatibilitySettings) {
 	}
 
 	// P7-OC02: strict mode support
-	c.StrictMode = settings.SupportsStrictMode
+	c.StrictMode = settings.SupportsStrictMode != nil && *settings.SupportsStrictMode
 
 	// P7-OC03: reasoning effort support
-	c.ReasoningEffort = settings.SupportsReasoningEffort
+	c.ReasoningEffort = settings.SupportsReasoningEffort != nil && *settings.SupportsReasoningEffort
 	if c.ReasoningEffort && settings.ReasoningEffortMap != nil {
 		if val, ok := settings.ReasoningEffortMap["high"]; ok {
 			c.ReasoningEffortValue = val
@@ -297,21 +380,54 @@ type ProviderResponse struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
-// Model represents a language model from a specific provider.
+// ModelImageResizeOptions defines the cache-safe image resize profile.
+type ModelImageResizeOptions struct {
+	MaxWidth    int `json:"maxWidth,omitempty"`
+	MaxHeight   int `json:"maxHeight,omitempty"`
+	MaxBytes    int `json:"maxBytes,omitempty"`
+	JPEGQuality int `json:"jpegQuality,omitempty"`
+}
+
+// ModelImageInputLimits bounds image counts and preprocessing.
+type ModelImageInputLimits struct {
+	Resize        *ModelImageResizeOptions `json:"resize,omitempty"`
+	MaxPerMessage int                      `json:"maxPerMessage,omitempty"`
+	MaxPerRequest int                      `json:"maxPerRequest,omitempty"`
+}
+
+// ModelInputLimits describes provider request limits.
+type ModelInputLimits struct {
+	MaxRequestBytes int                    `json:"maxRequestBytes,omitempty"`
+	Images          *ModelImageInputLimits `json:"images,omitempty"`
+}
+
+// Model represents an operation-specific model from a provider.
 type Model struct {
-	ID            string                 `json:"id"`
-	Name          string                 `json:"name"`
-	API           string                 `json:"api"`
-	Provider      string                 `json:"provider"`
-	BaseURL       string                 `json:"baseUrl,omitempty"`
-	Headers       map[string]string      `json:"headers,omitempty"`
-	Reasoning     bool                   `json:"reasoning"`
-	Input         []InputType            `json:"input"`
-	Output        []OutputType           `json:"output"`
-	Cost          CostProfile            `json:"cost"`
-	ContextWindow int                    `json:"contextWindow"`
-	MaxTokens     int                    `json:"maxTokens"`
-	Compat        *CompatibilitySettings `json:"compat,omitempty"`
+	requestConfig                 *modelRequestConfig
+	Type                          string                    `json:"type,omitempty"`
+	InputLimits                   *ModelInputLimits         `json:"inputLimits,omitempty"`
+	SamplingParams                map[string]any            `json:"samplingParams,omitempty"`
+	SamplingParamsByThinkingLevel map[string]map[string]any `json:"samplingParamsByThinkingLevel,omitempty"`
+	ThinkingLevelMap              map[string]*string        `json:"thinkingLevelMap,omitempty"`
+	ID                            string                    `json:"id"`
+	Name                          string                    `json:"name"`
+	API                           string                    `json:"api"`
+	Provider                      string                    `json:"provider"`
+	BaseURL                       string                    `json:"baseUrl,omitempty"`
+	Headers                       map[string]string         `json:"headers,omitempty"`
+	Reasoning                     bool                      `json:"reasoning"`
+	Input                         []InputType               `json:"input"`
+	Output                        []OutputType              `json:"output"`
+	Cost                          CostProfile               `json:"cost"`
+	ContextWindow                 int                       `json:"contextWindow"`
+	MaxTokens                     int                       `json:"maxTokens"`
+	Compat                        *CompatibilitySettings    `json:"compat,omitempty"`
+	PromptCache                   *PromptCacheTTL           `json:"promptCache,omitempty"`
+	// Lab, Enabled, and Providers describe models of catalog services, such
+	// as Radius, that route each model to one of several providers.
+	Lab       string                 `json:"lab,omitempty"`
+	Enabled   *bool                  `json:"enabled,omitempty"`
+	Providers []ModelServingProvider `json:"providers,omitempty"`
 }
 
 // SupportsInput reports whether the model supports the given input type.
@@ -346,20 +462,29 @@ func (m *Model) GetCompat() *OpenAICompletionsCompat {
 
 	// If model.Compat is set, use it to override defaults
 	if m.Compat != nil {
-		if m.Compat.SupportsStore {
-			detected.SupportsStore = m.Compat.SupportsStore
+		if m.Compat.CacheControlFormat != "" {
+			detected.CacheControlFormat = m.Compat.CacheControlFormat
 		}
-		if m.Compat.SupportsDeveloperRole {
-			detected.SupportsDeveloperRole = m.Compat.SupportsDeveloperRole
+		if m.Compat.SupportsLongCacheRetention != nil {
+			detected.SupportsLongCacheRetention = *m.Compat.SupportsLongCacheRetention
 		}
-		if m.Compat.SupportsReasoningEffort {
-			detected.SupportsReasoningEffort = m.Compat.SupportsReasoningEffort
+		if m.Compat.SupportsStore != nil {
+			detected.SupportsStore = *m.Compat.SupportsStore
+		}
+		if m.Compat.SupportsDeveloperRole != nil {
+			detected.SupportsDeveloperRole = *m.Compat.SupportsDeveloperRole
+		}
+		if m.Compat.SupportsReasoningEffort != nil {
+			detected.SupportsReasoningEffort = *m.Compat.SupportsReasoningEffort
 		}
 		if m.Compat.ReasoningEffortMap != nil {
 			detected.ReasoningEffortMap = m.Compat.ReasoningEffortMap
 		}
-		if m.Compat.SupportsUsageInStreaming {
-			detected.SupportsUsageInStreaming = m.Compat.SupportsUsageInStreaming
+		if m.Compat.SupportsUsageInStreaming != nil {
+			detected.SupportsUsageInStreaming = *m.Compat.SupportsUsageInStreaming
+		}
+		if m.Compat.SupportsFinishReason != nil {
+			detected.SupportsFinishReason = *m.Compat.SupportsFinishReason
 		}
 		if m.Compat.MaxTokensField != "" {
 			detected.MaxTokensField = m.Compat.MaxTokensField
@@ -385,12 +510,16 @@ func (m *Model) GetCompat() *OpenAICompletionsCompat {
 		if m.Compat.ZAIToolStream {
 			detected.ZAIToolStream = m.Compat.ZAIToolStream
 		}
+		if m.Compat.RequiresReasoningContentOnAssistantMessages {
+			detected.RequiresReasoningContentOnAssistantMessages = true
+		}
 		if m.Compat.SendSessionAffinityHeaders {
 			detected.SendSessionAffinityHeaders = m.Compat.SendSessionAffinityHeaders
 		}
-		if m.Compat.SupportsStrictMode {
-			detected.SupportsStrictMode = m.Compat.SupportsStrictMode
+		if m.Compat.SupportsStrictMode != nil {
+			detected.SupportsStrictMode = *m.Compat.SupportsStrictMode
 		}
+		detected.SupportsOpenAIGrammarTools = m.Compat.SupportsOpenAIGrammarTools
 	}
 
 	*compat = detected
@@ -403,19 +532,35 @@ func detectModelCompat(m *Model) OpenAICompletionsCompat {
 	provider := m.Provider
 	baseURL := m.BaseURL
 
-	isZAI := provider == ProviderZAI || strings.Contains(baseURL, "api.z.ai")
+	isZAI := provider == ProviderZAI || provider == ProviderZAICodingCN ||
+		strings.Contains(baseURL, "api.z.ai") || strings.Contains(baseURL, "open.bigmodel.cn")
+	isTogether := provider == ProviderTogether || strings.Contains(baseURL, "api.together.ai") || strings.Contains(baseURL, "api.together.xyz")
+	isMoonshot := provider == ProviderMoonshotAI || provider == ProviderMoonshotAICN || strings.Contains(baseURL, "api.moonshot.")
+	isOpenRouter := provider == ProviderOpenRouter || strings.Contains(baseURL, "openrouter.ai")
+	isCloudflareWorkersAI := provider == ProviderCloudflareWorkersAI || strings.Contains(baseURL, "api.cloudflare.com")
+	isCloudflareAIGateway := provider == ProviderCloudflareAIGateway || strings.Contains(baseURL, "gateway.ai.cloudflare.com")
+	isNVIDIA := provider == ProviderNVIDIA || strings.Contains(baseURL, "integrate.api.nvidia.com")
+	isAntLing := provider == ProviderAntLing || strings.Contains(baseURL, "api.ant-ling.com")
+	isDeepSeek := provider == ProviderDeepSeek || strings.Contains(strings.ToLower(baseURL), "deepseek.com")
 
-	isNonStandard := provider == ProviderCerebras ||
+	isNonStandard := isNVIDIA ||
+		provider == ProviderCerebras ||
 		strings.Contains(baseURL, "cerebras.ai") ||
 		provider == ProviderxAI ||
 		strings.Contains(baseURL, "api.x.ai") ||
+		isTogether ||
 		strings.Contains(baseURL, "chutes.ai") ||
-		strings.Contains(baseURL, "deepseek.com") ||
+		isDeepSeek ||
 		isZAI ||
+		isMoonshot ||
 		provider == ProviderOpenCode ||
-		strings.Contains(baseURL, "opencode.ai")
+		strings.Contains(baseURL, "opencode.ai") ||
+		isCloudflareWorkersAI ||
+		isCloudflareAIGateway ||
+		isAntLing
 
-	useMaxTokens := strings.Contains(baseURL, "chutes.ai")
+	useMaxTokens := strings.Contains(baseURL, "chutes.ai") || isDeepSeek || isMoonshot || isCloudflareAIGateway ||
+		isTogether || isNVIDIA || isAntLing || isZAI
 
 	isGrok := provider == ProviderxAI || strings.Contains(baseURL, "api.x.ai")
 	isGroq := provider == ProviderGroq || strings.Contains(baseURL, "groq.com")
@@ -433,34 +578,48 @@ func detectModelCompat(m *Model) OpenAICompletionsCompat {
 	// GLM-5.3 on opencode-go always engages in thinking and cannot be disabled.
 	// Sending reasoning_effort: "" (empty) is interpreted as trying to disable
 	// thinking and rejected. Disable reasoning_effort for this model.
-	supportsReasoningEffort := !isGrok && !isZAI
+	supportsReasoningEffort := !isGrok && !isZAI && !isMoonshot && !isTogether && !isCloudflareAIGateway && !isNVIDIA && !isAntLing
 	if provider == ProviderOpenCodeGo && m.ID == "glm-5.3" {
 		supportsReasoningEffort = false
 	}
 
-	// Determine thinking format
 	thinkingFormat := ThinkingFormatOpenAI
-	if isZAI {
+	switch {
+	case isDeepSeek:
+		thinkingFormat = ThinkingFormatDeepSeek
+	case isZAI:
 		thinkingFormat = ThinkingFormatZAI
-	} else if provider == ProviderOpenRouter || strings.Contains(baseURL, "openrouter.ai") {
+	case isTogether:
+		thinkingFormat = ThinkingFormatTogether
+	case isAntLing:
+		thinkingFormat = ThinkingFormatAntLing
+	case isOpenRouter:
 		thinkingFormat = ThinkingFormatOpenRouter
 	}
 
+	var cacheControlFormat string
+	if provider == ProviderOpenRouter && strings.HasPrefix(m.ID, "anthropic/") {
+		cacheControlFormat = "anthropic"
+	}
 	return OpenAICompletionsCompat{
-		SupportsStore:                    !isNonStandard,
-		SupportsDeveloperRole:            !isNonStandard,
-		SupportsReasoningEffort:          supportsReasoningEffort,
-		ReasoningEffortMap:               reasoningEffortMap,
-		SupportsUsageInStreaming:         true,
-		MaxTokensField:                   map[bool]string{true: "max_tokens", false: "max_completion_tokens"}[useMaxTokens],
-		RequiresToolResultName:           false,
-		RequiresAssistantAfterToolResult: false,
-		RequiresThinkingAsText:           false,
-		ThinkingFormat:                   thinkingFormat,
-		OpenRouterRouting:                nil,
-		VercelGatewayRouting:             nil,
-		ZAIToolStream:                    false,
-		SupportsStrictMode:               true,
+		CacheControlFormat:                          cacheControlFormat,
+		SupportsLongCacheRetention:                  !isTogether && !isCloudflareWorkersAI && !isCloudflareAIGateway && !isNVIDIA && !isAntLing,
+		SupportsStore:                               !isNonStandard,
+		SupportsDeveloperRole:                       !isNonStandard,
+		SupportsReasoningEffort:                     supportsReasoningEffort,
+		ReasoningEffortMap:                          reasoningEffortMap,
+		SupportsUsageInStreaming:                    true,
+		SupportsFinishReason:                        true,
+		MaxTokensField:                              map[bool]string{true: "max_tokens", false: "max_completion_tokens"}[useMaxTokens],
+		RequiresToolResultName:                      false,
+		RequiresAssistantAfterToolResult:            false,
+		RequiresThinkingAsText:                      false,
+		ThinkingFormat:                              thinkingFormat,
+		RequiresReasoningContentOnAssistantMessages: isDeepSeek,
+		OpenRouterRouting:                           nil,
+		VercelGatewayRouting:                        nil,
+		ZAIToolStream:                               false,
+		SupportsStrictMode:                          true,
 	}
 }
 
@@ -485,10 +644,13 @@ const (
 	ReasoningMedium  ReasoningLevel = "medium"
 	ReasoningHigh    ReasoningLevel = "high"
 	ReasoningXHigh   ReasoningLevel = "xhigh"
+	ReasoningMax     ReasoningLevel = "max"
 )
 
 // ContentBlock represents a piece of content in a message.
 type ContentBlock struct {
+	// Namespace identifies dynamically loaded Responses tools for same-model replay.
+	Namespace  *string         `json:"namespace,omitempty"`
 	Type       string          `json:"type"`
 	Text       string          `json:"text,omitempty"`
 	Data       string          `json:"data,omitempty"`
@@ -513,26 +675,43 @@ type ContentBlock struct {
 
 // ToolCall represents a tool call from the model.
 type ToolCall struct {
+	Namespace *string         `json:"namespace,omitempty"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
 }
 
 // Tool defines a callable tool for the model.
+type ConstrainedSamplingConfig struct {
+	Type     string            `json:"type"`
+	Strict   string            `json:"strict,omitempty"`
+	Variants map[string]string `json:"variants,omitempty"`
+}
+
 type Tool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Parameters  json.RawMessage `json:"parameters"`
+	ConstrainedSampling json.RawMessage `json:"constrainedSampling,omitempty"`
+	Name                string          `json:"name"`
+	Description         string          `json:"description"`
+	Parameters          json.RawMessage `json:"parameters"`
 }
 
 // Message represents a conversation message.
+type ToolReference struct {
+	Name string `json:"name"`
+}
+
 type Message struct {
-	Role       string `json:"role"`
-	Content    any    `json:"content"`
-	ID         string `json:"id,omitempty"`
-	ToolCallID string `json:"toolCallId,omitempty"`
-	ToolName   string `json:"toolName,omitempty"`
-	IsError    bool   `json:"isError,omitempty"`
+	Diagnostics  []AssistantDiagnostic `json:"diagnostics,omitempty"`
+	Sections     map[string]*string    `json:"sections,omitempty"`
+	ToolsAdded   []Tool                `json:"toolsAdded,omitempty"`
+	ToolsRemoved []ToolReference       `json:"toolsRemoved,omitempty"`
+	DurationMs   *float64              `json:"durationMs,omitempty"`
+	Role         string                `json:"role"`
+	Content      any                   `json:"content"`
+	ID           string                `json:"id,omitempty"`
+	ToolCallID   string                `json:"toolCallId,omitempty"`
+	ToolName     string                `json:"toolName,omitempty"`
+	IsError      bool                  `json:"isError,omitempty"`
 	// Timestamp is a Unix timestamp in milliseconds at the public ai boundary.
 	Timestamp int64 `json:"timestamp"`
 	// Provider, API, and Model store the source model info for cross-model
@@ -541,6 +720,8 @@ type Message struct {
 	API        string `json:"api,omitempty"`
 	Model      string `json:"model,omitempty"`
 	StopReason string `json:"stopReason,omitempty"`
+	// ProviderThinkingLevel is the native effort an assistant turn was produced with.
+	ProviderThinkingLevel string `json:"providerThinkingLevel,omitempty"`
 }
 
 type messageAlias Message
@@ -585,8 +766,15 @@ func (m *Message) ToAssistantMessage() (AssistantMessage, bool) {
 	}
 
 	return AssistantMessage{
-		Role:    m.Role,
-		Content: m.ContentBlocks(),
+		Role:        m.Role,
+		Content:     m.ContentBlocks(),
+		Provider:    m.Provider,
+		API:         m.API,
+		Model:       m.Model,
+		StopReason:  StopReason(m.StopReason),
+		Timestamp:   m.Timestamp,
+		DurationMs:  m.DurationMs,
+		Diagnostics: m.Diagnostics,
 	}, true
 }
 
@@ -625,8 +813,23 @@ func (m *Message) MarshalJSON() ([]byte, error) {
 // normalizing the public role contract to "toolResult".
 func (m *Message) UnmarshalJSON(data []byte) error {
 	var alias messageAlias
-	if err := json.Unmarshal(data, &alias); err != nil {
+	wire := struct {
+		*messageAlias
+		Content json.RawMessage `json:"content"`
+	}{messageAlias: &alias}
+	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
+	}
+	if len(wire.Content) > 0 {
+		if wire.Content[0] == '[' {
+			var blocks []ContentBlock
+			if err := json.Unmarshal(wire.Content, &blocks); err != nil {
+				return fmt.Errorf("decode message content blocks: %w", err)
+			}
+			alias.Content = blocks
+		} else if err := json.Unmarshal(wire.Content, &alias.Content); err != nil {
+			return fmt.Errorf("decode message content: %w", err)
+		}
 	}
 
 	alias.Role = normalizeMessageRole(alias.Role)
@@ -637,18 +840,29 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 }
 
 // AssistantMessage represents a response from the model.
+type AssistantDiagnostic struct {
+	Type      string            `json:"type"`
+	Timestamp int64             `json:"timestamp"`
+	Error     map[string]string `json:"error,omitempty"`
+	Details   map[string]string `json:"details,omitempty"`
+}
+
 type AssistantMessage struct {
-	Role       string         `json:"role"`
-	API        string         `json:"api,omitempty"`
-	Provider   string         `json:"provider,omitempty"`
-	Model      string         `json:"model,omitempty"`
-	Content    []ContentBlock `json:"content"`
-	StopReason StopReason     `json:"stopReason"`
-	Usage      Usage          `json:"usage"`
+	Diagnostics []AssistantDiagnostic `json:"diagnostics,omitempty"`
+	DurationMs  *float64              `json:"durationMs,omitempty"`
+	Role        string                `json:"role"`
+	API         string                `json:"api,omitempty"`
+	Provider    string                `json:"provider,omitempty"`
+	Model       string                `json:"model,omitempty"`
+	Content     []ContentBlock        `json:"content"`
+	StopReason  StopReason            `json:"stopReason"`
+	Usage       Usage                 `json:"usage"`
 	// Timestamp is a Unix timestamp in milliseconds at the public ai boundary.
 	Timestamp    int64  `json:"timestamp,omitempty"`
 	ErrorMessage string `json:"errorMessage,omitempty"`
 	ResponseID   string `json:"responseId,omitempty"`
+	// ProviderThinkingLevel is the native effort an assistant turn was produced with.
+	ProviderThinkingLevel string `json:"providerThinkingLevel,omitempty"`
 }
 
 type assistantMessageAlias AssistantMessage
@@ -701,12 +915,14 @@ func normalizeUnixMilliseconds(ts int64) int64 {
 
 // Usage represents token usage and cost for a response.
 type Usage struct {
-	Input       int  `json:"input"`
-	Output      int  `json:"output"`
-	CacheRead   int  `json:"cacheRead,omitempty"`
-	CacheWrite  int  `json:"cacheWrite,omitempty"`
-	TotalTokens int  `json:"totalTokens"`
-	Cost        Cost `json:"cost"`
+	Input      int `json:"input"`
+	Output     int `json:"output"`
+	CacheRead  int `json:"cacheRead,omitempty"`
+	CacheWrite int `json:"cacheWrite,omitempty"`
+	// CacheWrite1h is the part of CacheWrite written with one-hour retention.
+	CacheWrite1h int  `json:"cacheWrite1h,omitempty"`
+	TotalTokens  int  `json:"totalTokens"`
+	Cost         Cost `json:"cost"`
 }
 
 func (*Usage) isStreamEvent() {}
@@ -793,13 +1009,24 @@ func (c *Cost) UnmarshalJSON(data []byte) error {
 
 // CalculateCost computes the cost based on the model's pricing.
 func (u *Usage) CalculateCost(profile CostProfile) {
+	inputTokens := u.Input + u.CacheRead + u.CacheWrite
+	matchedThreshold := -1
+	for _, tier := range profile.Tiers {
+		if inputTokens > tier.InputTokensAbove && tier.InputTokensAbove > matchedThreshold {
+			matchedThreshold = tier.InputTokensAbove
+			profile.Input, profile.Output, profile.CacheRead, profile.CacheWrite = tier.Input, tier.Output, tier.CacheRead, tier.CacheWrite
+		}
+	}
+	u.Cost = Cost{}
 	u.Cost.Input = float64(u.Input) * profile.Input / 1_000_000
 	u.Cost.Output = float64(u.Output) * profile.Output / 1_000_000
 	if u.CacheRead > 0 {
 		u.Cost.CacheRead = float64(u.CacheRead) * profile.CacheRead / 1_000_000
 	}
 	if u.CacheWrite > 0 {
-		u.Cost.CacheWrite = float64(u.CacheWrite) * profile.CacheWrite / 1_000_000
+		// Anthropic charges twice the base input rate for one-hour cache writes.
+		long := min(u.CacheWrite1h, u.CacheWrite)
+		u.Cost.CacheWrite = (float64(u.CacheWrite-long)*profile.CacheWrite + float64(long)*profile.Input*2) / 1_000_000
 	}
 	*u = normalizeUsage(*u)
 }
@@ -1002,6 +1229,27 @@ func emitTerminalStreamError(ctx context.Context, handler EventHandler, partial 
 	})
 }
 
+// finishStream emits the terminal event for a stream that reached its end. Like
+// upstream providers, it fails when the request was aborted, when the provider
+// never reported a stop reason (stopped is false), or when the stop reason is
+// an error.
+func finishStream(ctx context.Context, handler EventHandler, output AssistantMessage, stopped bool, unstopped string) {
+	switch {
+	case ctx.Err() != nil:
+		emitTerminalStreamError(ctx, handler, output, fmt.Errorf("request was aborted: %w", context.Cause(ctx)), StopReasonAborted)
+	case !stopped:
+		emitTerminalStreamError(ctx, handler, output, errors.New(unstopped), StopReasonError)
+	case output.StopReason == StopReasonError || output.StopReason == StopReasonAborted:
+		message := output.ErrorMessage
+		if message == "" {
+			message = "an unknown error occurred"
+		}
+		emitTerminalStreamError(ctx, handler, output, errors.New(message), StopReasonError)
+	default:
+		handler(ctx, Done{Reason: output.StopReason, Message: output})
+	}
+}
+
 // EventHandler is called for each streaming event.
 type EventHandler func(ctx context.Context, event StreamEvent)
 
@@ -1019,4 +1267,13 @@ type Completer interface {
 type Client interface {
 	Streamer
 	Completer
+}
+
+// NestedToolCall records a nested execution without retaining arguments or output.
+type NestedToolCall struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Status     string   `json:"status"`
+	DurationMs *float64 `json:"durationMs,omitempty"`
+	Error      string   `json:"error,omitempty"`
 }

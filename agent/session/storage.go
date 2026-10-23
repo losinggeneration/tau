@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/paths"
 )
 
@@ -74,9 +75,15 @@ func (s *Storage) ListCWD(cwd string) ([]SessionSummary, error) {
 
 // SetPinned records whether a session is pinned in the workspace list.
 func (s *Storage) SetPinned(id string, pinned bool) error {
-	if _, err := s.resolveID(id); err != nil {
+	path, err := s.resolveID(id)
+	if err != nil {
 		return err
 	}
+	header, err := ReadHeader(path)
+	if err != nil {
+		return fmt.Errorf("read pinned session header: %w", err)
+	}
+	id = header.ID
 	pins, err := s.readPins()
 	if err != nil {
 		return err
@@ -170,15 +177,36 @@ func (s *Storage) Delete(id string) error {
 
 // Restore moves a session from the trash back to the sessions directory.
 func (s *Storage) Restore(id string) error {
+	if id == "" {
+		return errors.New("session ID must not be empty")
+	}
 	trashDir := s.TrashDir()
 
-	// Find the file in trash matching the ID prefix
-	matches, err := filepath.Glob(filepath.Join(trashDir, "*"+id+"*"))
+	files, err := filepath.Glob(filepath.Join(trashDir, "*.jsonl"))
 	if err != nil {
 		return fmt.Errorf("search trash: %w", err)
 	}
+	var matches, exactMatches []string
+	for _, path := range files {
+		header, err := ReadHeader(path)
+		if err != nil {
+			continue
+		}
+		if header.ID == id {
+			exactMatches = append(exactMatches, path)
+		}
+		if strings.HasPrefix(header.ID, id) {
+			matches = append(matches, path)
+		}
+	}
+	if len(exactMatches) > 0 {
+		matches = exactMatches
+	}
 	if len(matches) == 0 {
 		return fmt.Errorf("session %q not found in trash", id)
+	}
+	if len(matches) > 1 {
+		return fmt.Errorf("ambiguous session ID %q matches %d trashed sessions", id, len(matches))
 	}
 
 	header, err := ReadHeader(matches[0])
@@ -189,8 +217,12 @@ func (s *Storage) Restore(id string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create restore dir: %w", err)
 	}
-	if err := os.Rename(matches[0], filepath.Join(destDir, filepath.Base(matches[0]))); err != nil {
-		return err
+	filename, err := uniqueFilename(destDir, filepath.Base(matches[0]))
+	if err != nil {
+		return fmt.Errorf("restore filename: %w", err)
+	}
+	if err := os.Rename(matches[0], filepath.Join(destDir, filename)); err != nil {
+		return fmt.Errorf("restore session: %w", err)
 	}
 
 	// Invalidate index cache
@@ -283,12 +315,19 @@ func (s *Storage) MoveCWD(id, newCWD string) (string, error) {
 
 // BranchTo moves the current position to a different entry by appending a
 // position_change entry. New entries will be children of that entry.
-func (s *Storage) BranchTo(sessionID string, branchFromID string) error {
+func (s *Storage) BranchTo(sessionID string, branchFromID string) (err error) {
+	r, err := s.Open(sessionID)
+	if err != nil {
+		return fmt.Errorf("open branch session: %w", err)
+	}
+	if r.FindByID(branchFromID) == nil && branchFromID != r.Header().ID {
+		return fmt.Errorf("entry %q not found", branchFromID)
+	}
 	w, err := s.Resume(sessionID)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = w.Close() }()
+	defer func() { err = errors.Join(err, w.Close()) }()
 
 	entry := NewPositionChangeEntry(branchFromID)
 	if err := w.Append(entry); err != nil {
@@ -315,7 +354,12 @@ func (s *Storage) GetBranchEntries(sessionID string, fromID string) ([]Entry, er
 		byID[entries[i].ID] = &entries[i]
 	}
 
+	visited := make(map[string]bool)
 	for currentID != "" {
+		if visited[currentID] {
+			return nil, fmt.Errorf("cycle in session branch at entry %q", currentID)
+		}
+		visited[currentID] = true
 		// Check header first
 		if currentID == r.Header().ID {
 			break
@@ -357,6 +401,25 @@ func (s *Storage) Fork(parentID string, atEntry *string) (*Writer, error) {
 		return nil, fmt.Errorf("read parent header: %w", err)
 	}
 
+	r, err := ReadFile(parentPath)
+	if err != nil {
+		return nil, fmt.Errorf("read parent for fork: %w", err)
+	}
+	var selected map[string]bool
+	if atEntry != nil {
+		if *atEntry == "" || (r.FindByID(*atEntry) == nil && *atEntry != parentHeader.ID) {
+			return nil, fmt.Errorf("fork entry %q not found", *atEntry)
+		}
+		branch, err := s.GetBranchEntries(parentHeader.ID, *atEntry)
+		if err != nil {
+			return nil, fmt.Errorf("read fork branch: %w", err)
+		}
+		selected = make(map[string]bool, len(branch))
+		for _, entry := range branch {
+			selected[entry.ID] = true
+		}
+	}
+
 	pid := parentHeader.ID
 	header := NewHeader(parentHeader.CWD, &pid, atEntry)
 
@@ -366,23 +429,15 @@ func (s *Storage) Fork(parentID string, atEntry *string) (*Writer, error) {
 	}
 
 	copyErr := func() error {
-		if atEntry != nil {
-			branch, err := s.GetBranchEntries(parentHeader.ID, *atEntry)
-			if err != nil {
-				return fmt.Errorf("read fork branch: %w", err)
-			}
-			for _, entry := range branch {
-				if err := w.Append(entry); err != nil {
-					return fmt.Errorf("copy fork entry: %w", err)
+		for _, entry := range r.Entries() {
+			if selected != nil && !selected[entry.ID] {
+				// Legacy summaries are detached, but still belong to their kept branch.
+				legacySummary := entry.Type == EntryTypeCompaction && entry.ParentID == nil && entry.FirstKeptID != nil && selected[*entry.FirstKeptID]
+				summaryUsage := entry.Type == EntryTypeCustom && entry.CustomType != nil && *entry.CustomType == SummaryUsageType && entry.ParentID != nil && selected[*entry.ParentID]
+				if !legacySummary && !summaryUsage {
+					continue
 				}
 			}
-			return nil
-		}
-		r, err := ReadFile(parentPath)
-		if err != nil {
-			return fmt.Errorf("read parent for fork: %w", err)
-		}
-		for _, entry := range r.Entries() {
 			if err := w.Append(entry); err != nil {
 				return fmt.Errorf("copy fork entry: %w", err)
 			}
@@ -401,6 +456,31 @@ func (s *Storage) Fork(parentID string, atEntry *string) (*Writer, error) {
 	return w, nil
 }
 
+// AppendSummaryUsage records billed summary usage at the session's current position.
+func (s *Storage) AppendSummaryUsage(id string, usage ai.Usage) (err error) {
+	w, err := s.Resume(id)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, w.Close()) }()
+	reader, err := ReadFile(w.Path())
+	if err != nil {
+		return fmt.Errorf("read summary usage position: %w", err)
+	}
+	var parentID *string
+	if position := reader.CurrentPosition(); position != "" {
+		parentID = &position
+	}
+	entry, err := NewSummaryUsageEntry(parentID, usage)
+	if err != nil {
+		return err
+	}
+	if err := w.Append(entry); err != nil {
+		return fmt.Errorf("append summary usage: %w", err)
+	}
+	return ReleaseOwner(w.Path())
+}
+
 // Compact appends a compaction entry to the session.
 func (s *Storage) Compact(id string, summary string, firstKeptID string, tokensBefore, tokensAfter int) error {
 	return s.CompactWithHook(id, summary, firstKeptID, tokensBefore, tokensAfter, false)
@@ -408,14 +488,20 @@ func (s *Storage) Compact(id string, summary string, firstKeptID string, tokensB
 
 // CompactWithHook appends a compaction entry to the session, with control over
 // whether the compaction came from a plugin hook.
-func (s *Storage) CompactWithHook(id string, summary string, firstKeptID string, tokensBefore, tokensAfter int, fromHook bool) error {
+func (s *Storage) CompactWithHook(id string, summary string, firstKeptID string, tokensBefore, tokensAfter int, fromHook bool) (err error) {
 	w, err := s.Resume(id)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = w.Close() }()
-
+	defer func() { err = errors.Join(err, w.Close()) }()
+	reader, err := ReadFile(w.Path())
+	if err != nil {
+		return fmt.Errorf("read compaction position: %w", err)
+	}
 	entry := NewCompactionEntry(summary, firstKeptID, tokensBefore, tokensAfter, fromHook)
+	if position := reader.CurrentPosition(); position != "" {
+		entry.ParentID = &position
+	}
 	if err := w.Append(entry); err != nil {
 		return err
 	}
@@ -423,14 +509,21 @@ func (s *Storage) CompactWithHook(id string, summary string, firstKeptID string,
 }
 
 // SummarizeBranch appends a branch_summary entry.
-func (s *Storage) SummarizeBranch(id, fromID, summary string) error {
+func (s *Storage) SummarizeBranch(id, fromID, summary string) (err error) {
 	w, err := s.Resume(id)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = w.Close() }()
+	defer func() { err = errors.Join(err, w.Close()) }()
+	reader, err := ReadFile(w.Path())
+	if err != nil {
+		return fmt.Errorf("read branch summary position: %w", err)
+	}
 
 	entry := NewBranchSummaryEntry(fromID, summary, false)
+	if position := reader.CurrentPosition(); position != "" {
+		entry.ParentID = &position
+	}
 	if err := w.Append(entry); err != nil {
 		return err
 	}
@@ -439,33 +532,32 @@ func (s *Storage) SummarizeBranch(id, fromID, summary string) error {
 
 // resolveID finds the session file matching an ID (supports unique prefixes).
 func (s *Storage) resolveID(id string) (string, error) {
-	// Try exact path first for callers that pass a file path.
+	if id == "" {
+		return "", errors.New("session ID must not be empty")
+	}
+	// File paths remain supported aliases for storage callers.
 	if st, err := os.Stat(id); err == nil && !st.IsDir() {
 		return id, nil
 	}
-
-	matches, err := s.findSessionFiles("*" + id + "*.jsonl")
+	files, err := s.findSessionFiles("*.jsonl")
 	if err != nil {
 		return "", fmt.Errorf("search session: %w", err)
 	}
-	if len(matches) == 0 {
-		matches, err = s.findSessionFiles("*-" + id + ".jsonl")
+	var matches, exactMatches []string
+	for _, path := range files {
+		header, err := ReadHeader(path)
 		if err != nil {
-			return "", fmt.Errorf("search session: %w", err)
+			continue
+		}
+		if header.ID == id {
+			exactMatches = append(exactMatches, path)
+		}
+		if strings.HasPrefix(header.ID, id) {
+			matches = append(matches, path)
 		}
 	}
-	if len(matches) == 0 {
-		// Final fallback: read headers from all files to find matching full ID.
-		allMatches, err := s.findSessionFiles("*.jsonl")
-		if err != nil {
-			return "", fmt.Errorf("search session: %w", err)
-		}
-		for _, path := range allMatches {
-			h, err := ReadHeader(path)
-			if err == nil && h.ID == id {
-				matches = append(matches, path)
-			}
-		}
+	if len(exactMatches) > 0 {
+		matches = exactMatches
 	}
 	if len(matches) == 0 {
 		return "", fmt.Errorf("session %q not found", id)

@@ -1,9 +1,12 @@
 package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"iter"
 	"net/http"
 	"strings"
 
@@ -31,6 +34,16 @@ func (c *googleClient) Complete(ctx context.Context, model *Model, prompt *Conte
 
 // Stream implements Client.
 func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) error {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	cfg := applyOptions(opts)
 	apiKey := cfg.apiKey
 	if apiKey == "" {
@@ -59,7 +72,7 @@ func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context
 	}
 
 	// Create client using the SDK pattern that honors model.headers, model.baseUrl, apiVersion
-	client, err := c.createClient(ctx, apiKey, cfg.headers)
+	client, err := c.createClient(ctx, apiKey, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create Google GenAI client: %w", err)
 	}
@@ -87,22 +100,31 @@ func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context
 
 	// Add tools if present with tool config for tool choice
 	if len(transformedPrompt.Tools) > 0 {
-		config.Tools = []*genai.Tool{
-			{
-				FunctionDeclarations: c.convertTools(transformedPrompt.Tools),
-			},
+		declarations, strict, err := googleFunctionDeclarations(model, transformedPrompt.Tools, googleJSONSchemaParameters)
+		if err != nil {
+			return err
 		}
-		// Add toolConfig if toolChoice is specified
-		if toolChoiceMode(cfg.toolChoice) != "" {
+		functions := make([]*genai.FunctionDeclaration, len(declarations))
+		for i, declaration := range declarations {
+			functions[i] = &genai.FunctionDeclaration{
+				Name:                 transformedPrompt.Tools[i].Name,
+				Description:          transformedPrompt.Tools[i].Description,
+				ParametersJsonSchema: declaration["parametersJsonSchema"],
+			}
+		}
+		config.Tools = []*genai.Tool{{FunctionDeclarations: functions}}
+		if mode := googleFunctionCallingMode(cfg.toolChoice, strict); mode != "" {
 			config.ToolConfig = &genai.ToolConfig{
-				FunctionCallingConfig: &genai.FunctionCallingConfig{
-					Mode: mapToolChoiceToGenAI(cfg.toolChoice),
-				},
+				FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigMode(mode)},
 			}
 		}
 	}
 
-	config.ThinkingConfig = buildGenAIThinkingConfig(model, cfg)
+	thinkingConfig, err := buildGenAIThinkingConfig(model, cfg)
+	if err != nil {
+		return err
+	}
+	config.ThinkingConfig = thinkingConfig
 
 	// Add temperature if set
 	if cfg.temperature != nil {
@@ -116,6 +138,50 @@ func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context
 		config.TopP = &p
 	}
 
+	return streamGoogleChunks(ctx, model, retryGoogleStream(ctx, cfg, func() iter.Seq2[*genai.GenerateContentResponse, error] {
+		return client.Models.GenerateContentStream(ctx, model.ID, contents, config)
+	}), handler)
+}
+
+// retryGoogleStream retries a stream whose first result is a retryable
+// failure, matching upstream's retryGoogleRequest. Later failures are not retried.
+func retryGoogleStream(ctx context.Context, cfg *options, start func() iter.Seq2[*genai.GenerateContentResponse, error]) iter.Seq2[*genai.GenerateContentResponse, error] {
+	return func(yield func(*genai.GenerateContentResponse, error) bool) {
+		retries := 0
+		if cfg.maxRetries != nil {
+			retries = *cfg.maxRetries
+		}
+		for attempt := 0; ; attempt++ {
+			next, stop := iter.Pull2(start())
+			chunk, err, ok := next()
+			if ok && err != nil {
+				stop()
+				var status int
+				if apiErr, isAPI := errors.AsType[genai.APIError](err); isAPI {
+					status = apiErr.Code
+				}
+				retry, waitErr := waitProviderRetry(ctx, "google", cfg, attempt, retries, status, nil, providerBackoff(attempt), err)
+				if waitErr != nil {
+					yield(nil, waitErr)
+					return
+				}
+				if retry {
+					continue
+				}
+				yield(nil, err)
+				return
+			}
+			defer stop()
+			for ok && yield(chunk, err) {
+				chunk, err, ok = next()
+			}
+			return
+		}
+	}
+}
+
+// streamGoogleChunks converts a GenAI response stream into Tau stream events.
+func streamGoogleChunks(ctx context.Context, model *Model, chunks iter.Seq2[*genai.GenerateContentResponse, error], handler EventHandler) error {
 	// Set up streaming with shared context for tool call handling
 	var (
 		sharedCtx = &googleStreamingCtx{
@@ -140,42 +206,25 @@ func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context
 
 	// Iterate over the stream - errors come from the iterator itself
 
-	for chunk, err := range client.Models.GenerateContentStream(ctx, model.ID, contents, config) {
+	var finished bool
+	for chunk, err := range chunks {
 		if err != nil {
-			// Treat abort signal errors as StopReasonAborted
-			if strings.Contains(err.Error(), "aborted") || strings.Contains(err.Error(), "canceled") {
-				emitTerminalStreamError(ctx, handler, AssistantMessage{
-					Role:       "assistant",
-					API:        APIGoogleGenerativeAI,
-					Provider:   model.Provider,
-					Model:      model.ID,
-					Content:    output.Content,
-					ResponseID: output.ResponseID,
-					Usage:      output.Usage,
-					Timestamp:  output.Timestamp,
-				}, err, StopReasonAborted)
-			} else {
-				emitTerminalStreamError(ctx, handler, AssistantMessage{
-					Role:       "assistant",
-					API:        APIGoogleGenerativeAI,
-					Provider:   model.Provider,
-					Model:      model.ID,
-					Content:    output.Content,
-					ResponseID: output.ResponseID,
-					Usage:      output.Usage,
-					Timestamp:  output.Timestamp,
-				}, err, StopReasonError)
+			reason := StopReasonError
+			if ctx.Err() != nil {
+				reason = StopReasonAborted
 			}
+			emitTerminalStreamError(ctx, handler, output, err, reason)
 			return nil
 		}
 
 		// Handle candidates
 		for _, cand := range chunk.Candidates {
-			if cand.Content == nil {
-				continue
+			var parts []*genai.Part
+			if cand.Content != nil {
+				parts = cand.Content.Parts
 			}
 
-			for _, part := range cand.Content.Parts {
+			for _, part := range parts {
 				// Handle text content
 				if part.Text != "" {
 					blockType := ContentBlockText
@@ -270,12 +319,12 @@ func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context
 						ToolCall:     toolCall,
 						Partial:      output,
 					})
-					output.StopReason = StopReasonToolUse
 				}
 			}
 
-			if cand.FinishReason != "" && output.StopReason != StopReasonToolUse {
-				output.StopReason = googleStopReason(string(cand.FinishReason))
+			if cand.FinishReason != "" {
+				finished = true
+				output.StopReason, output.ErrorMessage = googleFinish(string(cand.FinishReason), output.Content)
 			}
 		}
 
@@ -300,40 +349,23 @@ func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context
 		endGoogleBlock(ctx, handler, output, len(output.Content)-1, *currentBlock)
 	}
 
-	handler(ctx, Done{
-		Reason:  output.StopReason,
-		Message: output,
-	})
+	finishStream(ctx, handler, output, finished, "google stream ended without a finish reason")
 
 	return nil
 }
 
-func buildGenAIThinkingConfig(model *Model, cfg *options) *genai.ThinkingConfig {
-	if !model.Reasoning {
-		return nil
+func buildGenAIThinkingConfig(model *Model, cfg *options) (*genai.ThinkingConfig, error) {
+	thinking, ok, err := resolveGoogleThinking(model, cfg)
+	if err != nil || !ok {
+		return nil, err
 	}
-
-	if cfg.thinkingBudgetTokens > 0 {
-		if level, ok := googleThinkingLevelToGenAI(cfg.googleThinkingLevel); ok {
-			return &genai.ThinkingConfig{ThinkingLevel: level, IncludeThoughts: true}
-		}
-		if level, ok := disabledGoogleThinkingLevel(model.ID); ok {
-			genaiLevel, ok := googleThinkingLevelToGenAI(level)
-			if ok {
-				return &genai.ThinkingConfig{ThinkingLevel: genaiLevel, IncludeThoughts: true}
-			}
-		}
-		budget := int32(cfg.thinkingBudgetTokens)
-		return &genai.ThinkingConfig{ThinkingBudget: &budget, IncludeThoughts: true}
+	config := &genai.ThinkingConfig{IncludeThoughts: thinking.enabled}
+	if level, ok := googleThinkingLevelToGenAI(thinking.level); ok {
+		config.ThinkingLevel = level
+	} else if thinking.budget != nil {
+		config.ThinkingBudget = new(int32(*thinking.budget))
 	}
-
-	if level, ok := disabledGoogleThinkingLevel(model.ID); ok {
-		genaiLevel, ok := googleThinkingLevelToGenAI(level)
-		if ok {
-			return &genai.ThinkingConfig{ThinkingLevel: genaiLevel}
-		}
-	}
-	return &genai.ThinkingConfig{ThinkingBudget: new(int32)}
+	return config, nil
 }
 
 func googleThinkingLevelToGenAI(level GoogleThinkingLevel) (genai.ThinkingLevel, bool) {
@@ -463,7 +495,8 @@ type googleStreamingCtx struct {
 
 // createClient creates a Google GenAI client that honors model headers and base URL.
 // This matches pi-mono's behavior of merging model.headers with options.headers.
-func (c *googleClient) createClient(ctx context.Context, apiKey string, optionsHeaders map[string]string) (*genai.Client, error) {
+func (c *googleClient) createClient(ctx context.Context, apiKey string, cfg *options) (*genai.Client, error) {
+	optionsHeaders := cfg.headers
 	httpOpts := &genai.HTTPOptions{}
 
 	// Honor model.baseUrl if present
@@ -478,9 +511,7 @@ func (c *googleClient) createClient(ctx context.Context, apiKey string, optionsH
 		for k, v := range c.model.Headers {
 			headers[k] = v
 		}
-		for k, v := range optionsHeaders {
-			headers[k] = v
-		}
+		copyConfiguredHeaders(headers, optionsHeaders)
 		if len(headers) > 0 {
 			httpOpts.Headers = http.Header{}
 			for k, v := range headers {
@@ -489,23 +520,12 @@ func (c *googleClient) createClient(ctx context.Context, apiKey string, optionsH
 		}
 	}
 
-	return genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:      apiKey,
-		HTTPOptions: *httpOpts,
-	})
-}
-
-// mapToolChoiceToGenAI maps our tool choice string to Google's FunctionCallingConfig mode.
-// This bridges the shared mapToolChoice function with the genai type.
-func mapToolChoiceToGenAI(choice any) genai.FunctionCallingConfigMode {
-	switch mapToolChoice(choice) {
-	case "NONE":
-		return genai.FunctionCallingConfigModeNone
-	case "ANY":
-		return genai.FunctionCallingConfigModeAny
-	default:
-		return genai.FunctionCallingConfigModeAuto
+	config := &genai.ClientConfig{APIKey: apiKey, HTTPOptions: *httpOpts}
+	if cfg.timeout > 0 {
+		base := cmp.Or(http.DefaultClient.Transport, http.DefaultTransport)
+		config.HTTPClient = &http.Client{Transport: &headerTimeoutTransport{base: base, timeout: cfg.timeout, label: "google"}}
 	}
+	return genai.NewClient(ctx, config)
 }
 
 func googleToolResultParts(msg Message, blocks []ContentBlock) []*genai.Part {
@@ -536,33 +556,4 @@ func googleHasFunctionResponse(content *genai.Content) bool {
 		}
 	}
 	return false
-}
-
-// convertParametersToSchema converts parameters to a Google Schema.
-func convertParametersToSchema(params json.RawMessage, schema *genai.Schema) error {
-	return json.Unmarshal(params, schema)
-}
-
-// convertTools converts our Tool slice to Google FunctionDeclarations.
-func (c *googleClient) convertTools(tools []Tool) []*genai.FunctionDeclaration {
-	result := make([]*genai.FunctionDeclaration, 0, len(tools))
-
-	for _, tool := range tools {
-		var params *genai.Schema
-
-		if tool.Parameters != nil {
-			var schema genai.Schema
-			if err := convertParametersToSchema(tool.Parameters, &schema); err == nil {
-				params = &schema
-			}
-		}
-
-		result = append(result, &genai.FunctionDeclaration{
-			Name:        tool.Name,
-			Description: tool.Description,
-			Parameters:  params,
-		})
-	}
-
-	return result
 }

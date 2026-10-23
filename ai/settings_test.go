@@ -1,9 +1,17 @@
 package ai
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestModelRegistry_LoadMissing verifies a missing models.json returns empty.
@@ -346,5 +354,474 @@ func TestDirectoryOverrideFieldsRoundTrip(t *testing.T) {
 	}
 	if reloaded.SkillDir != "/project-skills" || reloaded.ExtensionDir != "/ext" {
 		t.Fatalf("round-trip lost fields: %+v", reloaded)
+	}
+}
+
+func TestDefaultToolsLayerModifiers(t *testing.T) {
+	user := &Settings{DefaultTools: []string{"read", "bash"}}
+	merged := MergeSettings(user, &Settings{DefaultTools: []string{"-bash", "+grep"}})
+	if got := merged.DefaultTools; !slices.Equal(got, []string{"read", "bash", "-bash", "+grep"}) {
+		t.Fatalf("merged tools: %v", got)
+	}
+	replaced := MergeSettings(user, &Settings{DefaultTools: []string{}})
+	if replaced.DefaultTools == nil || len(replaced.DefaultTools) != 0 {
+		t.Fatalf("explicit empty selection lost: %v", replaced.DefaultTools)
+	}
+}
+
+func TestDefaultToolsEmptySelectionRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := SaveSettings(path, &Settings{DefaultTools: []string{}}); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := LoadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.DefaultTools == nil || len(settings.DefaultTools) != 0 {
+		t.Fatalf("empty tool selection lost: %v", settings.DefaultTools)
+	}
+}
+
+func TestPerModelCompactionSettings(t *testing.T) {
+	settings := &Settings{Compaction: CompactionSettings{ReserveTokens: 100, KeepRecentTokens: 200, ModelOverrides: map[string]CompactionModelOverride{"test/model": {ReserveTokens: new(0), KeepRecentTokens: new(50)}}}}
+	resolved, err := settings.ResolveCompaction(&Model{Provider: "test", ID: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ReserveTokens != 0 || resolved.KeepRecentTokens != 50 {
+		t.Fatalf("resolved: %#v", resolved)
+	}
+	settings.Compaction.ModelOverrides["test/model"] = CompactionModelOverride{ReserveTokens: new(-1)}
+	if _, err := settings.ResolveCompaction(&Model{Provider: "test", ID: "model"}); err == nil {
+		t.Fatal("negative override accepted")
+	}
+}
+
+func TestExplicitRetryAndCompactionSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(`{"retry":{"enabled":false,"maxRetries":0,"baseDelayMs":0},"compaction":{"enabled":false,"reserveTokens":0,"keepRecentTokens":0}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project, err := LoadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := MergeSettings(&Settings{Retry: RetrySettings{Enabled: true, MaxRetries: 5, BaseDelayMs: 10}, Compaction: CompactionSettings{Enabled: true, ReserveTokens: 100, KeepRecentTokens: 100}}, project)
+	retry := merged.ResolveRetry()
+	if retry.Enabled || retry.MaxRetries != 0 || retry.BaseDelayMs != 0 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	limits, err := merged.ResolveCompaction(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits.Enabled || limits.ReserveTokens != 0 || limits.KeepRecentTokens != 0 {
+		t.Fatalf("compaction=%+v", limits)
+	}
+	if err := SaveSettings(path, merged); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := LoadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.ResolveRetry().Enabled || restored.ResolveRetry().MaxRetries != 0 {
+		t.Fatal("explicit values lost on save")
+	}
+	defaults := (&Settings{}).ResolveRetry()
+	if !defaults.Enabled || defaults.MaxRetries != 3 {
+		t.Fatalf("defaults=%+v", defaults)
+	}
+}
+
+func TestPresentSettingsSerializeCurrentValues(t *testing.T) {
+	var settings Settings
+	if err := json.Unmarshal([]byte(`{"retry":{"enabled":true,"maxRetries":4},"compaction":{"enabled":true,"keepRecentTokens":100}}`), &settings); err != nil {
+		t.Fatal(err)
+	}
+	settings.Retry.Enabled = false
+	settings.Retry.MaxRetries = 0
+	settings.Compaction.Enabled = false
+	settings.Compaction.KeepRecentTokens = 0
+	data, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored Settings
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if retry := restored.ResolveRetry(); retry.Enabled || retry.MaxRetries != 0 {
+		t.Fatalf("mutated retry values lost: %s", data)
+	}
+	limits, err := restored.ResolveCompaction(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits.Enabled || limits.KeepRecentTokens != 0 {
+		t.Fatalf("mutated compaction values lost: %s", data)
+	}
+}
+
+func TestMergeSettingsExplicitImageAndTerminalFalse(t *testing.T) {
+	user, err := parseSettings([]byte(`{"images":{"blockImages":true},"terminal":{"clearOnShrink":true}}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"images":{"blockImages":false},"terminal":{"clearOnShrink":false}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	assert.False(t, merged.Images.BlockImages)
+	assert.False(t, merged.Terminal.ClearOnShrink)
+	data, err := json.Marshal(merged)
+	require.NoError(t, err)
+	roundTrip, err := parseSettings(data)
+	require.NoError(t, err)
+	merged = MergeSettings(user, roundTrip)
+	assert.False(t, merged.Images.BlockImages)
+	assert.False(t, merged.Terminal.ClearOnShrink)
+}
+
+func TestMergeSettingsExplicitTopLevelValues(t *testing.T) {
+	user, err := parseSettings([]byte(`{"hideThinkingBlock":true,"quietStartup":true,"collapseChangelog":true,"showHardwareCursor":true,"enableSkillCommands":true,"enableInstallTelemetry":true,"editorPaddingX":4,"autocompleteMaxVisible":8,"shellCommandPrefix":"sandbox","theme":"dark","skills":["user-skill"]}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"hideThinkingBlock":false,"quietStartup":false,"collapseChangelog":false,"showHardwareCursor":false,"enableSkillCommands":false,"editorPaddingX":0,"autocompleteMaxVisible":0,"shellCommandPrefix":"","theme":"","skills":[]}`))
+	require.NoError(t, err)
+	check := func(t *testing.T, merged *Settings) {
+		t.Helper()
+		assert.False(t, merged.HideThinkingBlock)
+		assert.False(t, merged.QuietStartup)
+		assert.False(t, merged.CollapseChangelog)
+		assert.False(t, merged.ShowHardwareCursor)
+		assert.False(t, merged.EnableSkillCommands)
+		assert.True(t, merged.EnableInstallTelemetry, "absent project field must preserve user preference")
+		assert.Zero(t, merged.EditorPaddingX)
+		assert.Zero(t, merged.AutocompleteMaxVisible)
+		assert.Empty(t, merged.ShellCommandPrefix)
+		assert.Empty(t, merged.Theme)
+		require.NotNil(t, merged.Skills)
+		assert.Empty(t, merged.Skills)
+	}
+	check(t, MergeSettings(user, project))
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, SaveSettings(path, project))
+	reloaded, err := LoadSettings(path)
+	require.NoError(t, err)
+	check(t, MergeSettings(user, reloaded))
+	merged := MergeSettings(user, &Settings{})
+	assert.True(t, merged.EnableInstallTelemetry)
+	assert.True(t, merged.HideThinkingBlock)
+}
+
+func TestMergeSettingsExplicitNestedReset(t *testing.T) {
+	user, err := parseSettings([]byte(`{"bash":{"commandPrefix":"sandbox","envAllowlist":["HOME"],"envExtra":{"MODE":"safe"},"outputCap":100},"read":{"lineCap":12},"markdown":{"codeBlockIndent":"  "},"branchSummary":{"skipPrompt":true,"reserveTokens":100},"images":{"maxWidth":400}}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"bash":{"commandPrefix":"","envAllowlist":[],"envExtra":{},"outputCap":0},"read":{"lineCap":0},"markdown":{"codeBlockIndent":""},"branchSummary":{"skipPrompt":false,"reserveTokens":0},"images":{"maxWidth":0}}`))
+	require.NoError(t, err)
+	check := func(merged *Settings) {
+		t.Helper()
+		assert.Empty(t, merged.Bash.CommandPrefix)
+		assert.Empty(t, merged.Bash.EnvAllowlist)
+		assert.Empty(t, merged.Bash.EnvExtra)
+		assert.Zero(t, merged.Bash.OutputCap)
+		assert.Zero(t, merged.Read.LineCap)
+		assert.Empty(t, merged.Markdown.CodeBlockIndent)
+		assert.False(t, merged.BranchSummary.SkipPrompt)
+		assert.Zero(t, merged.BranchSummary.ReserveTokens)
+		assert.Zero(t, merged.Images.MaxWidth)
+	}
+	check(MergeSettings(user, project))
+	data, err := json.Marshal(project)
+	require.NoError(t, err)
+	project, err = parseSettings(data)
+	require.NoError(t, err)
+	check(MergeSettings(user, project))
+}
+
+func TestMergeSettingsDoesNotMutateModelOverrides(t *testing.T) {
+	user := &Settings{Models: map[string]ModelSettings{"test/model": {ThinkingLevel: "high"}}}
+	project := &Settings{Models: map[string]ModelSettings{"test/model": {ThinkingLevel: "low"}}}
+	merged := MergeSettings(user, project)
+	assert.Equal(t, "high", user.Models["test/model"].ThinkingLevel)
+	merged.Models["test/model"] = ModelSettings{ThinkingLevel: "off"}
+	assert.Equal(t, "low", project.Models["test/model"].ThinkingLevel)
+	assert.Equal(t, "high", user.Models["test/model"].ThinkingLevel)
+}
+
+func TestThinkingBudgetsExplicitZeroSurvivesMergeAndSave(t *testing.T) {
+	project, err := parseSettings([]byte(`{"thinkingBudgets":{"medium":0}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(&Settings{ThinkingBudgets: ThinkingBudgetsSettings{Medium: 1234, High: 4321}}, project)
+	budgets := merged.ResolveThinkingBudgets()
+	require.NotNil(t, budgets.Medium)
+	assert.Zero(t, *budgets.Medium)
+	require.NotNil(t, budgets.High)
+	assert.Equal(t, 4321, *budgets.High)
+	data, err := json.Marshal(merged)
+	require.NoError(t, err)
+	loaded, err := parseSettings(data)
+	require.NoError(t, err)
+	require.NotNil(t, loaded.ResolveThinkingBudgets().Medium)
+	assert.Zero(t, *loaded.ResolveThinkingBudgets().Medium)
+}
+
+func TestParseSettingsMigratesLegacyAzureProviderKey(t *testing.T) {
+	settings, err := parseSettings([]byte(`{
+		"defaultProvider": "azure-openai-responses",
+		"enabledModels": ["azure-openai-responses/gpt-5.4:high", "azure-openai-responses/*", "anthropic/*"],
+		"models": {"azure-openai-responses/gpt-5.4": {"thinkingLevel": "low"}}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.DefaultProvider != ProviderAzureOpenAI {
+		t.Errorf("defaultProvider = %q", settings.DefaultProvider)
+	}
+	if want := []string{"azure/gpt-5.4:high", "azure/*", "anthropic/*"}; !slices.Equal(settings.EnabledModels, want) {
+		t.Errorf("enabledModels = %q, want %q", settings.EnabledModels, want)
+	}
+	if settings.Models["azure/gpt-5.4"].ThinkingLevel != "low" || len(settings.Models) != 1 {
+		t.Errorf("models = %+v", settings.Models)
+	}
+}
+
+func TestSettingsResourcePathsKeepScopeAndRawValues(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	load := func(dir, contents string) *Settings {
+		t.Helper()
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		path := filepath.Join(dir, "settings.json")
+		require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
+		s, err := LoadSettings(path)
+		require.NoError(t, err)
+		return s
+	}
+	userDir := filepath.Join(home, "agent")
+	projectDir := filepath.Join(t.TempDir(), ".tau")
+	user := load(userDir, `{"skills":["skills","!~/shared/*","+./skills/keep","-./skills/drop"],"themes":["themes"],"extensions":["extensions"]}`)
+	project := load(projectDir, `{"prompts":["prompts","!prompts/skip*","+~/shared/keep.md","-~/shared/drop.md"]}`)
+	merged := MergeSettings(user, project)
+	assert.Equal(t, []string{
+		filepath.Join(userDir, "skills"), "!" + filepath.Join(home, "shared", "*"),
+		"+" + filepath.Join(userDir, "skills", "keep"), "-" + filepath.Join(userDir, "skills", "drop"),
+	}, merged.ResourcePaths("skills"))
+	assert.Equal(t, []string{
+		filepath.Join(projectDir, "prompts"), "!" + filepath.Join(projectDir, "prompts", "skip*"),
+		"+" + filepath.Join(home, "shared", "keep.md"), "-" + filepath.Join(home, "shared", "drop.md"),
+	}, merged.ResourcePaths("prompts"))
+	assert.Equal(t, []string{filepath.Join(userDir, "extensions")}, merged.ResourcePaths("extensions"))
+	assert.Equal(t, []string{filepath.Join(userDir, "themes")}, merged.ResourcePaths("themes"))
+	assert.Equal(t, user.Skills, merged.Skills)
+	data, err := json.Marshal(merged)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), userDir)
+	assert.NotContains(t, string(data), projectDir)
+	assert.Contains(t, string(data), "!~/shared/*")
+	assert.Empty(t, MergeSettings(user, load(projectDir, `{"skills":[]}`)).ResourcePaths("skills"))
+}
+
+func TestRetrySettingsSeparateAgentAndProviderLimits(t *testing.T) {
+	user, err := ParseSettings([]byte(`{"retry":{"maxDelayMs":45000,"provider":{"timeoutMs":30000},"maxAgentDelayMs":7}}`))
+	require.NoError(t, err)
+	project, err := ParseSettings([]byte(`{"retry":{"provider":{"maxRetries":0,"maxRetryDelayMs":0},"maxAgentDelayMs":0,"baseDelayMs":0}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	data, err := json.Marshal(merged)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), `"maxDelayMs"`)
+	reloaded, err := ParseSettings(data)
+	require.NoError(t, err)
+	resolved := reloaded.ResolveRetry()
+	assert.Zero(t, resolved.MaxAgentDelayMs)
+	assert.Zero(t, resolved.BaseDelayMs)
+	require.NotNil(t, resolved.Provider.TimeoutMs)
+	require.NotNil(t, resolved.Provider.MaxRetries)
+	require.NotNil(t, resolved.Provider.MaxRetryDelayMs)
+	assert.Equal(t, 30000, *resolved.Provider.TimeoutMs)
+	assert.Zero(t, *resolved.Provider.MaxRetries)
+	assert.Zero(t, *resolved.Provider.MaxRetryDelayMs)
+	legacy := user.ResolveRetry()
+	assert.Equal(t, 7, legacy.MaxAgentDelayMs)
+	assert.Equal(t, 45000, *legacy.Provider.MaxRetryDelayMs)
+	defaults := (*Settings)(nil).ResolveRetry()
+	assert.Equal(t, 60000, defaults.MaxAgentDelayMs)
+	assert.Equal(t, 60000, *defaults.Provider.MaxRetryDelayMs)
+}
+
+func TestRetrySettingsLegacyLimitDoesNotOverrideExplicitProviderLimit(t *testing.T) {
+	settings, err := ParseSettings([]byte(`{"retry":{"maxDelayMs":90000,"provider":{"maxRetryDelayMs":0}}}`))
+	require.NoError(t, err)
+	assert.Zero(t, *settings.ResolveRetry().Provider.MaxRetryDelayMs)
+	assert.Equal(t, 60000, settings.ResolveRetry().MaxAgentDelayMs)
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, SaveSettings(path, settings))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), `"maxDelayMs"`)
+	restored, err := LoadSettings(path)
+	require.NoError(t, err)
+	require.NotNil(t, restored.ResolveRetry().Provider.MaxRetryDelayMs)
+	assert.Zero(t, *restored.ResolveRetry().Provider.MaxRetryDelayMs)
+}
+
+func TestRetrySettingsLegacyNullUsesDefaultProviderLimit(t *testing.T) {
+	settings, err := ParseSettings([]byte(`{"retry":{"maxDelayMs":null}}`))
+	require.NoError(t, err)
+	assert.Equal(t, 60000, *settings.ResolveRetry().Provider.MaxRetryDelayMs)
+}
+
+func TestConcurrentSettingsLoadAndSavePreserveKeys(t *testing.T) {
+	dir := t.TempDir()
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := range 32 {
+		workers.Go(func() {
+			<-start
+			var settings *Settings
+			if i%2 == 0 {
+				parsed, err := ParseSettings([]byte(`{"defaultModel":"configured","quietStartup":false,"editorPaddingX":0,"extensionSetting":{"enabled":true}}`))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				settings = parsed
+			} else {
+				settings = &Settings{DefaultModel: "configured", Plugins: map[string]json.RawMessage{
+					"defaultModel":     json.RawMessage(`"must not override"`),
+					"extensionSetting": json.RawMessage(`{"enabled":true}`),
+				}}
+			}
+			path := filepath.Join(dir, fmt.Sprintf("%d.json", i))
+			if err := SaveSettings(path, settings); err != nil {
+				t.Error(err)
+				return
+			}
+			restored, err := LoadSettings(path)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if restored.DefaultModel != "configured" {
+				t.Errorf("typed key overridden: %q", restored.DefaultModel)
+			}
+			if _, ok := restored.Plugins["defaultModel"]; i%2 == 0 && ok {
+				t.Error("typed key preserved as an extension")
+			}
+			var extension struct {
+				Enabled bool `json:"enabled"`
+			}
+			if err := json.Unmarshal(restored.Plugins["extensionSetting"], &extension); err != nil {
+				t.Error(err)
+				return
+			}
+			if !extension.Enabled {
+				t.Error("extension key lost")
+			}
+		})
+	}
+	close(start)
+	workers.Wait()
+}
+
+func TestSettingsRuntimeDefaultsMatchUpstream(t *testing.T) {
+	parse := func(raw string) *Settings {
+		t.Helper()
+		settings, err := ParseSettings([]byte(raw))
+		require.NoError(t, err)
+		return settings
+	}
+
+	t.Run("transport", func(t *testing.T) {
+		for raw, want := range map[string]Transport{
+			`{}`:                                     TransportAuto,
+			`{"transport":"sse"}`:                    TransportSSE,
+			`{"transport":"websocket-cached"}`:       TransportWS,
+			`{"websockets":true}`:                    TransportWS,
+			`{"websockets":false}`:                   TransportSSE,
+			`{"transport":"auto","websockets":true}`: TransportAuto,
+		} {
+			got, err := parse(raw).ResolveTransport()
+			require.NoError(t, err, raw)
+			assert.Equal(t, want, got, raw)
+		}
+		migrated := parse(`{"websockets":true}`)
+		assert.NotContains(t, migrated.Plugins, "websockets")
+		assert.Equal(t, "websocket", migrated.Transport)
+		_, err := parse(`{"transport":"carrier-pigeon"}`).ResolveTransport()
+		require.ErrorContains(t, err, `invalid transport "carrier-pigeon"`)
+		got, err := (*Settings)(nil).ResolveTransport()
+		require.NoError(t, err)
+		assert.Equal(t, TransportAuto, got)
+	})
+
+	t.Run("skill commands", func(t *testing.T) {
+		assert.True(t, parse(`{}`).SkillCommandsEnabled())
+		assert.True(t, (*Settings)(nil).SkillCommandsEnabled())
+		assert.False(t, parse(`{"enableSkillCommands":false}`).SkillCommandsEnabled())
+		assert.False(t, MergeSettings(parse(`{"enableSkillCommands":true}`), parse(`{"enableSkillCommands":false}`)).SkillCommandsEnabled())
+		assert.True(t, MergeSettings(parse(`{"enableSkillCommands":false}`), parse(`{"enableSkillCommands":true}`)).SkillCommandsEnabled())
+	})
+
+	t.Run("code block indent", func(t *testing.T) {
+		assert.Equal(t, "  ", parse(`{}`).ResolveCodeBlockIndent())
+		assert.Equal(t, "  ", (*Settings)(nil).ResolveCodeBlockIndent())
+		assert.Equal(t, "\t", parse(`{"markdown":{"codeBlockIndent":"\t"}}`).ResolveCodeBlockIndent())
+		empty := parse(`{"markdown":{"codeBlockIndent":""}}`)
+		assert.Empty(t, empty.ResolveCodeBlockIndent())
+		assert.Empty(t, MergeSettings(parse(`{"markdown":{"codeBlockIndent":"    "}}`), empty).ResolveCodeBlockIndent())
+		path := filepath.Join(t.TempDir(), "settings.json")
+		require.NoError(t, SaveSettings(path, empty))
+		loaded, err := LoadSettings(path)
+		require.NoError(t, err)
+		assert.Empty(t, loaded.ResolveCodeBlockIndent())
+	})
+}
+
+func TestFullscreenWheelSettingsBoundsAndRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{`{}`, 0},
+		{`{"fullscreenWheelScrollLines":"auto"}`, 0},
+		{`{"fullscreenWheelScrollLines":null}`, 0},
+		{`{"fullscreenWheelScrollLines":0}`, 1},
+		{`{"fullscreenWheelScrollLines":-2}`, 1},
+		{`{"fullscreenWheelScrollLines":2.9}`, 2},
+		{`{"fullscreenWheelScrollLines":999}`, 100},
+		{`{"fullscreenWheelScrollLines":"invalid"}`, 0},
+	} {
+		s, err := ParseSettings([]byte(tc.raw))
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, s.ResolveFullscreenWheelScrollLines(), tc.raw)
+		path := filepath.Join(t.TempDir(), "settings.json")
+		require.NoError(t, SaveSettings(path, s))
+		restored, err := LoadSettings(path)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, restored.ResolveFullscreenWheelScrollLines(), tc.raw)
+	}
+	user, err := ParseSettings([]byte(`{"fullscreenWheelScrollLines":7}`))
+	require.NoError(t, err)
+	project, err := ParseSettings([]byte(`{"fullscreenWheelScrollLines":0}`))
+	require.NoError(t, err)
+	assert.Equal(t, 1, MergeSettings(user, project).ResolveFullscreenWheelScrollLines())
+	assert.Equal(t, 7, MergeSettings(user, &Settings{}).ResolveFullscreenWheelScrollLines())
+}
+
+func TestSettingsValueMarshalKeepsExplicitZeros(t *testing.T) {
+	var settings Settings
+	if err := json.Unmarshal([]byte(`{"hideThinkingBlock":false,"retry":{"enabled":false}}`), &settings); err != nil {
+		t.Fatal(err)
+	}
+	byValue, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPointer, err := json.Marshal(&settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(byValue) != string(byPointer) || !strings.Contains(string(byValue), `"hideThinkingBlock":false`) {
+		t.Fatalf("value=%s pointer=%s", byValue, byPointer)
 	}
 }

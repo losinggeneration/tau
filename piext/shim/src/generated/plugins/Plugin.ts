@@ -9,6 +9,9 @@ import type { EventResponse as _plugins_EventResponse, EventResponse__Output as 
 import type { InitRequest as _plugins_InitRequest, InitRequest__Output as _plugins_InitRequest__Output } from '../plugins/InitRequest.ts';
 import type { InitResponse as _plugins_InitResponse, InitResponse__Output as _plugins_InitResponse__Output } from '../plugins/InitResponse.ts';
 import type { ListRegistrationsRequest as _plugins_ListRegistrationsRequest, ListRegistrationsRequest__Output as _plugins_ListRegistrationsRequest__Output } from '../plugins/ListRegistrationsRequest.ts';
+import type { ModelRouteRequest as _plugins_ModelRouteRequest, ModelRouteRequest__Output as _plugins_ModelRouteRequest__Output } from '../plugins/ModelRouteRequest.ts';
+import type { ModelRouteResponse as _plugins_ModelRouteResponse, ModelRouteResponse__Output as _plugins_ModelRouteResponse__Output } from '../plugins/ModelRouteResponse.ts';
+import type { ReachToolsResponse as _plugins_ReachToolsResponse, ReachToolsResponse__Output as _plugins_ReachToolsResponse__Output } from '../plugins/ReachToolsResponse.ts';
 import type { Registrations as _plugins_Registrations, Registrations__Output as _plugins_Registrations__Output } from '../plugins/Registrations.ts';
 import type { ShutdownRequest as _plugins_ShutdownRequest, ShutdownRequest__Output as _plugins_ShutdownRequest__Output } from '../plugins/ShutdownRequest.ts';
 import type { ShutdownResponse as _plugins_ShutdownResponse, ShutdownResponse__Output as _plugins_ShutdownResponse__Output } from '../plugins/ShutdownResponse.ts';
@@ -72,6 +75,24 @@ export interface PluginClient extends grpc.Client {
   onTerminalInput(argument: _plugins_TerminalInput, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_TerminalInputResponse__Output>): grpc.ClientUnaryCall;
   onTerminalInput(argument: _plugins_TerminalInput, callback: grpc.requestCallback<_plugins_TerminalInputResponse__Output>): grpc.ClientUnaryCall;
   
+  ReachTools(argument: _plugins_ToolCall, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  ReachTools(argument: _plugins_ToolCall, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  ReachTools(argument: _plugins_ToolCall, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  ReachTools(argument: _plugins_ToolCall, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  reachTools(argument: _plugins_ToolCall, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  reachTools(argument: _plugins_ToolCall, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  reachTools(argument: _plugins_ToolCall, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  reachTools(argument: _plugins_ToolCall, callback: grpc.requestCallback<_plugins_ReachToolsResponse__Output>): grpc.ClientUnaryCall;
+  
+  RouteModel(argument: _plugins_ModelRouteRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  RouteModel(argument: _plugins_ModelRouteRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  RouteModel(argument: _plugins_ModelRouteRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  RouteModel(argument: _plugins_ModelRouteRequest, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  routeModel(argument: _plugins_ModelRouteRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  routeModel(argument: _plugins_ModelRouteRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  routeModel(argument: _plugins_ModelRouteRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  routeModel(argument: _plugins_ModelRouteRequest, callback: grpc.requestCallback<_plugins_ModelRouteResponse__Output>): grpc.ClientUnaryCall;
+  
   Shutdown(argument: _plugins_ShutdownRequest, metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ShutdownResponse__Output>): grpc.ClientUnaryCall;
   Shutdown(argument: _plugins_ShutdownRequest, metadata: grpc.Metadata, callback: grpc.requestCallback<_plugins_ShutdownResponse__Output>): grpc.ClientUnaryCall;
   Shutdown(argument: _plugins_ShutdownRequest, options: grpc.CallOptions, callback: grpc.requestCallback<_plugins_ShutdownResponse__Output>): grpc.ClientUnaryCall;
@@ -96,6 +117,10 @@ export interface PluginHandlers extends grpc.UntypedServiceImplementation {
   
   OnTerminalInput: grpc.handleUnaryCall<_plugins_TerminalInput__Output, _plugins_TerminalInputResponse>;
   
+  ReachTools: grpc.handleUnaryCall<_plugins_ToolCall__Output, _plugins_ReachToolsResponse>;
+  
+  RouteModel: grpc.handleUnaryCall<_plugins_ModelRouteRequest__Output, _plugins_ModelRouteResponse>;
+  
   Shutdown: grpc.handleUnaryCall<_plugins_ShutdownRequest__Output, _plugins_ShutdownResponse>;
   
 }
@@ -107,5 +132,7 @@ export interface PluginDefinition extends grpc.ServiceDefinition {
   ListRegistrations: MethodDefinition<_plugins_ListRegistrationsRequest, _plugins_Registrations, _plugins_ListRegistrationsRequest__Output, _plugins_Registrations__Output>
   OnEvent: MethodDefinition<_plugins_Event, _plugins_EventResponse, _plugins_Event__Output, _plugins_EventResponse__Output>
   OnTerminalInput: MethodDefinition<_plugins_TerminalInput, _plugins_TerminalInputResponse, _plugins_TerminalInput__Output, _plugins_TerminalInputResponse__Output>
+  ReachTools: MethodDefinition<_plugins_ToolCall, _plugins_ReachToolsResponse, _plugins_ToolCall__Output, _plugins_ReachToolsResponse__Output>
+  RouteModel: MethodDefinition<_plugins_ModelRouteRequest, _plugins_ModelRouteResponse, _plugins_ModelRouteRequest__Output, _plugins_ModelRouteResponse__Output>
   Shutdown: MethodDefinition<_plugins_ShutdownRequest, _plugins_ShutdownResponse, _plugins_ShutdownRequest__Output, _plugins_ShutdownResponse__Output>
 }

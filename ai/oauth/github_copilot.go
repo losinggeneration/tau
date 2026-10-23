@@ -3,30 +3,51 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/oauth2"
 
 	airoot "github.com/losinggeneration/tau/ai"
 )
 
+const (
+	copilotClientID   = "Iv1.b507a08c87ecfe98"
+	copilotAPIVersion = "2026-06-01"
+	copilotIndividual = "https://api.individual.githubcopilot.com"
+
+	// CopilotAvailableModelsKey is the credential Extra key holding the model
+	// IDs the signed-in account can use.
+	CopilotAvailableModelsKey = "availableModelIds"
+	copilotEnterpriseKey      = "enterprise_url"
+)
+
 // GitHub Copilot OAuth provider.
 type githubCopilotProvider struct {
-	clientID     string
-	authURL      string
-	tokenURL     string
-	callbackPort int
+	client *http.Client
+	// sleep waits between rate-limited model requests; tests replace it.
+	sleep func(context.Context, time.Duration) error
 }
 
 func NewGitHubCopilotProvider() Provider {
-	return &githubCopilotProvider{
-		clientID:     "01ab58ac19854d7297f5d8e34fc69819",
-		authURL:      "https://github.com/login/device/code",
-		tokenURL:     "https://github.com/login/oauth/access_token",
-		callbackPort: 53693,
+	return &githubCopilotProvider{client: &http.Client{Timeout: 30 * time.Second}, sleep: sleepContext}
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -39,24 +60,16 @@ func (p *githubCopilotProvider) Name() string {
 }
 
 func (p *githubCopilotProvider) UsesCallbackServer() bool {
-	return true
+	return false
 }
 
 func (p *githubCopilotProvider) ModifyModels(models []*airoot.Model, credentials *Credentials) []*airoot.Model {
-	baseURL := GetGitHubCopilotBaseURL(credentials.Access, "")
-	if credentials.Extra != nil {
-		if domain, ok := credentials.Extra["enterprise_url"].(string); ok && domain != "" {
-			baseURL = fmt.Sprintf("https://copilot-api.%s", normalizeDomain(domain))
-		}
-	}
-
-	// Update base URL for all GitHub Copilot models
+	baseURL := GetGitHubCopilotBaseURL(credentials.Access, copilotEnterpriseDomain(credentials))
 	for _, m := range models {
-		if m.Provider == "github-copilot" {
+		if m.Provider == airoot.ProviderGitHubCopilot {
 			m.BaseURL = baseURL
 		}
 	}
-
 	return models
 }
 
@@ -65,36 +78,15 @@ func normalizeDomain(input string) string {
 	if trimmed == "" {
 		return ""
 	}
-
 	raw := trimmed
 	if !strings.Contains(raw, "://") {
 		raw = "https://" + raw
 	}
-
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return ""
 	}
-
 	return parsed.Hostname()
-}
-
-func getBaseURLFromToken(token string) string {
-	match := strings.Split(token, "proxy-ep=")
-	if len(match) < 2 {
-		return ""
-	}
-
-	host := match[1]
-	if idx := strings.Index(host, ";"); idx >= 0 {
-		host = host[:idx]
-	}
-	if host == "" {
-		return ""
-	}
-
-	host = strings.Replace(host, "proxy.", "api.", 1)
-	return "https://" + host
 }
 
 // NormalizeDomain normalizes an enterprise GitHub URL/domain to a hostname.
@@ -105,350 +97,401 @@ func NormalizeDomain(input string) string {
 // GetGitHubCopilotBaseURL resolves the API base URL for the given token/domain.
 // The Copilot token contains a proxy-ep field that encodes the API endpoint.
 func GetGitHubCopilotBaseURL(token string, enterpriseDomain string) string {
-	if fromToken := getBaseURLFromToken(token); fromToken != "" {
+	if fromToken := airoot.CopilotBaseURL(token); fromToken != "" {
 		return fromToken
 	}
-
 	if domain := normalizeDomain(enterpriseDomain); domain != "" {
 		return "https://copilot-api." + domain
 	}
-
-	return "https://api.individual.githubcopilot.com"
+	return copilotIndividual
 }
-
-const (
-	copilotUserAgent     = "GitHubCopilotChat/0.35.0"
-	copilotEditorVersion = "vscode/1.107.0"
-	copilotPluginVersion = "copilot-chat/0.35.0"
-	copilotIntegrationID = "vscode-chat"
-)
 
 // CopilotHeaders returns the headers required for Copilot API requests.
 func CopilotHeaders() map[string]string {
 	return map[string]string{
-		"User-Agent":             copilotUserAgent,
-		"Editor-Version":         copilotEditorVersion,
-		"Editor-Plugin-Version":  copilotPluginVersion,
-		"Copilot-Integration-Id": copilotIntegrationID,
+		"User-Agent":             "GitHubCopilotChat/0.35.0",
+		"Editor-Version":         "vscode/1.107.0",
+		"Editor-Plugin-Version":  "copilot-chat/0.35.0",
+		"Copilot-Integration-Id": "vscode-chat",
 	}
 }
 
-// EnableGitHubCopilotModel enables a specific model for the user's GitHub Copilot account.
-// This is required for some models (like Claude, Grok) before they can be used.
-// Returns true if the model was enabled successfully.
-func EnableGitHubCopilotModel(ctx context.Context, token string, modelID string, enterpriseDomain string) (bool, error) {
-	baseURL := GetGitHubCopilotBaseURL(token, enterpriseDomain)
-	policyURL := fmt.Sprintf("%s/models/%s/policy", baseURL, modelID)
+func copilotEnterpriseDomain(credentials *Credentials) string {
+	if credentials == nil {
+		return ""
+	}
+	domain, _ := credentials.Extra[copilotEnterpriseKey].(string)
+	return normalizeDomain(domain)
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, policyURL, strings.NewReader(`{"state":"enabled"}`))
+// CopilotAvailableModels returns the model IDs recorded at sign-in or refresh,
+// and false when the credential records none.
+func CopilotAvailableModels(extra map[string]any) ([]string, bool) {
+	switch ids := extra[CopilotAvailableModelsKey].(type) {
+	case []string:
+		return ids, true
+	case []any:
+		out := make([]string, 0, len(ids))
+		for _, id := range ids {
+			text, ok := id.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, text)
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func (p *githubCopilotProvider) Login(ctx context.Context, callbacks LoginCallbacks) (*Credentials, error) {
+	input, err := callbacks.OnPrompt(ctx, "GitHub Enterprise URL/domain (blank for github.com)", "company.ghe.com")
 	if err != nil {
-		return false, fmt.Errorf("create request: %w", err)
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	enterpriseDomain := normalizeDomain(input)
+	if strings.TrimSpace(input) != "" && enterpriseDomain == "" {
+		return nil, errors.New("invalid GitHub Enterprise URL/domain")
+	}
+	domain := enterpriseDomain
+	if domain == "" {
+		domain = "github.com"
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	req.Header.Set("Openai-Intent", "chat-policy")
-	req.Header.Set("X-Interaction-Type", "chat-policy")
-
-	for k, v := range CopilotHeaders() {
-		req.Header.Set(k, v)
+	config := oauth2.Config{
+		ClientID: copilotClientID,
+		Endpoint: oauth2.Endpoint{
+			DeviceAuthURL: "https://" + domain + "/login/device/code",
+			TokenURL:      "https://" + domain + "/login/oauth/access_token",
+		},
 	}
-
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	resp, err := client.Do(req)
+	oauthCtx := context.WithValue(ctx, oauth2.HTTPClient, p.client)
+	device, err := config.DeviceAuth(oauthCtx, oauth2.SetAuthURLParam("scope", "read:user"))
 	if err != nil {
-		return false, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("github device authorization: %w", err)
 	}
-	defer func() {
-		if closeErr := closeBody(resp); err == nil && closeErr != nil {
-			err = closeErr
-		}
-	}()
-
-	return resp.StatusCode == http.StatusOK, nil
-}
-
-// EnableAllGitHubCopilotModels enables all known GitHub Copilot models.
-// This is called after successful login to ensure all models are available.
-// The callback is called with (modelID, success) for each model.
-func EnableAllGitHubCopilotModels(ctx context.Context, token string, enterpriseDomain string, callback func(modelID string, success bool)) error {
-	// List of known GitHub Copilot models that may require policy acceptance
-	// This should be kept in sync with the model registry
-	copilotModels := []string{
-		"gpt-4o",
-		"gpt-4o-mini",
-		"claude-3-5-sonnet",
-		"claude-3-5-sonnet-latest",
-		"claude-3-5-haiku",
-		"claude-3-opus",
-		"claude-3-sonnet",
-		"o1",
-		"o1-mini",
-		"o1-preview",
-		"o3-mini",
-		"o3-mini-high",
-		"grok-2",
-		"grok-2-mini",
-		"grok-beta",
-		"grok-v1-beta",
+	// The verification URI is opened in a browser, so it must be a web URL.
+	if parsed, err := url.Parse(device.VerificationURI); err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return nil, errors.New("untrusted verification_uri in device code response")
 	}
-
-	// Enable models concurrently
-	type result struct {
-		modelID string
-		success bool
-		err     error
-	}
-
-	results := make(chan result, len(copilotModels))
-
-	for _, modelID := range copilotModels {
-		go func() {
-			success, err := EnableGitHubCopilotModel(ctx, token, modelID, enterpriseDomain)
-			results <- result{modelID: modelID, success: success, err: err}
-		}()
-	}
-
-	var lastErr error
-	for range copilotModels {
-		r := <-results
-		if r.err != nil && lastErr == nil {
-			lastErr = r.err
-		}
-		if callback != nil {
-			callback(r.modelID, r.success)
-		}
-	}
-
-	return lastErr
-}
-
-func (p *githubCopilotProvider) Login(ctx context.Context, callbacks LoginCallbacks) (creds *Credentials, err error) {
-	// For basic login without enterprise domain, delegate to LoginWithEnterpriseDomain with empty domain
-	return p.LoginWithEnterpriseDomain(ctx, callbacks, "", nil)
-}
-
-// LoginWithEnterpriseDomain runs the GitHub Copilot OAuth login flow with enterprise domain support.
-// If enterpriseDomain is empty, it uses github.com. After successful login, it enables all known models.
-func (p *githubCopilotProvider) LoginWithEnterpriseDomain(
-	ctx context.Context,
-	callbacks LoginCallbacks,
-	enterpriseDomain string,
-	onProgress func(modelID string, success bool),
-) (creds *Credentials, err error) {
-	// GitHub Device Flow doesn't use PKCE
-	server := newCallbackServer("github-copilot", p.callbackPort)
-	if err := server.Start(); err != nil {
-		return nil, fmt.Errorf("start callback server: %w", err)
-	}
-	defer func() {
-		if stopErr := server.Stop(); err == nil && stopErr != nil {
-			err = stopErr
-		}
-	}()
-
-	// Step 1: Request device code
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.authURL, strings.NewReader("client_id="+p.clientID+"&scope=read:user"))
+	callbacks.OnAuth(device.VerificationURI, "Enter code "+device.UserCode)
+	githubToken, err := p.pollDeviceToken(ctx, config.Endpoint.TokenURL, device)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request device code: %w", err)
-	}
-	defer func() {
-		if closeErr := closeBody(resp); err == nil && closeErr != nil {
-			err = closeErr
-		}
-	}()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	var deviceResp struct {
-		DeviceCode      string `json:"device_code"`
-		UserCode        string `json:"user_code"`
-		VerificationURI string `json:"verification_uri"`
-		Interval        int    `json:"interval"`
-	}
-	if err := json.Unmarshal(body, &deviceResp); err != nil {
-		return nil, fmt.Errorf("parse device response: %w", err)
-	}
-
-	// Show user code
-	callbacks.OnAuth(deviceResp.VerificationURI+"?input="+deviceResp.UserCode, "Enter this code: "+deviceResp.UserCode)
-
-	// Step 2: Poll for token
-	ticker := time.NewTicker(time.Duration(deviceResp.Interval) * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-			tokenResp, err := p.exchangeTokenWithEnterprise(ctx, deviceResp.DeviceCode, enterpriseDomain)
-			if err != nil {
-				if strings.Contains(err.Error(), "authorization_pending") {
-					continue
-				}
-
-				return nil, err
-			}
-
-			// Store enterprise domain in credentials
-			if enterpriseDomain != "" {
-				if tokenResp.Extra == nil {
-					tokenResp.Extra = make(map[string]any)
-				}
-				tokenResp.Extra["enterprise_url"] = enterpriseDomain
-			}
-
-			// Enable all known models
-			if onProgress != nil {
-				callbacks.OnProgress("Enabling models...")
-			}
-			if err := EnableAllGitHubCopilotModels(ctx, tokenResp.Access, enterpriseDomain, onProgress); err != nil {
-				// Log but don't fail - model enablement is best effort
-				callbacks.OnProgress(fmt.Sprintf("Warning: failed to enable some models: %v", err))
-			}
-
-			return tokenResp, nil
-		}
-	}
-}
-
-func (p *githubCopilotProvider) exchangeTokenWithEnterprise(ctx context.Context, deviceCode string, enterpriseDomain string) (*Credentials, error) {
-	body := "grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=" + deviceCode + "&client_id=" + p.clientID
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.tokenURL, strings.NewReader(body))
+	creds, err := p.copilotToken(ctx, githubToken, enterpriseDomain)
 	if err != nil {
 		return nil, err
 	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	resp, err := client.Do(req)
+	available, policy, err := p.copilotModels(ctx, creds.Access, enterpriseDomain, 2, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if closeErr := closeBody(resp); err == nil && closeErr != nil {
-			err = closeErr
+	if len(policy) > 0 {
+		callbacks.OnProgress("Enabling models...")
+		enabled, err := p.enableModels(ctx, creds.Access, enterpriseDomain, policy)
+		if err != nil {
+			return nil, err
 		}
-	}()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		for _, id := range enabled {
+			if !slices.Contains(available, id) {
+				available = append(available, id)
+			}
+		}
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange status: %d body: %s", resp.StatusCode, respBody)
-	}
-
-	var tokenResp struct {
-		AccessToken  string `json:"access_token"`
-		TokenType    string `json:"token_type"`
-		RefreshToken string `json:"refresh_token,omitempty"`
-		ExpiresIn    int    `json:"expires_in,omitempty"`
-		Scope        string `json:"scope,omitempty"`
-		ExpiresAt    int64  `json:"expires_at,omitempty"`
-	}
-	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
-		return nil, fmt.Errorf("parse token response: %w", err)
-	}
-
-	creds := &Credentials{
-		Access:  tokenResp.AccessToken,
-		Refresh: tokenResp.RefreshToken,
-		Expires: int64(tokenResp.ExpiresIn)*1000 - 5*60*1000,
-	}
-
+	creds.Extra[CopilotAvailableModelsKey] = available
 	return creds, nil
 }
 
+// pollDeviceToken polls for the GitHub access token as RFC 8628 describes,
+// following GitHub's interval on slow_down. GitHub reports pending and failed
+// authorizations as successful responses with an error field.
+func (p *githubCopilotProvider) pollDeviceToken(ctx context.Context, tokenURL string, device *oauth2.DeviceAuthResponse) (string, error) {
+	interval := 5 * time.Second
+	if device.Interval > 0 {
+		interval = time.Duration(device.Interval) * time.Second
+	}
+	headers := map[string]string{
+		"Accept":       "application/json",
+		"Content-Type": "application/x-www-form-urlencoded",
+		"User-Agent":   CopilotHeaders()["User-Agent"],
+	}
+	form := url.Values{
+		"client_id":   {copilotClientID},
+		"device_code": {device.DeviceCode},
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+	}.Encode()
+	var slowDowns int
+	for {
+		wait := interval
+		if !device.Expiry.IsZero() {
+			remaining := time.Until(device.Expiry)
+			if remaining <= 0 {
+				break
+			}
+			wait = min(wait, remaining)
+		}
+		if err := p.sleep(ctx, wait); err != nil {
+			return "", err
+		}
+		if !device.Expiry.IsZero() && !time.Now().Before(device.Expiry) {
+			break
+		}
+		resp, body, err := p.do(ctx, http.MethodPost, tokenURL, headers, form)
+		if err != nil {
+			return "", fmt.Errorf("github device token request: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return "", fmt.Errorf("github device token request: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		}
+		var raw struct {
+			AccessToken *string  `json:"access_token"`
+			Error       *string  `json:"error"`
+			Description string   `json:"error_description"`
+			Interval    *float64 `json:"interval"`
+		}
+		if err := json.Unmarshal(body, &raw); err != nil || (raw.AccessToken == nil && raw.Error == nil) {
+			return "", errors.New("invalid device token response")
+		}
+		if raw.AccessToken != nil {
+			return *raw.AccessToken, nil
+		}
+		switch *raw.Error {
+		case "authorization_pending":
+		case "slow_down":
+			slowDowns++
+			if raw.Interval != nil && *raw.Interval > 0 {
+				interval = max(time.Duration(*raw.Interval*float64(time.Second)), time.Second)
+			} else {
+				interval += 5 * time.Second
+			}
+		default:
+			if raw.Description != "" {
+				return "", fmt.Errorf("device flow failed: %s: %s", *raw.Error, raw.Description)
+			}
+			return "", fmt.Errorf("device flow failed: %s", *raw.Error)
+		}
+	}
+	if slowDowns > 0 {
+		return "", errors.New("device flow timed out after one or more slow_down responses; this is often caused by clock drift in WSL or VM environments, so sync or restart the VM clock and try again")
+	}
+	return "", errors.New("device flow timed out")
+}
+
+// RefreshToken exchanges the stored GitHub token for a new Copilot token and
+// records the models the account can currently use.
 func (p *githubCopilotProvider) RefreshToken(ctx context.Context, credentials *Credentials) (*Credentials, error) {
-	if credentials.Refresh == "" {
-		return nil, fmt.Errorf("missing refresh token")
+	if credentials == nil || credentials.Refresh == "" {
+		return nil, errors.New("missing refresh token")
 	}
-
-	// Get the Copilot token endpoint
-	copilotTokenURL := "https://api.individual.githubcopilot.com/copilot_internal/v2/token"
-	if credentials.Extra != nil {
-		if domain, ok := credentials.Extra["enterprise_url"].(string); ok && domain != "" {
-			copilotTokenURL = fmt.Sprintf("https://api.%s/copilot_internal/v2/token", normalizeDomain(domain))
-		}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotTokenURL, nil)
+	enterpriseDomain := copilotEnterpriseDomain(credentials)
+	creds, err := p.copilotToken(ctx, credentials.Refresh, enterpriseDomain)
 	if err != nil {
 		return nil, err
 	}
-
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", credentials.Refresh))
-	req.Header.Set("User-Agent", copilotUserAgent)
-	req.Header.Set("Editor-Version", copilotEditorVersion)
-	req.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
-	req.Header.Set("Copilot-Integration-Id", copilotIntegrationID)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	resp, err := client.Do(req)
+	available, _, err := p.copilotModels(ctx, creds.Access, enterpriseDomain, 0, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if closeErr := closeBody(resp); err == nil && closeErr != nil {
-			err = closeErr
-		}
-	}()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("refresh failed (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp struct {
-		Token     string `json:"token"`
-		ExpiresAt int    `json:"expires_at"`
-	}
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("parse refresh response: %w", err)
-	}
-
-	if tokenResp.Token == "" {
-		return nil, fmt.Errorf("refresh response missing token: %s", string(body))
-	}
-
-	// Calculate new expiration time, subtracting 5 minutes for safety margin
-	expires := int64(tokenResp.ExpiresAt)*1000 - 5*60*1000
-
-	return &Credentials{
-		Access:  tokenResp.Token,
-		Refresh: credentials.Refresh, // Keep original refresh token
-		Expires: expires,
-		Extra:   credentials.Extra,
-	}, nil
+	creds.Extra[CopilotAvailableModelsKey] = available
+	return creds, nil
 }
 
 func (p *githubCopilotProvider) GetAPIKey(credentials *Credentials) string {
 	return credentials.Access
+}
+
+// copilotToken exchanges a GitHub access token for a Copilot API token.
+func (p *githubCopilotProvider) copilotToken(ctx context.Context, githubToken, enterpriseDomain string) (*Credentials, error) {
+	domain := enterpriseDomain
+	if domain == "" {
+		domain = "github.com"
+	}
+	headers := CopilotHeaders()
+	headers["Accept"] = "application/json"
+	headers["Authorization"] = "Bearer " + githubToken
+	resp, body, err := p.do(ctx, http.MethodGet, "https://api."+domain+"/copilot_internal/v2/token", headers, "")
+	if err != nil {
+		return nil, fmt.Errorf("copilot token request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("copilot token request: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var raw struct {
+		Token     *string  `json:"token"`
+		ExpiresAt *float64 `json:"expires_at"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil || raw.Token == nil || raw.ExpiresAt == nil {
+		return nil, errors.New("invalid Copilot token response fields")
+	}
+	extra := map[string]any{}
+	if enterpriseDomain != "" {
+		extra[copilotEnterpriseKey] = enterpriseDomain
+	}
+	return &Credentials{
+		Refresh: githubToken,
+		Access:  *raw.Token,
+		Expires: int64(*raw.ExpiresAt*1000) - 5*60*1000,
+		Extra:   extra,
+	}, nil
+}
+
+// copilotModels lists the account's tool-capable models: those it can use now,
+// and shipped models whose policy still needs enabling.
+func (p *githubCopilotProvider) copilotModels(ctx context.Context, token, enterpriseDomain string, retries int, budget time.Duration) (available, policy []string, err error) {
+	baseURL := GetGitHubCopilotBaseURL(token, enterpriseDomain)
+	headers := CopilotHeaders()
+	headers["Accept"] = "application/json"
+	headers["Authorization"] = "Bearer " + token
+	headers["X-GitHub-Api-Version"] = copilotAPIVersion
+	resp, body, err := p.doRateLimited(ctx, http.MethodGet, baseURL+"/models", headers, "", retries, budget)
+	if err != nil {
+		return nil, nil, fmt.Errorf("copilot models request: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, nil, fmt.Errorf("copilot models request: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var catalog struct {
+		Data []struct {
+			ID           *string `json:"id"`
+			Picker       bool    `json:"model_picker_enabled"`
+			Capabilities struct {
+				Supports struct {
+					ToolCalls *bool `json:"tool_calls"`
+				} `json:"supports"`
+			} `json:"capabilities"`
+			Policy struct {
+				State string `json:"state"`
+			} `json:"policy"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &catalog); err != nil || catalog.Data == nil {
+		return nil, nil, errors.New("invalid Copilot models response")
+	}
+	type accountModel struct {
+		id, state string
+		picker    bool
+	}
+	var models []accountModel
+	for _, item := range catalog.Data {
+		if item.ID == nil || (item.Capabilities.Supports.ToolCalls != nil && !*item.Capabilities.Supports.ToolCalls) {
+			continue
+		}
+		models = append(models, accountModel{id: *item.ID, state: item.Policy.State, picker: item.Picker})
+	}
+	available = []string{}
+	for _, model := range models {
+		if model.picker && model.state != "disabled" {
+			available = append(available, model.id)
+		}
+	}
+	// Some Individual accounts report every picker flag false despite enabled
+	// policies; only that endpoint falls back to the policy state.
+	fallback := baseURL == copilotIndividual && len(available) == 0
+	if fallback {
+		for _, model := range models {
+			if model.state == "enabled" {
+				available = append(available, model.id)
+			}
+		}
+	}
+	for _, model := range models {
+		if model.state != "unconfigured" || (!model.picker && !fallback) {
+			continue
+		}
+		if _, err := airoot.GetModel(airoot.ProviderGitHubCopilot, model.id); err == nil {
+			policy = append(policy, model.id)
+		}
+	}
+	return available, policy, nil
+}
+
+// enableModels accepts each model's policy in turn and returns the ones that
+// succeeded. Policy updates are best effort; exhausted rate limiting stops the
+// batch.
+func (p *githubCopilotProvider) enableModels(ctx context.Context, token, enterpriseDomain string, ids []string) ([]string, error) {
+	baseURL := GetGitHubCopilotBaseURL(token, enterpriseDomain)
+	headers := CopilotHeaders()
+	headers["Content-Type"] = "application/json"
+	headers["Authorization"] = "Bearer " + token
+	headers["openai-intent"] = "chat-policy"
+	headers["x-interaction-type"] = "chat-policy"
+	var enabled []string
+	for _, id := range ids {
+		resp, _, err := p.doRateLimited(ctx, http.MethodPost, baseURL+"/models/"+url.PathEscape(id)+"/policy", headers, `{"state":"enabled"}`, 2, 5*time.Second)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			break
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			enabled = append(enabled, id)
+		}
+	}
+	return enabled, nil
+}
+
+// doRateLimited retries 429 responses within budget, honoring retry-after.
+// Each attempt has its own five-second limit.
+func (p *githubCopilotProvider) doRateLimited(ctx context.Context, method, target string, headers map[string]string, body string, retries int, budget time.Duration) (*http.Response, []byte, error) {
+	deadline := time.Now().Add(budget)
+	for retry := 0; ; retry++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		resp, data, err := p.do(attemptCtx, method, target, headers, body)
+		cancel()
+		if err != nil || resp.StatusCode != http.StatusTooManyRequests || retry >= retries || budget <= 0 {
+			return resp, data, err
+		}
+		delay := 500 * time.Millisecond << retry
+		if value := resp.Header.Get("Retry-After"); value != "" {
+			if seconds, err := strconv.ParseFloat(value, 64); err == nil {
+				delay = time.Duration(seconds * float64(time.Second))
+			} else if at, err := http.ParseTime(value); err == nil {
+				delay = time.Until(at)
+			} else {
+				return resp, data, nil
+			}
+		}
+		delay = max(delay, 0)
+		if delay >= time.Until(deadline) {
+			return resp, data, nil
+		}
+		if err := p.sleep(ctx, delay); err != nil {
+			return nil, nil, err
+		}
+	}
+}
+
+// do sends one request and reads its whole body, keeping close failures.
+func (p *githubCopilotProvider) do(ctx context.Context, method, target string, headers map[string]string, body string) (resp *http.Response, data []byte, err error) {
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	resp, err = p.client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if closeErr := closeBody(resp); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	data, err = io.ReadAll(resp.Body)
+	return resp, data, err
 }

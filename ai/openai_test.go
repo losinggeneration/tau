@@ -3,8 +3,14 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // zaiTestModel returns a model configured like the generated "zai/glm-5.2"
@@ -36,7 +42,7 @@ func opencodeGoKimiK26TestModel() *Model {
 		Compat: &CompatibilitySettings{
 			MaxTokensField:          "max_tokens",
 			ThinkingFormat:          ThinkingFormatDeepSeek,
-			SupportsReasoningEffort: false,
+			SupportsReasoningEffort: new(false),
 		},
 	}
 }
@@ -50,66 +56,31 @@ func newOpenAIClientForTest(t *testing.T, model *Model) *openAIClient {
 	return c
 }
 
-// TestOpenAIBuildRequestZAIDisablesThinkingWhenNoReasoning verifies that the
-// OpenAI-completions provider sends an explicit `enable_thinking: false` to
-// z.ai when no reasoning effort is requested. Without this, z.ai defaults to
-// thinking-on and GLM-5.x returns reasoning-only turns with empty visible
-// content — the "Empty response from the server" symptom. Mirrors pi-mono's
-// openai-completions provider behavior.
-func TestOpenAIBuildRequestZAIDisablesThinkingWhenNoReasoning(t *testing.T) {
+// TestOpenAIBuildRequestZAIThinkingObject verifies z.ai gets upstream's
+// thinking object: explicitly disabled with no reasoning (z.ai otherwise
+// thinks and GLM-5.x returns reasoning-only turns), and enabled without
+// clearing earlier thinking when a level is requested.
+func TestOpenAIBuildRequestZAIThinkingObject(t *testing.T) {
 	client := newOpenAIClientForTest(t, zaiTestModel())
-	reqBody, err := client.buildRequest(client.model, &Context{
-		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, &options{})
-	if err != nil {
-		t.Fatalf("buildRequest: %v", err)
-	}
-
-	var req map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
-		t.Fatalf("unmarshal request: %v", err)
-	}
-
-	raw, ok := req["enable_thinking"]
-	if !ok {
-		t.Fatalf("enable_thinking not set; want explicit false. body: %s", reqBody)
-	}
-	var got bool
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("enable_thinking not a bool: %v", err)
-	}
-	if got {
-		t.Fatalf("enable_thinking = true, want false (default thinking level is off)")
-	}
-}
-
-// TestOpenAIBuildRequestZAIEnablesThinkingWhenReasoningOn verifies the on path
-// still sends enable_thinking: true when a reasoning effort is requested.
-func TestOpenAIBuildRequestZAIEnablesThinkingWhenReasoningOn(t *testing.T) {
-	client := newOpenAIClientForTest(t, zaiTestModel())
-	o := options{reasoning: ReasoningHigh}
-	reqBody, err := client.buildRequest(client.model, &Context{
-		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, &o)
-	if err != nil {
-		t.Fatalf("buildRequest: %v", err)
-	}
-
-	var req map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
-		t.Fatalf("unmarshal request: %v", err)
-	}
-
-	raw, ok := req["enable_thinking"]
-	if !ok {
-		t.Fatalf("enable_thinking not set; want true. body: %s", reqBody)
-	}
-	var got bool
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("enable_thinking not a bool: %v", err)
-	}
-	if !got {
-		t.Fatalf("enable_thinking = false, want true (reasoning effort requested)")
+	for _, tc := range []struct {
+		reasoning ReasoningLevel
+		want      string
+	}{
+		{"", `{"type":"disabled"}`},
+		{ReasoningOff, `{"type":"disabled"}`},
+		{ReasoningHigh, `{"clear_thinking":false,"type":"enabled"}`},
+	} {
+		reqBody, err := client.buildRequest(client.model, &Context{Messages: []Message{{Role: "user", Content: "hi"}}}, &options{reasoning: tc.reasoning})
+		if err != nil {
+			t.Fatalf("buildRequest: %v", err)
+		}
+		var req map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
+			t.Fatalf("unmarshal request: %v", err)
+		}
+		if string(req["thinking"]) != tc.want || req["enable_thinking"] != nil {
+			t.Fatalf("reasoning %q body = %s, want thinking %s", tc.reasoning, reqBody, tc.want)
+		}
 	}
 }
 
@@ -446,10 +417,10 @@ func TestOpenAIBuildRequestOmitsSessionAffinityHeadersByDefault(t *testing.T) {
 		// The request body never contains these anyway; this is a header test.
 	}
 	// Inspect transport headers by simulating what openAIClient.Stream does:
-	// headers := sessionHeaders(&o) gated by model.GetCompat().SendSessionAffinityHeaders.
+	// headers := sessionHeaders(model, &o) gated by model.GetCompat().SendSessionAffinityHeaders.
 	gotHeaders := map[string]string{}
 	if model.GetCompat().SendSessionAffinityHeaders {
-		for k, v := range sessionHeaders(&o) {
+		for k, v := range sessionHeaders(model, &o) {
 			gotHeaders[k] = v
 		}
 	}
@@ -483,7 +454,7 @@ func TestOpenAIBuildRequestSendsSessionAffinityHeadersWhenEnabled(t *testing.T) 
 	if !model.GetCompat().SendSessionAffinityHeaders {
 		t.Fatal("SendSessionAffinityHeaders should be true")
 	}
-	hdrs := sessionHeaders(&o)
+	hdrs := sessionHeaders(&Model{}, &o)
 	if hdrs["session_id"] != "test-session-id" {
 		t.Fatalf("session_id header = %q, want %q", hdrs["session_id"], "test-session-id")
 	}
@@ -603,20 +574,17 @@ func TestBuildOpenAICompatRequestBodyUsesDeveloperRoleForReasoningModels(t *test
 		Provider:  ProviderOpenAI,
 		Reasoning: true,
 	}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		SystemPrompt: "You are helpful.",
 		Messages:     []Message{{Role: "user", Content: "hello"}},
-	}, &options{})
+	}, &options{}))
 
-	messages, ok := body["messages"].([]map[string]any)
-	if !ok {
-		t.Fatalf("messages type = %T", body["messages"])
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("messages = %v", body["messages"])
 	}
-	if len(messages) == 0 {
-		t.Fatal("no messages")
-	}
-	if messages[0]["role"] != "developer" {
-		t.Fatalf("first message role = %v, want developer", messages[0]["role"])
+	if messages[0].(map[string]any)["role"] != "developer" {
+		t.Fatalf("first message role = %v, want developer", messages[0].(map[string]any)["role"])
 	}
 }
 
@@ -626,20 +594,17 @@ func TestBuildOpenAICompatRequestBodyUsesSystemRoleForNonReasoningModels(t *test
 		API:      APIOpenAICompletions,
 		Provider: ProviderOpenAI,
 	}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		SystemPrompt: "You are helpful.",
 		Messages:     []Message{{Role: "user", Content: "hello"}},
-	}, &options{})
+	}, &options{}))
 
-	messages, ok := body["messages"].([]map[string]any)
-	if !ok {
-		t.Fatalf("messages type = %T", body["messages"])
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("messages = %v", body["messages"])
 	}
-	if len(messages) == 0 {
-		t.Fatal("no messages")
-	}
-	if messages[0]["role"] != "system" {
-		t.Fatalf("first message role = %v, want system", messages[0]["role"])
+	if messages[0].(map[string]any)["role"] != "system" {
+		t.Fatalf("first message role = %v, want system", messages[0].(map[string]any)["role"])
 	}
 }
 
@@ -647,9 +612,9 @@ func TestBuildOpenAICompatRequestBodyUsesSystemRoleForNonReasoningModels(t *test
 
 func TestBuildOpenAICompatRequestBodySetsStoreFalse(t *testing.T) {
 	model := &Model{ID: "gpt-4o", Provider: ProviderOpenAI}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, &options{})
+	}, &options{}))
 
 	store, ok := body["store"]
 	if !ok {
@@ -664,15 +629,15 @@ func TestBuildOpenAICompatRequestBodySetsStoreFalse(t *testing.T) {
 
 func TestBuildOpenAICompatRequestBodyIncludesStreamOptions(t *testing.T) {
 	model := &Model{ID: "gpt-4o", Provider: ProviderOpenAI}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, &options{})
+	}, &options{}))
 
-	so, ok := body["stream_options"].(map[string]bool)
+	so, ok := body["stream_options"].(map[string]any)
 	if !ok {
 		t.Fatalf("stream_options type = %T", body["stream_options"])
 	}
-	if !so["include_usage"] {
+	if so["include_usage"] != true {
 		t.Fatal("stream_options.include_usage = false, want true")
 	}
 }
@@ -681,14 +646,14 @@ func TestBuildOpenAICompatRequestBodyIncludesStreamOptions(t *testing.T) {
 
 func TestBuildOpenAICompatRequestBodyUsesMaxCompletionTokens(t *testing.T) {
 	model := &Model{ID: "gpt-4o", Provider: ProviderOpenAI}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, &options{maxTokens: 4096})
+	}, &options{maxTokens: 4096}))
 
 	if _, ok := body["max_completion_tokens"]; !ok {
 		t.Fatal("max_completion_tokens not set")
 	}
-	if body["max_completion_tokens"] != 4096 {
+	if body["max_completion_tokens"] != float64(4096) {
 		t.Fatalf("max_completion_tokens = %v, want 4096", body["max_completion_tokens"])
 	}
 	if _, ok := body["max_tokens"]; ok {
@@ -700,24 +665,21 @@ func TestBuildOpenAICompatRequestBodyUsesMaxCompletionTokens(t *testing.T) {
 
 func TestBuildOpenAICompatRequestBodySetsStrictFalseOnTools(t *testing.T) {
 	model := &Model{ID: "gpt-4o", Provider: ProviderOpenAI}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		Messages: []Message{{Role: "user", Content: "hi"}},
 		Tools: []Tool{{
 			Name:        "read",
 			Description: "Read a file",
 			Parameters:  json.RawMessage(`{"type":"object"}`),
 		}},
-	}, &options{})
+	}, &options{}))
 
-	tools, ok := body["tools"].([]map[string]any)
-	if !ok {
-		t.Fatalf("tools type = %T", body["tools"])
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		t.Fatalf("tools = %v", body["tools"])
 	}
-	if len(tools) == 0 {
-		t.Fatal("no tools")
-	}
-	if tools[0]["strict"] != false {
-		t.Fatalf("tools[0].strict = %v, want false", tools[0]["strict"])
+	if strict := tools[0].(map[string]any)["function"].(map[string]any)["strict"]; strict != false {
+		t.Fatalf("tools[0].function.strict = %v, want false", strict)
 	}
 }
 
@@ -892,20 +854,23 @@ func TestStreamOpenAICompatMapsUnknownFinishReasonToError(t *testing.T) {
 	}
 	stream := strings.NewReader(strings.Join(chunks, "\n"))
 
-	var doneEvents []Done
+	var errorEvents []StreamError
 	err := streamOpenAICompatResponse(context.Background(), &Model{ID: "gpt-4o", Provider: ProviderOpenAI}, stream, func(_ context.Context, event StreamEvent) {
-		if d, ok := event.(Done); ok {
-			doneEvents = append(doneEvents, d)
+		switch e := event.(type) {
+		case Done:
+			t.Fatalf("finish_reason error ended with Done: %+v", e)
+		case StreamError:
+			errorEvents = append(errorEvents, e)
 		}
 	}, ProviderOpenAI)
 	if err != nil {
 		t.Fatalf("streamOpenAICompatResponse: %v", err)
 	}
-	if len(doneEvents) == 0 {
-		t.Fatal("no Done event received")
+	if len(errorEvents) != 1 {
+		t.Fatalf("error events = %d, want 1", len(errorEvents))
 	}
 
-	msg := doneEvents[0].Message
+	msg := errorEvents[0].Msg
 	if msg.StopReason != StopReasonError {
 		t.Fatalf("stopReason = %v, want error", msg.StopReason)
 	}
@@ -989,14 +954,14 @@ func TestConvertMessagesForOpenAICompatConvertsThinkingToText(t *testing.T) {
 
 func TestBuildOpenAICompatRequestBodyForwardsToolChoice(t *testing.T) {
 	model := &Model{ID: "gpt-4o", Provider: ProviderOpenAI}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		Messages: []Message{{Role: "user", Content: "hi"}},
 		Tools: []Tool{{
 			Name:        "read",
 			Description: "Read",
 			Parameters:  json.RawMessage(`{"type":"object"}`),
 		}},
-	}, &options{toolChoice: "auto"})
+	}, &options{toolChoice: "auto"}))
 
 	if body["tool_choice"] != "auto" {
 		t.Fatalf("tool_choice = %v, want auto", body["tool_choice"])
@@ -1060,7 +1025,7 @@ func TestHasToolHistory(t *testing.T) {
 
 func TestBuildOpenAICompatRequestBodySendsEmptyToolsForToolHistory(t *testing.T) {
 	model := &Model{ID: "gpt-4o", Provider: ProviderOpenAI}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		Messages: []Message{
 			{Role: "assistant", Content: []ContentBlock{
 				{Type: ContentBlockToolCall, ID: "call_1", Name: "read", Arguments: json.RawMessage(`{}`)},
@@ -1068,7 +1033,7 @@ func TestBuildOpenAICompatRequestBodySendsEmptyToolsForToolHistory(t *testing.T)
 			{Role: "toolResult", ToolCallID: "call_1", Content: "result"},
 			{Role: "user", Content: "follow up"},
 		},
-	}, &options{})
+	}, &options{}))
 
 	tools, ok := body["tools"]
 	if !ok {
@@ -1115,34 +1080,6 @@ func TestParseOpenAICompatUsageWithDetailedTokens(t *testing.T) {
 	// output = completion_tokens + reasoning_tokens = 50 + 20 = 70
 	if usage.Output != 70 {
 		t.Fatalf("output = %d, want 70", usage.Output)
-	}
-}
-
-// --- P7-OC12: OpenRouter Anthropic cache_control ---
-
-func TestMaybeAddOpenRouterAnthropicCacheControl(t *testing.T) {
-	model := &Model{
-		ID:       "anthropic/claude-sonnet-4-20250514",
-		Provider: ProviderOpenRouter,
-	}
-	messages := []map[string]any{
-		{"role": "user", "content": "hello"},
-		{"role": "assistant", "content": "hi there"},
-	}
-
-	maybeAddOpenRouterAnthropicCacheControl(model, messages)
-
-	// The last user/assistant message should have cache_control
-	lastMsg := messages[len(messages)-1]
-	content, ok := lastMsg["content"].([]map[string]any)
-	if !ok {
-		t.Fatalf("content type = %T, expected to be converted to array", lastMsg["content"])
-	}
-	if len(content) == 0 {
-		t.Fatal("content array is empty")
-	}
-	if _, hasCC := content[0]["cache_control"]; !hasCC {
-		t.Fatal("cache_control not set on last text part")
 	}
 }
 
@@ -1213,19 +1150,19 @@ func TestBuildOpenAICompatRequestBodyOpenRouterProviderRouting(t *testing.T) {
 			},
 		},
 	}
-	body := buildOpenAICompatRequestBody(model, &Context{
+	body := requireBody(t)(buildOpenAICompatRequestBody(model, &Context{
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, &options{})
+	}, &options{}))
 
-	provider, ok := body["provider"].(*OpenRouterRouting)
+	provider, ok := body["provider"].(map[string]any)
 	if !ok {
-		t.Fatalf("provider type = %T, want *OpenRouterRouting", body["provider"])
+		t.Fatalf("provider type = %T", body["provider"])
 	}
-	if len(provider.Only) != 1 || provider.Only[0] != "anthropic" {
-		t.Fatalf("provider.Only = %v, want [anthropic]", provider.Only)
+	if only, _ := provider["only"].([]any); len(only) != 1 || only[0] != "anthropic" {
+		t.Fatalf("provider.only = %v, want [anthropic]", provider["only"])
 	}
-	if provider.AllowFallbacks == nil || *provider.AllowFallbacks {
-		t.Fatalf("provider.AllowFallbacks = %v, want false", provider.AllowFallbacks)
+	if provider["allow_fallbacks"] != false {
+		t.Fatalf("provider = %v, want allow_fallbacks false", provider)
 	}
 }
 
@@ -1351,7 +1288,7 @@ func TestOpenAIRequestHeadersSessionAffinityGating(t *testing.T) {
 		Provider: ProviderGroq,
 		Compat:   &CompatibilitySettings{SendSessionAffinityHeaders: false},
 	}
-	for k := range sessionHeaders(&o) {
+	for k := range sessionHeaders(optedOut, &o) {
 		if _, ok := openAIRequestHeaders(optedOut, &o)[k]; ok {
 			t.Errorf("header %q forwarded despite SendSessionAffinityHeaders=false", k)
 		}
@@ -1362,7 +1299,7 @@ func TestOpenAIRequestHeadersSessionAffinityGating(t *testing.T) {
 		Compat:   &CompatibilitySettings{SendSessionAffinityHeaders: true},
 	}
 	got := openAIRequestHeaders(optedIn, &o)
-	want := sessionHeaders(&o)
+	want := sessionHeaders(optedIn, &o)
 	if len(want) == 0 {
 		t.Skip("no session headers configured for this option set")
 	}
@@ -1831,7 +1768,7 @@ func TestConvertAssistantMessageForResponses(t *testing.T) {
 		},
 	}
 
-	result := convertAssistantMessageForResponses(model, msg, 0)
+	result := requireItems(t)(convertAssistantMessageForResponses(model, msg, 0, nil))
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message item, got %d", len(result))
 	}
@@ -1862,7 +1799,7 @@ func TestConvertAssistantMessageForResponsesPreservesTextSignaturePhaseAndLegacy
 			}},
 		}
 
-		result := convertAssistantMessageForResponses(model, msg, 2)
+		result := requireItems(t)(convertAssistantMessageForResponses(model, msg, 2, nil))
 		if got := result[0]["id"]; got != "msg_abc123" {
 			t.Fatalf("expected id msg_abc123, got %v", got)
 		}
@@ -1881,7 +1818,7 @@ func TestConvertAssistantMessageForResponsesPreservesTextSignaturePhaseAndLegacy
 			}},
 		}
 
-		result := convertAssistantMessageForResponses(model, msg, 3)
+		result := requireItems(t)(convertAssistantMessageForResponses(model, msg, 3, nil))
 		if got := result[0]["id"]; got != "legacy-msg-id" {
 			t.Fatalf("expected legacy id to round-trip, got %v", got)
 		}
@@ -1901,7 +1838,7 @@ func TestConvertAssistantMessageForResponsesPreservesTextSignaturePhaseAndLegacy
 			}},
 		}
 
-		result := convertAssistantMessageForResponses(model, msg, 4)
+		result := requireItems(t)(convertAssistantMessageForResponses(model, msg, 4, nil))
 		if len(result) != 1 {
 			t.Fatalf("expected 1 message item, got %d", len(result))
 		}
@@ -1928,7 +1865,7 @@ func TestConvertAssistantMessageForResponsesReplayFixturePreservesAndStripsIDs(t
 			{Type: ContentBlockToolCall, ID: "call_same|fc_same", Name: "lookup", Arguments: json.RawMessage(`{"q":"one"}`)},
 		},
 	}
-	items := convertAssistantMessageForResponses(model, sameModel, 7)
+	items := requireItems(t)(convertAssistantMessageForResponses(model, sameModel, 7, nil))
 	requireResponsesItem(t, items, "reasoning.encrypted", "rs_1")
 	message := requireResponsesItem(t, items, "message", "msg_same")
 	if got := message["phase"]; got != "final_answer" {
@@ -1941,7 +1878,7 @@ func TestConvertAssistantMessageForResponsesReplayFixturePreservesAndStripsIDs(t
 
 	differentModel := sameModel
 	differentModel.Model = "gpt-4.1"
-	items = convertAssistantMessageForResponses(model, differentModel, 8)
+	items = requireItems(t)(convertAssistantMessageForResponses(model, differentModel, 8, nil))
 	tool = requireResponsesItem(t, items, "function_call", "")
 	if _, ok := tool["id"]; ok {
 		t.Fatalf("different-model replay should strip function_call item id, got %v", tool["id"])
@@ -2066,7 +2003,7 @@ func TestBuildCodexRequestBodyOmitsRestoredToolResultWithEmptyCallID(t *testing.
 		},
 	}
 
-	body := buildCodexRequestBody(model, prompt, &options{})
+	body := requireBody(t)(buildCodexRequestBody(model, prompt, &options{}))
 	input := body["input"].([]map[string]any)
 	for i, item := range input {
 		if item["type"] != "function_call_output" {
@@ -2909,7 +2846,7 @@ data: {"type":"response.completed","response":{"id":"resp_abc123","status":"comp
 // TestProcessResponsesStreamIncompleteStatus tests incomplete status mapping.
 func TestProcessResponsesStreamIncompleteStatus(t *testing.T) {
 	sseData := `data: {"type":"response.created","response":{"id":"resp_abc123"}}
-data: {"type":"response.completed","response":{"id":"resp_abc123","status":"incomplete","incomplete_details":{"reason":"max_tokens reached"}}}
+data: {"type":"response.completed","response":{"id":"resp_abc123","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}
 `
 
 	reader := newResponsesStreamReader(strings.NewReader(sseData))
@@ -3130,22 +3067,25 @@ func TestToolCallID(t *testing.T) {
 // TestMapResponsesStopReason tests stop reason mapping.
 func TestMapResponsesStopReason(t *testing.T) {
 	tests := []struct {
-		status   string
-		expected StopReason
+		status, reason string
+		expected       StopReason
+		message        string
 	}{
-		{"completed", StopReasonStop},
-		{"incomplete", StopReasonLength},
-		{"failed", StopReasonError},
-		{"cancelled", StopReasonAborted},
-		{"in_progress", StopReasonStop},
-		{"queued", StopReasonStop},
-		{"unknown", StopReasonStop},
+		{status: "completed", expected: StopReasonStop},
+		{status: "incomplete", reason: "max_output_tokens", expected: StopReasonLength},
+		{status: "incomplete", reason: "content_filter", expected: StopReasonError, message: "Response incomplete: content_filter"},
+		{status: "incomplete", expected: StopReasonError, message: "Response incomplete without a provider reason"},
+		{status: "failed", expected: StopReasonError},
+		{status: "cancelled", expected: StopReasonError},
+		{status: "in_progress", expected: StopReasonStop},
+		{status: "queued", expected: StopReasonStop},
+		{status: "", expected: StopReasonStop},
 	}
 
 	for _, tt := range tests {
-		result := mapResponsesStopReason(tt.status)
-		if result != tt.expected {
-			t.Errorf("mapResponsesStopReason(%q) = %q, expected %q", tt.status, result, tt.expected)
+		result, message := mapResponsesStopReason(tt.status, tt.reason)
+		if result != tt.expected || message != tt.message {
+			t.Errorf("mapResponsesStopReason(%q, %q) = %q %q, expected %q %q", tt.status, tt.reason, result, message, tt.expected, tt.message)
 		}
 	}
 }
@@ -3203,5 +3143,563 @@ func TestHasToolCalls(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("hasToolCalls() = %v, expected %v", result, tt.expected)
 		}
+	}
+}
+
+func TestOpenAISamplingPrecedence(t *testing.T) {
+	model := &Model{ID: "test", Reasoning: true, SamplingParams: map[string]any{"temperature": 0.2, "top_p": 0.3, "min_p": 0.05}, SamplingParamsByThinkingLevel: map[string]map[string]any{"off": {"temperature": 0.7}, "high": {"top_k": 20}}}
+	body := func(opts ...Option) map[string]any {
+		t.Helper()
+		request, err := buildOpenAIChatCompletionsRequest(model, &Context{}, applyOptions(opts))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	// Sampling parameters land after the named fields, so they win over the
+	// request temperature, and unmodeled keys pass through.
+	got := body(WithTemperature(0.9))
+	if got["temperature"] != 0.7 || got["top_p"] != 0.3 || got["min_p"] != 0.05 || got["top_k"] != nil {
+		t.Fatalf("off-level sampling = %v", got)
+	}
+	got = body(WithReasoning(ReasoningHigh), WithSamplingParams(map[string]any{"temperature": 0.1, "repetition_penalty": 1.1}))
+	if got["temperature"] != 0.1 || got["top_k"] != float64(20) || got["repetition_penalty"] != 1.1 {
+		t.Fatalf("request sampling = %v", got)
+	}
+	request, err := buildOpenAIChatCompletionsRequest(model, &Context{}, applyOptions([]Option{WithSamplingParams(map[string]any{"top_k": 5})}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapped := requireBody(t)(openAIRequestToMap(request)); mapped["top_k"] != float64(5) {
+		t.Fatalf("map body = %v", mapped)
+	}
+}
+
+func TestOpenAICompletionToolStrictPreference(t *testing.T) {
+	disabled := &Model{ID: "test", API: APIOpenAICompletions, Provider: ProviderOpenAI, Compat: &CompatibilitySettings{SupportsStrictMode: new(false)}}
+	tool := Tool{Name: "lookup", Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`), ConstrainedSampling: json.RawMessage(`{"type":"json_schema","strict":"prefer"}`)}
+	body, err := newOpenAIClientForTest(t, disabled).buildRequest(disabled, &Context{Tools: []Tool{tool}}, &options{})
+	if err != nil || strings.Contains(body, `"strict"`) {
+		t.Fatalf("catalog-disabled strict mode sent strict: %v %s", err, body)
+	}
+	tool.ConstrainedSampling = json.RawMessage(`{"type":"json_schema","strict":"require"}`)
+	if _, err := newOpenAIClientForTest(t, disabled).buildRequest(disabled, &Context{Tools: []Tool{tool}}, &options{}); err == nil {
+		t.Fatal("required strict sampling accepted where the catalog disables strict mode")
+	}
+	for _, supported := range []*bool{nil, new(true)} {
+		model := &Model{ID: "test", API: APIOpenAICompletions, Provider: ProviderOpenAI, Compat: &CompatibilitySettings{SupportsStrictMode: supported}}
+		for _, mode := range []string{"prefer", "require"} {
+			client := newOpenAIClientForTest(t, model)
+			body, err := client.buildRequest(model, &Context{Tools: []Tool{{Name: "lookup", Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`), ConstrainedSampling: json.RawMessage(`{"type":"json_schema","strict":"` + mode + `"}`)}}}, &options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var request struct {
+				Tools []struct {
+					Function struct {
+						Strict     bool           `json:"strict"`
+						Parameters map[string]any `json:"parameters"`
+					} `json:"function"`
+				} `json:"tools"`
+			}
+			if err := json.Unmarshal([]byte(body), &request); err != nil {
+				t.Fatal(err)
+			}
+			if !request.Tools[0].Function.Strict {
+				t.Fatalf("%s strict=false", mode)
+			}
+		}
+	}
+}
+
+func TestAzureChatCompletionsResolveEndpointAndDeployment(t *testing.T) {
+	var path, sentModel string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		sentModel = body.Model
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+	t.Setenv("AZURE_OPENAI_BASE_URL", "")
+	t.Setenv("AZURE_OPENAI_RESOURCE_NAME", "")
+	t.Setenv("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "deepseek-v4-pro=my-deepseek")
+	model := &Model{ID: "deepseek-v4-pro", API: APIOpenAICompletions, Provider: "azure"}
+	client, err := GetClient(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Stream(t.Context(), model, &Context{Messages: []Message{{Role: "user", Content: "hi"}}}, func(context.Context, StreamEvent) {}); err == nil || !strings.Contains(err.Error(), "missing endpoint") {
+		t.Fatalf("unconfigured endpoint error = %v", err)
+	}
+	t.Setenv("AZURE_OPENAI_BASE_URL", server.URL+"/openai/v1")
+	message, err := client.Complete(t.Context(), model, &Context{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/openai/v1/chat/completions" || sentModel != "my-deepseek" || message.Model != "deepseek-v4-pro" {
+		t.Fatalf("path=%q model=%q message=%+v", path, sentModel, message)
+	}
+	path = ""
+	configured := &Model{ID: "deepseek-v4-pro", API: APIOpenAICompletions, Provider: "azure", BaseURL: "http://127.0.0.1:1/unused"}
+	client, err = GetClient(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Complete(t.Context(), configured, &Context{Messages: []Message{{Role: "user", Content: "hi"}}}); err != nil || path != "/openai/v1/chat/completions" {
+		t.Fatalf("environment endpoint did not override the model base URL: path=%q err=%v", path, err)
+	}
+}
+
+func TestOpenAICompletionsTerminalOutcomesMatchUpstream(t *testing.T) {
+	chunk := func(delta, finish string) string {
+		reason := "null"
+		if finish != "" {
+			reason = `"` + finish + `"`
+		}
+		return `data: {"id":"c1","choices":[{"index":0,"delta":` + delta + `,"finish_reason":` + reason + `}]}`
+	}
+	text := chunk(`{"content":"hi"}`, "")
+	tool := chunk(`{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]}`, "")
+	for _, tc := range []struct {
+		name, want string
+		lines      []string
+		noFinish   bool
+		cancel     bool
+		reason     StopReason
+	}{
+		{name: "ok", lines: []string{text, chunk(`{}`, "stop")}, reason: StopReasonStop},
+		{name: "missing finish", lines: []string{text}, reason: StopReasonError, want: "stream ended without finish_reason"},
+		{name: "content filter", lines: []string{text, chunk(`{}`, "content_filter")}, reason: StopReasonError, want: "Provider finish_reason: content_filter"},
+		{name: "unsupported finish stop", lines: []string{text}, noFinish: true, reason: StopReasonStop},
+		{name: "unsupported finish tool", lines: []string{tool}, noFinish: true, reason: StopReasonToolUse},
+		{name: "canceled", lines: []string{text, chunk(`{}`, "stop")}, cancel: true, reason: StopReasonAborted, want: "request was aborted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := &Model{ID: "m", API: APIOpenAICompletions, Provider: "custom"}
+			if tc.noFinish {
+				model.Compat = &CompatibilitySettings{SupportsFinishReason: new(false)}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			var terminal []StreamEvent
+			err := streamOpenAIResponse(ctx, model, strings.NewReader(strings.Join(append(tc.lines, "data: [DONE]"), "\n\n")+"\n\n"), func(_ context.Context, ev StreamEvent) {
+				switch ev.(type) {
+				case Done, StreamError:
+					terminal = append(terminal, ev)
+				}
+			})
+			if err != nil {
+				t.Fatalf("stream: %v", err)
+			}
+			if len(terminal) != 1 {
+				t.Fatalf("terminal = %#v", terminal)
+			}
+			switch e := terminal[0].(type) {
+			case Done:
+				if tc.want != "" || e.Reason != tc.reason {
+					t.Fatalf("done %s, want %s %q", e.Reason, tc.reason, tc.want)
+				}
+			case StreamError:
+				if tc.want == "" || e.Msg.StopReason != tc.reason || !strings.Contains(e.Msg.ErrorMessage, tc.want) {
+					t.Fatalf("error %s %q, want %s %q", e.Msg.StopReason, e.Msg.ErrorMessage, tc.reason, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAICompletionsThinkingFormatsMatchUpstream(t *testing.T) {
+	str := func(value string) *string { return &value }
+	tests := []struct {
+		name      string
+		compat    *CompatibilitySettings
+		levels    map[string]*string
+		reasoning ReasoningLevel
+		maxTokens int
+		want      map[string]string
+	}{
+		{name: "together on", compat: &CompatibilitySettings{ThinkingFormat: "together", SupportsReasoningEffort: new(true)}, reasoning: ReasoningHigh, want: map[string]string{"reasoning": `{"enabled":true}`, "reasoning_effort": `"high"`}},
+		{name: "together off", compat: &CompatibilitySettings{ThinkingFormat: "together"}, reasoning: ReasoningOff, want: map[string]string{"reasoning": `{"enabled":false}`}},
+		{
+			name: "baseten vars", compat: &CompatibilitySettings{ThinkingFormat: "baseten", SupportsReasoningEffort: new(true), ChatTemplateArgs: json.RawMessage(`{"enable_thinking":{"$var":"thinking.enabled"},"effort":{"$var":"thinking.effort","omitWhenOff":true},"budget":{"$var":"thinking.budget"},"fixed":1}`)},
+			levels: map[string]*string{"low": str("light")}, reasoning: ReasoningLow, maxTokens: 3000,
+			want: map[string]string{"chat_template_args": `{"budget":1976,"effort":"light","enable_thinking":true,"fixed":1}`, "reasoning_effort": `"light"`},
+		},
+		{
+			name: "baseten off", compat: &CompatibilitySettings{ThinkingFormat: "baseten", SupportsReasoningEffort: new(true), ChatTemplateArgs: json.RawMessage(`{"enable_thinking":{"$var":"thinking.enabled"},"effort":{"$var":"thinking.effort","omitWhenOff":true}}`)},
+			levels: map[string]*string{"off": str("none")}, reasoning: ReasoningOff,
+			want: map[string]string{"chat_template_args": `{"enable_thinking":false}`, "reasoning_effort": `"none"`},
+		},
+		{name: "chat template budget field", compat: &CompatibilitySettings{ThinkingFormat: "chat-template", ThinkingTokenBudgetField: "thinking_budget_tokens", ChatTemplateKwargs: json.RawMessage(`{"reasoning":{"$var":"thinking.enabled"}}`)}, reasoning: ReasoningMedium, want: map[string]string{"chat_template_kwargs": `{"reasoning":true}`, "thinking_budget_tokens": "8192"}},
+		{name: "ant-ling unmapped", compat: &CompatibilitySettings{ThinkingFormat: "ant-ling"}, reasoning: ReasoningHigh, want: map[string]string{"reasoning": ""}},
+		{name: "ant-ling mapped", compat: &CompatibilitySettings{ThinkingFormat: "ant-ling"}, levels: map[string]*string{"high": str("deep")}, reasoning: ReasoningHigh, want: map[string]string{"reasoning": `{"effort":"deep"}`}},
+		{name: "string thinking off", compat: &CompatibilitySettings{ThinkingFormat: "string-thinking"}, reasoning: ReasoningOff, want: map[string]string{"thinking": `"none"`}},
+		{name: "openrouter mapped off", compat: &CompatibilitySettings{ThinkingFormat: "openrouter"}, levels: map[string]*string{"off": str("minimal")}, want: map[string]string{"reasoning": `{"effort":"minimal"}`}},
+		{name: "deepseek unsupported off", compat: &CompatibilitySettings{ThinkingFormat: "deepseek"}, levels: map[string]*string{"off": nil}, reasoning: ReasoningOff, want: map[string]string{"thinking": ""}},
+		{name: "openai off value", compat: &CompatibilitySettings{SupportsReasoningEffort: new(true)}, levels: map[string]*string{"off": str("none")}, reasoning: ReasoningOff, want: map[string]string{"reasoning_effort": `"none"`}},
+		{name: "openai clamps to supported level", compat: &CompatibilitySettings{SupportsReasoningEffort: new(true)}, levels: map[string]*string{"minimal": nil}, reasoning: ReasoningMinimal, want: map[string]string{"reasoning_effort": `"low"`}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			model := &Model{ID: "m", Provider: "custom", API: APIOpenAICompletions, BaseURL: "https://example.com/v1", Reasoning: true, MaxTokens: 32000, Compat: tc.compat, ThinkingLevelMap: tc.levels}
+			o := &options{reasoning: tc.reasoning, maxTokens: tc.maxTokens}
+			body, err := newOpenAIClientForTest(t, model).buildRequest(model, &Context{}, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(body), &fields); err != nil {
+				t.Fatal(err)
+			}
+			for field, want := range tc.want {
+				if string(fields[field]) != want {
+					t.Errorf("%s = %s, want %q in %s", field, fields[field], want, body)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAICompletionsReplaysThinkingInItsStreamedField(t *testing.T) {
+	model := &Model{ID: "local", API: APIOpenAICompletions, Provider: "custom", BaseURL: "http://localhost:8080/v1", Reasoning: true}
+	stream := "data: {\"choices\":[{\"delta\":{\"reasoning\":\"step one\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n"
+	var done *Done
+	if err := streamOpenAIResponse(context.Background(), model, strings.NewReader(stream), func(_ context.Context, event StreamEvent) {
+		if d, ok := event.(Done); ok {
+			done = &d
+		}
+	}); err != nil || done == nil {
+		t.Fatalf("stream: %v %v", err, done)
+	}
+	if done.Message.Content[0].ThoughtSignature != "reasoning" {
+		t.Fatalf("thinking block = %+v, want the reasoning field recorded", done.Message.Content[0])
+	}
+
+	reply := Message{Role: "assistant", Provider: model.Provider, Model: model.ID, API: model.API, Content: done.Message.Content}
+	body, err := newOpenAIClientForTest(t, model).buildRequest(model, &Context{Messages: []Message{{Role: "user", Content: "q"}, reply}}, &options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `"content":"answer","reasoning":"step one"`) {
+		t.Fatalf("replay = %s, want the answer as content and thinking under reasoning", body)
+	}
+
+	deepseek := &Model{ID: "deepseek-reasoner", API: APIOpenAICompletions, Provider: ProviderDeepSeek, BaseURL: "https://api.deepseek.com", Reasoning: true}
+	body, err = newOpenAIClientForTest(t, deepseek).buildRequest(deepseek, &Context{Messages: []Message{{Role: "user", Content: "q"}, {Role: "assistant", Provider: ProviderDeepSeek, Model: "deepseek-reasoner", API: APIOpenAICompletions, Content: []ContentBlock{{Type: ContentBlockText, Text: "a"}}}}}, &options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `"content":"a","reasoning_content":""`) {
+		t.Fatalf("deepseek replay = %s, want an empty reasoning_content", body)
+	}
+}
+
+func TestOpenAICompletionsGrammarToolsMatchUpstream(t *testing.T) {
+	code := Tool{Name: "code", Description: "run", Parameters: json.RawMessage(`{"type":"object","properties":{"source":{"type":"string"}},"required":["source"]}`), ConstrainedSampling: json.RawMessage(`{"type":"grammar","variants":{"openai_regex":"x+"}}`)}
+	prompt := &Context{Tools: []Tool{code}, Messages: []Message{
+		{Role: "user", Content: "go"},
+		{Role: "assistant", Content: []ContentBlock{{Type: ContentBlockToolCall, ID: "call_1", Name: "code", Arguments: json.RawMessage(`{"source":"xx"}`)}}},
+		{Role: "toolResult", ToolCallID: "call_1", ToolName: "code", Content: []ContentBlock{{Type: ContentBlockText, Text: "ok"}}},
+	}}
+	model := &Model{ID: "gpt", API: APIOpenAICompletions, Provider: ProviderOpenAI, Compat: &CompatibilitySettings{SupportsOpenAIGrammarTools: true}}
+	body, err := newOpenAIClientForTest(t, model).buildRequest(model, prompt, &options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Tools    []map[string]any `json:"tools"`
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &request); err != nil {
+		t.Fatal(err)
+	}
+	wantTool := map[string]any{"type": "custom", "custom": map[string]any{"name": "code", "description": "run", "format": map[string]any{"type": "grammar", "grammar": map[string]any{"syntax": "regex", "definition": "x+"}}}}
+	if !reflect.DeepEqual(request.Tools[0], wantTool) {
+		t.Fatalf("tool = %v", request.Tools[0])
+	}
+	wantCall := []any{map[string]any{"id": "call_1", "type": "custom", "custom": map[string]any{"name": "code", "input": "xx"}}}
+	if !reflect.DeepEqual(request.Messages[1]["tool_calls"], wantCall) {
+		t.Fatalf("replayed call = %v", request.Messages[1]["tool_calls"])
+	}
+
+	plain := &Model{ID: "gpt", API: APIOpenAICompletions, Provider: ProviderOpenAI}
+	body, err = newOpenAIClientForTest(t, plain).buildRequest(plain, prompt, &options{})
+	if err != nil || !strings.Contains(body, `"type":"function"`) || strings.Contains(body, `"custom"`) {
+		t.Fatalf("grammar tool without grammar support = %s, %v", body, err)
+	}
+
+	stream := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"custom","custom":{"name":"code","input":"x"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"custom":{"input":"\"y"}}]}}]}`,
+		`data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}`,
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	var (
+		deltas strings.Builder
+		done   *Done
+	)
+	err = streamOpenAIResponseWithAPI(t.Context(), model, strings.NewReader(stream), func(_ context.Context, event StreamEvent) {
+		switch e := event.(type) {
+		case ToolCallDelta:
+			deltas.WriteString(e.Delta)
+		case Done:
+			done = &e
+		}
+	}, map[string]string{"code": "source"}, model.API, model.Provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"source":"x\"y"}`
+	if deltas.String() != want || done == nil || string(done.Message.Content[0].Arguments) != want || done.Message.Content[0].Name != "code" {
+		t.Fatalf("deltas = %s, done = %+v", deltas.String(), done)
+	}
+}
+
+func TestOpenAISharedThinkingBudgets(t *testing.T) {
+	model := &Model{ID: "local", Reasoning: true, MaxTokens: 16000}
+	for _, tc := range []struct {
+		level ReasoningLevel
+		want  int
+	}{{ReasoningLow, 0}, {ReasoningXHigh, 3000}, {ReasoningMax, 3000}, {ReasoningOff, 0}} {
+		t.Run(string(tc.level), func(t *testing.T) {
+			opts := applyOptions([]Option{WithReasoning(tc.level), WithThinkingBudgets(&ThinkingBudgets{Low: new(0), High: new(3000)})})
+			effort := string(tc.level)
+			if tc.level == ReasoningOff {
+				effort = ""
+			}
+			if got := openAIThinkingBudget(&openAIRequest{MaxTokens: 8000}, model, opts, effort); got != tc.want {
+				t.Fatalf("budget=%d want=%d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOpenAISharedThinkingBudgetRequest(t *testing.T) {
+	model := &Model{ID: "local", Reasoning: true, MaxTokens: 16000, Compat: &CompatibilitySettings{SupportsThinkingTokenBudget: true}}
+	for _, tc := range []struct {
+		name  string
+		extra []Option
+		want  int
+	}{
+		{"shared", nil, 3000},
+		{"answer room", []Option{WithMaxTokens(2000)}, 976},
+		{"token override", []Option{WithThinkingBudgetTokens(1000)}, 1000},
+		{"off", []Option{WithReasoning(ReasoningOff)}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := []Option{WithReasoning(ReasoningHigh), WithThinkingBudgets(&ThinkingBudgets{High: new(3000)})}
+			body, err := (&openAIClient{}).buildRequest(model, &Context{}, applyOptions(append(opts, tc.extra...)))
+			require.NoError(t, err)
+			var req struct {
+				Budget int `json:"thinking_token_budget"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(body), &req))
+			require.Equal(t, tc.want, req.Budget)
+		})
+	}
+}
+
+func TestCompletionsPromptCachePolicy(t *testing.T) {
+	for _, client := range []string{"direct", "compatible"} {
+		for _, scenario := range []struct {
+			name, baseURL, provider, retention, env, session, key, ttl string
+			long                                                       *bool
+		}{
+			{name: "default short", baseURL: "https://api.openai.com/v1", session: "session", key: "session"},
+			{name: "provider default endpoint", session: "session", key: "session"},
+			{name: "long", baseURL: "https://api.openai.com/v1", retention: "long", session: "session", key: "session", ttl: "24h"},
+			{name: "none", baseURL: "https://api.openai.com/v1", retention: "none", env: "long", session: "session"},
+			{name: "environment", baseURL: "https://api.openai.com/v1", env: "long", session: "session", key: "session", ttl: "24h"},
+			{name: "explicit short overrides environment", baseURL: "https://api.openai.com/v1", env: "long", retention: "short", session: "session", key: "session"},
+			{name: "proxy rejects long", baseURL: "https://proxy.example/v1", long: new(false), retention: "long", session: "session"},
+			{name: "proxy accepts long", baseURL: "https://proxy.example/v1", long: new(true), retention: "long", session: "session", key: "session", ttl: "24h"},
+			{name: "proxy short", baseURL: "https://proxy.example/v1", long: new(true), retention: "short", session: "session"},
+			{name: "no session", baseURL: "https://api.openai.com/v1", retention: "long", ttl: "24h"},
+			{name: "unicode key", baseURL: "https://api.openai.com/v1", session: strings.Repeat("界", 65), key: strings.Repeat("界", 64)},
+			{name: "unsupported detected provider", baseURL: "https://api.together.xyz/v1", provider: ProviderTogether, retention: "long", session: "session"},
+		} {
+			t.Run(client+"/"+scenario.name, func(t *testing.T) {
+				t.Setenv("PI_CACHE_RETENTION", scenario.env)
+				model := &Model{ID: "model", API: APIOpenAICompletions, Provider: ProviderOpenAI, BaseURL: scenario.baseURL, Compat: &CompatibilitySettings{SupportsLongCacheRetention: scenario.long}}
+				if scenario.provider != "" {
+					model.Provider = scenario.provider
+				}
+				prompt := &Context{Messages: []Message{{Role: "user", Content: "hello"}}}
+				o := applyOptions([]Option{WithCacheRetention(scenario.retention), WithSessionID(scenario.session)})
+				var body map[string]any
+				if client == "direct" {
+					encoded, err := (&openAIClient{}).buildRequest(model, prompt, o)
+					require.NoError(t, err)
+					require.NoError(t, json.Unmarshal([]byte(encoded), &body))
+				} else {
+					var err error
+					body, err = buildOpenAICompatRequestBody(model, prompt, o)
+					require.NoError(t, err)
+				}
+				if scenario.key == "" {
+					require.NotContains(t, body, "prompt_cache_key")
+				} else {
+					require.Equal(t, scenario.key, body["prompt_cache_key"])
+				}
+				if scenario.ttl == "" {
+					require.NotContains(t, body, "prompt_cache_retention")
+				} else {
+					require.Equal(t, scenario.ttl, body["prompt_cache_retention"])
+				}
+				if model.GetCompat().SupportsStore {
+					require.Equal(t, false, body["store"])
+				} else {
+					require.NotContains(t, body, "store")
+				}
+			})
+		}
+	}
+}
+
+func TestCompletionsCacheMarkersFollowFinalRequest(t *testing.T) {
+	for _, scenario := range []struct {
+		name, provider, id, format, retention, env, ttl, tail string
+		long                                                  *bool
+		marked                                                bool
+	}{
+		{name: "detected OpenRouter", provider: ProviderOpenRouter, id: "anthropic/model", marked: true},
+		{name: "disabled OpenRouter", provider: ProviderOpenRouter, id: "anthropic/model", retention: "none"},
+		{name: "custom format", format: "anthropic", marked: true},
+		{name: "unknown format", format: "other"},
+		{name: "explicit format disables detection", provider: ProviderOpenRouter, id: "anthropic/model", format: "none"},
+		{name: "long markers", format: "anthropic", retention: "long", marked: true, ttl: "1h"},
+		{name: "environment markers", format: "anthropic", env: "long", marked: true, ttl: "1h"},
+		{name: "unsupported long markers", format: "anthropic", retention: "long", long: new(false), marked: true},
+		{name: "tool result", format: "anthropic", tail: "tool", marked: true},
+		{name: "image tail", format: "anthropic", tail: "image", marked: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Setenv("PI_CACHE_RETENTION", scenario.env)
+			model := &Model{ID: scenario.id, API: APIOpenAICompletions, Provider: scenario.provider, BaseURL: "https://proxy.example/v1", Input: []InputType{InputText, InputImage}, Compat: &CompatibilitySettings{CacheControlFormat: scenario.format, SupportsLongCacheRetention: scenario.long}}
+			prompt := &Context{SystemPrompt: "policy", Messages: []Message{{Role: "user", Content: "hello"}}, Tools: []Tool{{Name: "first", Parameters: json.RawMessage(`{"type":"object"}`)}, {Name: "last", Parameters: json.RawMessage(`{"type":"object"}`)}}}
+			if scenario.tail == "tool" {
+				prompt.Messages = append(prompt.Messages, Message{Role: "assistant", API: model.API, Provider: model.Provider, Model: model.ID, Content: []ContentBlock{{Type: ContentBlockToolCall, ID: "call", Name: "last", Arguments: json.RawMessage(`{}`)}}}, Message{Role: "toolResult", ToolCallID: "call", ToolName: "last", Content: []ContentBlock{{Type: ContentBlockText, Text: "done"}}})
+			}
+			if scenario.tail == "image" {
+				prompt.Messages = append(prompt.Messages, Message{Role: "user", Content: []ContentBlock{{Type: ContentBlockImage, MimeType: "image/png", Data: "AA=="}}})
+			}
+			before, err := json.Marshal(prompt)
+			require.NoError(t, err)
+			body, err := buildOpenAICompatRequestBody(model, prompt, applyOptions([]Option{WithCacheRetention(scenario.retention)}))
+			require.NoError(t, err)
+			after, err := json.Marshal(prompt)
+			require.NoError(t, err)
+			require.Equal(t, string(before), string(after))
+			messages := body["messages"].([]any)
+			tools := body["tools"].([]any)
+			marker := map[string]any{"type": "ephemeral"}
+			if scenario.ttl != "" {
+				marker["ttl"] = scenario.ttl
+			}
+			last := len(messages) - 1
+			if scenario.tail == "image" {
+				last--
+			}
+			if scenario.marked {
+				require.IsType(t, []any{}, messages[0].(map[string]any)["content"])
+				require.Equal(t, marker, messages[0].(map[string]any)["content"].([]any)[0].(map[string]any)["cache_control"])
+				require.Equal(t, marker, tools[1].(map[string]any)["cache_control"])
+				require.IsType(t, []any{}, messages[last].(map[string]any)["content"])
+				require.Equal(t, marker, messages[last].(map[string]any)["content"].([]any)[0].(map[string]any)["cache_control"])
+				if scenario.tail == "tool" {
+					require.Equal(t, "hello", messages[1].(map[string]any)["content"])
+				}
+			} else {
+				encoded, err := json.Marshal(body)
+				require.NoError(t, err)
+				require.NotContains(t, string(encoded), "cache_control")
+			}
+			require.NotContains(t, tools[0].(map[string]any), "cache_control")
+		})
+	}
+}
+
+func TestCompletionsCachePolicyReachesStreamTransport(t *testing.T) {
+	for _, api := range []string{APIOpenAICompletions, APIOpenAICompatible} {
+		for _, retention := range []string{"none", "long"} {
+			t.Run(api+"/"+retention, func(t *testing.T) {
+				t.Setenv("PI_CACHE_RETENTION", "long")
+				var requests, callbacks, done int
+				original := http.DefaultClient
+				t.Cleanup(func() { http.DefaultClient = original })
+				http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					requests++
+					require.Equal(t, "/v1/chat/completions", req.URL.Path)
+					var body map[string]any
+					require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
+					require.Equal(t, false, body["store"])
+					if retention == "long" {
+						require.Equal(t, "session", body["prompt_cache_key"])
+						require.Equal(t, "24h", body["prompt_cache_retention"])
+						require.Equal(t, "1h", body["tools"].([]any)[0].(map[string]any)["cache_control"].(map[string]any)["ttl"])
+					} else {
+						require.NotContains(t, body, "prompt_cache_key")
+						require.NotContains(t, body, "prompt_cache_retention")
+						require.NotContains(t, body["tools"].([]any)[0].(map[string]any), "cache_control")
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))}, nil
+				})}
+				model := &Model{ID: "custom", API: api, Provider: ProviderOpenAI, BaseURL: "https://api.openai.com/v1", Compat: &CompatibilitySettings{CacheControlFormat: "anthropic"}}
+				var client Client
+				if api == APIOpenAICompletions {
+					var err error
+					client, err = newOpenAIClient(model)
+					require.NoError(t, err)
+				} else {
+					client = &openAICompatClient{model: model}
+				}
+				err := client.Stream(t.Context(), model, &Context{SystemPrompt: "policy", Messages: []Message{{Role: "user", Content: "hi"}}, Tools: []Tool{{Name: "read", Parameters: json.RawMessage(`{"type":"object"}`)}}}, func(_ context.Context, event StreamEvent) {
+					if _, ok := event.(Done); ok {
+						done++
+					}
+				}, WithAPIKey("test-key"), WithSessionID("session"), WithCacheRetention(retention), WithPayloadCallback(func(payload any) any {
+					callbacks++
+					encoded, err := json.Marshal(payload)
+					require.NoError(t, err)
+					if retention == "none" {
+						require.NotContains(t, string(encoded), "cache_control")
+					} else {
+						require.Contains(t, string(encoded), "cache_control")
+					}
+					return nil
+				}))
+				require.NoError(t, err)
+				require.Equal(t, 1, requests)
+				require.Equal(t, 1, callbacks)
+				require.Equal(t, 1, done)
+			})
+		}
+	}
+}
+
+func TestClampOpenAIPromptCacheKey(t *testing.T) {
+	for _, key := range []string{"", "session", strings.Repeat("界", 64), strings.Repeat("界", 63) + "😀z", strings.Repeat("e\u0301", 33)} {
+		chars := []rune(key)
+		want := string(chars[:min(len(chars), 64)])
+		require.Equal(t, want, clampOpenAIPromptCacheKey(key))
 	}
 }

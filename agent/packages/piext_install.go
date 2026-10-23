@@ -188,7 +188,7 @@ func (m *InstallManager) installPiDeps(ctx context.Context, dir string, peerDeps
 	}
 	args := []string{"install", "--omit=dev", "--prefix", dir}
 	args = append(args, peerDeps...)
-	cmd := exec.CommandContext(ctx, "npm", args...)
+	cmd := npmCommand(ctx, m.NPMCommand, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -201,7 +201,7 @@ func (m *InstallManager) npmPackPackage(ctx context.Context, spec, dst string) (
 	if m.npmPack != nil {
 		return m.npmPack(ctx, spec, dst)
 	}
-	cmd := exec.CommandContext(ctx, "npm", "pack", spec, "--pack-destination", dst)
+	cmd := npmCommand(ctx, m.NPMCommand, "pack", spec, "--pack-destination", dst)
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {

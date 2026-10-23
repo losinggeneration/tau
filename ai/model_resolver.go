@@ -2,7 +2,6 @@ package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 )
 
@@ -241,78 +240,4 @@ func RestoreModelFromSession(
 		Model:           ModelSpec{},
 		FallbackMessage: msg,
 	}
-}
-
-// ResolveModelScope resolves model patterns with optional glob support.
-// Patterns may include glob characters (*, ?, [abc]) for matching multiple models.
-// Supports optional thinking level suffix: "pattern:level".
-func ResolveModelScope(patterns []string, candidates []ModelSpec) []ScopedModel {
-	if len(patterns) == 0 {
-		return nil
-	}
-
-	var scopedModels []ScopedModel
-	seen := make(map[string]bool)
-
-	for _, pattern := range patterns {
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" {
-			continue
-		}
-
-		// Check if pattern contains glob characters
-		hasGlob := strings.ContainsAny(pattern, "*?[") && !strings.Contains(pattern, "/")
-
-		if hasGlob {
-			// Extract optional thinking level suffix
-			var globPattern string
-			var thinkingLevel string
-
-			colonIdx := strings.LastIndex(pattern, ":")
-			if colonIdx != -1 {
-				suffix := pattern[colonIdx+1:]
-				if IsValidThinkingLevel(suffix) {
-					thinkingLevel = suffix
-					globPattern = pattern[:colonIdx]
-				} else {
-					globPattern = pattern
-				}
-			} else {
-				globPattern = pattern
-			}
-
-			// Match against provider/model format OR just model ID
-			patternLower := strings.ToLower(globPattern)
-			for _, spec := range candidates {
-				fullID := strings.ToLower(spec.Provider + "/" + spec.Model)
-				modelID := strings.ToLower(spec.Model)
-
-				if globMatch(patternLower, fullID) || globMatch(patternLower, modelID) {
-					key := spec.String()
-					if !seen[key] {
-						seen[key] = true
-						scopedModels = append(scopedModels, ScopedModel{
-							Model:         spec,
-							ThinkingLevel: thinkingLevel,
-						})
-					}
-				}
-			}
-		} else {
-			// Non-glob pattern: use ParseModelPattern for thinking level extraction
-			result := ParseModelPattern(pattern, candidates, false)
-			if result.Spec.Model != "" {
-				key := result.Spec.String()
-				if !seen[key] {
-					seen[key] = true
-					scopedModels = append(scopedModels, ScopedModel{
-						Model:         result.Spec,
-						ThinkingLevel: result.ThinkingLevel,
-					})
-				}
-			}
-		}
-	}
-
-	return scopedModels
 }

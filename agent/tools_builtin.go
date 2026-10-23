@@ -382,7 +382,9 @@ type ToolConfig struct {
 	BashTempFile bool
 }
 
-func (c ToolConfig) bashOps() BashOperations {
+// BashOperations returns the configured shell backend, or a DefaultBashOps
+// built from the shell settings.
+func (c ToolConfig) BashOperations() BashOperations {
 	if c.BashOps != nil {
 		return c.BashOps
 	}
@@ -636,6 +638,16 @@ func ReadTool(cfg ToolConfig) Tool {
 							displayDims = fmt.Sprintf("%dx%d", r.NewW, r.NewH)
 						}
 						resizeNote = r.Note
+					}
+					if ctx.Model != nil && ctx.Model.InputLimits != nil && ctx.Model.InputLimits.Images != nil {
+						block, err := ResizeImageBlock(ai.ContentBlock{Type: ai.ContentBlockImage, Data: base64.StdEncoding.EncodeToString(imageData), MimeType: mimeType}, ctx.Model.InputLimits.Images.Resize)
+						if err != nil {
+							return &ToolResult{Content: err.Error(), IsError: true}, nil
+						}
+						imageData, err = base64.StdEncoding.DecodeString(block.Data)
+						if err != nil {
+							return nil, fmt.Errorf("decode resized image: %w", err)
+						}
 					}
 					encoded := base64.StdEncoding.EncodeToString(imageData)
 					content := resizeNote
@@ -1088,7 +1100,8 @@ type BashToolConfig struct {
 	EnvExtra map[string]string
 }
 
-func prefixBashCommand(prefix, command string) string {
+// PrefixBashCommand applies the configured shell prefix once.
+func PrefixBashCommand(prefix, command string) string {
 	if prefix == "" || strings.HasPrefix(command, prefix) {
 		return command
 	}
@@ -1101,7 +1114,7 @@ func bashResultIsError(res BashResult) bool {
 
 // BashTool returns a tool for executing shell commands.
 func BashTool(cfg ToolConfig) Tool {
-	ops := cfg.bashOps()
+	ops := cfg.BashOperations()
 	_ = cfg.bashTempFile() // ensure config is consulted
 	return Tool{
 		Name:        "bash",
@@ -1133,7 +1146,7 @@ func BashTool(cfg ToolConfig) Tool {
 			if !ok {
 				return nil, ErrCommandMustBeString
 			}
-			command = prefixBashCommand(cfg.CommandPrefix, command)
+			command = PrefixBashCommand(cfg.CommandPrefix, command)
 
 			cmdCtx := ctx.Context
 			if cmdCtx == nil {
@@ -1161,6 +1174,9 @@ func BashTool(cfg ToolConfig) Tool {
 				Command: command,
 				Dir:     dir,
 				Timeout: timeout,
+			}
+			if ctx.OnUpdate != nil {
+				req.OnOutput = func(chunk string) { ctx.OnUpdate(&ToolResult{Content: chunk}) }
 			}
 
 			res, runErr := ops.Run(cmdCtx, req)

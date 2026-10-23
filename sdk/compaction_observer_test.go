@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -116,4 +117,49 @@ func TestCompactionWithoutAnObserver(t *testing.T) {
 	before := calls
 	require.NoError(t, sess.Compact(testContext(t)))
 	assert.Equal(t, before, calls, "cleared observer still received events")
+}
+
+// A compaction that fails after compaction_start must still raise
+// compaction_end, or a frontend keeps its compaction indicator forever.
+func TestCompactionEndReportsAbortAfterStart(t *testing.T) {
+	sess := compactionObserverSession(t)
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
+
+	var seen []Event
+	sess.(EventObserver).SetEventObserver(func(e Event) {
+		seen = append(seen, e)
+		if e.Type == "compaction_start" {
+			cancel()
+		}
+	})
+	require.ErrorIs(t, sess.Compact(ctx), context.Canceled)
+
+	require.Len(t, seen, 2)
+	assert.Equal(t, "compaction_end", seen[1].Type)
+	payload := seen[1].Payload.(map[string]any)
+	assert.Equal(t, true, payload["aborted"])
+	assert.Equal(t, "manual", payload["reason"])
+	assert.NotContains(t, payload, "summary")
+}
+
+func TestAutomaticCompactionFailuresNameTheirTrigger(t *testing.T) {
+	for reason, prefix := range map[string]string{
+		compactionReasonThreshold: "Auto-compaction failed: ",
+		compactionReasonOverflow:  "Context overflow recovery failed: ",
+		compactionReasonManual:    "",
+	} {
+		s := compactionObserverSession(t).(*agentSession)
+		s.settings = &ai.Settings{Compaction: ai.CompactionSettings{KeepRecentTokens: -1}}
+		var payload map[string]any
+		s.SetEventObserver(func(e Event) {
+			if e.Type == "compaction_end" {
+				payload = e.Payload.(map[string]any)
+			}
+		})
+		require.Error(t, s.compact(testContext(t), compactionTrigger{reason: reason}, ""))
+		require.NotNil(t, payload, reason)
+		assert.Equal(t, prefix+"compaction token settings must be non-negative", payload["error_message"], reason)
+		assert.Equal(t, false, payload["will_retry"], reason)
+	}
 }

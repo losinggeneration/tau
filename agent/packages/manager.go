@@ -36,6 +36,8 @@ func (e ErrAlreadyInstalled) Error() string {
 type Manager struct {
 	userDir    string
 	projectDir string
+	// NPMCommand replaces the npm executable when removing npm packages.
+	NPMCommand []string
 }
 
 // NewManager returns a Manager that installs packages into userDir and
@@ -161,6 +163,7 @@ func (m *Manager) Uninstall(ctx context.Context, name string, scope Scope) error
 	if sidecar != nil && strings.HasPrefix(sidecar.Source, "npm:") {
 		// This is an npm package - use InstallManager for npm uninstall
 		installMgr := NewInstallManager(m.userDir, m.projectDir)
+		installMgr.NPMCommand = m.NPMCommand
 		return installMgr.UninstallFromNPM(ctx, name, scope)
 	}
 

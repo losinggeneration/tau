@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -342,7 +344,7 @@ func TestToolConfigOutputCapPlumbed(t *testing.T) {
 	cfg := ToolConfig{
 		BashOutputCap: 50,
 	}
-	ops := cfg.bashOps()
+	ops := cfg.BashOperations()
 	// ops is *DefaultBashOps; check OutputCap field
 	dops, ok := ops.(*DefaultBashOps)
 	if !ok {
@@ -357,7 +359,7 @@ func TestToolConfigBashShellPlumbed(t *testing.T) {
 	cfg := ToolConfig{
 		BashShell: "/bin/bash",
 	}
-	ops := cfg.bashOps()
+	ops := cfg.BashOperations()
 	dops, ok := ops.(*DefaultBashOps)
 	if !ok {
 		t.Fatalf("expected *DefaultBashOps, got %T", ops)
@@ -371,7 +373,7 @@ func TestToolConfigEnvAllowlistPlumbed(t *testing.T) {
 	cfg := ToolConfig{
 		BashEnvAllowlist: []string{"PATH"},
 	}
-	ops := cfg.bashOps()
+	ops := cfg.BashOperations()
 	dops, ok := ops.(*DefaultBashOps)
 	if !ok {
 		t.Fatalf("expected *DefaultBashOps, got %T", ops)
@@ -385,7 +387,7 @@ func TestToolConfigEnvExtraPlumbed(t *testing.T) {
 	cfg := ToolConfig{
 		BashEnvExtra: map[string]string{"TEST_KEY": "TEST_VAL"},
 	}
-	ops := cfg.bashOps()
+	ops := cfg.BashOperations()
 	dops, ok := ops.(*DefaultBashOps)
 	if !ok {
 		t.Fatalf("expected *DefaultBashOps, got %T", ops)
@@ -417,7 +419,7 @@ func TestToolConfigBashDurationsPlumbed(t *testing.T) {
 		BashStreamWindow: 250 * time.Millisecond,
 		BashKillGrace:    3 * time.Second,
 	}
-	ops := cfg.bashOps()
+	ops := cfg.BashOperations()
 	dops, ok := ops.(*DefaultBashOps)
 	if !ok {
 		t.Fatalf("expected *DefaultBashOps, got %T", ops)
@@ -509,5 +511,89 @@ func TestDefaultBashOpsRunSanitizesOutput(t *testing.T) {
 	}
 	if strings.Contains(result.Output, "\r") {
 		t.Errorf("carriage return leaked through: %q", result.Output)
+	}
+}
+
+func TestTerminateBashProcessEscalatesAndJoins(t *testing.T) {
+	done := make(chan struct{})
+	var signals []syscall.Signal
+	err := terminateBashProcess(done, time.Millisecond, func(signal syscall.Signal) error {
+		signals = append(signals, signal)
+		if signal == syscall.SIGKILL {
+			close(done)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 2 || signals[0] != syscall.SIGTERM || signals[1] != syscall.SIGKILL {
+		t.Fatalf("signals=%v", signals)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("returned before process settled")
+	}
+}
+
+func TestTerminateBashProcessRetainsSignalErrors(t *testing.T) {
+	done := make(chan struct{})
+	failure := errors.New("terminate failed")
+	err := terminateBashProcess(done, time.Millisecond, func(signal syscall.Signal) error {
+		if signal == syscall.SIGTERM {
+			return failure
+		}
+		close(done)
+		return nil
+	})
+	if !errors.Is(err, failure) {
+		t.Fatalf("lost signal error: %v", err)
+	}
+}
+
+func TestCancelledDefaultBashDoesNotStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	ops := NewDefaultBashOps()
+	ops.Shell = "/nonexistent/tau-shell"
+	result, err := ops.Run(ctx, BashRequest{Command: "unsafe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CancelReason != BashCancelReload || result.Output != "" {
+		t.Fatalf("cancelled command attempted startup: %+v", result)
+	}
+}
+
+type streamingBashOps struct{}
+
+func (streamingBashOps) Run(_ context.Context, req BashRequest) (BashResult, error) {
+	for _, chunk := range []string{"\x1b[3", "1mred", "\n"} {
+		req.OnOutput(chunk)
+	}
+	return BashResult{Output: "red\n"}, nil
+}
+
+func TestBashOutputStreamsBeforeResult(t *testing.T) {
+	var streamed []string
+	buffer := &streamingBuffer{onOutput: func(chunk string) { streamed = append(streamed, chunk) }}
+	for _, chunk := range []string{"a", "b\n"} {
+		if _, err := buffer.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if buffer.buf.String() != "ab\n" || strings.Join(streamed, "|") != "a|b\n" {
+		t.Fatalf("buffer=%q streamed=%q", buffer.buf.String(), streamed)
+	}
+
+	var updates []string
+	tool := BashTool(ToolConfig{BashOps: streamingBashOps{}})
+	result, err := tool.Execute(ToolContext{Context: t.Context(), Args: map[string]any{"command": "x"}, OnUpdate: func(partial *ToolResult) { updates = append(updates, partial.Content) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(updates, "") != "\x1b[31mred\n" || len(updates) != 3 || result.Content != "red\n" {
+		t.Fatalf("updates=%q result=%q", updates, result.Content)
 	}
 }

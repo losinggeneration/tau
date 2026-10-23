@@ -61,3 +61,5 @@ export type { SessionGetLabelRequest as SessionGetLabelRequestP } from "./genera
 export type { SessionGetLabelResponse__Output as SessionGetLabelResponseP } from "./generated/plugins/SessionGetLabelResponse.ts";
 export type { SessionSendUserMessageRequest as SessionSendUserMessageRequestP } from "./generated/plugins/SessionSendUserMessageRequest.ts";
 export type { SessionSendUserMessageResponse__Output as SessionSendUserMessageResponseP } from "./generated/plugins/SessionSendUserMessageResponse.ts";
+export type { ModelRouteRequest__Output as ModelRouteRequestP } from "./generated/plugins/ModelRouteRequest.ts";
+export type { ModelRouteResponse as ModelRouteResponseP } from "./generated/plugins/ModelRouteResponse.ts";

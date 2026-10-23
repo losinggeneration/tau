@@ -3,6 +3,7 @@ package artifacts
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -245,5 +246,26 @@ func TestSplitPatterns(t *testing.T) {
 	}
 	if len(patterns) != 3 {
 		t.Errorf("expected 3 pattern entries, got %d", len(patterns))
+	}
+}
+
+func TestApplyFilterExpandsHomeAfterModifiers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	a := filepath.Join(home, "skills", "a", "SKILL.md")
+	b := filepath.Join(home, "skills", "b", "SKILL.md")
+	other := filepath.Join(t.TempDir(), "other.md")
+	for _, tc := range []struct {
+		patterns []string
+		want     []string
+	}{
+		{[]string{"~/skills/*"}, []string{a, b}},
+		{[]string{"!~/skills/*"}, []string{other}},
+		{[]string{"!~/skills/*", "+~/skills/a"}, []string{other, a}},
+		{[]string{"!~/skills/*", "+~/skills/a", "-~/skills/a"}, []string{other}},
+	} {
+		if got := ApplyFilter([]string{a, b, other}, tc.patterns, t.TempDir()); !slices.Equal(got, tc.want) {
+			t.Errorf("ApplyFilter(%v) = %v, want %v", tc.patterns, got, tc.want)
+		}
 	}
 }

@@ -644,7 +644,7 @@ func TestClaudeAgentProviderRegistration(t *testing.T) {
 	if mirrored.API != APIClaudeAgent || mirrored.Provider != ProviderClaudeAgent {
 		t.Fatalf("mirrored model = %s/%s via %s", mirrored.Provider, mirrored.ID, mirrored.API)
 	}
-	if mirrored.Cost != (CostProfile{}) {
+	if !reflect.DeepEqual(mirrored.Cost, CostProfile{}) {
 		t.Fatalf("mirrored model cost = %#v, want zero", mirrored.Cost)
 	}
 }

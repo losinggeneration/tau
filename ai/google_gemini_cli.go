@@ -25,7 +25,7 @@ const (
 	antigravityAutopushEndpoint = "https://autopush-cloudcode-pa.sandbox.googleapis.com"
 
 	// Retry configuration
-	maxRetries               = 3
+	defaultGeminiCLIRetries  = 3
 	baseDelayMs              = 1000
 	maxEmptyStreamRetries    = 2
 	emptyStreamBaseDelayMs   = 500
@@ -47,16 +47,6 @@ const (
 )
 
 // googleGeminiCLIOptions extends the standard options with Gemini CLI-specific fields.
-type googleGeminiCLIOptions struct {
-	thinking *geminiThinkingConfig
-}
-
-type geminiThinkingConfig struct {
-	enabled      bool
-	budgetTokens int
-	level        GoogleThinkingLevel
-}
-
 // GeminiCLICredentials represents the JSON-encoded API key format for Gemini CLI.
 type GeminiCLICredentials struct {
 	Token     string `json:"token"`
@@ -99,7 +89,7 @@ type generationConfig struct {
 
 type thinkingConfig struct {
 	IncludeThoughts bool                `json:"includeThoughts,omitempty"`
-	ThinkingBudget  int                 `json:"thinkingBudget,omitempty"`
+	ThinkingBudget  *int                `json:"thinkingBudget,omitempty"`
 	ThinkingLevel   GoogleThinkingLevel `json:"thinkingLevel,omitempty"`
 }
 
@@ -184,6 +174,16 @@ func (c *googleGeminiCLIClient) Complete(ctx context.Context, model *Model, prom
 
 // Stream implements Client.
 func (c *googleGeminiCLIClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) error {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	cfg := applyOptions(opts)
 
 	// Parse OAuth credentials from apiKey (JSON-encoded: {token, projectId})
@@ -218,16 +218,10 @@ func (c *googleGeminiCLIClient) Stream(ctx context.Context, model *Model, prompt
 		endpoints = []string{defaultGeminiCLIEndpoint}
 	}
 
-	// Build request
-	geminiOpts := &googleGeminiCLIOptions{}
-	if cfg.thinkingEnabled || cfg.thinkingBudgetTokens > 0 || cfg.reasoning != ReasoningOff {
-		geminiOpts.thinking = &geminiThinkingConfig{
-			enabled:      true,
-			budgetTokens: cfg.thinkingBudgetTokens,
-		}
+	requestBody, err := buildGeminiCLIRequest(model, prompt, creds.ProjectID, isAntigravity, cfg)
+	if err != nil {
+		return err
 	}
-
-	requestBody := buildGeminiCLIRequest(model, prompt, creds.ProjectID, geminiOpts, isAntigravity, cfg)
 
 	// Allow payload callback to modify request
 	if hasPayloadCallback(cfg) {
@@ -252,7 +246,15 @@ func (c *googleGeminiCLIClient) Stream(ctx context.Context, model *Model, prompt
 	var requestURL string
 	endpointIndex := 0
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	retries := defaultGeminiCLIRetries
+	if cfg.maxRetries != nil {
+		retries = *cfg.maxRetries
+	}
+	maxDelay := cfg.maxRetryDelayMs
+	if !cfg.maxRetryDelaySet {
+		maxDelay = 60000
+	}
+	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -269,22 +271,38 @@ func (c *googleGeminiCLIClient) Stream(ctx context.Context, model *Model, prompt
 			req.Header.Set(k, v)
 		}
 
+		requestCtx, cancel := context.WithCancelCause(ctx)
+		req = req.WithContext(requestCtx)
+		headerTimeout := fmt.Errorf("google gemini cli: response headers timed out: %w", context.DeadlineExceeded)
+		var timer *time.Timer
+		if cfg.timeout > 0 {
+			timer = time.AfterFunc(cfg.timeout, func() { cancel(headerTimeout) })
+		}
 		resp, err := http.DefaultClient.Do(req)
+		if timer != nil {
+			timer.Stop()
+		}
 		if err != nil {
+			if errors.Is(context.Cause(requestCtx), headerTimeout) {
+				err = headerTimeout
+			}
+			cancel(nil)
 			lastErr = fmt.Errorf("google gemini cli: request failed: %w", err)
-			if attempt < maxRetries {
-				delayMs := baseDelayMs * int(math.Pow(2, float64(attempt)))
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(time.Duration(delayMs) * time.Millisecond):
-					continue
-				}
+			if ctx.Err() != nil {
+				return fmt.Errorf("google gemini cli: request: %w", ctx.Err())
+			}
+			if attempt >= retries {
+				return lastErr
+			}
+			delay := time.Duration(baseDelayMs*(1<<min(attempt, 4))) * time.Millisecond
+			if err := sleepWithContext(ctx, delay); err != nil {
+				return fmt.Errorf("google gemini cli: retry: %w", err)
 			}
 			continue
 		}
 
 		if resp.StatusCode == http.StatusOK {
+			defer cancel(nil)
 			response = resp
 			break
 		}
@@ -298,11 +316,15 @@ func (c *googleGeminiCLIClient) Stream(ctx context.Context, model *Model, prompt
 				readErr = fmt.Errorf("close error body: %w", closeErr)
 			}
 		}
+		cancel(nil)
 		if readErr != nil {
-			lastErr = fmt.Errorf("google gemini cli: API error (%d): %w", resp.StatusCode, readErr)
-			continue
+			return fmt.Errorf("google gemini cli: API error (%d): %w", resp.StatusCode, readErr)
 		}
 		errorText := string(body)
+		lastErr = fmt.Errorf("google gemini cli: API error (%d): %s", resp.StatusCode, extractErrorMessage(errorText))
+		if attempt >= retries {
+			return lastErr
+		}
 
 		// On 403/404, cascade to next endpoint immediately
 		if (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound) && endpointIndex < len(endpoints)-1 {
@@ -311,7 +333,7 @@ func (c *googleGeminiCLIClient) Stream(ctx context.Context, model *Model, prompt
 		}
 
 		// Check if retryable
-		if attempt < maxRetries && isRetryableError(resp.StatusCode, errorText) {
+		if isRetryableError(resp.StatusCode, errorText) {
 			if endpointIndex < len(endpoints)-1 {
 				endpointIndex++
 			}
@@ -321,32 +343,22 @@ func (c *googleGeminiCLIClient) Stream(ctx context.Context, model *Model, prompt
 			if serverDelay > 0 {
 				delayMs = serverDelay
 			} else {
-				delayMs = baseDelayMs * int(math.Pow(2, float64(attempt)))
+				delayMs = baseDelayMs * (1 << min(attempt, 4))
 			}
 
 			// Check max retry delay
-			if cfg.maxRetryDelayMs > 0 && serverDelay > cfg.maxRetryDelayMs {
+			if maxDelay > 0 && serverDelay > maxDelay {
 				delaySeconds := int(math.Ceil(float64(serverDelay) / 1000))
-				maxDelaySeconds := int(math.Ceil(float64(cfg.maxRetryDelayMs) / 1000))
+				maxDelaySeconds := int(math.Ceil(float64(maxDelay) / 1000))
 				return fmt.Errorf("google gemini cli: server requested %ds retry delay (max: %ds): %s", delaySeconds, maxDelaySeconds, extractErrorMessage(errorText))
 			}
 
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Duration(delayMs) * time.Millisecond):
-				continue
+			if err := sleepWithContext(ctx, time.Duration(delayMs)*time.Millisecond); err != nil {
+				return fmt.Errorf("google gemini cli: retry: %w", err)
 			}
+			continue
 		}
 
-		lastErr = fmt.Errorf("google gemini cli: API error (%d): %s", resp.StatusCode, extractErrorMessage(errorText))
-
-		if resp.StatusCode == http.StatusOK {
-			break
-		}
-	}
-
-	if response == nil || response.StatusCode != http.StatusOK {
 		return lastErr
 	}
 
@@ -398,7 +410,7 @@ func buildGeminiCLIHeaders(isAntigravity bool, model *Model, cfg *options) map[s
 }
 
 // buildGeminiCLIRequest builds the Cloud Code Assist request body.
-func buildGeminiCLIRequest(model *Model, prompt *Context, projectID string, opts *googleGeminiCLIOptions, isAntigravity bool, cfg *options) *CloudCodeAssistRequest {
+func buildGeminiCLIRequest(model *Model, prompt *Context, projectID string, isAntigravity bool, cfg *options) (*CloudCodeAssistRequest, error) {
 	// Apply TransformContext for cross-provider compatibility
 	transformedPrompt := prompt
 	if transformed, err := TransformContext(prompt, model, nil); err == nil {
@@ -416,22 +428,14 @@ func buildGeminiCLIRequest(model *Model, prompt *Context, projectID string, opts
 		genConfig.MaxOutputTokens = &maxTokens
 	}
 
-	// Build thinking config
-	if model.Reasoning {
-		if opts.thinking != nil && opts.thinking.enabled {
-			genConfig.ThinkingConfig = &thinkingConfig{
-				IncludeThoughts: true,
-			}
-			if cfg.googleThinkingLevel != "" {
-				genConfig.ThinkingConfig.ThinkingLevel = cfg.googleThinkingLevel
-			} else if opts.thinking.level != "" {
-				genConfig.ThinkingConfig.ThinkingLevel = opts.thinking.level
-			} else if opts.thinking.budgetTokens > 0 {
-				genConfig.ThinkingConfig.ThinkingBudget = opts.thinking.budgetTokens
-			}
-		} else if opts.thinking != nil && !opts.thinking.enabled {
-			// Disable thinking for reasoning models
-			genConfig.ThinkingConfig = getDisabledThinkingConfig(model.ID)
+	thinking, ok, err := resolveGoogleThinking(model, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		genConfig.ThinkingConfig = &thinkingConfig{IncludeThoughts: thinking.enabled, ThinkingLevel: thinking.level}
+		if thinking.level == "" {
+			genConfig.ThinkingConfig.ThinkingBudget = thinking.budget
 		}
 	}
 
@@ -459,14 +463,19 @@ func buildGeminiCLIRequest(model *Model, prompt *Context, projectID string, opts
 
 	// Tools
 	if len(prompt.Tools) > 0 {
-		tools := convertGeminiCLITools(prompt.Tools, strings.HasPrefix(model.ID, "claude-"))
-		innerReq.Tools = tools
+		field := googleJSONSchemaParameters
+		if strings.HasPrefix(model.ID, "claude-") {
+			field = googleLegacyParameters
+		}
+		declarations, strict, err := googleFunctionDeclarations(model, prompt.Tools, field)
+		if err != nil {
+			return nil, err
+		}
+		innerReq.Tools = []any{map[string]any{"functionDeclarations": declarations}}
 
-		if toolChoiceMode(cfg.toolChoice) != "" {
+		if mode := googleFunctionCallingMode(cfg.toolChoice, strict); mode != "" {
 			innerReq.ToolConfig = &toolConfig{
-				FunctionCallingConfig: functionCallingConfig{
-					Mode: mapGeminiCLIToolChoice(cfg.toolChoice),
-				},
+				FunctionCallingConfig: functionCallingConfig{Mode: mode},
 			}
 		}
 	}
@@ -504,7 +513,7 @@ func buildGeminiCLIRequest(model *Model, prompt *Context, projectID string, opts
 		RequestType: requestType,
 		UserAgent:   userAgent,
 		RequestID:   requestID,
-	}
+	}, nil
 }
 
 // getAntigravitySystemInstruction returns the Antigravity system instruction.
@@ -513,28 +522,6 @@ func getAntigravitySystemInstruction() string {
 		"You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question." +
 		"**Absolute paths only**" +
 		"**Proactiveness**"
-}
-
-// getDisabledThinkingConfig returns the thinking config to disable thinking for specific models.
-func getDisabledThinkingConfig(modelID string) *thinkingConfig {
-	if level, ok := disabledGoogleThinkingLevel(modelID); ok {
-		return &thinkingConfig{ThinkingLevel: level}
-	}
-	return &thinkingConfig{ThinkingBudget: 0}
-}
-
-// mapGeminiCLIToolChoice maps tool choice option to API string.
-func mapGeminiCLIToolChoice(choice any) string {
-	switch toolChoiceMode(choice) {
-	case "auto":
-		return "MODE_UNSPECIFIED"
-	case "none":
-		return "NONE"
-	case "any":
-		return "ANY"
-	default:
-		return "MODE_UNSPECIFIED"
-	}
 }
 
 // streamGeminiCLIResponse streams the SSE response.
@@ -556,7 +543,7 @@ func streamGeminiCLIResponse(ctx context.Context, model *Model, response *http.R
 		Usage:      Usage{},
 	}
 
-	started := false
+	var started, finished bool
 	ensureStarted := func() {
 		if !started {
 			handler(ctx, Start{Partial: output})
@@ -592,16 +579,17 @@ func streamGeminiCLIResponse(ctx context.Context, model *Model, response *http.R
 		}
 
 		candidate := respData.Candidates
-		if len(candidate) == 0 || candidate[0].Content == nil {
+		if len(candidate) == 0 {
 			continue
 		}
 
 		cand := candidate[0]
-		if cand.Content.Parts == nil {
-			continue
+		var parts []cloudCodeResponsePart
+		if cand.Content != nil {
+			parts = cand.Content.Parts
 		}
 
-		for _, part := range cand.Content.Parts {
+		for _, part := range parts {
 			isThinking := part.Thought
 
 			if part.Text != "" {
@@ -693,10 +681,8 @@ func streamGeminiCLIResponse(ctx context.Context, model *Model, response *http.R
 
 		// Handle finish reason
 		if cand.FinishReason != "" {
-			output.StopReason = googleStopReason(cand.FinishReason)
-			if hasToolCalls(output.Content) {
-				output.StopReason = StopReasonToolUse
-			}
+			finished = true
+			output.StopReason, output.ErrorMessage = googleFinish(cand.FinishReason, output.Content)
 		}
 
 		// Handle usage metadata
@@ -720,14 +706,17 @@ func streamGeminiCLIResponse(ctx context.Context, model *Model, response *http.R
 		endGeminiCLIBlock(ctx, handler, output, blockIndex(), *currentBlock)
 	}
 
-	if !started {
+	if err := reader.Error(); err != nil && ctx.Err() == nil {
+		ensureStarted()
+		emitTerminalStreamError(ctx, handler, output, fmt.Errorf("google gemini cli: read stream: %w", err), StopReasonError)
+		return nil
+	}
+	if !started && ctx.Err() == nil {
 		return fmt.Errorf("google gemini cli: empty response stream")
 	}
+	ensureStarted()
 
-	handler(ctx, Done{
-		Reason:  output.StopReason,
-		Message: output,
-	})
+	finishStream(ctx, handler, output, finished, "google gemini cli stream ended without a finish reason")
 
 	return nil
 }
@@ -860,29 +849,6 @@ func convertGeminiCLIToolResult(msg Message, blocks []ContentBlock) []cloudCodeC
 	return parts
 }
 
-// convertGeminiCLITools converts tools to Cloud Code format.
-func convertGeminiCLITools(tools []Tool, useParameters bool) []any {
-	result := make([]any, 0, len(tools))
-
-	for _, tool := range tools {
-		funcDecl := make(map[string]any)
-		funcDecl["name"] = tool.Name
-		if tool.Description != "" {
-			funcDecl["description"] = tool.Description
-		}
-		if tool.Parameters != nil && useParameters {
-			// Claude models on Cloud Code need legacy "parameters" field
-			var schema map[string]any
-			if err := json.Unmarshal(tool.Parameters, &schema); err == nil {
-				funcDecl["parameters"] = schema
-			}
-		}
-		result = append(result, map[string]any{"functionDeclarations": []map[string]any{funcDecl}})
-	}
-
-	return result
-}
-
 // extractRetryDelay extracts retry delay from error response (in milliseconds).
 // Checks headers first (retry-after, x-ratelimit-reset, x-ratelimit-reset-after),
 // then parses body patterns like:
@@ -971,24 +937,11 @@ func ExtractRetryDelay(errorText string, headers http.Header) int {
 
 // BuildGeminiCLIRequest exposes the Gemini CLI request builder for parity with
 // the TS helper export.
-func BuildGeminiCLIRequest(model *Model, prompt *Context, projectID string, cfg *options, isAntigravity bool) *CloudCodeAssistRequest {
+func BuildGeminiCLIRequest(model *Model, prompt *Context, projectID string, cfg *options, isAntigravity bool) (*CloudCodeAssistRequest, error) {
 	if cfg == nil {
 		cfg = &options{}
 	}
-
-	opts := &googleGeminiCLIOptions{}
-	if cfg.reasoning != "" && cfg.reasoning != ReasoningOff {
-		opts.thinking = &geminiThinkingConfig{
-			enabled:      true,
-			budgetTokens: cfg.thinkingBudgetTokens,
-			level:        cfg.googleThinkingLevel,
-		}
-	}
-	if cfg.reasoning == ReasoningOff {
-		opts.thinking = &geminiThinkingConfig{enabled: false}
-	}
-
-	return buildGeminiCLIRequest(model, prompt, projectID, opts, isAntigravity, cfg)
+	return buildGeminiCLIRequest(model, prompt, projectID, isAntigravity, cfg)
 }
 
 // isRetryableError determines if an error is retryable.

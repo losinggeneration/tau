@@ -2,11 +2,13 @@ package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"strings"
 	"time"
 )
@@ -21,6 +23,7 @@ var DefaultBaseURLs = map[string]string{
 	ProviderOllama:     "http://localhost:11434/v1",
 	ProviderLMStudio:   "http://localhost:1234/v1",
 	ProviderVLLM:       "http://localhost:8000/v1",
+	ProviderLlamaCpp:   DefaultLlamaServerURL + "/v1",
 	// Additional providers matching pi parity
 	ProviderDeepSeek:            "https://api.deepseek.com/v1",
 	ProviderFireworks:           "https://api.fireworks.ai/v1",
@@ -61,7 +64,8 @@ func (c *openAIClient) SetTransportOption(opts TransportOption) {
 // newOpenAIClient creates a new OpenAI-compatible client.
 func newOpenAIClient(model *Model) (*openAIClient, error) {
 	baseURL := model.BaseURL
-	if baseURL == "" {
+	// Azure endpoints come from the environment first; Stream resolves them per request.
+	if baseURL == "" && model.Provider != ProviderAzureOpenAI {
 		baseURL = DefaultBaseURLs[model.Provider]
 		if baseURL == "" {
 			return nil, fmt.Errorf("no base URL for provider: %s", model.Provider)
@@ -86,6 +90,16 @@ func (c *openAIClient) Complete(ctx context.Context, model *Model, prompt *Conte
 
 // Stream implements Client.
 func (c *openAIClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, withCopilotHeaders(model, prompt, opts))
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	var o options
 	o.apply(opts)
 
@@ -93,6 +107,20 @@ func (c *openAIClient) Stream(ctx context.Context, model *Model, prompt *Context
 	reqBody, err := c.buildRequest(model, prompt, &o)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
+	}
+
+	transport := c.transport
+	if model.Provider == ProviderAzureOpenAI {
+		baseURL, _, deployment, err := resolveAzureConfig(model, &o)
+		if err != nil {
+			return err
+		}
+		azure := *transport
+		azure.baseURL = strings.TrimSuffix(baseURL, "/")
+		transport = &azure
+		if reqBody, err = withRequestModel(reqBody, deployment); err != nil {
+			return err
+		}
 	}
 
 	if hasPayloadCallback(&o) {
@@ -103,7 +131,8 @@ func (c *openAIClient) Stream(ctx context.Context, model *Model, prompt *Context
 		}
 	}
 
-	resp, err := doOpenAIChatCompletions(ctx, model, &o, c.transport.withRequestOptions(model, &o), reqBody)
+	o.transportOpts = cmp.Or(o.transportOpts, c.transportOpts)
+	resp, err := doOpenAIChatCompletions(ctx, model, &o, transport.withRequestOptions(model, &o), reqBody)
 	if err != nil {
 		return err
 	}
@@ -120,7 +149,11 @@ func (c *openAIClient) Stream(ctx context.Context, model *Model, prompt *Context
 	// on every chunk, so agent_loop's `partialMessage.Content = e.Partial.Content`
 	// overwrote any accumulated text — reasoning-only models like opencode-go
 	// kimi-k2.6 / glm-5.x therefore appeared to return empty content.)
-	return streamOpenAIResponse(ctx, c.model, resp.Body, handler)
+	grammar, err := grammarInputProperties(prompt.Tools, model.GetCompat().SupportsOpenAIGrammarTools)
+	if err != nil {
+		return err
+	}
+	return streamOpenAIResponseWithAPI(ctx, c.model, resp.Body, handler, grammar, c.model.API, c.model.Provider)
 }
 
 // hasToolHistory checks if conversation messages contain tool calls or tool results.
@@ -216,7 +249,6 @@ func buildOpenAIChatCompletionsRequest(model *Model, prompt *Context, o *options
 	if err != nil {
 		return nil, err
 	}
-	maybeAddOpenRouterAnthropicCacheControlToMessages(model, msgs)
 
 	req := &openAIRequest{
 		Model:    model.ID,
@@ -232,46 +264,85 @@ func buildOpenAIChatCompletionsRequest(model *Model, prompt *Context, o *options
 		req.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
 
-	applyOpenAIRequestTools(req, transformedCtx, compat)
-	applyOpenAIRequestOptions(req, model, o, compat)
+	if err := applyOpenAIRequestTools(req, transformedCtx, compat); err != nil {
+		return nil, err
+	}
+	if err := applyOpenAIRequestOptions(req, model, o, compat); err != nil {
+		return nil, err
+	}
+	applyCompletionsCacheControl(req, compat, resolveCacheRetention(o.cacheRetention))
 	return req, nil
 }
 
-func applyOpenAIRequestTools(req *openAIRequest, prompt *Context, compat *OpenAICompletionsCompat) {
+func applyOpenAIRequestTools(req *openAIRequest, prompt *Context, compat *OpenAICompletionsCompat) error {
 	if len(prompt.Tools) > 0 {
 		req.Tools = make([]toolDefinition, len(prompt.Tools))
 		for i, t := range prompt.Tools {
+			grammar, err := resolveGrammarTool(t, compat.SupportsOpenAIGrammarTools)
+			if err != nil {
+				return err
+			}
+			if grammar != nil {
+				custom := &customToolDefinition{Name: t.Name, Description: t.Description, Format: customToolGrammar{Type: "grammar"}}
+				custom.Format.Grammar.Syntax = grammar.syntax
+				custom.Format.Grammar.Definition = grammar.definition
+				req.Tools[i] = toolDefinition{Type: "custom", Custom: custom}
+				continue
+			}
 			def := toolDefinition{
 				Type:     "function",
 				Function: toolToFunctionDefinition(t),
 			}
+			parameters, strict, err := strictToolParameters(t, compat.SupportsStrictMode, nil)
+			if err != nil {
+				return err
+			}
+			def.Function.Parameters = parameters
 			if compat.SupportsStrictMode {
-				def.Function.Strict = new(false)
+				def.Function.Strict = new(strict)
 			}
 			req.Tools[i] = def
 		}
 		if compat.ZAIToolStream {
 			req.ToolStream = true
 		}
-		return
+		return nil
 	}
 
 	if hasToolHistory(prompt.Messages) {
 		req.Tools = []toolDefinition{}
 	}
+	return nil
 }
 
-func applyOpenAIRequestOptions(req *openAIRequest, model *Model, o *options, compat *OpenAICompletionsCompat) {
+func applyOpenAIRequestOptions(req *openAIRequest, model *Model, o *options, compat *OpenAICompletionsCompat) error {
+	req.Temperature = o.temperature
+	req.TopP = o.topP
+	req.SamplingParams = resolveSamplingParams(model, o)
+
 	if o.toolChoice != nil {
 		req.ToolChoice = o.toolChoice
 	}
 
-	applyOpenAIReasoningOptions(req, model, o, compat)
 	applyOpenAIMaxTokens(req, model, o, compat)
+	if err := applyOpenAIReasoningOptions(req, model, o, compat); err != nil {
+		return err
+	}
 
 	if compat.SupportsStore {
-		store := cacheSessionID(o) != ""
-		req.Store = &store
+		req.Store = new(false)
+	}
+
+	retention := resolveCacheRetention(o.cacheRetention)
+	baseURL := model.BaseURL
+	if baseURL == "" {
+		baseURL = DefaultBaseURLs[model.Provider]
+	}
+	if strings.Contains(baseURL, "api.openai.com") && retention != CacheRetentionNone || retention == CacheRetentionLong && compat.SupportsLongCacheRetention {
+		req.PromptCacheKey = clampOpenAIPromptCacheKey(o.sessionID)
+	}
+	if retention == CacheRetentionLong && compat.SupportsLongCacheRetention {
+		req.PromptCacheRetention = "24h"
 	}
 
 	if hasOpenRouterRouting(compat.OpenRouterRouting) && (model.Provider == ProviderOpenRouter || strings.Contains(model.BaseURL, "openrouter.ai")) {
@@ -285,59 +356,211 @@ func applyOpenAIRequestOptions(req *openAIRequest, model *Model, o *options, com
 	if len(o.metadata) > 0 {
 		req.Metadata = o.metadata
 	}
+	return nil
 }
 
-func applyOpenAIReasoningOptions(req *openAIRequest, model *Model, o *options, compat *OpenAICompletionsCompat) {
-	if model.Reasoning && o.reasoning != "" && o.reasoning != ReasoningOff {
-		switch compat.ThinkingFormat {
-		case ThinkingFormatZAI:
-			req.EnableThinking = boolPtr(true)
-			if compat.SupportsReasoningEffort {
-				req.ReasoningEffort = mapReasoningEffort(o.reasoning, compat.ReasoningEffortMap)
-			}
-		case ThinkingFormatQwen:
-			req.EnableThinking = boolPtr(true)
-		case ThinkingFormatQwenChatTmpl:
-			req.ChatTemplate_kwargs = map[string]bool{"enable_thinking": true, "preserve_thinking": true}
-		case ThinkingFormatOpenRouter:
-			req.Reasoning = &openAIRouterReasoning{Effort: mapReasoningEffort(o.reasoning, compat.ReasoningEffortMap)}
-		case ThinkingFormatDeepSeek:
-			req.Thinking = &openAIThinking{Type: "enabled"}
-		default:
-			if compat.SupportsReasoningEffort {
-				req.ReasoningEffort = mapReasoningEffort(o.reasoning, compat.ReasoningEffortMap)
-			}
-		}
-		return
-	}
-
-	if o.thinkingEnabled && o.reasoning == "" {
-		switch compat.ThinkingFormat {
-		case ThinkingFormatZAI:
-			req.Thinking = &openAIThinking{Type: "enabled"}
-		case ThinkingFormatQwen:
-			req.EnableThinking = boolPtr(true)
-		case ThinkingFormatQwenChatTmpl:
-			req.ChatTemplate_kwargs = map[string]bool{"enable_thinking": true}
-		}
-		return
-	}
-
+// applyOpenAIReasoningOptions sends the request's thinking level in the
+// model's thinking format, mirroring upstream openai-completions.
+func applyOpenAIReasoningOptions(req *openAIRequest, model *Model, o *options, compat *OpenAICompletionsCompat) error {
 	if !model.Reasoning {
-		return
+		return nil
 	}
+	var effort string
+	if o.reasoning != "" && o.reasoning != ReasoningOff {
+		if effort = ClampThinkingLevel(model, string(o.reasoning)); effort == "off" {
+			effort = ""
+		}
+	}
+	// A bare WithThinkingEnabled turns thinking on without choosing a level.
+	enabled := effort != "" || o.thinkingEnabled && o.reasoning == ""
+	offValue, offMapped := model.ThinkingLevelMap["off"]
+	offSupported := !offMapped || offValue != nil
+	// mapped is the model's value for the effort, falling back to the effort
+	// itself; ok is false when the thinking map marks it unsupported.
+	mapped := func() (string, bool) {
+		if value, exists := model.ThinkingLevelMap[effort]; exists {
+			if value == nil {
+				return "", false
+			}
+			return *value, true
+		}
+		return mapReasoningEffort(ReasoningLevel(effort), compat.ReasoningEffortMap), true
+	}
+	mappedOr := func() string {
+		if value, ok := mapped(); ok {
+			return value
+		}
+		return effort
+	}
+	// leveled is the mapped effort, or the mapped off value when reasoning
+	// is off; ok is false when neither yields a string.
+	leveled := func() (string, bool) {
+		if effort != "" {
+			return mapped()
+		}
+		if offValue != nil {
+			return *offValue, true
+		}
+		return "", false
+	}
+	budget := openAIThinkingBudget(req, model, o, effort)
 
 	switch compat.ThinkingFormat {
-	case ThinkingFormatZAI, ThinkingFormatQwen:
-		req.EnableThinking = boolPtr(false)
+	case ThinkingFormatZAI:
+		if enabled {
+			req.Thinking = map[string]any{"type": "enabled", "clear_thinking": false}
+		} else {
+			req.Thinking = map[string]any{"type": "disabled"}
+		}
+		if value, ok := mapped(); ok && effort != "" && compat.SupportsReasoningEffort {
+			req.ReasoningEffort = value
+		}
+	case ThinkingFormatQwen:
+		req.EnableThinking = boolPtr(enabled)
+		if effort != "" && compat.SupportsReasoningEffort {
+			req.ReasoningEffort = mappedOr()
+		}
+	case ThinkingFormatQwenChatTmpl:
+		req.ChatTemplateKwargs = map[string]any{"enable_thinking": enabled, "preserve_thinking": true}
+	case ThinkingFormatChatTemplate, ThinkingFormatBaseten:
+		raw := json.RawMessage(nil)
+		if model.Compat != nil {
+			raw = model.Compat.ChatTemplateKwargs
+			if compat.ThinkingFormat == ThinkingFormatBaseten {
+				raw = model.Compat.ChatTemplateArgs
+			}
+		}
+		values, err := resolveChatTemplateValues(raw, effort, budget, leveled)
+		if err != nil {
+			return err
+		}
+		if compat.ThinkingFormat == ThinkingFormatChatTemplate {
+			req.ChatTemplateKwargs = values
+			break
+		}
+		req.ChatTemplateArgs = values
+		if value, ok := leveled(); ok && compat.SupportsReasoningEffort {
+			req.ReasoningEffort = value
+		}
 	case ThinkingFormatDeepSeek:
-		req.Thinking = &openAIThinking{Type: "disabled"}
+		if enabled {
+			req.Thinking = map[string]any{"type": "enabled"}
+		} else if offSupported {
+			req.Thinking = map[string]any{"type": "disabled"}
+		}
+		if effort != "" && compat.SupportsReasoningEffort {
+			req.ReasoningEffort = mappedOr()
+		}
 	case ThinkingFormatOpenRouter:
-		// OpenRouter treats an omitted reasoning object as provider default; keep
-		// the previous compat behavior by explicitly disabling it for reasoning
-		// models when the caller didn't request reasoning.
-		req.Reasoning = &openAIRouterReasoning{Effort: "none"}
+		if effort != "" {
+			req.Reasoning = map[string]any{"effort": mappedOr()}
+		} else if offSupported {
+			req.Reasoning = map[string]any{"effort": cmp.Or(deref(offValue), "none")}
+		}
+	case ThinkingFormatAntLing:
+		if value := model.ThinkingLevelMap[effort]; effort != "" && value != nil {
+			req.Reasoning = map[string]any{"effort": *value}
+		}
+	case ThinkingFormatTogether:
+		req.Reasoning = map[string]any{"enabled": enabled}
+		if effort != "" && compat.SupportsReasoningEffort {
+			req.ReasoningEffort = mappedOr()
+		}
+	case ThinkingFormatString:
+		if effort != "" {
+			req.Thinking = mappedOr()
+		} else if offSupported {
+			req.Thinking = cmp.Or(deref(offValue), "none")
+		}
+	default:
+		if effort != "" && compat.SupportsReasoningEffort {
+			req.ReasoningEffort = mappedOr()
+		} else if offValue != nil && compat.SupportsReasoningEffort {
+			req.ReasoningEffort = *offValue
+		}
 	}
+
+	if field := thinkingTokenBudgetField(model.Compat); field != "" && budget > 0 {
+		req.ThinkingBudget = map[string]int{field: budget}
+	}
+	return nil
+}
+
+func deref(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+// thinkingTokenBudgetField is the top-level request field that caps
+// reasoning tokens, or "" when the model has none.
+func thinkingTokenBudgetField(compat *CompatibilitySettings) string {
+	switch {
+	case compat == nil:
+		return ""
+	case compat.ThinkingTokenBudgetField != "":
+		return compat.ThinkingTokenBudgetField
+	case compat.SupportsThinkingTokenBudget:
+		return "thinking_token_budget"
+	default:
+		return ""
+	}
+}
+
+// openAIThinkingBudget caps the level's thinking budget so the answer keeps
+// room under the request's token ceiling; zero means none applies.
+func openAIThinkingBudget(req *openAIRequest, model *Model, o *options, effort string) int {
+	if effort == "" {
+		return 0
+	}
+	budget := o.thinkingBudgetTokens
+	if budget <= 0 {
+		budget = ThinkingBudgetForLevel(ReasoningLevel(effort), o.thinkingBudgets)
+	}
+	ceiling := cmp.Or(req.MaxTokens, req.MaxCompletionTokens, model.MaxTokens)
+	return min(budget, max(0, ceiling-minAnswerTokens))
+}
+
+// resolveChatTemplateValues fills configured chat-template values, replacing
+// {"$var": ...} references with the request's thinking state.
+func resolveChatTemplateValues(raw json.RawMessage, effort string, budget int, leveled func() (string, bool)) (map[string]any, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var values map[string]any
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("parse chat template values: %w", err)
+	}
+	resolved := make(map[string]any, len(values))
+	for key, value := range values {
+		ref, ok := value.(map[string]any)
+		if !ok {
+			resolved[key] = value
+			continue
+		}
+		if omit, _ := ref["omitWhenOff"].(bool); omit && effort == "" {
+			continue
+		}
+		switch ref["$var"] {
+		case "thinking.enabled":
+			resolved[key] = effort != ""
+		case "thinking.budget":
+			if budget > 0 {
+				resolved[key] = budget
+			}
+		case "thinking.effort":
+			if value, ok := leveled(); ok {
+				resolved[key] = value
+			}
+		default:
+			return nil, fmt.Errorf("chat template value %q: unknown $var %v", key, ref["$var"])
+		}
+	}
+	if len(resolved) == 0 {
+		return nil, nil
+	}
+	return resolved, nil
 }
 
 func applyOpenAIMaxTokens(req *openAIRequest, model *Model, o *options, compat *OpenAICompletionsCompat) {
@@ -364,40 +587,50 @@ func toolToFunctionDefinition(t Tool) functionDefinition {
 	}
 }
 
-// maybeAddOpenRouterAnthropicCacheControlToMessages adds cache_control for OpenRouter Anthropic models.
-// This version works with openAIMessage type.
-func maybeAddOpenRouterAnthropicCacheControlToMessages(model *Model, messages []openAIMessage) {
-	if model.Provider != ProviderOpenRouter || !strings.HasPrefix(model.ID, "anthropic/") {
+func clampOpenAIPromptCacheKey(key string) string {
+	chars := []rune(key)
+	return string(chars[:min(len(chars), 64)])
+}
+
+func applyCompletionsCacheControl(req *openAIRequest, compat *OpenAICompletionsCompat, retention CacheRetention) {
+	if compat.CacheControlFormat != "anthropic" || retention == CacheRetentionNone {
 		return
 	}
-
-	// Find last user/assistant message with text content and add cache_control
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		if msg.Role != "user" && msg.Role != "assistant" {
-			continue
-		}
-
-		// If content is a string, convert to array with cache_control
-		if contentStr, ok := msg.Content.(string); ok && contentStr != "" {
-			messages[i].Content = []map[string]any{
-				{
-					"type":          "text",
-					"text":          contentStr,
-					"cache_control": map[string]string{"type": "ephemeral"},
-				},
+	control := &cacheControlParam{Type: "ephemeral"}
+	if retention == CacheRetentionLong && compat.SupportsLongCacheRetention {
+		control.TTL = "1h"
+	}
+	mark := func(message *openAIMessage) bool {
+		switch content := message.Content.(type) {
+		case string:
+			if content != "" {
+				message.Content = []map[string]any{{"type": "text", "text": content, "cache_control": control}}
+				return true
 			}
-			return
-		}
-
-		// If content is an array, find last text part
-		if contentArr, ok := msg.Content.([]map[string]any); ok {
-			for j := len(contentArr) - 1; j >= 0; j-- {
-				part := contentArr[j]
-				if partType, ok := part["type"].(string); ok && partType == "text" {
-					part["cache_control"] = map[string]string{"type": "ephemeral"}
-					return
+		case []map[string]any:
+			for i := len(content) - 1; i >= 0; i-- {
+				if content[i]["type"] == "text" {
+					content[i]["cache_control"] = control
+					return true
 				}
+			}
+		}
+		return false
+	}
+	for i := range req.Messages {
+		if req.Messages[i].Role == "system" || req.Messages[i].Role == "developer" {
+			mark(&req.Messages[i])
+			break
+		}
+	}
+	if len(req.Tools) > 0 {
+		req.Tools[len(req.Tools)-1].CacheControl = control
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		switch req.Messages[i].Role {
+		case "user", "assistant", "tool":
+			if mark(&req.Messages[i]) {
+				return
 			}
 		}
 	}
@@ -405,6 +638,10 @@ func maybeAddOpenRouterAnthropicCacheControlToMessages(model *Model, messages []
 
 func (c *openAIClient) convertMessages(prompt *Context, model *Model, compat *OpenAICompletionsCompat) ([]openAIMessage, error) {
 	var msgs []openAIMessage
+	grammar, err := grammarInputProperties(prompt.Tools, compat.SupportsOpenAIGrammarTools)
+	if err != nil {
+		return nil, err
+	}
 
 	// Add system prompt (GAP-001: developer role vs system)
 	if prompt.SystemPrompt != "" {
@@ -433,7 +670,7 @@ func (c *openAIClient) convertMessages(prompt *Context, model *Model, compat *Op
 			})
 		}
 
-		msg, err := c.convertMessage(m, model, compat)
+		msg, err := c.convertMessage(m, model, compat, grammar)
 		if err != nil {
 			return nil, err
 		}
@@ -451,7 +688,7 @@ func (c *openAIClient) convertMessages(prompt *Context, model *Model, compat *Op
 			j := i + 1
 			for ; j < len(prompt.Messages) && normalizeMessageRole(prompt.Messages[j].Role) == "toolResult"; j++ {
 				toolMsg := prompt.Messages[j]
-				toolResult, _ := c.convertMessage(toolMsg, model, compat)
+				toolResult, _ := c.convertMessage(toolMsg, model, compat, grammar)
 				if toolResult != nil {
 					msgs = append(msgs, *toolResult)
 				}
@@ -500,7 +737,9 @@ func (c *openAIClient) extractImageBlocksFromToolResult(m Message) []map[string]
 	return imageBlocks
 }
 
-func (c *openAIClient) convertMessage(m Message, model *Model, compat *OpenAICompletionsCompat) (*openAIMessage, error) {
+// grammar maps grammar tools to their input property; their calls replay as
+// custom tool calls.
+func (c *openAIClient) convertMessage(m Message, model *Model, compat *OpenAICompletionsCompat, grammar map[string]string) (*openAIMessage, error) {
 	switch normalizeMessageRole(m.Role) {
 	case "system":
 		content, err := c.extractContent(m.Content, model)
@@ -550,6 +789,13 @@ func (c *openAIClient) convertMessage(m Message, model *Model, compat *OpenAICom
 					Type:     "function",
 					Function: functionCall{Name: b.Name, Arguments: string(b.Arguments)},
 				}
+				if property, ok := grammar[b.Name]; ok {
+					input, err := grammarToolInput(b.Name, b.Arguments, property)
+					if err != nil {
+						return nil, err
+					}
+					tc = toolCall{ID: b.ID, Type: "custom", Custom: &customToolInput{Name: b.Name, Input: SanitizeSurrogates(input)}}
+				}
 				toolCalls = append(toolCalls, tc)
 
 				// GAP-009: Collect reasoning_details for tool calls with thought signatures
@@ -585,12 +831,28 @@ func (c *openAIClient) convertMessage(m Message, model *Model, compat *OpenAICom
 			msg.Content = nil
 		}
 
-		// Add thinking content using signature field (GAP-002)
-		if len(thinkingBlocks) > 0 && !compat.RequiresThinkingAsText {
-			sig := thinkingBlocks[0].ThoughtSignature
-			if sig != "" {
-				msg.Content = sig // Use signature field for reasoning content
+		// Replay thinking in the reasoning field it streamed in.
+		if len(thinkingBlocks) > 0 && !compat.RequiresThinkingAsText && len(reasonings) == 0 {
+			field := thinkingBlocks[0].ThoughtSignature
+			if model.Provider == ProviderOpenCodeGo && field == "reasoning" {
+				field = "reasoning_content"
 			}
+			thinking := make([]string, 0, len(thinkingBlocks))
+			for _, block := range thinkingBlocks {
+				thinking = append(thinking, block.Thinking)
+			}
+			joined := strings.Join(thinking, "\n")
+			switch field {
+			case "reasoning_content":
+				msg.ReasoningContent = &joined
+			case "reasoning":
+				msg.Reasoning = &joined
+			case "reasoning_text":
+				msg.ReasoningText = &joined
+			}
+		}
+		if compat.RequiresReasoningContentOnAssistantMessages && model.Reasoning && msg.ReasoningContent == nil {
+			msg.ReasoningContent = new("")
 		}
 
 		// Add tool calls
@@ -772,10 +1034,12 @@ func (c *openAIClient) handleChunk(ctx context.Context, chunk openAIChunk, handl
 // on every chunk, so reasoning-only models (opencode-go kimi-k2.6, glm-5.x)
 // appeared empty in the TUI even though the upstream returned content.
 func streamOpenAIResponse(ctx context.Context, model *Model, body io.Reader, handler EventHandler) error {
-	return streamOpenAIResponseWithAPI(ctx, model, body, handler, model.API, model.Provider)
+	return streamOpenAIResponseWithAPI(ctx, model, body, handler, nil, model.API, model.Provider)
 }
 
-func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Reader, handler EventHandler, api, provider string) error {
+// grammar maps grammar tools to the argument their custom tool input is
+// stored in.
+func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Reader, handler EventHandler, grammar map[string]string, api, provider string) error {
 	reader := NewSSEReader(body)
 
 	output := &AssistantMessage{
@@ -796,10 +1060,16 @@ func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Read
 		compat.ReasoningDetails = true
 	}
 
+	var hasFinishReason bool
 	currentText := ""
 	currentThinking := ""
+	// currentThinkingField names the delta field the reasoning arrived in, so
+	// replay can send it back the same way.
+	var currentThinkingField string
 	currentToolCall := (*ToolCall)(nil)
 	currentToolCallSignature := ""
+	// currentCustomInput is set while a custom (grammar) tool call streams.
+	var currentCustomInput *grammarInputBuffer
 	contentIndex := 0
 
 	flushText := func() {
@@ -816,7 +1086,7 @@ func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Read
 		if currentThinking == "" {
 			return
 		}
-		output.Content = append(output.Content, ContentBlock{Type: ContentBlockThinking, Thinking: currentThinking})
+		output.Content = append(output.Content, ContentBlock{Type: ContentBlockThinking, Thinking: currentThinking, ThoughtSignature: currentThinkingField})
 		handler(ctx, ThinkingEnd{ContentIndex: contentIndex, Content: currentThinking, Partial: *output})
 		contentIndex++
 		currentThinking = ""
@@ -825,6 +1095,13 @@ func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Read
 	flushToolCall := func() {
 		if currentToolCall == nil {
 			return
+		}
+		if currentCustomInput != nil {
+			if delta := currentCustomInput.finish(); delta != "" {
+				currentToolCall.Arguments = currentCustomInput.arguments()
+				handler(ctx, ToolCallDelta{ContentIndex: contentIndex, Delta: delta, Partial: *output})
+			}
+			currentCustomInput = nil
 		}
 		output.Content = append(output.Content, ContentBlock{
 			Type:             ContentBlockToolCall,
@@ -916,6 +1193,10 @@ func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Read
 					handler(ctx, ThinkingStart{ContentIndex: contentIndex, Partial: *output})
 				}
 				currentThinking += choice.Delta.ReasoningContent
+				currentThinkingField = choice.Delta.ReasoningField
+				if model.Provider == ProviderOpenCodeGo && currentThinkingField == "reasoning" {
+					currentThinkingField = "reasoning_content"
+				}
 				handler(ctx, ThinkingDelta{ContentIndex: contentIndex, Delta: choice.Delta.ReasoningContent, Partial: *output})
 			}
 
@@ -942,9 +1223,25 @@ func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Read
 							Name:      tc.Function.Name,
 							Arguments: json.RawMessage{},
 						}
+						if tc.Custom != nil && tc.Function == (functionCall{}) {
+							currentToolCall.Name = tc.Custom.Name
+							property := grammar[tc.Custom.Name]
+							if property == "" {
+								property = "input"
+							}
+							currentCustomInput = newGrammarInputBuffer(property)
+							currentToolCall.Arguments = currentCustomInput.arguments()
+						}
 						handler(ctx, ToolCallStart{ContentIndex: contentIndex, Partial: *output})
 					}
-					if tc.Function.Arguments != "" {
+					if currentCustomInput != nil && tc.Custom != nil && tc.Custom.Input != "" {
+						delta, err := currentCustomInput.append(currentCustomInput.input+tc.Custom.Input, false)
+						if err != nil {
+							return fmt.Errorf("custom tool input: %w", err)
+						}
+						currentToolCall.Arguments = currentCustomInput.arguments()
+						handler(ctx, ToolCallDelta{ContentIndex: contentIndex, Delta: delta, Partial: *output})
+					} else if tc.Function.Arguments != "" {
 						currentToolCall.Arguments = append(currentToolCall.Arguments, tc.Function.Arguments...)
 						handler(ctx, ToolCallDelta{ContentIndex: contentIndex, Delta: tc.Function.Arguments, Partial: *output})
 					}
@@ -957,6 +1254,7 @@ func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Read
 			}
 
 			if choice.FinishReason != "" {
+				hasFinishReason = true
 				stopReason, errMsg := mapOpenAIStopReason(choice.FinishReason)
 				output.StopReason = stopReason
 				if errMsg != "" {
@@ -988,7 +1286,15 @@ func streamOpenAIResponseWithAPI(ctx context.Context, model *Model, body io.Read
 		flushToolCall()
 	}
 
-	handler(ctx, Done{Reason: output.StopReason, Message: *output})
+	if !hasFinishReason && !compat.SupportsFinishReason {
+		hasFinishReason = true
+		output.StopReason = StopReasonStop
+		if hasToolCalls(output.Content) {
+			output.StopReason = StopReasonToolUse
+		}
+	}
+	finishStream(ctx, handler, *output, hasFinishReason, "stream ended without finish_reason")
+
 	return nil
 }
 
@@ -1031,36 +1337,59 @@ type openAICompatContent struct {
 }
 
 type openAIRequest struct {
-	Model               string                 `json:"model"`
-	Messages            []openAIMessage        `json:"messages"`
-	Tools               []toolDefinition       `json:"tools,omitempty"`
-	Metadata            map[string]any         `json:"metadata,omitempty"`
-	Store               *bool                  `json:"store,omitempty"`
-	MaxTokens           int                    `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int                    `json:"max_completion_tokens,omitempty"`
-	ReasoningEffort     string                 `json:"reasoning_effort,omitempty"`
-	EnableThinking      *bool                  `json:"enable_thinking,omitempty"`
-	Thinking            *openAIThinking        `json:"thinking,omitempty"`
-	ChatTemplate_kwargs map[string]bool        `json:"chat_template_kwargs,omitempty"`
-	Reasoning           *openAIRouterReasoning `json:"reasoning,omitempty"`
-	Provider            any                    `json:"provider,omitempty"`
-	ProviderOptions     map[string]any         `json:"provider_options,omitempty"`
-	ToolChoice          any                    `json:"tool_choice,omitempty"`
-	ToolStream          bool                   `json:"tool_stream,omitempty"`
-	Stream              bool                   `json:"stream"`
-	StreamOptions       *streamOptions         `json:"stream_options,omitempty"`
+	PromptCacheKey       string           `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string           `json:"prompt_cache_retention,omitempty"`
+	Temperature          *float64         `json:"temperature,omitempty"`
+	TopP                 *float64         `json:"top_p,omitempty"`
+	Model                string           `json:"model"`
+	Messages             []openAIMessage  `json:"messages"`
+	Tools                []toolDefinition `json:"tools,omitempty"`
+	Metadata             map[string]any   `json:"metadata,omitempty"`
+	Store                *bool            `json:"store,omitempty"`
+	MaxTokens            int              `json:"max_tokens,omitempty"`
+	MaxCompletionTokens  int              `json:"max_completion_tokens,omitempty"`
+	ReasoningEffort      string           `json:"reasoning_effort,omitempty"`
+	EnableThinking       *bool            `json:"enable_thinking,omitempty"`
+	Thinking             any              `json:"thinking,omitempty"`
+	ChatTemplateKwargs   map[string]any   `json:"chat_template_kwargs,omitempty"`
+	ChatTemplateArgs     map[string]any   `json:"chat_template_args,omitempty"`
+	Reasoning            map[string]any   `json:"reasoning,omitempty"`
+	Provider             any              `json:"provider,omitempty"`
+	ProviderOptions      map[string]any   `json:"provider_options,omitempty"`
+	ToolChoice           any              `json:"tool_choice,omitempty"`
+	ToolStream           bool             `json:"tool_stream,omitempty"`
+	Stream               bool             `json:"stream"`
+	StreamOptions        *streamOptions   `json:"stream_options,omitempty"`
+	// ThinkingBudget is sent under a compat-configured top-level field.
+	ThinkingBudget map[string]int `json:"-"`
+	// SamplingParams are merged into the body last, so they override the
+	// named fields.
+	SamplingParams map[string]any `json:"-"`
 }
 
-// openAIRouterReasoning represents OpenRouter's reasoning object.
-type openAIRouterReasoning struct {
-	Effort string `json:"effort,omitempty"`
-}
-
-// openAIThinking represents the DeepSeek-style thinking object
-// { type: "enabled" | "disabled" } accepted by z.ai / opencode kimi backends.
-type openAIThinking struct {
-	Type         string `json:"type"`
-	BudgetTokens int    `json:"budget_tokens,omitempty"`
+func (r openAIRequest) MarshalJSON() ([]byte, error) {
+	type plain openAIRequest
+	data, err := json.Marshal(plain(r))
+	if err != nil || len(r.SamplingParams) == 0 && len(r.ThinkingBudget) == 0 {
+		return data, err
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(data, &body); err != nil {
+		return nil, err
+	}
+	extra := make(map[string]any, len(r.ThinkingBudget)+len(r.SamplingParams))
+	for key, value := range r.ThinkingBudget {
+		extra[key] = value
+	}
+	maps.Copy(extra, r.SamplingParams)
+	for key, value := range extra {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("sampling parameter %q: %w", key, err)
+		}
+		body[key] = encoded
+	}
+	return json.Marshal(body)
 }
 
 // boolPtr returns a pointer to v, used so *bool request fields can be
@@ -1079,12 +1408,23 @@ type openAIMessage struct {
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
 	ToolCalls        []toolCall       `json:"tool_calls,omitempty"`
 	ReasoningDetails []map[string]any `json:"reasoning_details,omitempty"`
+	ReasoningContent *string          `json:"reasoning_content,omitempty"`
+	Reasoning        *string          `json:"reasoning,omitempty"`
+	ReasoningText    *string          `json:"reasoning_text,omitempty"`
 }
 
 type toolCall struct {
-	ID       string       `json:"id"`
-	Type     string       `json:"type"`
-	Function functionCall `json:"function"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function functionCall     `json:"function,omitzero"`
+	Custom   *customToolInput `json:"custom,omitempty"`
+}
+
+// customToolInput is a custom (grammar) tool call; streamed deltas carry
+// input fragments.
+type customToolInput struct {
+	Name  string `json:"name,omitempty"`
+	Input string `json:"input"`
 }
 
 type functionCall struct {
@@ -1093,8 +1433,24 @@ type functionCall struct {
 }
 
 type toolDefinition struct {
-	Type     string             `json:"type"`
-	Function functionDefinition `json:"function"`
+	CacheControl *cacheControlParam    `json:"cache_control,omitempty"`
+	Type         string                `json:"type"`
+	Function     functionDefinition    `json:"function,omitzero"`
+	Custom       *customToolDefinition `json:"custom,omitempty"`
+}
+
+type customToolDefinition struct {
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	Format      customToolGrammar `json:"format"`
+}
+
+type customToolGrammar struct {
+	Type    string `json:"type"`
+	Grammar struct {
+		Syntax     string `json:"syntax"`
+		Definition string `json:"definition"`
+	} `json:"grammar"`
 }
 
 type functionDefinition struct {
@@ -1125,6 +1481,7 @@ type choice struct {
 type delta struct {
 	Content          openAICompatContentDelta `json:"content,omitempty"`
 	ReasoningContent string                   `json:"-"` // reasoning_content, reasoning, reasoning_text
+	ReasoningField   string                   `json:"-"` // which of those fields carried it
 	ReasoningDetails []reasoningDetail        `json:"reasoning_details,omitempty"`
 	ToolCalls        []toolCall               `json:"tool_calls,omitempty"`
 }
@@ -1246,11 +1603,11 @@ func (d *delta) UnmarshalJSON(data []byte) error {
 
 	switch {
 	case tmp.ReasoningContent != "":
-		d.ReasoningContent = tmp.ReasoningContent
+		d.ReasoningContent, d.ReasoningField = tmp.ReasoningContent, "reasoning_content"
 	case tmp.Reasoning != "":
-		d.ReasoningContent = tmp.Reasoning
+		d.ReasoningContent, d.ReasoningField = tmp.Reasoning, "reasoning"
 	case tmp.ReasoningText != "":
-		d.ReasoningContent = tmp.ReasoningText
+		d.ReasoningContent, d.ReasoningField = tmp.ReasoningText, "reasoning_text"
 	}
 
 	return nil
@@ -1299,4 +1656,23 @@ func timestamp() int64 {
 // AppendMessages appends messages to the context.
 func (c *Context) AppendMessages(msgs ...Message) {
 	c.Messages = append(c.Messages, msgs...)
+}
+
+// withRequestModel replaces the request's model, as Azure deployments may be
+// named differently from the catalog model.
+func withRequestModel(body, model string) (string, error) {
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &request); err != nil {
+		return "", fmt.Errorf("decode request: %w", err)
+	}
+	encoded, err := json.Marshal(model)
+	if err != nil {
+		return "", fmt.Errorf("encode model: %w", err)
+	}
+	request["model"] = encoded
+	updated, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("encode request: %w", err)
+	}
+	return string(updated), nil
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/losinggeneration/tau/ai"
 )
 
 // FormatVersion is the current session file format version.
@@ -17,6 +18,7 @@ const FormatVersion = CurrentSessionVersion
 type EntryType string
 
 const (
+	EntryTypeContextEdit    EntryType = "context_edit"
 	EntryTypeSession        EntryType = "session"
 	EntryTypeMessage        EntryType = "message"
 	EntryTypePositionChange EntryType = "position_change"
@@ -38,7 +40,7 @@ const EntryStatusDeleted = "deleted"
 // InContext returns true if the entry type is included in LLM context.
 func (t EntryType) InContext() bool {
 	switch t {
-	case EntryTypeMessage, EntryTypeCompaction, EntryTypeCustomMessage:
+	case EntryTypeMessage, EntryTypeCompaction, EntryTypeCustomMessage, EntryTypeBranchSummary:
 		return true
 	default:
 		return false
@@ -71,11 +73,12 @@ type Header struct {
 
 // Entry is the common envelope for all session entries after the header.
 type Entry struct {
-	Type      EntryType `json:"type"`
-	ID        string    `json:"id"`
-	ParentID  *string   `json:"parent_id,omitempty"`
-	Timestamp string    `json:"timestamp"`
-	Status    string    `json:"status,omitempty"`
+	Replacement json.RawMessage `json:"replacement,omitempty"`
+	Type        EntryType       `json:"type"`
+	ID          string          `json:"id"`
+	ParentID    *string         `json:"parent_id,omitempty"`
+	Timestamp   string          `json:"timestamp"`
+	Status      string          `json:"status,omitempty"`
 
 	// Message fields (EntryTypeMessage)
 	Message json.RawMessage `json:"message,omitempty"`
@@ -251,6 +254,34 @@ func NewCustomEntry(customType string, data json.RawMessage) Entry {
 	return e
 }
 
+// SummaryUsageType is the custom entry type that records billed usage of a
+// compaction or branch summary request. It hangs off the branch position the
+// summary was requested at, so forks of that branch keep it.
+const SummaryUsageType = "summary_usage"
+
+// NewSummaryUsageEntry records billed summary usage as a hidden child of parentID.
+func NewSummaryUsageEntry(parentID *string, usage ai.Usage) (Entry, error) {
+	data, err := json.Marshal(NormalizeUsage(usage))
+	if err != nil {
+		return Entry{}, fmt.Errorf("marshal summary usage: %w", err)
+	}
+	e := NewCustomEntry(SummaryUsageType, data)
+	e.ParentID = parentID
+	return e, nil
+}
+
+// NormalizeUsage fills the token and cost totals from their parts when a
+// provider reported only the breakdown.
+func NormalizeUsage(usage ai.Usage) ai.Usage {
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+	}
+	if usage.Cost.Total == 0 {
+		usage.Cost.Total = usage.Cost.Input + usage.Cost.Output + usage.Cost.CacheRead + usage.Cost.CacheWrite
+	}
+	return usage
+}
+
 // NewCustomMessageEntry creates a custom_message entry (injected into context).
 func NewCustomMessageEntry(customType string, data json.RawMessage, msg json.RawMessage) Entry {
 	e := NewEntry(EntryTypeCustomMessage, nil)
@@ -287,5 +318,39 @@ func ParseEntry(line []byte) (Entry, error) {
 	if err := json.Unmarshal(line, &e); err != nil {
 		return Entry{}, fmt.Errorf("parse entry: %w", err)
 	}
+	if e.Type == EntryTypeContextEdit {
+		if e.TargetID == nil || *e.TargetID == "" {
+			return Entry{}, fmt.Errorf("context edit requires targetId")
+		}
+		normalized, err := normalizeContextReplacement(e.Replacement)
+		if err != nil {
+			return Entry{}, err
+		}
+		e.Replacement = normalized
+	}
 	return e, nil
+}
+
+func normalizeContextReplacement(replacement json.RawMessage) (json.RawMessage, error) {
+	var value any
+	if err := json.Unmarshal(replacement, &value); err != nil {
+		return nil, fmt.Errorf("parse context replacement: %w", err)
+	}
+	if value == nil {
+		return json.RawMessage("null"), nil
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("context replacement must be null or contain string/array content")
+	}
+	switch object["content"].(type) {
+	case string, []any:
+		data, err := json.Marshal(object)
+		if err != nil {
+			return nil, fmt.Errorf("marshal context replacement: %w", err)
+		}
+		return data, nil
+	default:
+		return nil, fmt.Errorf("context replacement must contain string/array content")
+	}
 }

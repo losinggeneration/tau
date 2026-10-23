@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,7 +22,15 @@ type ProxyStreamOptions struct {
 	// MaxTokens limits the maximum number of tokens in the response.
 	MaxTokens int
 	// Reasoning sets the reasoning/thinking level.
-	Reasoning string
+	Reasoning       string
+	ThinkingBudgets *ai.ThinkingBudgets
+	CacheRetention  string
+	SessionID       string
+	Headers         map[string]string
+	Metadata        map[string]any
+	SamplingParams  map[string]any
+	Transport       ai.Transport
+	MaxRetryDelayMs *int
 	// Signal allows cancellation of the request.
 	Signal <-chan struct{}
 	// AuthToken is the auth token for the proxy server.
@@ -40,6 +49,27 @@ func StreamProxy(
 	authToken string,
 	opts ...ai.Option,
 ) (err error) {
+	// Like upstream, request failures surface as terminal assistant error
+	// events as well as the returned error.
+	failRequest := func(err error) error {
+		reason := ai.StopReasonError
+		if ctx.Err() != nil {
+			reason = ai.StopReasonAborted
+			err = errors.Join(err, context.Cause(ctx))
+		}
+		handler(ctx, ai.StreamError{Reason: string(reason), Err: err, Msg: ai.AssistantMessage{
+			Role:         "assistant",
+			StopReason:   reason,
+			ErrorMessage: err.Error(),
+			Timestamp:    time.Now().UnixMilli(),
+			API:          model.API,
+			Provider:     model.Provider,
+			Model:        model.ID,
+		}})
+
+		return err
+	}
+
 	// Ensure proxy URL ends with /api/stream
 	streamURL := strings.TrimRight(proxyURL, "/")
 	if !strings.HasSuffix(streamURL, "/api/stream") {
@@ -56,13 +86,13 @@ func StreamProxy(
 		"options": options,
 	})
 	if err != nil {
-		return fmt.Errorf("proxy: marshal request: %w", err)
+		return failRequest(fmt.Errorf("proxy: marshal request: %w", err))
 	}
 
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, streamURL, strings.NewReader(string(bodyBytes)))
 	if err != nil {
-		return fmt.Errorf("proxy: create request: %w", err)
+		return failRequest(fmt.Errorf("proxy: create request: %w", err))
 	}
 
 	// Set headers
@@ -72,41 +102,23 @@ func StreamProxy(
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 
-	// Execute request
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("proxy: request: %w", err)
+		return failRequest(fmt.Errorf("proxy: request: %w", err))
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
-			err = closeErr
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("proxy: close response: %w", closeErr))
 		}
 	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			return fmt.Errorf("proxy: status %d", resp.StatusCode)
+			return failRequest(fmt.Errorf("proxy: status %d: %w", resp.StatusCode, readErr))
 		}
 
-		// Emit a terminal StreamError event before returning the error.
-		// This matches the TypeScript reference behavior where non-OK responses
-		// surface as terminal assistant error events rather than raw errors.
-		errMsg := ai.AssistantMessage{
-			Role:         "assistant",
-			StopReason:   ai.StopReasonError,
-			ErrorMessage: fmt.Sprintf("proxy: status %d: %s", resp.StatusCode, string(body)),
-			Timestamp:    time.Now().UnixMilli(),
-			API:          model.API,
-			Provider:     model.Provider,
-			Model:        model.ID,
-		}
-		handler(ctx, ai.StreamError{
-			Reason: string(ai.StopReasonError),
-			Msg:    errMsg,
-		})
-
-		return fmt.Errorf("proxy: status %d: %s", resp.StatusCode, string(body))
+		return failRequest(fmt.Errorf("proxy: status %d: %s", resp.StatusCode, string(body)))
 	}
 
 	// Stream response
@@ -151,9 +163,14 @@ func StreamProxyWithOptions(
 ) error {
 	if options.Signal != nil {
 		runCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
+		done := make(chan struct{})
+		defer func() {
+			cancel()
+			<-done
+		}()
 
 		go func() {
+			defer close(done)
 			select {
 			case <-options.Signal:
 				cancel()
@@ -161,6 +178,11 @@ func StreamProxyWithOptions(
 			}
 		}()
 		ctx = runCtx
+		select {
+		case <-options.Signal:
+			cancel()
+		default:
+		}
 	}
 
 	// Build options slice
@@ -173,6 +195,30 @@ func StreamProxyWithOptions(
 	}
 	if options.Reasoning != "" {
 		opts = append(opts, ai.WithReasoning(ai.ReasoningLevel(options.Reasoning)))
+	}
+	if options.ThinkingBudgets != nil {
+		opts = append(opts, ai.WithThinkingBudgets(options.ThinkingBudgets))
+	}
+	if options.CacheRetention != "" {
+		opts = append(opts, ai.WithCacheRetention(options.CacheRetention))
+	}
+	if options.SessionID != "" {
+		opts = append(opts, ai.WithSessionID(options.SessionID))
+	}
+	if len(options.Headers) > 0 {
+		opts = append(opts, ai.WithHeaders(options.Headers))
+	}
+	if len(options.Metadata) > 0 {
+		opts = append(opts, ai.WithMetadata(options.Metadata))
+	}
+	if len(options.SamplingParams) > 0 {
+		opts = append(opts, ai.WithSamplingParams(options.SamplingParams))
+	}
+	if options.Transport != "" {
+		opts = append(opts, ai.WithTransport(options.Transport))
+	}
+	if options.MaxRetryDelayMs != nil {
+		opts = append(opts, ai.WithMaxRetryDelayMs(*options.MaxRetryDelayMs))
 	}
 
 	return StreamProxy(ctx, model, aiCtx, handler, options.ProxyURL, options.AuthToken, opts...)
@@ -233,35 +279,78 @@ func streamProxyResponse(ctx context.Context, model *ai.Model, body io.Reader, h
 		},
 	}
 
-	currentToolCall := (*ai.ToolCall)(nil)
-	toolCallPartialJSON := "" // Tracks partial JSON for streaming tool call arguments
+	toolCallJSON := make(map[int]string)
+
+	emit := func(err error) {
+		partial.StopReason = ai.StopReasonError
+		if ctx.Err() != nil {
+			partial.StopReason = ai.StopReasonAborted
+		}
+		partial.ErrorMessage = err.Error()
+		handler(ctx, ai.StreamError{Reason: string(partial.StopReason), Err: err, Msg: *partial})
+	}
+	fail := func(err error) error {
+		emit(err)
+		return err
+	}
 
 	for {
-		line, err := reader.ReadString('\n')
-		if err == io.EOF {
-			break
+		if ctx.Err() != nil {
+			return fail(fmt.Errorf("request aborted by user: %w", context.Cause(ctx)))
 		}
 
-		if err != nil {
-			return fmt.Errorf("proxy: read: %w", err)
+		line, readErr := reader.ReadString('\n')
+		if ctx.Err() != nil {
+			return fail(fmt.Errorf("proxy: read: %w", errors.Join(context.Cause(ctx), readErr)))
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return fail(fmt.Errorf("proxy: read: %w", readErr))
 		}
 
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
+		if !strings.HasPrefix(line, "data:") {
+			if readErr != nil {
+				break
+			}
+
 			continue
 		}
 
-		data := strings.TrimPrefix(line, "data: ")
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			if readErr != nil {
+				break
+			}
+			continue
+		}
 
 		var proxyEvent proxyEvent
 		if err := json.Unmarshal([]byte(data), &proxyEvent); err != nil {
-			// Treat malformed JSON as a protocol error. This matches the TypeScript
-			// reference behavior which throws on malformed data: lines.
-			handler(ctx, ai.StreamError{
-				Reason: string(ai.StopReasonError),
-				Msg:    *partial,
-			})
-			return fmt.Errorf("proxy: malformed event: %w", err)
+			return fail(fmt.Errorf("proxy: malformed event: %w", err))
+		}
+		index := proxyEvent.ContentIndex
+		var content *ai.ContentBlock
+		switch proxyEvent.Type {
+		case "text_start", "thinking_start", "toolcall_start":
+			// Content starts may replace an existing slot or append the next
+			// slot, but never allocate a peer-controlled sparse slice.
+			if index < 0 || index > len(partial.Content) {
+				return fail(fmt.Errorf("proxy: invalid content index %d for %s", index, proxyEvent.Type))
+			}
+			if index == len(partial.Content) {
+				partial.Content = append(partial.Content, ai.ContentBlock{})
+			}
+			delete(toolCallJSON, index)
+			content = &partial.Content[index]
+		case "text_delta", "text_end", "thinking_delta", "thinking_end", "toolcall_delta", "toolcall_end":
+			kind, _, _ := strings.Cut(proxyEvent.Type, "_")
+			if kind == "toolcall" {
+				kind = "toolCall"
+			}
+			if index < 0 || index >= len(partial.Content) || partial.Content[index].Type != kind {
+				return fail(fmt.Errorf("proxy: invalid content index or type for %s at %d", proxyEvent.Type, index))
+			}
+			content = &partial.Content[index]
 		}
 
 		switch proxyEvent.Type {
@@ -273,141 +362,82 @@ func streamProxyResponse(ctx context.Context, model *ai.Model, body io.Reader, h
 			handler(ctx, ai.Start{Partial: *partial})
 
 		case "text_start":
-			partial.Content = append(partial.Content, ai.ContentBlock{
-				Type: "text",
-			})
-			handler(ctx, ai.TextStart{ContentIndex: proxyEvent.ContentIndex, Partial: *partial})
+			*content = ai.ContentBlock{Type: "text"}
+			handler(ctx, ai.TextStart{ContentIndex: index, Partial: *partial})
 
 		case "text_delta":
-			if len(partial.Content) > proxyEvent.ContentIndex {
-				partial.Content[proxyEvent.ContentIndex].Text += proxyEvent.Delta
-			}
-
-			handler(ctx, ai.TextDelta{
-				ContentIndex: proxyEvent.ContentIndex,
-				Delta:        proxyEvent.Delta,
-				Partial:      *partial,
-			})
+			content.Text += proxyEvent.Delta
+			handler(ctx, ai.TextDelta{ContentIndex: index, Delta: proxyEvent.Delta, Partial: *partial})
 
 		case "text_end":
-			content := ""
-			if len(partial.Content) > proxyEvent.ContentIndex {
-				content = partial.Content[proxyEvent.ContentIndex].Text
-				// Update text signature for replay verification (pi-mono: proxy.ts:240)
-				partial.Content[proxyEvent.ContentIndex].TextSignature = proxyEvent.ContentSignature
-			}
-			handler(ctx, ai.TextEnd{
-				ContentIndex:     proxyEvent.ContentIndex,
-				Content:          content,
-				ContentSignature: proxyEvent.ContentSignature, // pi-mono parity
-				Partial:          *partial,
-			})
+			content.TextSignature = proxyEvent.ContentSignature
+			handler(ctx, ai.TextEnd{ContentIndex: index, Content: content.Text, ContentSignature: proxyEvent.ContentSignature, Partial: *partial})
 
 		case "thinking_start":
-			partial.Content = append(partial.Content, ai.ContentBlock{
-				Type: "thinking",
-			})
-			handler(ctx, ai.ThinkingStart{ContentIndex: proxyEvent.ContentIndex, Partial: *partial})
+			*content = ai.ContentBlock{Type: "thinking"}
+			handler(ctx, ai.ThinkingStart{ContentIndex: index, Partial: *partial})
 
 		case "thinking_delta":
-			if len(partial.Content) > proxyEvent.ContentIndex {
-				partial.Content[proxyEvent.ContentIndex].Thinking += proxyEvent.Delta
-			}
-
-			handler(ctx, ai.ThinkingDelta{
-				ContentIndex: proxyEvent.ContentIndex,
-				Delta:        proxyEvent.Delta,
-				Partial:      *partial,
-			})
+			content.Thinking += proxyEvent.Delta
+			handler(ctx, ai.ThinkingDelta{ContentIndex: index, Delta: proxyEvent.Delta, Partial: *partial})
 
 		case "thinking_end":
-			content := ""
-			if len(partial.Content) > proxyEvent.ContentIndex {
-				content = partial.Content[proxyEvent.ContentIndex].Thinking
-				// Update thinking signature for replay verification (pi-mono: proxy.ts:272)
-				partial.Content[proxyEvent.ContentIndex].ThoughtSignature = proxyEvent.ContentSignature
-			}
-			handler(ctx, ai.ThinkingEnd{
-				ContentIndex:     proxyEvent.ContentIndex,
-				Content:          content,
-				ContentSignature: proxyEvent.ContentSignature, // pi-mono parity
-				Partial:          *partial,
-			})
+			content.ThoughtSignature = proxyEvent.ContentSignature
+			handler(ctx, ai.ThinkingEnd{ContentIndex: index, Content: content.Thinking, ContentSignature: proxyEvent.ContentSignature, Partial: *partial})
 
 		case "toolcall_start":
-			currentToolCall = &ai.ToolCall{
-				ID:        proxyEvent.ID,
-				Name:      proxyEvent.ToolName,
-				Arguments: json.RawMessage(`{}`),
-			}
-			toolCallPartialJSON = "" // Reset partial JSON tracking
-			// Initialize the content block (pi-mono: proxy.ts:283-290)
-			if len(partial.Content) > proxyEvent.ContentIndex {
-				partial.Content[proxyEvent.ContentIndex] = ai.ContentBlock{
-					Type: "toolCall",
-					ID:   proxyEvent.ID,
-					Name: proxyEvent.ToolName,
-				}
-			} else {
-				partial.Content = append(partial.Content, ai.ContentBlock{
-					Type:      "toolCall",
-					ID:        proxyEvent.ID,
-					Name:      proxyEvent.ToolName,
-					Arguments: json.RawMessage(`{}`),
-				})
-			}
-			handler(ctx, ai.ToolCallStart{ContentIndex: proxyEvent.ContentIndex, Partial: *partial})
-		case "toolcall_delta":
-			if currentToolCall != nil {
-				// Accumulate partial JSON for streaming tool call arguments (pi-mono: proxy.ts:293-298)
-				toolCallPartialJSON += proxyEvent.Delta
-				// Use partial JSON parsing for streaming arguments
-				parsedArgs := ai.ParseStreamingJSON(toolCallPartialJSON)
-				argsJSON, err := json.Marshal(parsedArgs)
-				if err == nil {
-					currentToolCall.Arguments = argsJSON
-					if len(partial.Content) > proxyEvent.ContentIndex {
-						partial.Content[proxyEvent.ContentIndex].Arguments = argsJSON
-					}
-				}
-			}
+			*content = ai.ContentBlock{Type: "toolCall", ID: proxyEvent.ID, Name: proxyEvent.ToolName, Arguments: json.RawMessage(`{}`)}
+			toolCallJSON[index] = ""
+			handler(ctx, ai.ToolCallStart{ContentIndex: index, Partial: *partial})
 
-			handler(ctx, ai.ToolCallDelta{
-				ContentIndex: proxyEvent.ContentIndex,
-				Delta:        proxyEvent.Delta,
+		case "toolcall_delta":
+			previous, active := toolCallJSON[index]
+			if !active {
+				return fail(fmt.Errorf("proxy: toolcall_delta after toolcall_end at %d", index))
+			}
+			toolCallJSON[index] = previous + proxyEvent.Delta
+			arguments, err := json.Marshal(ai.ParseStreamingJSON(toolCallJSON[index]))
+			if err != nil {
+				return fail(fmt.Errorf("proxy: encode tool arguments: %w", err))
+			}
+			content.Arguments = arguments
+			handler(ctx, ai.ToolCallDelta{ContentIndex: index, Delta: proxyEvent.Delta, Partial: *partial})
+
+		case "toolcall_end":
+			if _, active := toolCallJSON[index]; !active {
+				return fail(fmt.Errorf("proxy: repeated toolcall_end at %d", index))
+			}
+			if call := proxyEvent.ToolCall; call != nil {
+				content.ID = call.ID
+				content.Name = call.Name
+				content.Namespace = call.Namespace
+				content.Arguments = call.Arguments
+			}
+			delete(toolCallJSON, index)
+			handler(ctx, ai.ToolCallEnd{
+				ContentIndex: index,
+				ToolCall:     ai.ToolCall{ID: content.ID, Name: content.Name, Arguments: content.Arguments, Namespace: content.Namespace},
 				Partial:      *partial,
 			})
 
-		case "toolcall_end":
-			if currentToolCall != nil {
-				// Update the content block with final arguments
-				if len(partial.Content) > proxyEvent.ContentIndex {
-					partial.Content[proxyEvent.ContentIndex].ID = currentToolCall.ID
-					partial.Content[proxyEvent.ContentIndex].Name = currentToolCall.Name
-					partial.Content[proxyEvent.ContentIndex].Arguments = currentToolCall.Arguments
-				}
-			}
-
-			if currentToolCall != nil {
-				handler(ctx, ai.ToolCallEnd{
-					ContentIndex: proxyEvent.ContentIndex,
-					ToolCall:     *currentToolCall,
-					Partial:      *partial,
-				})
-			}
-
-			currentToolCall = nil
-			toolCallPartialJSON = "" // Clear partial JSON tracking
-
 		case "done":
+			if proxyEvent.Reason != ai.StopReasonStop && proxyEvent.Reason != ai.StopReasonLength && proxyEvent.Reason != ai.StopReasonToolUse {
+				return fail(fmt.Errorf("proxy: invalid done reason %q", proxyEvent.Reason))
+			}
+			partial.ProviderThinkingLevel = proxyEvent.ProviderThinkingLevel
 			partial.StopReason = proxyEvent.Reason
 			if proxyEvent.Usage != nil {
 				partial.Usage = *proxyEvent.Usage
 			}
 
 			handler(ctx, ai.Done{Reason: proxyEvent.Reason, Message: *partial})
+			return nil
 
 		case "error":
+			if proxyEvent.Reason != ai.StopReasonError && proxyEvent.Reason != ai.StopReasonAborted {
+				return fail(fmt.Errorf("proxy: invalid error reason %q", proxyEvent.Reason))
+			}
+			partial.ProviderThinkingLevel = proxyEvent.ProviderThinkingLevel
 			partial.StopReason = proxyEvent.Reason
 			partial.ErrorMessage = proxyEvent.ErrorMessage
 			if proxyEvent.Usage != nil {
@@ -417,8 +447,17 @@ func streamProxyResponse(ctx context.Context, model *ai.Model, body io.Reader, h
 				Reason: string(proxyEvent.Reason),
 				Msg:    *partial,
 			})
+			return nil
+		}
+
+		if readErr != nil {
+			break
 		}
 	}
+
+	// A clean EOF without a terminal event means the server dropped the
+	// response mid-stream.
+	emit(errors.New("connection closed by proxy server before the response completed"))
 
 	return nil
 }
@@ -428,14 +467,38 @@ func extractSimpleStreamOptions(opts []ai.Option) map[string]any {
 	simpleOpts := ai.ExtractSimpleStreamOptions(opts)
 
 	options := make(map[string]any)
+	if simpleOpts.CacheRetention != "" {
+		options["cacheRetention"] = simpleOpts.CacheRetention
+	}
+	if simpleOpts.SessionID != "" {
+		options["sessionId"] = simpleOpts.SessionID
+	}
+	if len(simpleOpts.Headers) > 0 {
+		options["headers"] = simpleOpts.Headers
+	}
+	if len(simpleOpts.Metadata) > 0 {
+		options["metadata"] = simpleOpts.Metadata
+	}
+	if simpleOpts.MaxRetryDelaySet || simpleOpts.MaxRetryDelayMs > 0 {
+		options["maxRetryDelayMs"] = simpleOpts.MaxRetryDelayMs
+	}
 	if simpleOpts.Temperature != nil {
 		options["temperature"] = *simpleOpts.Temperature
 	}
 	if simpleOpts.MaxTokens > 0 {
 		options["maxTokens"] = simpleOpts.MaxTokens
 	}
+	if simpleOpts.ThinkingBudgets != nil {
+		options["thinkingBudgets"] = simpleOpts.ThinkingBudgets
+	}
 	if simpleOpts.Reasoning != "" {
 		options["reasoning"] = simpleOpts.Reasoning
+	}
+	if len(simpleOpts.SamplingParams) > 0 {
+		options["samplingParams"] = simpleOpts.SamplingParams
+	}
+	if simpleOpts.Transport != "" {
+		options["transport"] = simpleOpts.Transport
 	}
 
 	return options
@@ -444,15 +507,17 @@ func extractSimpleStreamOptions(opts []ai.Option) map[string]any {
 // proxyEvent represents the raw event from the proxy server.
 // Matches pi-mono's ProxyAssistantMessageEvent type (proxy.ts:36-57)
 type proxyEvent struct {
-	Type             string               `json:"type"`
-	ContentIndex     int                  `json:"contentIndex,omitempty"`
-	Delta            string               `json:"delta,omitempty"`
-	Content          string               `json:"content,omitempty"`
-	ContentSignature string               `json:"contentSignature,omitempty"` // pi-mono parity: for text/thinking signatures
-	ID               string               `json:"id,omitempty"`
-	ToolName         string               `json:"toolName,omitempty"`
-	Reason           ai.StopReason        `json:"reason,omitempty"`
-	ErrorMessage     string               `json:"errorMessage,omitempty"`
-	Usage            *ai.Usage            `json:"usage,omitempty"`
-	Message          *ai.AssistantMessage `json:"message,omitempty"`
+	ToolCall              *ai.ToolCall         `json:"toolCall,omitempty"`
+	ProviderThinkingLevel string               `json:"providerThinkingLevel,omitempty"`
+	Type                  string               `json:"type"`
+	ContentIndex          int                  `json:"contentIndex,omitempty"`
+	Delta                 string               `json:"delta,omitempty"`
+	Content               string               `json:"content,omitempty"`
+	ContentSignature      string               `json:"contentSignature,omitempty"` // text/thinking signatures
+	ID                    string               `json:"id,omitempty"`
+	ToolName              string               `json:"toolName,omitempty"`
+	Reason                ai.StopReason        `json:"reason,omitempty"`
+	ErrorMessage          string               `json:"errorMessage,omitempty"`
+	Usage                 *ai.Usage            `json:"usage,omitempty"`
+	Message               *ai.AssistantMessage `json:"message,omitempty"`
 }

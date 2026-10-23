@@ -151,7 +151,7 @@ func TestSettingsOverlay_ValueCyclingMaterializesNextValue(t *testing.T) {
 			continue
 		}
 		found = true
-		want := []string{"off", "minimal", "low", "medium", "high", "xhigh"}
+		want := []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 		if len(it.Values) != len(want) {
 			t.Fatalf("thinking level Values length = %d, want %d", len(it.Values), len(want))
 		}

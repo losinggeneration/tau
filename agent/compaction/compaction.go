@@ -4,9 +4,9 @@
 package compaction
 
 import (
-	"bytes"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"math"
 
 	"github.com/losinggeneration/tau/ai"
@@ -100,16 +100,12 @@ func estimateTokensChars(chars int) int {
 // EstimateTokens estimates the token count for an agent message.
 // Uses a chars/4 heuristic for conservative overestimation.
 func EstimateTokens(msg *AgentMessage) int {
+	if msg == nil {
+		return 0
+	}
 	chars := 0
 
 	switch msg.Role {
-	case RoleUser:
-		for _, block := range msg.Content {
-			if block.Type == ai.ContentBlockText && block.Text != "" {
-				chars += len(block.Text)
-			}
-		}
-
 	case RoleAssistant:
 		for _, block := range msg.Content {
 			switch block.Type {
@@ -131,7 +127,7 @@ func EstimateTokens(msg *AgentMessage) int {
 			}
 		}
 
-	case RoleTool:
+	case RoleSystem, RoleUser, RoleCustom, RoleTool, "toolResult":
 		for _, block := range msg.Content {
 			if block.Type == ai.ContentBlockText && block.Text != "" {
 				chars += len(block.Text)
@@ -148,6 +144,14 @@ func EstimateTokens(msg *AgentMessage) int {
 	case RoleBranchSummary, RoleCompactionSummary:
 		if msg.Summary != "" {
 			chars = len(msg.Summary)
+		}
+	}
+
+	if msg.Role == RoleSystem {
+		for _, section := range msg.Sections {
+			if section != nil {
+				chars += len(*section)
+			}
 		}
 	}
 
@@ -217,7 +221,7 @@ func EstimateContextTokens(messages []*AgentMessage) ContextUsageEstimate {
 	// Find last assistant with usage
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
-		if msg.Role == RoleAssistant {
+		if msg != nil && msg.Role == RoleAssistant {
 			if msg.StopReason != ai.StopReasonAborted && msg.StopReason != ai.StopReasonError && hasUsageTokens(msg.Usage) {
 				usageTokens := calculateContextTokens(msg.Usage)
 				var trailingTokens int
@@ -311,12 +315,15 @@ type ScannerEntry struct {
 	// (json: first_kept_entry_id); the caller is responsible for
 	// translating between the two representations.
 	FirstKeptID string
+	Summary     string
 }
 
 // validCutPointRoles contains message roles that are valid cut points.
 // Tool results are never valid cut points (they must follow their tool call).
 var validCutPointRoles = map[MessageRole]bool{
 	RoleUser:              true,
+	RoleCustom:            true,
+	RoleBashExecution:     true,
 	RoleAssistant:         true,
 	RoleBranchSummary:     true,
 	RoleCompactionSummary: true,
@@ -325,36 +332,17 @@ var validCutPointRoles = map[MessageRole]bool{
 // ParseEntryRole extracts the role from a scanner entry's message.
 // Returns empty string if parsing fails.
 func ParseEntryRole(entry *ScannerEntry) MessageRole {
-	if entry.Message == nil {
+	if entry == nil {
 		return ""
 	}
-
-	// Simple parse - we just need the role
-	// Try to find "role" in the JSON
-	start := bytes.Index(entry.Message, []byte(`"role"`))
-	if start < 0 {
+	var message struct {
+		Role               MessageRole `json:"role"`
+		ExcludeFromContext bool        `json:"excludeFromContext"`
+	}
+	if err := json.Unmarshal(entry.Message, &message); err != nil || message.ExcludeFromContext {
 		return ""
 	}
-	colon := bytes.Index(entry.Message[start:], []byte(`:`))
-	if colon < 0 {
-		return ""
-	}
-	valueStart := start + colon + 1
-	for valueStart < len(entry.Message) && (entry.Message[valueStart] == ' ' || entry.Message[valueStart] == '"') {
-		if entry.Message[valueStart] == '"' {
-			valueStart++
-			break
-		}
-		valueStart++
-	}
-	valueEnd := valueStart
-	for valueEnd < len(entry.Message) && entry.Message[valueEnd] != '"' {
-		valueEnd++
-	}
-	if valueEnd > valueStart {
-		return MessageRole(string(entry.Message[valueStart:valueEnd]))
-	}
-	return ""
+	return message.Role
 }
 
 // IsValidCutPointEntry returns true if this entry type is a valid cut point
@@ -374,23 +362,30 @@ func IsValidCutPointRole(role MessageRole) bool {
 	return validCutPointRoles[role]
 }
 
-// FindTurnStartIndex finds the user message (or bash execution) that starts
-// the turn containing the given entry index.
-// Returns -1 if no turn start found before the index.
+func isTurnStartEntry(entry *ScannerEntry) bool {
+	if entry == nil {
+		return false
+	}
+	switch entry.Type {
+	case "branch_summary":
+		return true
+	case "custom_message":
+		return ParseEntryRole(entry) != ""
+	case "message":
+		switch ParseEntryRole(entry) {
+		case RoleUser, RoleCustom, RoleBashExecution, RoleBranchSummary, RoleCompactionSummary:
+			return true
+		}
+	}
+	return false
+}
+
+// FindTurnStartIndex finds the context message that starts the containing turn.
+// Returns -1 if no turn start is found at or before the index.
 func FindTurnStartIndex(scanner EntryScanner, entryIndex, startIndex int) int {
 	for i := entryIndex; i >= startIndex; i-- {
-		entry := scanner.GetEntry(i)
-		if entry == nil {
-			continue
-		}
-		if entry.Type == "custom_message" || entry.Type == "branch_summary" {
+		if isTurnStartEntry(scanner.GetEntry(i)) {
 			return i
-		}
-		if entry.Type == "message" {
-			role := ParseEntryRole(entry)
-			if role == RoleUser || role == RoleBashExecution {
-				return i
-			}
 		}
 	}
 	return -1
@@ -408,7 +403,7 @@ func findValidCutPoints(scanner EntryScanner, startIndex, endIndex int) []int {
 			continue
 		}
 		// For message entries, also check the role
-		if entry.Type == "message" {
+		if entry.Type == "message" || entry.Type == "custom_message" {
 			role := ParseEntryRole(entry)
 			if !IsValidCutPointRole(role) {
 				continue
@@ -444,12 +439,12 @@ func FindCutPoint(scanner EntryScanner, startIndex, endIndex, keepRecentTokens i
 
 	for i := endIndex - 1; i >= startIndex; i-- {
 		entry := scanner.GetEntry(i)
-		if entry == nil || entry.Type != "message" {
+		if entry == nil {
 			continue
 		}
 
 		// Estimate this message's size
-		msg, err := ParseAgentMessage(entry.Message)
+		msg, err := parseScannerMessage(entry)
 		if err != nil || msg == nil {
 			continue
 		}
@@ -458,7 +453,10 @@ func FindCutPoint(scanner EntryScanner, startIndex, endIndex, keepRecentTokens i
 
 		// Check if we've exceeded the budget
 		if accumulatedTokens >= keepRecentTokens {
-			// Find the closest valid cut point at or after this entry
+			// Prefer the closest cut point at or after this entry. Trailing tool
+			// results that exceed the budget alone keep their preceding tool call
+			// instead of falling back to keeping everything.
+			cutIndex = cutPoints[len(cutPoints)-1]
 			for _, cp := range cutPoints {
 				if cp >= i {
 					cutIndex = cp
@@ -479,8 +477,8 @@ func FindCutPoint(scanner EntryScanner, startIndex, endIndex, keepRecentTokens i
 		if prevEntry.Type == "compaction" {
 			break
 		}
-		if prevEntry.Type == "message" {
-			// Stop if we hit any message
+		if IsValidCutPointEntry(prevEntry.Type) {
+			// Context-visible entries are not adjacent metadata.
 			break
 		}
 		// Include this non-message entry (bash, settings change, etc.)
@@ -488,21 +486,16 @@ func FindCutPoint(scanner EntryScanner, startIndex, endIndex, keepRecentTokens i
 	}
 
 	// Determine if this is a split turn
-	cutEntry := scanner.GetEntry(cutIndex)
-	isUserMessage := false
-	if cutEntry != nil && cutEntry.Type == "message" {
-		role := ParseEntryRole(cutEntry)
-		isUserMessage = role == RoleUser
-	}
+	startsTurn := isTurnStartEntry(scanner.GetEntry(cutIndex))
 	turnStartIndex := -1
-	if !isUserMessage {
+	if !startsTurn {
 		turnStartIndex = FindTurnStartIndex(scanner, cutIndex, startIndex)
 	}
 
 	return CutPointResult{
 		FirstKeptIndex: cutIndex,
 		TurnStartIndex: turnStartIndex,
-		IsSplitTurn:    !isUserMessage && turnStartIndex != -1,
+		IsSplitTurn:    !startsTurn && turnStartIndex != -1,
 	}
 }
 
@@ -511,6 +504,7 @@ func FindCutPoint(scanner EntryScanner, startIndex, endIndex, keepRecentTokens i
 type AgentMessage struct {
 	Role       MessageRole
 	Content    []ai.ContentBlock
+	Sections   map[string]*string
 	Command    string // for bashExecution role
 	Output     string // for bashExecution role
 	Summary    string // for branchSummary/compactionSummary role
@@ -518,21 +512,53 @@ type AgentMessage struct {
 	StopReason ai.StopReason
 }
 
+func parseScannerMessage(entry *ScannerEntry) (*AgentMessage, error) {
+	if entry == nil {
+		return nil, nil
+	}
+	switch entry.Type {
+	case "branch_summary":
+		if entry.Summary == "" {
+			return nil, nil
+		}
+		return &AgentMessage{Role: RoleBranchSummary, Summary: entry.Summary}, nil
+	case "message", "custom_message":
+		return ParseAgentMessage(entry.Message)
+	default:
+		return nil, nil
+	}
+}
+
 // ParseAgentMessage parses a raw JSON message into an AgentMessage.
+// Messages excluded from model context return nil.
 func ParseAgentMessage(data []byte) (*AgentMessage, error) {
 	if data == nil {
 		return nil, nil
 	}
 
 	var raw struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Sections           map[string]*string `json:"sections"`
+		Role               string             `json:"role"`
+		ExcludeFromContext bool               `json:"excludeFromContext"`
+		Content            json.RawMessage    `json:"content"`
+		Usage              ai.Usage           `json:"usage"`
+		StopReason         ai.StopReason      `json:"stopReason"`
+		LegacyStopReason   ai.StopReason      `json:"stop_reason"`
+		Command            *string            `json:"command"`
+		Output             *string            `json:"output"`
+		Summary            *string            `json:"summary"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
 
-	msg := &AgentMessage{Role: MessageRole(raw.Role)}
+	if raw.ExcludeFromContext {
+		return nil, nil
+	}
+	if raw.StopReason == "" {
+		raw.StopReason = raw.LegacyStopReason
+	}
+	msg := &AgentMessage{Sections: raw.Sections, Role: MessageRole(raw.Role), Usage: raw.Usage, StopReason: raw.StopReason}
 
 	if raw.Content != nil {
 		if err := json.Unmarshal(raw.Content, &msg.Content); err != nil {
@@ -544,35 +570,33 @@ func ParseAgentMessage(data []byte) (*AgentMessage, error) {
 		}
 	}
 
-	// Extract special fields based on role
-	switch msg.Role {
-	case RoleBashExecution:
-		var exec struct {
+	// Older compaction records stored special-role fields inside content.
+	if msg.Role == RoleBashExecution || msg.Role == RoleBranchSummary || msg.Role == RoleCompactionSummary {
+		var legacy struct {
 			Command string `json:"command"`
 			Output  string `json:"output"`
-		}
-		if raw.Content != nil {
-			_ = json.Unmarshal(raw.Content, &exec)
-			msg.Command = exec.Command
-			msg.Output = exec.Output
-		}
-	case RoleBranchSummary, RoleCompactionSummary:
-		var sum struct {
 			Summary string `json:"summary"`
 		}
-		if raw.Content != nil {
-			_ = json.Unmarshal(raw.Content, &sum)
-			msg.Summary = sum.Summary
-		}
-	case RoleAssistant:
-		if raw.Content != nil {
-			var assistant struct {
-				Usage ai.Usage `json:"usage"`
+		if len(raw.Content) > 0 && raw.Content[0] == '{' {
+			if err := json.Unmarshal(raw.Content, &legacy); err != nil {
+				return nil, fmt.Errorf("parse special message content: %w", err)
 			}
-			_ = json.Unmarshal(raw.Content, &assistant)
-			msg.Usage = assistant.Usage
+		}
+		switch msg.Role {
+		case RoleBashExecution:
+			msg.Command, msg.Output = legacy.Command, legacy.Output
+			if raw.Command != nil {
+				msg.Command = *raw.Command
+			}
+			if raw.Output != nil {
+				msg.Output = *raw.Output
+			}
+		case RoleBranchSummary, RoleCompactionSummary:
+			msg.Summary = legacy.Summary
+			if raw.Summary != nil {
+				msg.Summary = *raw.Summary
+			}
 		}
 	}
-
 	return msg, nil
 }

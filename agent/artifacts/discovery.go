@@ -16,6 +16,7 @@ import (
 
 	"github.com/losinggeneration/tau/agent/packages"
 	"github.com/losinggeneration/tau/commands"
+	"github.com/losinggeneration/tau/paths"
 )
 
 // SourceTier represents where an artifact was discovered.
@@ -176,9 +177,17 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 		cfg.HomeDir = home
 	}
 
+	if cfg.CWD != "" {
+		absolute, err := filepath.Abs(cfg.CWD)
+		if err != nil {
+			return nil, fmt.Errorf("artifacts: resolve working directory: %w", err)
+		}
+		cfg.CWD = absolute
+	}
+
 	// 1. CLI paths (highest precedence)
 	for _, path := range cfg.CLIPaths[KindSkill] {
-		e, err := discoverArtifactPath(path, KindSkill, TierCLI)
+		e, err := discoverArtifactPath(paths.ResourcePath(path, cfg.CWD, cfg.HomeDir), KindSkill, TierCLI)
 		if err != nil {
 			warn(cfg.Log, "skill", path, err)
 			continue
@@ -186,7 +195,7 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 		entries = append(entries, e...)
 	}
 	for _, path := range cfg.CLIPaths[KindPrompt] {
-		e, err := discoverArtifactPath(path, KindPrompt, TierCLI)
+		e, err := discoverArtifactPath(paths.ResourcePath(path, cfg.CWD, cfg.HomeDir), KindPrompt, TierCLI)
 		if err != nil {
 			warn(cfg.Log, "prompt", path, err)
 			continue
@@ -194,7 +203,7 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 		entries = append(entries, e...)
 	}
 	for _, path := range cfg.CLIPaths[KindTheme] {
-		e, err := discoverArtifactPath(path, KindTheme, TierCLI)
+		e, err := discoverArtifactPath(paths.ResourcePath(path, cfg.CWD, cfg.HomeDir), KindTheme, TierCLI)
 		if err != nil {
 			warn(cfg.Log, "theme", path, err)
 			continue
@@ -202,7 +211,7 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 		entries = append(entries, e...)
 	}
 	for _, path := range cfg.CLIPaths[KindExtension] {
-		e, err := discoverArtifactPath(path, KindExtension, TierCLI)
+		e, err := discoverArtifactPath(paths.ResourcePath(path, cfg.CWD, cfg.HomeDir), KindExtension, TierCLI)
 		if err != nil {
 			warn(cfg.Log, "extension", path, err)
 			continue
@@ -273,62 +282,49 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 		entries = append(entries, e...)
 	}
 
-	// 5. Settings paths
-	if !cfg.DisableSkills {
-		for _, path := range cfg.SettingsPaths[KindSkill] {
-			es, tier := discoverArtifactPathWithSettingsTier(path, cfg.CWD, cfg.HomeDir, KindSkill)
-			if len(es) > 0 {
-				for i := range es {
-					es[i].Kind = KindSkill
-				}
-				entries = append(entries, es...)
-			} else if tier != TierBuiltin {
-				warn(cfg.Log, "skill", path, errors.New("not found"))
-			}
+	// Settings entries discover plain paths; patterns select within the discovered set.
+	for _, kind := range []ArtifactKind{KindSkill, KindPrompt, KindTheme, KindExtension} {
+		if (kind == KindSkill && cfg.DisableSkills) || (kind == KindPrompt && cfg.DisablePrompts) ||
+			(kind == KindTheme && cfg.DisableThemes) || (kind == KindExtension && cfg.DisableExtensions) {
+			continue
 		}
-	}
-	if !cfg.DisablePrompts {
-		for _, path := range cfg.SettingsPaths[KindPrompt] {
-			es, tier := discoverArtifactPathWithSettingsTier(path, cfg.CWD, cfg.HomeDir, KindPrompt)
+		plain, _ := splitPatterns(cfg.SettingsPaths[kind])
+		for _, path := range plain {
+			es, tier := discoverArtifactPathWithSettingsTier(paths.ResourcePath(path, cfg.CWD, cfg.HomeDir), cfg.CWD, cfg.HomeDir, kind)
 			if len(es) > 0 {
-				for i := range es {
-					es[i].Kind = KindPrompt
-				}
 				entries = append(entries, es...)
 			} else if tier != TierBuiltin {
-				warn(cfg.Log, "prompt", path, errors.New("not found"))
-			}
-		}
-	}
-	if !cfg.DisableThemes {
-		for _, path := range cfg.SettingsPaths[KindTheme] {
-			es, tier := discoverArtifactPathWithSettingsTier(path, cfg.CWD, cfg.HomeDir, KindTheme)
-			if len(es) > 0 {
-				for i := range es {
-					es[i].Kind = KindTheme
-				}
-				entries = append(entries, es...)
-			} else if tier != TierBuiltin {
-				warn(cfg.Log, "theme", path, errors.New("not found"))
-			}
-		}
-	}
-	if !cfg.DisableExtensions {
-		for _, path := range cfg.SettingsPaths[KindExtension] {
-			es, tier := discoverArtifactPathWithSettingsTier(path, cfg.CWD, cfg.HomeDir, KindExtension)
-			if len(es) > 0 {
-				for i := range es {
-					es[i].Kind = KindExtension
-				}
-				entries = append(entries, es...)
-			} else if tier != TierBuiltin {
-				warn(cfg.Log, "extension", path, errors.New("not found"))
+				warn(cfg.Log, string(kind), path, errors.New("not found"))
 			}
 		}
 	}
 
 	// 6. Packages (TierPackages)
 	entries = append(entries, discoverPackageArtifacts(cfg)...)
+
+	for kind, configured := range cfg.SettingsPaths {
+		_, patterns := splitPatterns(configured)
+		if len(patterns) == 0 {
+			continue
+		}
+		for i, pattern := range patterns {
+			patterns[i] = paths.ResourcePath(pattern, cfg.CWD, cfg.HomeDir)
+		}
+		var candidates []string
+		for _, entry := range entries {
+			if entry.Kind == kind && entry.Tier != TierCLI {
+				candidates = append(candidates, entry.SourcePath)
+			}
+		}
+		enabled := ApplyFilter(candidates, patterns, cfg.CWD)
+		allowed := make(map[string]bool, len(enabled))
+		for _, path := range enabled {
+			allowed[path] = true
+		}
+		entries = slices.DeleteFunc(entries, func(entry Entry) bool {
+			return entry.Kind == kind && entry.Tier != TierCLI && !allowed[entry.SourcePath]
+		})
+	}
 
 	// 7. Built-in themes (TierBuiltin)
 	if !cfg.DisableThemes {
@@ -351,7 +347,7 @@ func discoverPackageArtifacts(cfg DiscoveryConfig) []Entry {
 	var entries []Entry
 
 	for _, basePath := range cfg.PackagePaths {
-		basePath = expandPath(basePath)
+		basePath = paths.ResourcePath(basePath, cfg.CWD, cfg.HomeDir)
 		pkgDirs, err := os.ReadDir(basePath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -461,16 +457,16 @@ func discoverArtifactPath(path string, kind ArtifactKind, tier SourceTier) ([]En
 
 // discoverArtifactPathWithSettingsTier discovers artifacts at settings paths.
 func discoverArtifactPathWithSettingsTier(path, cwd, homeDir string, kind ArtifactKind) ([]Entry, SourceTier) {
-	path = expandPath(path)
+	path = paths.ResourcePath(path, cwd, homeDir)
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return nil, TierBuiltin
 	}
 
 	tier := TierSettings
-	if cwd != "" && (strings.HasPrefix(path, cwd) || strings.HasPrefix(path+string(filepath.Separator), cwd+string(filepath.Separator))) {
+	if pathWithin(path, cwd) {
 		tier = TierProject
-	} else if strings.HasPrefix(path, homeDir) {
+	} else if pathWithin(path, homeDir) {
 		tier = TierUser
 	}
 
@@ -485,9 +481,9 @@ func discoverArtifactPathWithSettingsTier(path, cwd, homeDir string, kind Artifa
 		// - Skills: find both root-level .md files and subdirs with SKILL.md.
 		// Determine rootDir based on tier for ignore file collection.
 		var settingsRoot string
-		if cwd != "" && (strings.HasPrefix(path, cwd) || strings.HasPrefix(path+string(filepath.Separator), cwd+string(filepath.Separator))) {
+		if pathWithin(path, cwd) {
 			settingsRoot = cwd
-		} else if strings.HasPrefix(path, homeDir) {
+		} else if pathWithin(path, homeDir) {
 			settingsRoot = homeDir
 		} else {
 			settingsRoot = path
@@ -501,6 +497,14 @@ func discoverArtifactPathWithSettingsTier(path, cwd, homeDir string, kind Artifa
 		return nil, tier
 	}
 	return e, tier
+}
+
+func pathWithin(path, root string) bool {
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // discoverDir discovers all artifacts in a directory.
@@ -861,13 +865,7 @@ func isSkippedDirName(name string) bool {
 
 // expandPath expands ~ and environment variables in a path.
 func expandPath(path string) string {
-	if strings.HasPrefix(path, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			path = home + path[1:]
-		}
-	}
-	path = os.ExpandEnv(path)
-	return path
+	return paths.ResourcePath(path, "", "")
 }
 
 // warn logs a warning.

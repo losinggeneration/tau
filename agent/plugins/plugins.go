@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -67,9 +68,15 @@ var DefaultRPCTimeouts = DefaultRPCConfig{
 
 // ToolRegistration represents a tool registered by a plugin.
 type ToolRegistration struct {
-	Name        string
-	Description string
-	Parameters  map[string]string // JSON schema as string map
+	HasReachesTools     bool
+	Namespace           json.RawMessage
+	DefaultActive       *bool
+	Exposure            string
+	OutputSchema        json.RawMessage
+	ConstrainedSampling json.RawMessage
+	Name                string
+	Description         string
+	Parameters          map[string]string // JSON schema as string map
 }
 
 // CommandRegistration represents a command registered by a plugin.
@@ -94,6 +101,18 @@ type Registrations struct {
 	EventSubscriptions []string
 	CLIFlags           []CLIFlag
 	ToolPrefix         string
+	VirtualModels      []VirtualModelRegistration
+}
+
+// VirtualModelRegistration is a catalog model the plugin routes per request.
+type VirtualModelRegistration struct {
+	Provider       string
+	ID             string
+	Name           string
+	ThinkingLevels []string
+	Input          []ai.InputType
+	ContextWindow  int
+	MaxTokens      int
 }
 
 // PluginInfo holds information about a loaded plugin.
@@ -106,9 +125,6 @@ type PluginInfo struct {
 	APIVersion    string
 	Registrations Registrations
 	Cleanup       func()
-
-	// client is the go-plugin client (used for shutdown coordination).
-	client *plugin.Client
 
 	// grpcClient is the gRPC client for calling Shutdown.
 	grpcClient proto.PluginClient
@@ -174,6 +190,7 @@ type Manager struct {
 
 	// sessionAccessor handles session read/write for Host service RPCs.
 	sessionAccessor SessionAccessor
+	toolDiscovery   func(context.Context, *proto.ToolDiscoveryRequest) (json.RawMessage, error)
 
 	// commandRegistry is the command registry for plugin commands.
 	commandRegistry *commands.InMemoryRegistry
@@ -197,17 +214,27 @@ type Manager struct {
 	hostMu      sync.Mutex
 	hostSockets map[string]*hostSocket
 
+	// cleanups tracks plugin cleanup hooks so Shutdown can join them.
+	cleanups     sync.WaitGroup
+	cleanupGrace time.Duration
+
 	// sessionCWDProvider returns the current session CWD (may be nil).
 	sessionCWDProvider func() string
 
 	// messageSender routes plugin sendUserMessage calls to the active
 	// session's Send/Steer/FollowUp methods. May be nil.
 	// deliverAs: "" -> Send (normal); "steer" -> Steer; "followUp" -> FollowUp.
-	messageSender func(text string, deliverAs string) error
+	messageSender       func(text string, deliverAs string) error
+	customMessageSender func(context.Context, json.RawMessage, *bool, string) error
+
+	// compactor routes plugin SessionCompact calls to the active session's
+	// Compact. May be nil.
+	compactor func(ctx context.Context, instructions string) error
 
 	// loadFn is the function used by AttemptLoadWithRetry to load a plugin.
 	// Defaults to m.Load. Tests can override to avoid launching subprocesses.
-	loadFn func(ctx context.Context, path string, manifestPath ...string) (*PluginInfo, error)
+	loadFn        func(ctx context.Context, path string, manifestPath ...string) (*PluginInfo, error)
+	connectPlugin PluginConnector
 
 	// extensionPaths are additional paths to load extensions from (via --extension CLI flag).
 	extensionPaths []string
@@ -225,21 +252,36 @@ type Manager struct {
 	// use never writes to stdout/stderr unless the application opts in.
 	logger *slog.Logger
 
-	shimReady       chan error
-	shimReadyClosed bool
-	shimInstallFn   piext.InstallFn
-	shimStatusFn    piext.StatusFn
+	shimSetup     *shimSetup
+	shimClosed    bool
+	shimInstallFn piext.InstallFn
+	shimStatusFn  piext.StatusFn
 }
 
 // ToolProgressEvent represents a tool progress update from a plugin.
 type ToolProgressEvent struct {
-	ToolCallID string
-	Content    string
-	IsError    bool
+	NestedCalls []ai.NestedToolCall
+	ToolCallID  string
+	Content     string
+	IsError     bool
 }
 
 // ManagerOption configures a plugin Manager.
 type ManagerOption func(*Manager)
+
+// PluginConnector opens a plugin connection and returns nonnil, idempotent cleanup.
+// On error, the connector must release its own resources.
+// Initialization and registration remain the manager's responsibility.
+type PluginConnector func(ctx context.Context, path string, manifest *Manifest, manifestPath, hostSocket string) (proto.PluginClient, func(), error)
+
+// WithPluginConnector replaces subprocess startup, allowing in-process transports.
+func WithPluginConnector(connect PluginConnector) ManagerOption {
+	return func(m *Manager) {
+		if connect != nil {
+			m.connectPlugin = connect
+		}
+	}
+}
 
 // WithLogger configures the plugin manager diagnostic logger. Nil discards.
 func WithLogger(logger *slog.Logger) ManagerOption {
@@ -379,7 +421,7 @@ type SessionHeader struct {
 // The pluginName field identifies which plugin registered this handler.
 type EventHandler struct {
 	PluginName string
-	Handler    func(name string, payload json.RawMessage, sessionID string) EventResponse
+	Handler    func(ctx context.Context, name string, payload json.RawMessage, sessionID string) EventResponse
 }
 
 // ToolHandler executes a tool call.
@@ -408,28 +450,23 @@ type HandshakeResult struct {
 	ManifestPath  string
 	Manifest      *Manifest
 	Hash          string
-	Close         func() // releases plugin resources
+	Close         func() error // releases plugin resources
 }
 
 type pluginStartup struct {
-	client        *plugin.Client
 	grpcClient    proto.PluginClient
 	apiVersion    string
 	registrations Registrations
 	cleanup       func()
 }
 
-func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manifest, manifestPath string, timeouts DefaultRPCConfig) (*pluginStartup, error) {
-	pluginName := filepath.Base(path)
-	hostSocket, err := m.prepareHostSocketLocked(pluginName)
-	if err != nil {
-		return nil, fmt.Errorf("prepare host socket: %w", err)
+func (m *Manager) connectPluginProcess(ctx context.Context, path string, manifest *Manifest, manifestPath, hostSocket string) (proto.PluginClient, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
-
 	cmd, err := buildPluginCmd(path, manifest, manifestPath, hostSocket)
 	if err != nil {
-		m.closeHostSocketLocked(pluginName)
-		return nil, fmt.Errorf("build plugin command: %w", err)
+		return nil, nil, fmt.Errorf("build plugin command: %w", err)
 	}
 
 	client := plugin.NewClient(&plugin.ClientConfig{
@@ -447,21 +484,45 @@ func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manife
 
 	cleanup := func() {
 		client.Kill()
-		m.closeHostSocketLocked(pluginName)
 	}
 
 	conn, err := client.Client()
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("plugin client: %w", err)
+		return nil, nil, fmt.Errorf("plugin client: %w", err)
 	}
 
 	grpcConn, err := GetPluginConn(conn)
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("plugin does not use gRPC protocol: %w", err)
+		return nil, nil, fmt.Errorf("plugin does not use gRPC protocol: %w", err)
 	}
 	grpcClient := proto.NewPluginClient(grpcConn)
+
+	return grpcClient, cleanup, nil
+}
+
+func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manifest, manifestPath string, timeouts DefaultRPCConfig) (*pluginStartup, error) {
+	pluginName := filepath.Base(path)
+	hostSocket, err := m.prepareHostSocketLocked(pluginName)
+	if err != nil {
+		return nil, fmt.Errorf("prepare host socket: %w", err)
+	}
+
+	grpcClient, closeConnection, err := m.connectPlugin(ctx, path, manifest, manifestPath, hostSocket)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("connect plugin: %w", err), m.closeHostSocketLocked(pluginName))
+	}
+	if grpcClient == nil || closeConnection == nil {
+		if closeConnection != nil {
+			closeConnection()
+		}
+		return nil, errors.Join(errors.New("plugin connector requires a client and cleanup"), m.closeHostSocketLocked(pluginName))
+	}
+	fail := func(err error) error {
+		closeConnection()
+		return errors.Join(err, m.closeHostSocketLocked(pluginName))
+	}
 
 	cwd := ""
 	if m.sessionCWDProvider != nil {
@@ -490,16 +551,13 @@ func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manife
 		ManifestPath: manifestPath,
 	})
 	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("initialize: %w", err)
+		return nil, fail(fmt.Errorf("initialize: %w", err))
 	}
 	if resp.Error != "" {
-		cleanup()
-		return nil, fmt.Errorf("plugin init error: %s", resp.Error)
+		return nil, fail(fmt.Errorf("plugin init error: %s", resp.Error))
 	}
 	if !isAPIVersionSupported(resp.ApiVersion) {
-		cleanup()
-		return nil, fmt.Errorf("unsupported api version: %s (supported: %v)", resp.ApiVersion, SupportedAPIVersions)
+		return nil, fail(fmt.Errorf("unsupported api version: %s (supported: %v)", resp.ApiVersion, SupportedAPIVersions))
 	}
 
 	regCtx, regCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -507,12 +565,10 @@ func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manife
 
 	regs, err := grpcClient.ListRegistrations(regCtx, &proto.ListRegistrationsRequest{})
 	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("list registrations: %w", err)
+		return nil, fail(fmt.Errorf("list registrations: %w", err))
 	}
 
 	return &pluginStartup{
-		client:     client,
 		grpcClient: grpcClient,
 		apiVersion: resp.ApiVersion,
 		registrations: Registrations{
@@ -521,8 +577,9 @@ func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manife
 			EventSubscriptions: regs.EventSubscriptions,
 			CLIFlags:           convertCLIFlags(regs.CliFlags),
 			ToolPrefix:         regs.ToolPrefix,
+			VirtualModels:      convertVirtualModelRegistrations(regs.VirtualModels),
 		},
-		cleanup: cleanup,
+		cleanup: closeConnection,
 	}, nil
 }
 
@@ -557,7 +614,10 @@ func (m *Manager) Handshake(ctx context.Context, path string) (*HandshakeResult,
 		ManifestPath:  manifestPath,
 		Manifest:      manifest,
 		Hash:          hash,
-		Close:         started.cleanup,
+		Close: func() error {
+			started.cleanup()
+			return m.closeHostSocketLocked(filepath.Base(path))
+		},
 	}, nil
 }
 
@@ -717,12 +777,14 @@ func NewManager(configDir string, ui ui.UI, commandRegistry *commands.InMemoryRe
 		cliFlags:            make(map[string]map[string]string),
 		progressSubscribers: make(map[string][]chan<- ToolProgressEvent),
 		hostSockets:         make(map[string]*hostSocket),
+		cleanupGrace:        GracePeriod,
 		logger:              logging.Discard(),
 		shimInstallFn:       piext.NPMInstall,
 	}
 
 	// Default loadFn delegates to Load. Tests override to avoid subprocess overhead.
 	m.loadFn = m.Load
+	m.connectPlugin = m.connectPluginProcess
 
 	// Apply options.
 	for _, opt := range opts {
@@ -844,7 +906,7 @@ func (m *Manager) Discover(ctx context.Context) error {
 		}
 	}
 
-	m.prepareShimIfNeeded(ctx)
+	m.filterConfiguredExtensions()
 
 	m.mu.Lock()
 	m.prepareShimIfNeeded(ctx)
@@ -967,7 +1029,6 @@ func (m *Manager) loadLocked(ctx context.Context, path string, manifestPath stri
 		Hash:          hash,
 		APIVersion:    started.apiVersion,
 		Registrations: started.registrations,
-		client:        started.client,
 		grpcClient:    started.grpcClient,
 		Cleanup:       started.cleanup,
 	}
@@ -1085,7 +1146,9 @@ func (m *Manager) AttemptLoadWithRetry(ctx context.Context, path string, manifes
 		// Clean up failed load attempt resources.
 		m.mu.Lock()
 		if info := m.plugins[filepath.Base(path)]; info != nil && info.Cleanup != nil {
-			pluginCleanup(info.Cleanup)
+			if err := m.releasePluginLocked(ctx, info.Name, info); err != nil {
+				m.logger.Warn("plugin cleanup failed", "plugin", info.Name, "error", err)
+			}
 			delete(m.plugins, filepath.Base(path))
 		}
 		m.mu.Unlock()
@@ -1167,9 +1230,15 @@ func convertToolRegistrations(tools []*proto.ToolRegistration) []ToolRegistratio
 	result := make([]ToolRegistration, 0, len(tools))
 	for _, t := range tools {
 		result = append(result, ToolRegistration{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  t.Parameters,
+			HasReachesTools:     t.HasReachesTools,
+			Namespace:           json.RawMessage(t.Namespace),
+			DefaultActive:       t.DefaultActive,
+			Name:                t.Name,
+			Description:         t.Description,
+			Parameters:          t.Parameters,
+			Exposure:            t.Exposure,
+			OutputSchema:        json.RawMessage(t.OutputSchema),
+			ConstrainedSampling: json.RawMessage(t.ConstrainedSampling),
 		})
 	}
 	return result
@@ -1202,6 +1271,72 @@ func convertCLIFlags(flags []*proto.CLIFlag) []CLIFlag {
 	return result
 }
 
+func convertVirtualModelRegistrations(models []*proto.VirtualModelRegistration) []VirtualModelRegistration {
+	result := make([]VirtualModelRegistration, 0, len(models))
+	for _, model := range models {
+		input := make([]ai.InputType, 0, len(model.Input))
+		for _, kind := range model.Input {
+			input = append(input, ai.InputType(kind))
+		}
+		result = append(result, VirtualModelRegistration{Provider: model.Provider, ID: model.Id, Name: model.Name, ThinkingLevels: slices.Clone(model.ThinkingLevels), Input: input, ContextWindow: int(model.ContextWindow), MaxTokens: int(model.MaxTokens)})
+	}
+	return result
+}
+
+// VirtualModels returns loaded plugins' virtual models. Their routers call
+// the registering plugin, which must still be loaded.
+func (m *Manager) VirtualModels() []ai.VirtualModelDefinition {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var definitions []ai.VirtualModelDefinition
+	for _, name := range slices.Sorted(maps.Keys(m.plugins)) {
+		for _, model := range m.plugins[name].Registrations.VirtualModels {
+			definitions = append(definitions, ai.VirtualModelDefinition{
+				Provider: model.Provider, ID: model.ID, Name: model.Name, ThinkingLevels: slices.Clone(model.ThinkingLevels), Input: slices.Clone(model.Input), ContextWindow: model.ContextWindow, MaxTokens: model.MaxTokens,
+				Route: func(ctx context.Context, request ai.ModelRouteRequest) (ai.ModelRoute, error) {
+					return m.routeModel(ctx, name, model, request)
+				},
+			})
+		}
+	}
+	return definitions
+}
+
+func (m *Manager) routeModel(ctx context.Context, pluginName string, model VirtualModelRegistration, request ai.ModelRouteRequest) (ai.ModelRoute, error) {
+	m.mu.RLock()
+	info, ok := m.plugins[pluginName]
+	var client proto.PluginClient
+	var timeouts DefaultRPCConfig
+	if ok {
+		client, timeouts = info.grpcClient, info.getTimeouts()
+	}
+	m.mu.RUnlock()
+	if client == nil {
+		return ai.ModelRoute{}, fmt.Errorf("plugin %s is not loaded", pluginName)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return ai.ModelRoute{}, fmt.Errorf("encode route request: %w", err)
+	}
+	routeCtx, cancel := context.WithTimeout(ctx, timeouts.ExecuteTool)
+	defer cancel()
+	response, err := client.RouteModel(routeCtx, &proto.ModelRouteRequest{Provider: model.Provider, ModelId: model.ID, RequestJson: string(encoded)})
+	if err != nil {
+		return ai.ModelRoute{}, fmt.Errorf("plugin %s route model: %w", pluginName, err)
+	}
+	if response.Error != "" {
+		return ai.ModelRoute{}, fmt.Errorf("plugin %s route model: %s", pluginName, response.Error)
+	}
+	route := ai.ModelRoute{Model: &ai.Model{Provider: response.Provider, ID: response.ModelId}, ThinkingLevel: response.ThinkingLevel}
+	if response.StateJson != "" {
+		if !json.Valid([]byte(response.StateJson)) {
+			return ai.ModelRoute{}, fmt.Errorf("plugin %s returned router state that is not JSON", pluginName)
+		}
+		route.State = json.RawMessage(response.StateJson)
+	}
+	return route, nil
+}
+
 // registerPlugin registers a plugin's tools, commands, event subscriptions, and CLI flags
 // into the manager's internal maps and the command registry.
 func (m *Manager) registerPlugin(info *PluginInfo) {
@@ -1214,7 +1349,7 @@ func (m *Manager) registerPlugin(info *PluginInfo) {
 	for _, tool := range info.Registrations.Tools {
 		fullName := toolPrefix + tool.Name
 		m.toolHandlers[fullName] = func(ctx context.Context, toolName, toolCallID, arguments string) (string, bool, error) {
-			return m.executeTool(ctx, pluginName, toolName, toolCallID, arguments)
+			return m.executeTool(ctx, pluginName, tool.Name, toolCallID, arguments)
 		}
 	}
 
@@ -1250,8 +1385,8 @@ func (m *Manager) registerPlugin(info *PluginInfo) {
 	for _, eventName := range info.Registrations.EventSubscriptions {
 		m.eventHandlers[eventName] = append(m.eventHandlers[eventName], EventHandler{
 			PluginName: pluginName,
-			Handler: func(name string, payload json.RawMessage, sessionID string) EventResponse {
-				return m.handleEvent(pluginName, eventName, payload, sessionID)
+			Handler: func(ctx context.Context, name string, payload json.RawMessage, sessionID string) EventResponse {
+				return m.handleEvent(ctx, pluginName, eventName, payload, sessionID)
 			},
 		})
 	}
@@ -1267,36 +1402,42 @@ func (m *Manager) registerPlugin(info *PluginInfo) {
 
 // executeTool executes a tool call on a plugin.
 func (m *Manager) executeTool(ctx context.Context, pluginName, toolName, toolCallID, arguments string) (string, bool, error) {
-	m.mu.RLock()
-	info, ok := m.plugins[pluginName]
-	if !ok {
-		m.mu.RUnlock()
-		return "", false, fmt.Errorf("plugin not found: %s", pluginName)
-	}
-	grpcClient := info.grpcClient
-	m.mu.RUnlock()
-
-	if grpcClient == nil {
-		return "", false, fmt.Errorf("plugin %s: no gRPC client", pluginName)
-	}
-
-	timeouts := info.getTimeouts()
-	execCtx, cancel := context.WithTimeout(ctx, timeouts.ExecuteTool)
-	defer cancel()
-
-	result, err := grpcClient.ExecuteTool(execCtx, &proto.ToolCall{
-		ToolName:   toolName,
-		ToolCallId: toolCallID,
-		Arguments:  arguments,
-	})
+	result, err := m.executeToolResult(ctx, pluginName, toolName, toolCallID, arguments)
 	if err != nil {
-		return "", true, fmt.Errorf("execute tool: %w", err)
+		return "", true, err
 	}
-
+	if result.Rejection != "" {
+		return "", true, fmt.Errorf("plugin execution rejected: %s", result.Rejection)
+	}
 	if result.IsError {
 		return result.Output, true, fmt.Errorf("%s", result.ErrorMessage)
 	}
 	return result.Output, false, nil
+}
+
+func (m *Manager) executeToolResult(ctx context.Context, pluginName, toolName, toolCallID, arguments string) (*proto.ToolResult, error) {
+	m.mu.RLock()
+	info, ok := m.plugins[pluginName]
+	if !ok {
+		m.mu.RUnlock()
+		return nil, fmt.Errorf("plugin not found: %s", pluginName)
+	}
+	client := info.grpcClient
+	timeouts := info.getTimeouts()
+	m.mu.RUnlock()
+	if client == nil {
+		return nil, fmt.Errorf("plugin %s: no gRPC client", pluginName)
+	}
+	execCtx, cancel := context.WithTimeout(ctx, timeouts.ExecuteTool)
+	defer cancel()
+	result, err := client.ExecuteTool(execCtx, &proto.ToolCall{ToolName: toolName, ToolCallId: toolCallID, Arguments: arguments})
+	if err != nil {
+		return nil, fmt.Errorf("execute tool: %w", err)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("plugin returned no tool result")
+	}
+	return result, nil
 }
 
 // executeCommand executes a command on a plugin.
@@ -1339,9 +1480,7 @@ func (m *Manager) executeCommand(ctx context.Context, pluginName, name, argument
 }
 
 // handleEvent dispatches an event to a plugin.
-func (m *Manager) handleEvent(pluginName, eventName string, payload json.RawMessage, sessionID string) EventResponse {
-	ctx := context.Background()
-
+func (m *Manager) handleEvent(ctx context.Context, pluginName, eventName string, payload json.RawMessage, sessionID string) EventResponse {
 	m.mu.RLock()
 	info, ok := m.plugins[pluginName]
 	if !ok {
@@ -1372,6 +1511,9 @@ func (m *Manager) handleEvent(pluginName, eventName string, payload json.RawMess
 	})
 	if err != nil {
 		m.logger.Warn("plugin event handler failed", "event", eventName, "plugin", pluginName, "error", err)
+		if eventName == "user_bash" {
+			return EventResponse{Block: true, BlockReason: fmt.Sprintf("user bash handler failed: %v", err)}
+		}
 		return EventResponse{}
 	}
 
@@ -1444,10 +1586,11 @@ func (m *Manager) ReloadNamed(ctx context.Context, name string) error {
 		}
 	}
 
-	m.prepareShimIfNeeded(ctx)
+	m.filterConfiguredExtensions()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.prepareShimIfNeeded(ctx)
 
 	// Check each loaded plugin for hash changes or force restart.
 	for pluginName, info := range m.plugins {
@@ -1501,14 +1644,11 @@ type PluginShutdowner interface {
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
+	err := m.stopShimSetupLocked(ctx)
 	for name, info := range m.plugins {
-		if err := m.shutdownPluginLocked(ctx, name, info, DefaultDrainTimeout); err != nil {
-			m.logger.Warn("plugin shutdown failed", "plugin", name, "error", err)
-		}
+		err = errors.Join(err, m.shutdownPluginLocked(ctx, name, info, DefaultDrainTimeout))
 	}
-
-	return nil
+	return errors.Join(err, m.waitCleanups(ctx))
 }
 
 // GracePeriod is the time to wait after SIGTERM before sending SIGKILL.
@@ -1517,12 +1657,8 @@ const GracePeriod = 2 * time.Second
 // shutdownPluginLocked calls the Shutdown RPC on a plugin.
 // Caller must hold m.mu.
 func (m *Manager) shutdownPluginLocked(ctx context.Context, name string, info *PluginInfo, drainTimeout time.Duration) error {
-	// If we don't have a gRPC connection, cleanup without blocking the caller.
-	if info.Cleanup == nil || info.grpcClient == nil {
-		if info.Cleanup != nil {
-			pluginCleanup(info.Cleanup)
-		}
-		return nil
+	if info.grpcClient == nil {
+		return m.releasePluginLocked(ctx, name, info)
 	}
 
 	// Attempt cooperative shutdown via Shutdown RPC.
@@ -1536,22 +1672,34 @@ func (m *Manager) shutdownPluginLocked(ctx context.Context, name string, info *P
 	// Cancel the drain context to stop waiting.
 	cancel()
 
-	// If the plugin responded gracefully, cleanup and return.
-	if err == nil && resp.Graceful {
-		m.logger.Debug("plugin shut down gracefully", "plugin", name)
-		pluginCleanup(info.Cleanup)
-		return nil
+	if releaseErr := m.releasePluginLocked(ctx, name, info); releaseErr != nil {
+		return errors.Join(shutdownResponseError(name, resp, err), releaseErr)
 	}
+	if err := shutdownResponseError(name, resp, err); err != nil {
+		return err
+	}
+	m.logger.Debug("plugin shut down gracefully", "plugin", name)
+	return nil
+}
 
-	// Plugin didn't shut down gracefully within timeout or returned an error.
-	// Send SIGTERM.
-	m.logger.Warn("plugin did not shut down gracefully; sending SIGTERM", "plugin", name, "error", err)
+// releasePluginLocked kills the plugin process and closes its Host socket.
+func (m *Manager) releasePluginLocked(ctx context.Context, name string, info *PluginInfo) error {
+	return errors.Join(m.runCleanup(ctx, name, info.Cleanup), m.closeHostSocketLocked(name))
+}
 
-	// Get the process to signal.
-	// The plugin.Client's process handling is internal, so we use Cleanup which kills it.
-	// For more graceful handling, we'd need to track the process directly.
-	pluginCleanup(info.Cleanup)
-
+func shutdownResponseError(name string, resp *proto.ShutdownResponse, err error) error {
+	if err != nil {
+		return fmt.Errorf("shutdown plugin %s: %w", name, err)
+	}
+	if resp == nil {
+		return fmt.Errorf("shutdown plugin %s: empty response", name)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("shutdown plugin %s: %s", name, resp.Error)
+	}
+	if !resp.Graceful {
+		return fmt.Errorf("shutdown plugin %s: drain did not finish gracefully", name)
+	}
 	return nil
 }
 
@@ -1577,6 +1725,7 @@ func (m *Manager) ShutdownPlugin(ctx context.Context, name string, drainTimeout 
 // be re-added here when the operations are added.
 var CancellableEvents = map[string]bool{
 	"tool_call":              true,
+	"user_bash":              true,
 	"session_before_fork":    true,
 	"session_before_compact": true,
 }
@@ -1588,16 +1737,16 @@ func IsCancellableEvent(name string) bool { return CancellableEvents[name] }
 // DispatchEvent sends an event to all subscribed plugins.
 // Returns true if any plugin returned a block verdict for a cancellable
 // event (see CancellableEvents).
-func (m *Manager) DispatchEvent(name string, payload json.RawMessage, sessionID string) bool {
-	return m.DispatchEventResponse(name, payload, sessionID).Block
+func (m *Manager) DispatchEvent(ctx context.Context, name string, payload json.RawMessage, sessionID string) bool {
+	return m.DispatchEventResponse(ctx, name, payload, sessionID).Block
 }
 
 // DispatchEventResponse sends an event to all subscribed plugins and returns
 // the aggregated response. For cancellable events, the first block verdict is
 // propagated. For compaction_request, the first non-nil Compaction result is
 // propagated.
-func (m *Manager) DispatchEventResponse(name string, payload json.RawMessage, sessionID string) EventResponse {
-	responses := m.DispatchEventCollect(name, payload, sessionID)
+func (m *Manager) DispatchEventResponse(ctx context.Context, name string, payload json.RawMessage, sessionID string) EventResponse {
+	responses := m.DispatchEventCollect(ctx, name, payload, sessionID)
 
 	resp := EventResponse{}
 	for _, r := range responses {
@@ -1609,6 +1758,12 @@ func (m *Manager) DispatchEventResponse(name string, payload json.RawMessage, se
 			break
 		}
 
+		if name == "user_bash" && len(r.ResponseData) > 0 {
+			if len(resp.ResponseData) > 0 {
+				return EventResponse{Block: true, BlockReason: "multiple user bash overrides"}
+			}
+			resp.ResponseData = r.ResponseData
+		}
 		// Propagate compaction result for compaction_request events.
 		if name == "compaction_request" && r.Compaction != nil && resp.Compaction == nil {
 			resp.Compaction = r.Compaction
@@ -1621,14 +1776,63 @@ func (m *Manager) DispatchEventResponse(name string, payload json.RawMessage, se
 // every handler's response in dispatch (registration) order. Use this for
 // events whose per-plugin responses matter individually, e.g. chaining
 // before_agent_start system-prompt rewrites.
-func (m *Manager) DispatchEventCollect(name string, payload json.RawMessage, sessionID string) []EventResponse {
+func (m *Manager) DispatchEventCollect(ctx context.Context, name string, payload json.RawMessage, sessionID string) []EventResponse {
 	m.mu.RLock()
-	handlers := m.eventHandlers[name]
+	handlers := slices.Clone(m.eventHandlers[name])
 	m.mu.RUnlock()
 
 	responses := make([]EventResponse, 0, len(handlers))
 	for _, handler := range handlers {
-		responses = append(responses, handler.Handler(name, payload, sessionID))
+		response := handler.Handler(ctx, name, payload, sessionID)
+		responses = append(responses, response)
+		var fields map[string]json.RawMessage
+		var update map[string]json.RawMessage
+		if len(response.ResponseData) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(response.ResponseData, &update); err != nil {
+			m.logger.Warn("parse mutable event response", "event", name, "error", err)
+			continue
+		}
+		var keys []string
+		switch name {
+		case "before_agent_start":
+			keys = []string{"systemPrompt"}
+		case "context", "context_with_system":
+			keys = []string{"messages"}
+		case "input":
+			var action string
+			if raw := update["action"]; raw != nil {
+				if err := json.Unmarshal(raw, &action); err != nil {
+					m.logger.Warn("parse input action", "error", err)
+					continue
+				}
+			}
+			if action == "handled" {
+				return responses
+			}
+			if action == "transform" {
+				keys = []string{"text", "images"}
+			}
+		}
+		if len(keys) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(payload, &fields); err != nil || fields == nil {
+			m.logger.Warn("parse mutable event payload", "event", name, "error", err)
+			continue
+		}
+		for _, key := range keys {
+			if value := update[key]; value != nil {
+				fields[key] = value
+			}
+		}
+		next, err := json.Marshal(fields)
+		if err != nil {
+			m.logger.Warn("marshal mutable event payload", "event", name, "error", err)
+			continue
+		}
+		payload = next
 	}
 	return responses
 }
@@ -1636,7 +1840,7 @@ func (m *Manager) DispatchEventCollect(name string, payload json.RawMessage, ses
 // DispatchCompactionHook dispatches a compaction_request event to all subscribed
 // plugins. Returns the first successful result, or an empty result if no plugin
 // handled the event.
-func (m *Manager) DispatchCompactionHook(transcript string, tokensBefore int64, sessionID string) proto.CompactionHookResult {
+func (m *Manager) DispatchCompactionHook(ctx context.Context, transcript string, tokensBefore int64, sessionID string) proto.CompactionHookResult {
 	// Build the compaction request payload.
 	payload := struct {
 		Transcript   string `json:"transcript"`
@@ -1644,7 +1848,7 @@ func (m *Manager) DispatchCompactionHook(transcript string, tokensBefore int64, 
 	}{transcript, tokensBefore}
 	payloadBytes, _ := json.Marshal(payload)
 
-	resp := m.DispatchEventResponse("compaction_request", payloadBytes, sessionID)
+	resp := m.DispatchEventResponse(ctx, "compaction_request", payloadBytes, sessionID)
 	if resp.Compaction != nil {
 		return *resp.Compaction
 	}
@@ -1661,10 +1865,16 @@ func (m *Manager) RegisterEventHandler(name string, handler EventHandler) {
 
 // ToolHandlerDesc describes a plugin tool for registration in the agent.
 type ToolHandlerDesc struct {
-	Name        string
-	Description string
-	Parameters  map[string]any
-	Handler     ToolHandler
+	HasReachesTools     bool
+	Namespace           json.RawMessage
+	DefaultActive       *bool
+	Exposure            string
+	OutputSchema        json.RawMessage
+	ConstrainedSampling json.RawMessage
+	Name                string
+	Description         string
+	Parameters          map[string]any
+	Handler             ToolHandler
 }
 
 // Tools returns all plugin tools as ToolHandlerDesc for agent registration.
@@ -1686,6 +1896,12 @@ func (m *Manager) Tools() []ToolHandlerDesc {
 				if fullName == name {
 					desc.Description = tool.Description
 					desc.Parameters = parseToolParameters(tool.Parameters)
+					desc.Namespace = tool.Namespace
+					desc.DefaultActive = tool.DefaultActive
+					desc.HasReachesTools = tool.HasReachesTools
+					desc.Exposure = tool.Exposure
+					desc.OutputSchema = tool.OutputSchema
+					desc.ConstrainedSampling = tool.ConstrainedSampling
 					break
 				}
 			}
@@ -1770,13 +1986,71 @@ func (m *Manager) UnregisterToolProgressSubscriber(toolCallID string, ch chan<- 
 
 func (m *Manager) broadcastToolProgress(event ToolProgressEvent) {
 	m.progressMu.RLock()
-	subs := append([]chan<- ToolProgressEvent(nil), m.progressSubscribers[event.ToolCallID]...)
-	m.progressMu.RUnlock()
+	defer m.progressMu.RUnlock()
 
-	for _, sub := range subs {
+	for _, sub := range m.progressSubscribers[event.ToolCallID] {
 		select {
 		case sub <- event:
 		default:
 		}
 	}
+}
+
+// ExecutePluginToolResult retains structured plugin output while supporting legacy handlers.
+func (m *Manager) ExecutePluginToolResult(ctx context.Context, toolName, toolCallID, arguments string) (*proto.ToolResult, error) {
+	m.mu.RLock()
+	var pluginName, localName string
+	for name, info := range m.plugins {
+		for _, tool := range info.Registrations.Tools {
+			if info.Registrations.ToolPrefix+tool.Name == toolName && info.grpcClient != nil {
+				pluginName = name
+				localName = tool.Name
+				break
+			}
+		}
+	}
+	m.mu.RUnlock()
+	if pluginName != "" {
+		return m.executeToolResult(ctx, pluginName, localName, toolCallID, arguments)
+	}
+	output, isError, err := m.ExecutePluginTool(ctx, toolName, toolCallID, arguments)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.ToolResult{Output: output, IsError: isError}, nil
+}
+
+// ReachPluginTools evaluates a plugin's reach callback using its local tool name.
+func (m *Manager) ReachPluginTools(ctx context.Context, name string, args map[string]any) ([]string, error) {
+	data, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("encode reach arguments: %w", err)
+	}
+	m.mu.RLock()
+	var client proto.PluginClient
+	var local string
+	var timeout time.Duration
+	for _, info := range m.plugins {
+		for _, tool := range info.Registrations.Tools {
+			if info.Registrations.ToolPrefix+tool.Name == name && tool.HasReachesTools {
+				client = info.grpcClient
+				local = tool.Name
+				timeout = info.getTimeouts().ExecuteTool
+			}
+		}
+	}
+	m.mu.RUnlock()
+	if client == nil {
+		return nil, errors.New("reach callback unavailable")
+	}
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result, err := client.ReachTools(execCtx, &proto.ToolCall{ToolName: local, Arguments: string(data)})
+	if err != nil {
+		return nil, fmt.Errorf("plugin reach callback: %w", err)
+	}
+	if result == nil {
+		return nil, errors.New("plugin returned no reach result")
+	}
+	return result.Names, nil
 }

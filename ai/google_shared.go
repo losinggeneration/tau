@@ -2,6 +2,7 @@ package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -110,15 +111,116 @@ func isGemma4Model(modelID string) bool {
 	return strings.Contains(lower, "gemma-4") || strings.Contains(lower, "gemma4")
 }
 
-func disabledGoogleThinkingLevel(modelID string) (GoogleThinkingLevel, bool) {
-	switch {
-	case isGemini3ProModel(modelID):
-		return GoogleThinkingLevelLow, true
-	case isGemini3FlashModel(modelID), isGemma4Model(modelID):
-		return GoogleThinkingLevelMinimal, true
-	default:
-		return GoogleThinkingLevelUnspecified, false
+// googleThinking is a request's Gemini thinking control. A disabled control
+// with a level keeps the model's lowest level for models that cannot turn
+// thinking off.
+type googleThinking struct {
+	level   GoogleThinkingLevel
+	budget  *int
+	enabled bool
+}
+
+var googleThinkingLevelModelID = regexp.MustCompile(`gemini-3(?:\.\d+)?-(?:pro|flash)|gemma-?4`)
+
+// usesGoogleThinkingLevel reports whether the model takes Gemini's discrete
+// thinkingLevel instead of a token thinkingBudget.
+func usesGoogleThinkingLevel(model *Model) bool {
+	id := strings.ToLower(model.ID)
+	return googleThinkingLevelModelID.MatchString(id) || id == "gemini-flash-latest" || id == "gemini-flash-lite-latest"
+}
+
+// resolveGoogleThinkingLevel maps a supported level through the model's
+// thinking map to one of Google's four levels.
+func resolveGoogleThinkingLevel(model *Model, level string) (GoogleThinkingLevel, error) {
+	resolved := level
+	if mapped := model.ThinkingLevelMap[level]; mapped != nil {
+		resolved = strings.ToLower(*mapped)
 	}
+	switch resolved {
+	case "minimal", "low", "medium", "high":
+		return GoogleThinkingLevel(strings.ToUpper(resolved)), nil
+	default:
+		return "", fmt.Errorf("unsupported Google thinking level mapping for %s/%s: %s -> %s", model.Provider, model.ID, level, resolved)
+	}
+}
+
+// googleThinkingBudget is upstream's per-model budget for a resolved level;
+// -1 lets the model choose.
+func googleThinkingBudget(model *Model, level GoogleThinkingLevel, custom *ThinkingBudgets) int {
+	if custom != nil {
+		budget := map[GoogleThinkingLevel]*int{
+			GoogleThinkingLevelMinimal: custom.Minimal,
+			GoogleThinkingLevelLow:     custom.Low,
+			GoogleThinkingLevelMedium:  custom.Medium,
+			GoogleThinkingLevelHigh:    custom.High,
+		}[level]
+		if budget != nil {
+			return *budget
+		}
+	}
+	budgets := map[GoogleThinkingLevel]int{GoogleThinkingLevelMinimal: 128, GoogleThinkingLevelLow: 2048, GoogleThinkingLevelMedium: 8192}
+	switch {
+	case strings.Contains(model.ID, "2.5-pro"):
+		budgets[GoogleThinkingLevelHigh] = 32768
+	case strings.Contains(model.ID, "2.5-flash-lite"):
+		budgets[GoogleThinkingLevelMinimal] = 512
+		budgets[GoogleThinkingLevelHigh] = 24576
+	case strings.Contains(model.ID, "2.5-flash"):
+		budgets[GoogleThinkingLevelHigh] = 24576
+	default:
+		return -1
+	}
+	return budgets[level]
+}
+
+// resolveGoogleThinking mirrors upstream's Gemini streamSimple: no or off
+// reasoning disables thinking, level-controlled models get a discrete level,
+// and the rest a token budget. ok is false when the model keeps its default.
+func resolveGoogleThinking(model *Model, o *options) (thinking googleThinking, ok bool, err error) {
+	if !model.Reasoning {
+		return googleThinking{}, false, nil
+	}
+	if o.reasoning == "" && (o.thinkingEnabled || o.thinkingBudgetTokens > 0) {
+		thinking = googleThinking{enabled: true, level: o.googleThinkingLevel}
+		if thinking.level == "" && o.thinkingBudgetTokens > 0 {
+			thinking.budget = new(o.thinkingBudgetTokens)
+		}
+		return thinking, true, nil
+	}
+	var level string
+	if o.reasoning != "" && o.reasoning != ReasoningOff {
+		level = ClampThinkingLevel(model, string(o.reasoning))
+	}
+	if level == "" || level == "off" {
+		if !usesGoogleThinkingLevel(model) {
+			return googleThinking{budget: new(0)}, true, nil
+		}
+		fallback := ClampThinkingLevel(model, "off")
+		if fallback == "off" {
+			return googleThinking{budget: new(0)}, true, nil
+		}
+		resolved, err := resolveGoogleThinkingLevel(model, fallback)
+		if err != nil {
+			return googleThinking{}, false, err
+		}
+		return googleThinking{level: resolved}, true, nil
+	}
+	resolved, err := resolveGoogleThinkingLevel(model, level)
+	if err != nil {
+		return googleThinking{}, false, err
+	}
+	thinking = googleThinking{enabled: true}
+	switch {
+	case o.googleThinkingLevel != "":
+		thinking.level = o.googleThinkingLevel
+	case usesGoogleThinkingLevel(model):
+		thinking.level = resolved
+	case o.thinkingBudgetTokens > 0:
+		thinking.budget = new(o.thinkingBudgetTokens)
+	default:
+		thinking.budget = new(googleThinkingBudget(model, resolved, o.thinkingBudgets))
+	}
+	return thinking, true, nil
 }
 
 // retainThoughtSignature preserves the last non-empty signature for a block.
@@ -323,6 +425,20 @@ func googleStopReason(reason string) StopReason {
 	}
 }
 
+// googleFinish maps a finish reason like upstream: a normal stop with tool
+// calls becomes toolUse, and error reasons report the raw reason.
+func googleFinish(reason string, content []ContentBlock) (StopReason, string) {
+	stop := googleStopReason(reason)
+	switch {
+	case stop == StopReasonStop && hasToolCalls(content):
+		return StopReasonToolUse, ""
+	case stop == StopReasonError || stop == StopReasonAborted:
+		return stop, "Provider stopped with: " + reason
+	}
+
+	return stop, ""
+}
+
 // MapGoogleStopReason maps Google's finish reason to the shared StopReason.
 func MapGoogleStopReason(reason string) StopReason {
 	return googleStopReason(reason)
@@ -339,38 +455,74 @@ func HasDuplicateToolCallID(content []ContentBlock, id string) bool {
 	return false
 }
 
-// ConvertTools converts tools to Gemini function declarations format.
-// By default uses parametersJsonSchema which supports full JSON Schema.
-// Set useParameters to true to use the legacy parameters field instead.
-// This matches the TypeScript convertTools function from providers/google-shared.ts.
-func ConvertTools(tools []Tool, useParameters bool) []map[string]any {
-	if len(tools) == 0 {
-		return nil
-	}
-
-	declarations := make([]map[string]any, len(tools))
+// googleFunctionDeclarations converts tools to Gemini function
+// declarations. Parameters use parametersJsonSchema, made strict for tools
+// that ask for it on Gemini 3 and newer, which validate required
+// parameters; legacy declarations use OpenAPI parameters stripped of JSON
+// Schema meta keywords. strict reports whether any tool is strict.
+func googleFunctionDeclarations(model *Model, tools []Tool, legacy googleParameterField) (declarations []map[string]any, strict bool, err error) {
+	supported := isGeminiMajorVersionAtLeast(model.ID, 3)
+	declarations = make([]map[string]any, len(tools))
 	for i, tool := range tools {
-		decl := map[string]any{
-			"name":        tool.Name,
-			"description": tool.Description,
+		parameters, toolStrict, err := strictToolParameters(tool, supported, nil)
+		if err != nil {
+			return nil, false, err
 		}
-		if useParameters {
-			// Legacy parameters field
-			var params map[string]any
-			if err := json.Unmarshal(tool.Parameters, &params); err == nil {
-				decl["parameters"] = params
+		strict = strict || toolStrict
+		var schema any
+		if len(parameters) > 0 {
+			if err := json.Unmarshal(parameters, &schema); err != nil {
+				return nil, false, fmt.Errorf("tool %q parameters: %w", tool.Name, err)
 			}
+		}
+		declarations[i] = map[string]any{"name": tool.Name, "description": tool.Description}
+		if legacy {
+			declarations[i]["parameters"] = stripSchemaMetaDeclarations(schema)
 		} else {
-			// Full JSON Schema support
-			var params map[string]any
-			if err := json.Unmarshal(tool.Parameters, &params); err == nil {
-				decl["parametersJsonSchema"] = params
-			}
+			declarations[i]["parametersJsonSchema"] = schema
 		}
-		declarations[i] = decl
 	}
+	return declarations, strict, nil
+}
 
-	return []map[string]any{
-		{"functionDeclarations": declarations},
+// googleParameterField selects the legacy OpenAPI parameters field, which
+// Cloud Code Assist needs for Claude models.
+type googleParameterField bool
+
+const (
+	googleJSONSchemaParameters googleParameterField = false
+	googleLegacyParameters     googleParameterField = true
+)
+
+// stripSchemaMetaDeclarations removes JSON Schema meta keywords that the
+// OpenAPI parameters field rejects.
+func stripSchemaMetaDeclarations(schema any) any {
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return schema
 	}
+	result := make(map[string]any, len(object))
+	for key, value := range object {
+		switch key {
+		case "$schema", "$id", "$anchor", "$dynamicAnchor", "$vocabulary", "$comment", "$defs", "definitions":
+			continue
+		}
+		result[key] = stripSchemaMetaDeclarations(value)
+	}
+	return result
+}
+
+// googleFunctionCallingMode resolves the function-calling mode: an explicit
+// none or any wins, strict tools need VALIDATED, and otherwise the requested
+// choice applies ("" when there is none).
+func googleFunctionCallingMode(choice any, strict bool) string {
+	switch mode := toolChoiceMode(choice); {
+	case mode == "none" || mode == "any":
+		return mapToolChoice(choice)
+	case strict:
+		return "VALIDATED"
+	case mode != "":
+		return mapToolChoice(choice)
+	}
+	return ""
 }

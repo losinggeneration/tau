@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -159,10 +160,14 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	w.closed = true
-	if err := w.file.Close(); err != nil {
-		return err
+	var err error
+	if closeErr := w.file.Close(); closeErr != nil {
+		err = fmt.Errorf("close session file: %w", closeErr)
 	}
-	return ReleaseOwner(w.path)
+	if releaseErr := ReleaseOwner(w.path); releaseErr != nil {
+		err = errors.Join(err, fmt.Errorf("release session owner: %w", releaseErr))
+	}
+	return err
 }
 
 // Path returns the file path.
@@ -306,6 +311,8 @@ func uniqueFilename(dir, filename string) (string, error) {
 	path := filepath.Join(dir, filename)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return filename, nil
+	} else if err != nil {
+		return "", fmt.Errorf("stat session destination: %w", err)
 	}
 
 	// File exists, find a unique name
@@ -315,6 +322,8 @@ func uniqueFilename(dir, filename string) (string, error) {
 		path := filepath.Join(dir, candidate)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			return candidate, nil
+		} else if err != nil {
+			return "", fmt.Errorf("stat session destination: %w", err)
 		}
 	}
 }
@@ -387,6 +396,13 @@ func RenameSession(oldPath, newName string) (newPath string, err error) {
 		slug,
 	)
 	newPath = filepath.Join(filepath.Dir(oldPath), newFilename)
+	if newPath != oldPath {
+		newFilename, err = uniqueFilename(filepath.Dir(oldPath), newFilename)
+		if err != nil {
+			return "", fmt.Errorf("rename filename: %w", err)
+		}
+		newPath = filepath.Join(filepath.Dir(oldPath), newFilename)
+	}
 
 	if err := os.Rename(oldPath, newPath); err != nil {
 		return "", fmt.Errorf("rename session file: %w", err)

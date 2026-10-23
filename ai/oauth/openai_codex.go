@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -168,15 +170,12 @@ func (p *openaiCodexProvider) Login(ctx context.Context, callbacks LoginCallback
 	verifier := oauth2.GenerateVerifier()
 	state := oauth2.GenerateVerifier()
 
-	server := newCallbackServer(state, p.callbackPort)
-	if err := server.Start(); err != nil {
-		return nil, fmt.Errorf("start callback server: %w", err)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	defer func() {
-		if stopErr := server.Stop(); err == nil && stopErr != nil {
-			err = stopErr
-		}
-	}()
+	server := newCallbackServer(state, p.callbackPort)
+	listenErr := server.startFixed(ctx)
+	defer func() { err = errors.Join(err, server.Stop()) }()
 
 	redirectURI := server.AuthCallbackURL()
 	config := p.oauthConfig(redirectURI)
@@ -189,15 +188,21 @@ func (p *openaiCodexProvider) Login(ctx context.Context, callbacks LoginCallback
 	)
 
 	callbacks.OnAuth(authURL, "A browser window should open. Complete login to finish.")
-
-	// Wait for callback or timeout
-	code, _, waitErr := server.WaitForCode(ctx)
-	if waitErr != nil {
-		return nil, fmt.Errorf("wait for code: %w", waitErr)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	if code == "" {
-		return nil, fmt.Errorf("no authorization code received")
+	listening := server
+	if listenErr != nil {
+		listening = nil
+		callbacks.OnProgress("Callback port unavailable. Paste the authorization code or redirect URL to finish sign-in.")
+	}
+	code, err := waitForAuthorizationCode(ctx, callbacks, listening, state)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, errors.Join(ctxErr, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("wait for code: %w", err)
 	}
 
 	callbacks.OnProgress("Exchanging authorization code for tokens...")
@@ -208,6 +213,30 @@ func (p *openaiCodexProvider) Login(ctx context.Context, callbacks LoginCallback
 	}
 
 	return openAICodexCredentialsFromOAuth2Token(tok, "")
+}
+
+// parseAuthorizationInput reads a pasted redirect URL, query string,
+// code#state, or bare code.
+func parseAuthorizationInput(input, expectedState string) (string, error) {
+	value := strings.TrimSpace(input)
+	var code, state string
+	if parsed, err := url.Parse(value); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		code, state = parsed.Query().Get("code"), parsed.Query().Get("state")
+	} else if before, after, ok := strings.Cut(value, "#"); ok {
+		code, state = before, after
+	} else if strings.Contains(value, "code=") {
+		query, err := url.ParseQuery(value)
+		if err != nil {
+			return "", fmt.Errorf("parse authorization input: %w", err)
+		}
+		code, state = query.Get("code"), query.Get("state")
+	} else {
+		code = value
+	}
+	if state != "" && state != expectedState {
+		return "", errors.New("state mismatch")
+	}
+	return code, nil
 }
 
 func (p *openaiCodexProvider) RefreshToken(ctx context.Context, credentials *Credentials) (*Credentials, error) {

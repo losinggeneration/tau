@@ -1,11 +1,13 @@
 package ai
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"maps"
 	"net/http"
 	"strings"
 )
@@ -52,6 +54,16 @@ func (c *openAIResponsesClient) Complete(ctx context.Context, model *Model, prom
 
 // Stream implements Client.Streamer.
 func (c *openAIResponsesClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, withCopilotHeaders(model, prompt, opts))
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	var o options
 	o.apply(opts)
 
@@ -65,10 +77,7 @@ func (c *openAIResponsesClient) Stream(ctx context.Context, model *Model, prompt
 	}
 
 	// Build URL
-	baseURL := model.BaseURL
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
-	}
+	baseURL := cmp.Or(requestBaseURL(model, apiKey), model.BaseURL, "https://api.openai.com/v1")
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	url := baseURL + "/responses"
@@ -92,26 +101,23 @@ func (c *openAIResponsesClient) Stream(ctx context.Context, model *Model, prompt
 		return fmt.Errorf("openai responses: marshal request: %w", err)
 	}
 
-	// Create request
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(bodyBytes)))
+	resp, err := sendProviderRequest(ctx, &o, providerRequest{label: "openai responses", send: func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		for k, v := range sessionHeaders(model, &o) {
+			req.Header.Set(k, v)
+		}
+		for k, v := range o.headers {
+			req.Header.Set(k, v)
+		}
+		return doHeaderRequest(req, o.timeout, "openai responses")
+	}})
 	if err != nil {
-		return fmt.Errorf("openai responses: create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	for k, v := range sessionHeaders(&o) {
-		req.Header.Set(k, v)
-	}
-	for k, v := range o.headers {
-		req.Header.Set(k, v)
-	}
-
-	// Execute request
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("openai responses: request: %w", err)
+		return err
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
@@ -121,14 +127,6 @@ func (c *openAIResponsesClient) Stream(ctx context.Context, model *Model, prompt
 
 	if hasResponseCallback(&o) {
 		invokeResponseCallback(&o, model, responseMetadata(resp))
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return fmt.Errorf("openai responses: status %d", resp.StatusCode)
-		}
-		return fmt.Errorf("openai responses: status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	// Initialize output message
@@ -151,9 +149,14 @@ func (c *openAIResponsesClient) Stream(ctx context.Context, model *Model, prompt
 	}
 
 	// Stream response using shared processor
+	grammarInputs, err := responsesGrammarInputs(model, prompt.Tools)
+	if err != nil {
+		return err
+	}
 	streamOpts := &ResponsesStreamOptions{
 		ServiceTier:             o.serviceTier,
 		ApplyServiceTierPricing: ServiceTierPricing,
+		GrammarInputs:           grammarInputs,
 	}
 
 	reader := newResponsesStreamReader(resp.Body)
@@ -179,28 +182,36 @@ func buildOpenAIResponsesBody(model *Model, prompt *Context, o *options) (map[st
 	}
 
 	retention := resolveCacheRetention(o.cacheRetention)
-	baseURL := model.BaseURL
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
-	}
-
 	// Add session/caching
 	if o.sessionID != "" && retention != CacheRetentionNone {
-		body["prompt_cache_key"] = o.sessionID
+		body["prompt_cache_key"] = clampOpenAIPromptCacheKey(o.sessionID)
 	}
 
-	// Add cache retention for direct OpenAI API
-	if retention == CacheRetentionLong && strings.Contains(baseURL, "api.openai.com") {
-		body["prompt_cache_retention"] = "24h"
+	baseURL := cmp.Or(model.BaseURL, "https://api.openai.com/v1")
+	apiKey := cmp.Or(o.apiKey, GetEnvAPIKey(model.Provider))
+	chatGPTSignIn := model.Provider == ProviderOpenAI && baseURL == "https://api.openai.com/v1" && apiKey != "" && !strings.HasPrefix(apiKey, "sk-")
+	longCache := model.Compat == nil || model.Compat.SupportsLongCacheRetention == nil || *model.Compat.SupportsLongCacheRetention
+	explicitCache := model.Compat != nil && model.Compat.SupportsExplicitPromptCacheMode
+	if !chatGPTSignIn {
+		switch {
+		case explicitCache && retention == CacheRetentionNone:
+			body["prompt_cache_options"] = map[string]any{"mode": "explicit"}
+		case retention == CacheRetentionLong && longCache:
+			if explicitCache {
+				body["prompt_cache_options"] = map[string]any{"ttl": "30m"}
+			} else {
+				body["prompt_cache_retention"] = "24h"
+			}
+		}
 	}
 
-	// Add max tokens
-	if o.maxTokens > 0 {
-		body["max_output_tokens"] = o.maxTokens
+	maxOutputTokens := model.Compat == nil || model.Compat.SupportsMaxOutputTokens == nil || *model.Compat.SupportsMaxOutputTokens
+	if o.maxTokens > 0 && maxOutputTokens && !chatGPTSignIn {
+		// Responses rejects output limits below 16 tokens.
+		body["max_output_tokens"] = max(o.maxTokens, 16)
 	}
 
-	// Add temperature
-	if o.temperature != nil {
+	if o.temperature != nil && !chatGPTSignIn {
 		body["temperature"] = *o.temperature
 	}
 
@@ -211,24 +222,28 @@ func buildOpenAIResponsesBody(model *Model, prompt *Context, o *options) (map[st
 
 	// Add tools
 	if len(prompt.Tools) > 0 {
-		body["tools"] = ConvertResponsesTools(prompt.Tools)
+		tools, err := responsesTools(model, prompt.Tools, supportsStrictMode(model, false))
+		if err != nil {
+			return nil, err
+		}
+		body["tools"] = tools
 	}
 
-	// Add reasoning options for reasoning-capable models
 	if model.Reasoning {
-		if o.reasoningEffort != "" || o.reasoningSummary != "" {
-			reasoning := map[string]any{
-				"effort":  defaultString(o.reasoningEffort, "medium"),
+		effort := responsesReasoningEffort(model, o)
+		if effort != "" || o.reasoningSummary != "" {
+			body["reasoning"] = map[string]any{
+				"effort":  defaultString(effort, "medium"),
 				"summary": defaultString(o.reasoningSummary, "auto"),
 			}
-			body["reasoning"] = reasoning
 			body["include"] = []string{"reasoning.encrypted_content"}
-		} else if model.Provider != ProviderGitHubCopilot {
-			body["reasoning"] = map[string]any{
-				"effort": "none",
-			}
+		} else if off, ok := responsesOffEffort(model); ok && model.Provider != ProviderGitHubCopilot {
+			body["reasoning"] = map[string]any{"effort": off}
 		}
 	}
+
+	// Last so model and request sampling parameters override named fields.
+	maps.Copy(body, resolveSamplingParams(model, o))
 
 	return body, nil
 }
@@ -255,6 +270,10 @@ func ConvertResponsesMessages(model *Model, prompt *Context, allowedToolCallProv
 		transformedPrompt = transformed
 	}
 
+	grammar, err := responsesGrammarInputs(model, prompt.Tools)
+	if err != nil {
+		return nil, err
+	}
 	messages := []map[string]any{}
 
 	// Add system prompt as developer/system message
@@ -272,7 +291,10 @@ func ConvertResponsesMessages(model *Model, prompt *Context, allowedToolCallProv
 
 	msgIndex := 0
 	for _, msg := range transformedPrompt.Messages {
-		converted := convertMessageForOpenAIResponses(model, msg, msgIndex)
+		converted, err := convertMessageForOpenAIResponses(model, msg, msgIndex, grammar)
+		if err != nil {
+			return nil, err
+		}
 		messages = append(messages, converted...)
 		msgIndex++
 	}
@@ -280,19 +302,27 @@ func ConvertResponsesMessages(model *Model, prompt *Context, allowedToolCallProv
 }
 
 // convertMessageForOpenAIResponses converts a single Message to OpenAI Responses format.
-func convertMessageForOpenAIResponses(model *Model, msg Message, msgIndex int) []map[string]any {
+// grammar maps grammar tools to their input property; their calls replay as
+// custom tool calls.
+func convertMessageForOpenAIResponses(model *Model, msg Message, msgIndex int, grammar map[string]string) ([]map[string]any, error) {
 	switch msg.Role {
 	case "user":
-		return convertUserMessageForResponses(model, msg)
+		return convertUserMessageForResponses(model, msg), nil
 
 	case "assistant":
-		return convertAssistantMessageForResponses(model, msg, msgIndex)
+		return convertAssistantMessageForResponses(model, msg, msgIndex, grammar)
 
 	case "tool", "toolResult":
-		return convertToolResultMessageForResponses(model, msg)
+		items := convertToolResultMessageForResponses(model, msg)
+		if _, ok := grammar[msg.ToolName]; ok {
+			for _, item := range items {
+				item["type"] = "custom_tool_call_output"
+			}
+		}
+		return items, nil
 
 	default:
-		return []map[string]any{}
+		return []map[string]any{}, nil
 	}
 }
 
@@ -347,7 +377,7 @@ func convertUserMessageForResponses(model *Model, msg Message) []map[string]any 
 }
 
 // convertAssistantMessageForResponses converts an assistant message to OpenAI Responses format.
-func convertAssistantMessageForResponses(model *Model, msg Message, msgIndex int) []map[string]any {
+func convertAssistantMessageForResponses(model *Model, msg Message, msgIndex int, grammar map[string]string) ([]map[string]any, error) {
 	var items []map[string]any
 
 	blocks := msg.ContentBlocks()
@@ -410,30 +440,48 @@ func convertAssistantMessageForResponses(model *Model, msg Message, msgIndex int
 				msg.Provider == model.Provider &&
 				msg.API == model.API
 
-			// For different-model messages, omit item ID to avoid pairing validation
-			if isDifferentModel && strings.HasPrefix(itemID, "fc_") {
+			// Different-model item ids trip pairing validation, and an id must
+			// match its item type: fc_ for function calls, ctc_ for custom
+			// ones. A call switches type when grammar tool support differs.
+			property, custom := grammar[block.Name]
+			prefix := "fc_"
+			if custom {
+				prefix = "ctc_"
+			}
+			if isDifferentModel || !strings.HasPrefix(itemID, prefix) {
 				itemID = ""
 			}
 
-			// Build function_call item
-			funcCall := map[string]any{
+			call := map[string]any{
 				"type":      "function_call",
 				"call_id":   callID,
 				"name":      block.Name,
 				"arguments": string(block.Arguments),
 			}
-			if itemID != "" {
-				funcCall["id"] = itemID
+			if custom {
+				input, err := grammarToolInput(block.Name, block.Arguments, property)
+				if err != nil {
+					return nil, err
+				}
+				delete(call, "arguments")
+				call["type"] = "custom_tool_call"
+				call["input"] = SanitizeSurrogates(input)
 			}
-			items = append(items, funcCall)
+			if itemID != "" {
+				call["id"] = itemID
+			}
+			if msg.Provider == model.Provider && msg.API == model.API && msg.Model == model.ID && block.Namespace != nil {
+				call["namespace"] = *block.Namespace
+			}
+			items = append(items, call)
 		}
 	}
 
 	if len(items) == 0 {
-		return []map[string]any{}
+		return []map[string]any{}, nil
 	}
 
-	return items
+	return items, nil
 }
 
 // convertToolResultMessageForResponses converts a tool result message to OpenAI Responses format.
@@ -561,6 +609,58 @@ func openAIResponsesToolCallIDNormalizerWithProviders(model *Model, allowedProvi
 // =============================================================================
 // Tool Conversion
 // =============================================================================
+
+// responsesGrammarInputs maps the request's grammar tools to their input
+// property when the model accepts OpenAI grammar tools.
+func responsesGrammarInputs(model *Model, tools []Tool) (map[string]string, error) {
+	return grammarInputProperties(tools, model.Compat != nil && model.Compat.SupportsOpenAIGrammarTools)
+}
+
+// supportsStrictMode reports the model's strict-mode compat flag, or fallback
+// when the catalog leaves it unset.
+func supportsStrictMode(model *Model, fallback bool) bool {
+	if model.Compat != nil && model.Compat.SupportsStrictMode != nil {
+		return *model.Compat.SupportsStrictMode
+	}
+	return fallback
+}
+
+// responsesTools converts request tools for the Responses family. Grammar
+// tools become custom tools when the model accepts them, and strict is sent
+// only when the provider supports strict mode.
+func responsesTools(model *Model, tools []Tool, strictSupported bool) ([]map[string]any, error) {
+	grammarSupported := model.Compat != nil && model.Compat.SupportsOpenAIGrammarTools
+	result := make([]map[string]any, len(tools))
+	for i, tool := range tools {
+		grammar, err := resolveGrammarTool(tool, grammarSupported)
+		if err != nil {
+			return nil, err
+		}
+		if grammar != nil {
+			result[i] = map[string]any{
+				"type":        "custom",
+				"name":        tool.Name,
+				"description": tool.Description,
+				"format":      map[string]any{"type": "grammar", "syntax": grammar.syntax, "definition": grammar.definition},
+			}
+			continue
+		}
+		parameters, strict, err := strictToolParameters(tool, strictSupported, nil)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = map[string]any{
+			"type":        "function",
+			"name":        tool.Name,
+			"description": tool.Description,
+			"parameters":  parameters,
+		}
+		if strictSupported {
+			result[i]["strict"] = strict
+		}
+	}
+	return result, nil
+}
 
 // ConvertResponsesTools converts tools to OpenAI Responses format.
 func ConvertResponsesTools(tools []Tool) []map[string]any {

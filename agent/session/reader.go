@@ -232,14 +232,12 @@ func (r *Reader) AllEntries() []Entry {
 	for _, id := range branch {
 		onBranch[id] = true
 	}
-	// Compaction entries are detached from the tree (nil parent, no children —
-	// later messages keep parenting to the last message), so a branch walk
-	// alone skips them. Anchor each one before the first entry it kept; that is
-	// also where it belongs chronologically in the full view.
+	// Legacy compactions are detached from the tree. Show summaries before
+	// their kept anchors, including linked compactions only on their own branch.
 	summariesBefore := make(map[string][]*Entry)
 	for i := range r.entries {
 		e := &r.entries[i]
-		if e.Type != EntryTypeCompaction || e.FirstKeptID == nil || !onBranch[*e.FirstKeptID] {
+		if e.Type != EntryTypeCompaction || e.FirstKeptID == nil || !onBranch[*e.FirstKeptID] || (e.ParentID != nil && !onBranch[e.ID]) {
 			continue
 		}
 		summariesBefore[*e.FirstKeptID] = append(summariesBefore[*e.FirstKeptID], e)
@@ -249,7 +247,7 @@ func (r *Reader) AllEntries() []Entry {
 		for _, e := range summariesBefore[id] {
 			out = append(out, *e)
 		}
-		if e, ok := byID[id]; ok && e.Type.InContext() {
+		if e, ok := byID[id]; ok && e.Type.InContext() && e.Type != EntryTypeCompaction {
 			out = append(out, *e)
 		}
 	}
@@ -266,14 +264,17 @@ func (r *Reader) ForgetSet(entryID string) (ids []string, parent string, err err
 	if target == nil {
 		return nil, "", fmt.Errorf("entry %q not found", entryID)
 	}
+	branch := r.ActiveBranch()
 	from := entryID
 	if target.Type == EntryTypeCompaction {
+		if target.ParentID != nil && !slices.Contains(branch, target.ID) {
+			return nil, "", fmt.Errorf("compaction %q is not on the active branch", entryID)
+		}
 		if target.FirstKeptID == nil {
 			return nil, "", fmt.Errorf("compaction %q has no anchor", entryID)
 		}
 		from = *target.FirstKeptID
 	}
-	branch := r.ActiveBranch()
 	idx := slices.Index(branch, from)
 	if idx < 0 {
 		return nil, "", fmt.Errorf("entry %q is not on the active branch", entryID)
@@ -288,7 +289,7 @@ func (r *Reader) ForgetSet(entryID string) (ids []string, parent string, err err
 	ids = slices.Clone(branch[idx:])
 	for _, e := range r.entries {
 		switch {
-		case e.Type == EntryTypeCompaction && e.FirstKeptID != nil && drop[*e.FirstKeptID],
+		case e.Type == EntryTypeCompaction && e.ParentID == nil && e.FirstKeptID != nil && drop[*e.FirstKeptID],
 			e.Type == EntryTypePositionChange && e.NewPosition != nil && drop[*e.NewPosition]:
 			ids = append(ids, e.ID)
 		}
@@ -318,7 +319,7 @@ func (r *Reader) CurrentPosition() string {
 	if startPos == "" {
 		// No position change; return the last message or custom_message entry
 		for i := len(r.entries) - 1; i >= 0; i-- {
-			if r.entries[i].Type == EntryTypeMessage || r.entries[i].Type == EntryTypeCustomMessage {
+			if r.entries[i].Type == EntryTypeMessage || r.entries[i].Type == EntryTypeCustomMessage || r.entries[i].Type == EntryTypeContextEdit || (r.entries[i].Type == EntryTypeBranchSummary && r.entries[i].ParentID != nil) || (r.entries[i].Type == EntryTypeCompaction && r.entries[i].ParentID != nil) {
 				return r.entries[i].ID
 			}
 		}
@@ -333,7 +334,7 @@ func (r *Reader) CurrentPosition() string {
 
 	// Find the last message or custom_message after the position_change that descends from startPos
 	for i := len(r.entries) - 1; i > posChangeIdx; i-- {
-		if r.entries[i].Type != EntryTypeMessage && r.entries[i].Type != EntryTypeCustomMessage {
+		if r.entries[i].Type != EntryTypeMessage && r.entries[i].Type != EntryTypeCustomMessage && r.entries[i].Type != EntryTypeContextEdit && (r.entries[i].Type != EntryTypeBranchSummary || r.entries[i].ParentID == nil) && (r.entries[i].Type != EntryTypeCompaction || r.entries[i].ParentID == nil) {
 			continue
 		}
 		// Walk ancestry to check if this message descends from startPos
@@ -440,9 +441,9 @@ func (r *Reader) contextEntries(unwindFallbacks bool) []Entry {
 			if unwindFallbacks && e.Fallback {
 				continue
 			}
-			// Check if this compaction is on the active branch by checking
-			// if first_kept_id is on the branch
-			if onBranch[*e.FirstKeptID] {
+			// Legacy compactions have no parent and are attached by their kept anchor.
+			// Linked compactions must belong to the selected branch themselves.
+			if e.ParentID == nil && onBranch[*e.FirstKeptID] {
 				compactionEntry = e
 				break
 			}
@@ -462,6 +463,7 @@ func (r *Reader) contextEntries(unwindFallbacks bool) []Entry {
 	afterCompaction := compactionEntry == nil // true if no compaction on branch
 	if compactionEntry != nil {
 		firstKeptID = *compactionEntry.FirstKeptID
+		result = systemEntriesBefore(branch, r.entries, firstKeptID)
 		result = append(result, *compactionEntry)
 	}
 
@@ -480,12 +482,12 @@ func (r *Reader) contextEntries(unwindFallbacks bool) []Entry {
 			continue
 		}
 
-		if e.Type.InContext() {
+		if e.Type.InContext() && e.Type != EntryTypeCompaction {
 			result = append(result, *e)
 		}
 	}
 
-	return result
+	return projectContextEdits(result, branch, r.entries)
 }
 
 // DisplayName returns the session display name from the most recent
@@ -720,4 +722,67 @@ func (r *Reader) MarshalJSON() ([]byte, error) {
 		ActiveBranch: r.ActiveBranch(),
 	}
 	return json.MarshalIndent(doc, "", "  ")
+}
+
+// projectContextEdits changes only model-visible content, never stored history.
+func projectContextEdits(contextEntries []Entry, branch []string, entries []Entry) []Entry {
+	onBranch := make(map[string]bool, len(branch))
+	for _, id := range branch {
+		onBranch[id] = true
+	}
+	edits := make(map[string]json.RawMessage)
+	for _, entry := range entries {
+		if entry.Type == EntryTypeContextEdit && entry.TargetID != nil && onBranch[entry.ID] {
+			edits[*entry.TargetID] = entry.Replacement
+		}
+	}
+	result := make([]Entry, 0, len(contextEntries))
+	for _, entry := range contextEntries {
+		replacement, edited := edits[entry.ID]
+		if edited && (entry.Type == EntryTypeMessage || entry.Type == EntryTypeCustomMessage) {
+			if string(replacement) == "null" {
+				continue
+			}
+			var patch struct {
+				Content json.RawMessage `json:"content"`
+			}
+			var message map[string]json.RawMessage
+			if err := json.Unmarshal(replacement, &patch); err != nil {
+				continue
+			}
+			if err := json.Unmarshal(entry.Message, &message); err != nil {
+				continue
+			}
+			message["content"] = patch.Content
+			raw, err := json.Marshal(message)
+			if err != nil {
+				continue
+			}
+			entry.Message = raw
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+// systemEntriesBefore preserves instructions and declarations when older turns are compacted.
+func systemEntriesBefore(branch []string, entries []Entry, firstKeptID string) []Entry {
+	byID := make(map[string]Entry, len(entries))
+	for _, entry := range entries {
+		byID[entry.ID] = entry
+	}
+	var result []Entry
+	for _, id := range branch {
+		if id == firstKeptID {
+			break
+		}
+		entry := byID[id]
+		if entry.Type != EntryTypeMessage {
+			continue
+		}
+		if message := entry.ToAgentMessage(); message != nil && message.Role == MessageRoleSystem {
+			result = append(result, entry)
+		}
+	}
+	return result
 }

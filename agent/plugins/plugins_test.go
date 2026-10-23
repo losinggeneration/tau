@@ -13,15 +13,20 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
+	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/ui"
 	baseui "github.com/losinggeneration/tau/ui"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDispatchEventCollect_RegistrationOrder ensures handlers receive events
@@ -36,14 +41,14 @@ func TestDispatchEventCollect_RegistrationOrder(t *testing.T) {
 		n := name
 		mgr.RegisterEventHandler("test_event", EventHandler{
 			PluginName: n,
-			Handler: func(_ string, _ json.RawMessage, _ string) EventResponse {
+			Handler: func(_ context.Context, _ string, _ json.RawMessage, _ string) EventResponse {
 				calls = append(calls, n)
 				return EventResponse{ResponseData: []byte(`"` + n + `"`)}
 			},
 		})
 	}
 
-	responses := mgr.DispatchEventCollect("test_event", nil, "sess-1")
+	responses := mgr.DispatchEventCollect(t.Context(), "test_event", nil, "sess-1")
 	if len(responses) != 3 {
 		t.Fatalf("expected 3 responses, got %d", len(responses))
 	}
@@ -62,7 +67,7 @@ func TestDispatchEventCollect_RegistrationOrder(t *testing.T) {
 // event with no subscribers is a no-op (no nil-deref, no spurious responses).
 func TestDispatchEventCollect_UnknownEventReturnsEmpty(t *testing.T) {
 	mgr := NewManager(t.TempDir(), nil, nil)
-	if got := mgr.DispatchEventCollect("nope", nil, "sess"); len(got) != 0 {
+	if got := mgr.DispatchEventCollect(t.Context(), "nope", nil, "sess"); len(got) != 0 {
 		t.Fatalf("expected 0 responses, got %d", len(got))
 	}
 }
@@ -310,7 +315,7 @@ func TestEventResponse_MarshalsResponseData(t *testing.T) {
 	mgr := NewManager(t.TempDir(), nil, nil)
 	mgr.RegisterEventHandler("before_agent_start", EventHandler{
 		PluginName: "p",
-		Handler: func(_ string, payload json.RawMessage, _ string) EventResponse {
+		Handler: func(_ context.Context, _ string, payload json.RawMessage, _ string) EventResponse {
 			var in struct {
 				SystemPrompt string `json:"systemPrompt"`
 			}
@@ -323,7 +328,7 @@ func TestEventResponse_MarshalsResponseData(t *testing.T) {
 			return EventResponse{ResponseData: out}
 		},
 	})
-	resps := mgr.DispatchEventCollect("before_agent_start", json.RawMessage(`{"systemPrompt":"base"}`), "s")
+	resps := mgr.DispatchEventCollect(t.Context(), "before_agent_start", json.RawMessage(`{"systemPrompt":"base"}`), "s")
 	if len(resps) != 1 || resps[0].ResponseData == nil {
 		t.Fatalf("missing response data: %+v", resps)
 	}
@@ -442,6 +447,40 @@ func TestSessionSendUserMessage_InvalidDeliverAs(t *testing.T) {
 	}
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("status code = %v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestSessionCompact verifies the gRPC Unavailable error when no compactor is
+// wired, and that a wired compactor receives the instructions and reports ok.
+func TestSessionCompact(t *testing.T) {
+	mgr := NewManager(t.TempDir(), nil, nil)
+	hs := NewHostService(mgr)
+
+	resp, err := hs.SessionCompact(context.Background(), &proto.SessionCompactRequest{Instructions: "focus"})
+	if err == nil {
+		t.Fatal("expected error when no compactor is configured")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("status code = %v, want Unavailable", status.Code(err))
+	}
+	if resp == nil || resp.Error == "" {
+		t.Errorf("expected error string in response, got %+v", resp)
+	}
+
+	var got string
+	mgr.SetCompactor(func(_ context.Context, instructions string) error {
+		got = instructions
+		return nil
+	})
+	resp, err = hs.SessionCompact(context.Background(), &proto.SessionCompactRequest{Instructions: "focus"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Ok || resp.Error != "" {
+		t.Errorf("resp = %+v, want ok", resp)
+	}
+	if got != "focus" {
+		t.Errorf("instructions = %q, want %q", got, "focus")
 	}
 }
 
@@ -632,7 +671,7 @@ func TestShimInterop(t *testing.T) {
 	// OnEvent must round-trip the systemPrompt rewrite through response_data
 	// (the pi extension system-prompt injection mechanism).
 	payload := `{"systemPrompt":"base"}`
-	responses := mgr.DispatchEventCollect("before_agent_start", json.RawMessage(payload), "interop-session")
+	responses := mgr.DispatchEventCollect(t.Context(), "before_agent_start", json.RawMessage(payload), "interop-session")
 	found := false
 	for _, r := range responses {
 		if strings.Contains(string(r.ResponseData), "interop-rules") {
@@ -686,6 +725,10 @@ func (c *terminalInputPluginClient) OnTerminalInput(_ context.Context, in *proto
 
 func (c *terminalInputPluginClient) Shutdown(context.Context, *proto.ShutdownRequest, ...grpc.CallOption) (*proto.ShutdownResponse, error) {
 	return &proto.ShutdownResponse{}, nil
+}
+
+func (c *terminalInputPluginClient) RouteModel(context.Context, *proto.ModelRouteRequest, ...grpc.CallOption) (*proto.ModelRouteResponse, error) {
+	return &proto.ModelRouteResponse{}, nil
 }
 
 func TestDispatchTerminalInputForwardsToLoadedPlugins(t *testing.T) {
@@ -829,4 +872,351 @@ func TestUIStateForwardsLiveAfterSetUI(t *testing.T) {
 	if got, _ := rec.statusFor("ponytail"); got != "ponytail: FULL" {
 		t.Errorf("live status = %q, want %q", got, "ponytail: FULL")
 	}
+}
+
+func TestDispatchEventCollectChainsMutablePayloads(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		initial, response string
+		field             string
+		want              string
+	}{
+		{name: "before_agent_start", initial: `{"systemPrompt":"base"}`, response: `{"systemPrompt":"rewritten"}`, field: "systemPrompt", want: "rewritten"},
+		{name: "input", initial: `{"text":"base"}`, response: `{"action":"transform","text":"rewritten"}`, field: "text", want: "rewritten"},
+		{name: "context", initial: `{"messages":[]}`, response: `{"messages":[{"role":"user","content":"rewritten"}]}`, field: "messages", want: `[{"role":"user","content":"rewritten"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := NewManager(t.TempDir(), nil, nil)
+			mgr.RegisterEventHandler(tc.name, EventHandler{Handler: func(context.Context, string, json.RawMessage, string) EventResponse {
+				return EventResponse{ResponseData: []byte(tc.response)}
+			}})
+			mgr.RegisterEventHandler(tc.name, EventHandler{Handler: func(_ context.Context, _ string, payload json.RawMessage, _ string) EventResponse {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(payload, &fields); err != nil {
+					t.Fatal(err)
+				}
+				got := string(fields[tc.field])
+				if tc.field != "messages" {
+					if err := json.Unmarshal(fields[tc.field], &got); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if got != tc.want {
+					t.Fatalf("second handler got %s, want %s", got, tc.want)
+				}
+				return EventResponse{}
+			}})
+			mgr.DispatchEventCollect(t.Context(), tc.name, json.RawMessage(tc.initial), "session")
+		})
+	}
+}
+
+func TestToolRegistrationsPreserveExecutionMetadata(t *testing.T) {
+	var registration proto.ToolRegistration
+	if err := protojson.Unmarshal([]byte(`{"name":"lookup","exposure":"deferred","outputSchema":"{\"type\":\"object\"}","constrainedSampling":"{\"type\":\"json_schema\",\"strict\":\"require\"}"}`), &registration); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(t.TempDir(), nil, nil)
+	manager.plugins["test"] = &PluginInfo{Registrations: Registrations{Tools: convertToolRegistrations([]*proto.ToolRegistration{&registration})}}
+	manager.toolHandlers["lookup"] = func(context.Context, string, string, string) (string, bool, error) { return "", false, nil }
+	desc := manager.Tools()[0]
+	if desc.Exposure != "deferred" || string(desc.OutputSchema) != `{"type":"object"}` || string(desc.ConstrainedSampling) != `{"type":"json_schema","strict":"require"}` {
+		t.Fatalf("metadata=%+v", desc)
+	}
+}
+
+func TestExecutePluginToolResultRetainsLegacyHandlers(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	manager.toolHandlers["legacy"] = func(context.Context, string, string, string) (string, bool, error) {
+		return "legacy output", false, nil
+	}
+	result, err := manager.ExecutePluginToolResult(t.Context(), "legacy", "id", "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "legacy output" || result.IsError {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestExecutePluginToolResultPreservesStructuredDataAndLocalName(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	want := &proto.ToolResult{Output: "ok", StructuredContent: `{"found":true}`, Usage: `{"input":1}`, Content: `[{"type":"text","text":"ok"}]`}
+	manager.plugins["test"] = &PluginInfo{Registrations: Registrations{ToolPrefix: "test.", Tools: []ToolRegistration{{Name: "lookup"}}}, grpcClient: &mockPluginClient{onExecuteTool: func(_ context.Context, request *proto.ToolCall) (*proto.ToolResult, error) {
+		if request.ToolName != "lookup" || request.ToolCallId != "call" {
+			t.Errorf("request=%+v", request)
+		}
+		return want, nil
+	}}}
+	got, err := manager.ExecutePluginToolResult(t.Context(), "test.lookup", "call", "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("result=%+v", got)
+	}
+}
+
+func TestLegacyPrefixedPluginToolUsesLocalRPCName(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	info := &PluginInfo{Name: "test", Registrations: Registrations{ToolPrefix: "test.", Tools: []ToolRegistration{{Name: "lookup"}}}, grpcClient: &mockPluginClient{onExecuteTool: func(_ context.Context, request *proto.ToolCall) (*proto.ToolResult, error) {
+		if request.ToolName != "lookup" {
+			t.Errorf("RPC tool name=%q", request.ToolName)
+		}
+		return &proto.ToolResult{Output: "ok"}, nil
+	}}}
+	manager.plugins["test"] = info
+	manager.registerPlugin(info)
+	if _, _, err := manager.ExecutePluginTool(t.Context(), "test.lookup", "call", "{}"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestToolNamespaceRegistrationTransport(t *testing.T) {
+	var registration proto.ToolRegistration
+	if err := protojson.Unmarshal([]byte(`{"name":"lookup","namespace":"{\"name\":\"docs\",\"aliases\":[\"manuals\"]}","defaultActive":false}`), &registration); err != nil {
+		t.Fatal(err)
+	}
+	converted := convertToolRegistrations([]*proto.ToolRegistration{&registration})
+	if len(converted) != 1 || converted[0].DefaultActive == nil || *converted[0].DefaultActive || string(converted[0].Namespace) != `{"name":"docs","aliases":["manuals"]}` {
+		t.Fatalf("metadata lost: %+v", converted)
+	}
+}
+
+func (c *terminalInputPluginClient) ReachTools(ctx context.Context, req *proto.ToolCall, opts ...grpc.CallOption) (*proto.ReachToolsResponse, error) {
+	return &proto.ReachToolsResponse{}, ctx.Err()
+}
+
+func TestPluginReachCallback(t *testing.T) {
+	manager := NewManager(t.TempDir(), ui.NewNoOpUI(), nil)
+	manager.plugins["test"] = &PluginInfo{grpcClient: &mockPluginClient{}, Registrations: Registrations{ToolPrefix: "ext_", Tools: []ToolRegistration{{Name: "caller", HasReachesTools: true}}}}
+	names, err := manager.ReachPluginTools(t.Context(), "ext_caller", map[string]any{"query": "docs"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"docs"}, names)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = manager.ReachPluginTools(ctx, "ext_caller", nil)
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = manager.ReachPluginTools(t.Context(), "missing", nil)
+	require.Error(t, err)
+}
+
+func TestPluginExecutionRejectionDiffersFromExplicitError(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	reply := &proto.ToolResult{Output: "usable error", IsError: true, NestedCalls: `[{"id":"child","name":"lookup","status":"error"}]`}
+	manager.plugins["test"] = &PluginInfo{Name: "test", Registrations: Registrations{Tools: []ToolRegistration{{Name: "lookup"}}}, grpcClient: &mockPluginClient{onExecuteTool: func(context.Context, *proto.ToolCall) (*proto.ToolResult, error) { return reply, nil }}}
+	manager.registerPlugin(manager.plugins["test"])
+	result, err := manager.ExecutePluginToolResult(t.Context(), "lookup", "call", "{}")
+	require.NoError(t, err)
+	require.Same(t, reply, result)
+	reply.Rejection = "transport rejected"
+	result, err = manager.ExecutePluginToolResult(t.Context(), "lookup", "call", "{}")
+	require.NoError(t, err)
+	require.Same(t, reply, result)
+	require.Equal(t, "transport rejected", result.Rejection)
+	_, isError, err := manager.ExecutePluginTool(t.Context(), "lookup", "call", "{}")
+	require.True(t, isError)
+	require.ErrorContains(t, err, "transport rejected")
+}
+
+type reachTestClient struct {
+	proto.PluginClient
+	reach func(context.Context) (*proto.ReachToolsResponse, error)
+}
+
+func (c *reachTestClient) ReachTools(ctx context.Context, _ *proto.ToolCall, _ ...grpc.CallOption) (*proto.ReachToolsResponse, error) {
+	return c.reach(ctx)
+}
+
+func TestPluginReachDeadlineAndEmptyResponse(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	client := &reachTestClient{reach: func(ctx context.Context) (*proto.ReachToolsResponse, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("reach callback has no execution deadline")
+		}
+		return nil, nil
+	}}
+	manager.plugins["test"] = &PluginInfo{grpcClient: client, Registrations: Registrations{Tools: []ToolRegistration{{Name: "caller", HasReachesTools: true}}}}
+	_, err := manager.ReachPluginTools(t.Context(), "caller", nil)
+	require.ErrorContains(t, err, "no reach result")
+}
+
+func TestPluginRegistrationReloadPreservesLoadoutMetadata(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	inactive := false
+	original := &PluginInfo{Name: "test", Registrations: Registrations{ToolPrefix: "ext_", Tools: []ToolRegistration{
+		{Name: "lookup", DefaultActive: &inactive, Exposure: "deferred", Namespace: json.RawMessage(`{"name":"docs"}`), HasReachesTools: true},
+		{Name: "removed"},
+	}}}
+	manager.plugins[original.Name] = original
+	manager.registerPlugin(original)
+	tools := manager.Tools()
+	require.Len(t, tools, 2)
+	index := slices.IndexFunc(tools, func(tool ToolHandlerDesc) bool { return tool.Name == "ext_lookup" })
+	require.NotEqual(t, -1, index)
+	require.NotNil(t, tools[index].DefaultActive)
+	require.False(t, *tools[index].DefaultActive)
+	require.True(t, tools[index].HasReachesTools)
+	require.Equal(t, "deferred", tools[index].Exposure)
+	require.JSONEq(t, `{"name":"docs"}`, string(tools[index].Namespace))
+	manager.unregisterPluginLocked(original)
+	replacement := &PluginInfo{Name: "test", Registrations: Registrations{ToolPrefix: "ext_", Tools: []ToolRegistration{{Name: "lookup", DefaultActive: new(true), Exposure: "direct"}}}}
+	manager.plugins[replacement.Name] = replacement
+	manager.registerPlugin(replacement)
+	tools = manager.Tools()
+	require.Len(t, tools, 1)
+	require.Equal(t, "ext_lookup", tools[0].Name)
+	require.True(t, *tools[0].DefaultActive)
+	require.Equal(t, "direct", tools[0].Exposure)
+	require.Empty(t, tools[0].Namespace)
+	require.False(t, tools[0].HasReachesTools)
+	manager.unregisterPluginLocked(replacement)
+	require.Empty(t, manager.Tools())
+}
+
+func TestPluginConnectorFailureClosesHostSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "connector-failure")
+	require.NoError(t, os.WriteFile(path, []byte("unused"), 0o600))
+	failure := errors.New("connection failed")
+	manager := NewManager(t.TempDir(), nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return nil, nil, failure
+	}))
+	_, err := manager.Load(t.Context(), path)
+	require.ErrorIs(t, err, failure)
+	require.Empty(t, manager.HostSocketPath(filepath.Base(path)))
+	require.Empty(t, manager.Tools())
+}
+
+func TestPluginConnectorInvalidResultClosesHostSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "connector-invalid")
+	require.NoError(t, os.WriteFile(path, []byte("unused"), 0o600))
+	for _, client := range []proto.PluginClient{nil, &mockPluginClient{}} {
+		manager := NewManager(t.TempDir(), nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+			return client, nil, nil
+		}))
+		_, err := manager.Load(t.Context(), path)
+		require.ErrorContains(t, err, "client and cleanup")
+		require.Empty(t, manager.HostSocketPath(filepath.Base(path)))
+		require.Empty(t, manager.Tools())
+	}
+}
+
+type routerPluginClient struct {
+	proto.PluginClient
+	request  *proto.ModelRouteRequest
+	response *proto.ModelRouteResponse
+}
+
+func (c *routerPluginClient) RouteModel(_ context.Context, request *proto.ModelRouteRequest, _ ...grpc.CallOption) (*proto.ModelRouteResponse, error) {
+	c.request = request
+	return c.response, nil
+}
+
+func TestManagerRoutesPluginVirtualModels(t *testing.T) {
+	m := NewManager(t.TempDir(), nil, nil)
+	client := &routerPluginClient{response: &proto.ModelRouteResponse{Provider: "anthropic", ModelId: "claude-sonnet-4-6", ThinkingLevel: "high", StateJson: `{"n":2}`}}
+	registrations := convertVirtualModelRegistrations([]*proto.VirtualModelRegistration{{Provider: "router", Id: "auto", Name: "Auto", ThinkingLevels: []string{"off", "high"}, Input: []string{"text"}, ContextWindow: 1000, MaxTokens: 100}})
+	m.plugins["router"] = &PluginInfo{Name: "router", grpcClient: client, Registrations: Registrations{VirtualModels: registrations}}
+
+	definitions := m.VirtualModels()
+	if len(definitions) != 1 {
+		t.Fatalf("virtual models = %+v", definitions)
+	}
+	definition := definitions[0]
+	if definition.Provider != "router" || definition.ID != "auto" || definition.Name != "Auto" || !slices.Equal(definition.ThinkingLevels, []string{"off", "high"}) || !slices.Equal(definition.Input, []ai.InputType{ai.InputText}) || definition.ContextWindow != 1000 || definition.MaxTokens != 100 {
+		t.Fatalf("definition = %+v", definition)
+	}
+	route, err := definition.Route(t.Context(), ai.ModelRouteRequest{Model: &ai.Model{Provider: "router", ID: "auto"}, Reason: ai.ModelRouteUser, ThinkingLevel: "high", State: json.RawMessage(`{"n":1}`), Messages: []ai.Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Model.Provider != "anthropic" || route.Model.ID != "claude-sonnet-4-6" || route.ThinkingLevel != "high" || string(route.State) != `{"n":2}` {
+		t.Fatalf("route = %+v", route)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(client.request.RequestJson), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if client.request.Provider != "router" || client.request.ModelId != "auto" || sent["reason"] != "user" || sent["thinkingLevel"] != "high" || sent["messages"] == nil || sent["state"].(map[string]any)["n"] != 1.0 {
+		t.Fatalf("route request = %+v %s", client.request, client.request.RequestJson)
+	}
+
+	client.response = &proto.ModelRouteResponse{Error: "no capacity"}
+	if _, err := definition.Route(t.Context(), ai.ModelRouteRequest{Model: &ai.Model{Provider: "router", ID: "auto"}}); err == nil || !strings.Contains(err.Error(), "no capacity") {
+		t.Fatalf("router error = %v", err)
+	}
+	client.response = &proto.ModelRouteResponse{Provider: "anthropic", ModelId: "claude-sonnet-4-6", StateJson: "{"}
+	if _, err := definition.Route(t.Context(), ai.ModelRouteRequest{Model: &ai.Model{Provider: "router", ID: "auto"}}); err == nil {
+		t.Fatal("accepted router state that is not JSON")
+	}
+	delete(m.plugins, "router")
+	if _, err := definition.Route(t.Context(), ai.ModelRouteRequest{Model: &ai.Model{Provider: "router", ID: "auto"}}); err == nil {
+		t.Fatal("routed through an unloaded plugin")
+	}
+}
+
+type shutdownResultClient struct {
+	proto.PluginClient
+	response *proto.ShutdownResponse
+	err      error
+	calls    int
+}
+
+func (c *shutdownResultClient) Shutdown(context.Context, *proto.ShutdownRequest, ...grpc.CallOption) (*proto.ShutdownResponse, error) {
+	c.calls++
+	return c.response, c.err
+}
+
+func TestShutdownReportsFailuresAndCleansEveryPlugin(t *testing.T) {
+	rpcErr := errors.New("RPC failed")
+	for _, tc := range []struct {
+		name     string
+		response *proto.ShutdownResponse
+		err      error
+	}{
+		{name: "rpc", err: rpcErr},
+		{name: "ungraceful", response: &proto.ShutdownResponse{}},
+		{name: "plugin error", response: &proto.ShutdownResponse{Graceful: true, Error: "drain failed"}},
+		{name: "nil response"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(t.TempDir(), nil, nil)
+			failed := &shutdownResultClient{response: tc.response, err: tc.err}
+			good := &shutdownResultClient{response: &proto.ShutdownResponse{Graceful: true}}
+			var cleaned atomic.Int32
+			m.plugins["failed"] = &PluginInfo{Name: "failed", grpcClient: failed, Cleanup: func() { cleaned.Add(1) }}
+			m.plugins["good"] = &PluginInfo{Name: "good", grpcClient: good, Cleanup: func() { cleaned.Add(1) }}
+			err := m.Shutdown(t.Context())
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "failed")
+			if tc.err != nil {
+				require.ErrorIs(t, err, tc.err)
+			}
+			require.EqualValues(t, 2, cleaned.Load())
+			require.Equal(t, 1, failed.calls)
+			require.Equal(t, 1, good.calls)
+		})
+	}
+}
+
+func TestShutdownPluginReportsCancellationWithoutSkippingCleanup(t *testing.T) {
+	m := NewManager(t.TempDir(), nil, nil)
+	client := &shutdownResultClient{err: context.Canceled}
+	var cleaned atomic.Bool
+	m.plugins["cancelled"] = &PluginInfo{Name: "cancelled", grpcClient: client, Cleanup: func() { cleaned.Store(true) }}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, m.ShutdownPlugin(ctx, "cancelled", time.Second), context.Canceled)
+	require.True(t, cleaned.Load())
+}
+
+func TestShutdownRetainsEveryRPCFailure(t *testing.T) {
+	m := NewManager(t.TempDir(), nil, nil)
+	first, second := errors.New("first RPC failure"), errors.New("second RPC failure")
+	for name, err := range map[string]error{"first": first, "second": second} {
+		m.plugins[name] = &PluginInfo{Name: name, grpcClient: &shutdownResultClient{err: err}, Cleanup: func() {}}
+	}
+	err := m.Shutdown(t.Context())
+	require.ErrorIs(t, err, first)
+	require.ErrorIs(t, err, second)
 }

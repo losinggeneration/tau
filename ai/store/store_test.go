@@ -669,3 +669,43 @@ func TestFileBackend_AtomicReplaceKeepsPermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIKeyFromCredentialResolvesStoredReferences(t *testing.T) {
+	t.Setenv("TAU_STORED_KEY_TEST", "from-process")
+	path := filepath.Join(t.TempDir(), "auth.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{
+  "env": {"type": "api_key", "key": "$TAU_STORED_KEY_TEST"},
+  "override": {"type": "api_key", "key": "pre-${TAU_STORED_KEY_TEST}", "env": {"TAU_STORED_KEY_TEST": "from-entry"}},
+  "escaped": {"type": "api_key", "key": "$$literal$!"},
+  "missing": {"type": "api_key", "key": "$TAU_STORED_KEY_MISSING"}
+}`), 0o600))
+	fb := NewFileBackend(path, Options{})
+	ctx := context.Background()
+
+	for provider, want := range map[string]string{"env": "from-process", "override": "pre-from-entry", "escaped": "$literal!"} {
+		cred, err := fb.Get(ctx, provider)
+		require.NoError(t, err)
+		key, err := APIKeyFromCredential(ctx, provider, cred)
+		require.NoError(t, err)
+		assert.Equal(t, want, key, provider)
+	}
+
+	cred, err := fb.Get(ctx, "missing")
+	require.NoError(t, err)
+	_, err = APIKeyFromCredential(ctx, "missing", cred)
+	require.ErrorContains(t, err, "TAU_STORED_KEY_MISSING")
+
+	override, err := fb.Get(ctx, "override")
+	require.NoError(t, err)
+	require.NoError(t, fb.Set(ctx, "copy", override))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var saved map[string]authCredential
+	require.NoError(t, json.Unmarshal(data, &saved))
+	assert.Equal(t, authCredential{Type: ai.CredentialTypeAPIKey, Key: "pre-${TAU_STORED_KEY_TEST}", Env: map[string]string{"TAU_STORED_KEY_TEST": "from-entry"}}, saved["copy"])
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = APIKeyFromCredential(canceled, "env", ai.NewAPIKeyCredential("!command"))
+	require.ErrorIs(t, err, context.Canceled)
+}

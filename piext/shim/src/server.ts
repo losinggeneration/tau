@@ -19,7 +19,14 @@ import {
 import { loadProto } from "./grpc.ts";
 import type { MTLSMaterial } from "./cert.ts";
 import { scheduleExit } from "./lifecycle.ts";
-import { buildPi, getRegistrations, toolParametersToMap } from "./pi-api.ts";
+import {
+	buildPi,
+	refreshToolLoadout,
+	flushToolLoadout,
+	getRegistrations,
+	toolParametersToMap,
+	virtualModelKey,
+} from "./pi-api.ts";
 import { buildContext } from "./ctx.ts";
 import { EventRouter } from "./events.ts";
 import { HostClient } from "./host.ts";
@@ -36,6 +43,8 @@ import type {
 	InitRequestP,
 	InitResponseP,
 	ListRegistrationsRequestP,
+	ModelRouteRequestP,
+	ModelRouteResponseP,
 	RegistrationsP,
 	ShutdownRequestP,
 	ShutdownResponseP,
@@ -46,12 +55,14 @@ import type {
 } from "./proto-types.ts";
 
 export interface PluginServiceHandlers {
+	ReachTools: handleUnaryCall<ToolCallP, { names: string[] }>;
 	Initialize: handleUnaryCall<InitRequestP, InitResponseP>;
 	ListRegistrations: handleUnaryCall<ListRegistrationsRequestP, RegistrationsP>;
 	OnEvent: handleUnaryCall<EventP, EventResponseP>;
 	ExecuteTool: handleUnaryCall<ToolCallP, ToolResultP>;
 	ExecuteCommand: handleUnaryCall<CommandInvocationP, CommandResultP>;
 	OnTerminalInput: handleUnaryCall<TerminalInputP, TerminalInputResponseP>;
+	RouteModel: handleUnaryCall<ModelRouteRequestP, ModelRouteResponseP>;
 	Shutdown: handleUnaryCall<ShutdownRequestP, ShutdownResponseP>;
 }
 
@@ -65,6 +76,7 @@ export interface PluginServiceBundle {
 }
 
 export interface BuildPluginServiceOptions {
+	host?: HostClient;
 	extensionEntries: string[];
 	cwd: string;
 	pluginName: string;
@@ -78,14 +90,19 @@ export interface BuildPluginServiceOptions {
  * cwd-relative) paths to JS/TS files; cwd is the package dir (set as
  * process.cwd() by tau for sh -c launched plugins).
  */
-export function buildPluginService(
-	{ extensionEntries, cwd, pluginName, onShutdownAcknowledged = scheduleExit }: BuildPluginServiceOptions,
-): PluginServiceBundle {
+export function buildPluginService({
+	extensionEntries,
+	cwd,
+	pluginName,
+	host = new HostClient(pluginName),
+	onShutdownAcknowledged = scheduleExit,
+}: BuildPluginServiceOptions): PluginServiceBundle {
 	const router = new EventRouter();
-	const host = new HostClient(pluginName);
 	const api = buildPi({ host, router, pluginName });
 
 	// Internal subscriptions for derived state (isIdle, model).
+	router.subscribeInternal("before_agent_start", () => shimState.markAgentStart());
+	router.subscribeInternal("agent_settled", () => shimState.markAgentEnd());
 	router.subscribeInternal("agent_start", () => shimState.markAgentStart());
 	router.subscribeInternal("agent_end", () => shimState.markAgentEnd());
 	router.subscribeInternal("model_select", (payload) => {
@@ -95,6 +112,27 @@ export function buildPluginService(
 	let initialized = false;
 	const inFlight = new Set<Promise<unknown>>();
 	const waitForInFlight = (): Promise<void> => Promise.allSettled(Array.from(inFlight)).then(() => undefined);
+
+	const track = (promise: Promise<unknown>): void => {
+		inFlight.add(promise);
+		promise.finally(() => inFlight.delete(promise)).catch(() => undefined);
+	};
+	const withLoadout = async <T>(action: () => Promise<T> | T): Promise<T> => {
+		await refreshToolLoadout(api);
+		let result: T;
+		try {
+			result = await action();
+		} catch (error) {
+			try {
+				await flushToolLoadout(api);
+			} catch (activationError) {
+				throw new AggregateError([error, activationError], `${String(error)}; ${String(activationError)}`);
+			}
+			throw error;
+		}
+		await flushToolLoadout(api);
+		return result;
+	};
 
 	const handlers: PluginServiceHandlers = {
 		// NOTE: grpc-js handlers must invoke `callback` explicitly — a returned
@@ -133,12 +171,44 @@ export function buildPluginService(
 			}
 		},
 
+		ReachTools(call, callback) {
+			const controller = new AbortController();
+			const cancel = () => controller.abort();
+			call.on?.("cancelled", cancel);
+			if (call.cancelled) cancel();
+			const handlerPromise = (async () => {
+				try {
+					controller.signal.throwIfAborted();
+					const tool = getRegistrations(api).tools.get(call.request.toolName ?? "");
+					if (!tool?.reachesTools) throw new Error("reach callback unavailable");
+					const args: unknown = JSON.parse(call.request.arguments || "{}");
+					if (!args || typeof args !== "object" || Array.isArray(args))
+						throw new Error("reach arguments must be an object");
+					const reach = await tool.reachesTools(args as Record<string, unknown>, { signal: controller.signal });
+					controller.signal.throwIfAborted();
+					if (reach !== "all" && (!Array.isArray(reach) || reach.some((name) => typeof name !== "string")))
+						throw new Error("invalid tool reach");
+					callback(null, { names: reach === "all" ? ["all"] : reach });
+				} catch (error) {
+					callback(new Error(error instanceof Error ? error.message : String(error)), null);
+				} finally {
+					call.removeListener?.("cancelled", cancel);
+				}
+			})();
+			track(handlerPromise);
+		},
 		ListRegistrations(_call, callback) {
 			const registrations = getRegistrations(api);
 			const tools = Array.from(registrations.tools.values()).map((t) => ({
+				hasReachesTools: typeof t.reachesTools === "function",
 				name: t.name,
 				description: t.description ?? "",
 				parameters: toolParametersToMap(t.parameters),
+				namespace: t.namespace ? JSON.stringify(t.namespace) : "",
+				...(t.defaultActive === undefined ? {} : { defaultActive: t.defaultActive }),
+				exposure: t.exposure ?? "",
+				outputSchema: t.outputSchema ? JSON.stringify(t.outputSchema) : "",
+				constrainedSampling: t.constrainedSampling === undefined ? "" : JSON.stringify(t.constrainedSampling),
 			}));
 			const commands = Array.from(registrations.commands.values()).map((c) => ({
 				name: c.name,
@@ -152,47 +222,59 @@ export function buildPluginService(
 				required: false,
 				defaultValue: String(f.default ?? ""),
 			}));
+			const virtualModels = Array.from(registrations.virtualModels.values()).map((model) => ({
+				provider: model.provider,
+				id: model.id,
+				name: model.name ?? model.id,
+				thinkingLevels: [...(model.thinkingLevels ?? [])],
+				input: [...(model.input ?? [])],
+				contextWindow: model.contextWindow ?? 0,
+				maxTokens: model.maxTokens ?? 0,
+			}));
 			callback(null, {
 				tools,
 				commands,
 				eventSubscriptions,
 				cliFlags,
 				toolPrefix: "",
+				virtualModels,
 			});
 		},
 
 		OnEvent(call, callback) {
 			const req = call.request;
 			const handlerPromise = (async (): Promise<EventResponseP> => {
-				// session_start: pre-fetch entries so ctx.sessionManager serves pi's
-				// synchronous getEntries/getBranch contract (extensions read their
-				// custom entries here to restore per-session state).
-				if ((req.name ?? "") === "session_start") {
-					await refreshSessionEntries(host);
-				}
-				const result = await router.dispatch(req.name ?? "", req.payload ?? "", () =>
-					buildContext({ host, cwd, pluginName }),
-				);
-				return {
-					block: result.block,
-					blockReason: result.blockReason,
-					responseData: result.responseData,
-				};
+				return withLoadout(async () => {
+					// session_start: pre-fetch entries so ctx.sessionManager serves pi's
+					// synchronous getEntries/getBranch contract (extensions read their
+					// custom entries here to restore per-session state).
+					if ((req.name ?? "") === "session_start") {
+						await refreshSessionEntries(host);
+					}
+					const result = await router.dispatch(req.name ?? "", req.payload ?? "", () =>
+						buildContext({ host, cwd, pluginName }),
+					);
+					return {
+						block: result.block,
+						blockReason: result.blockReason,
+						responseData: result.responseData,
+					};
+				});
 			})();
 			inFlight.add(handlerPromise);
 			handlerPromise.finally(() => inFlight.delete(handlerPromise)).catch(() => undefined);
 			handlerPromise.then(
 				(resp) => callback(null, resp),
-				(e: unknown) =>
-					callback(
-						e instanceof Error ? e : new Error(String(e)),
-						undefined,
-					),
+				(e: unknown) => callback(e instanceof Error ? e : new Error(String(e)), undefined),
 			);
 		},
 
 		ExecuteTool(call, callback) {
-			void (async () => {
+			const controller = new AbortController();
+			const cancel = () => controller.abort();
+			call.on?.("cancelled", cancel);
+			if (call.cancelled) cancel();
+			const handlerPromise = (async () => {
 				const req = call.request;
 				const toolName = req.toolName ?? "";
 				const tool = getRegistrations(api).tools.get(toolName);
@@ -204,20 +286,60 @@ export function buildPluginService(
 					});
 					return;
 				}
-				let args: Record<string, unknown> = {};
-				if (typeof req.arguments === "string" && req.arguments.length > 0) {
-					try {
-						const parsed: unknown = JSON.parse(req.arguments);
-						if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-							args = parsed as Record<string, unknown>;
-						}
-					} catch {
-						// Keep args empty on parse error.
-					}
-				}
-				const ctx = buildContext({ host, cwd, pluginName });
+				let args: Record<string, unknown>;
 				try {
-					const result = await tool.execute(args, ctx);
+					const parsed: unknown = JSON.parse(req.arguments || "{}");
+					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected an object");
+					args = parsed as Record<string, unknown>;
+				} catch (error) {
+					const message = `invalid tool arguments: ${error instanceof Error ? error.message : String(error)}`;
+					callback(null, { output: message, isError: true, rejection: message, errorMessage: message });
+					return;
+				}
+				const ctx = buildContext({ host, cwd, pluginName, signal: controller.signal });
+				let settled = false;
+				let progress = Promise.resolve();
+				let progressFailure: unknown;
+				ctx.onUpdate = (partial) => {
+					if (settled || controller.signal.aborted) return Promise.resolve();
+					const update = {
+						toolCallId: req.toolCallId ?? "",
+						content: (partial.content ?? [])
+							.filter((c) => c.type === "text")
+							.map((c) => String(c.text ?? ""))
+							.join(""),
+						isError: partial.isError,
+						nestedCalls: partial.nestedCalls?.slice(-128),
+					};
+					progress = progress
+						.then(() => {
+							if (!controller.signal.aborted) return host.toolProgress(update);
+						})
+						.catch((error) => {
+							progressFailure = error;
+						});
+					return progress;
+				};
+				try {
+					const result = await withLoadout(async () => {
+						let result;
+						let failure: unknown;
+						try {
+							controller.signal.throwIfAborted();
+							result = await tool.execute(args, ctx);
+						} catch (error) {
+							failure = error;
+						} finally {
+							settled = true;
+							await progress;
+						}
+						if (failure !== undefined && progressFailure !== undefined)
+							throw new AggregateError([failure, progressFailure], `${String(failure)}; ${String(progressFailure)}`);
+						if (failure !== undefined) throw failure;
+						if (progressFailure !== undefined) throw progressFailure;
+						controller.signal.throwIfAborted();
+						return result;
+					});
 					// pi ToolResult: { content: TextContent[] | ImageContent[], isError }
 					const content = Array.isArray(result?.content) ? result.content : [];
 					const text = content
@@ -226,21 +348,27 @@ export function buildPluginService(
 						.join("");
 					callback(null, {
 						output: text || (result ? JSON.stringify(result) : ""),
+						content: JSON.stringify(content),
+						nestedCalls: result?.nestedCalls === undefined ? "" : JSON.stringify(result.nestedCalls.slice(-128)),
+						structuredContent: result?.structuredContent === undefined ? "" : JSON.stringify(result.structuredContent),
+						usage: result?.usage === undefined ? "" : JSON.stringify(result.usage),
 						isError: result?.isError === true,
 						errorMessage: result?.isError === true ? text || "tool error" : "",
 					});
 				} catch (e) {
 					callback(null, {
 						output: `tool error: ${e instanceof Error ? e.message : String(e)}`,
+						rejection: e instanceof Error ? e.message : String(e),
 						isError: true,
 						errorMessage: e instanceof Error ? e.message : String(e),
 					});
 				}
 			})();
+			track(handlerPromise.finally(() => call.removeListener?.("cancelled", cancel)));
 		},
 
 		ExecuteCommand(call, callback) {
-			void (async () => {
+			const handlerPromise = (async () => {
 				const req = call.request;
 				const name = req.commandName ?? "";
 				const args = req.arguments ?? "";
@@ -255,7 +383,7 @@ export function buildPluginService(
 				}
 				const ctx = buildContext({ host, cwd, pluginName });
 				try {
-					const result = await cmd.handler(args, ctx);
+					const result = await withLoadout(() => cmd.handler(args, ctx));
 					callback(null, { output: commandOutput(result), isError: false, errorMessage: "" });
 				} catch (e) {
 					callback(null, {
@@ -265,6 +393,48 @@ export function buildPluginService(
 					});
 				}
 			})();
+			track(handlerPromise);
+		},
+
+		RouteModel(call, callback) {
+			const controller = new AbortController();
+			const cancel = () => controller.abort();
+			call.on?.("cancelled", cancel);
+			if (call.cancelled) cancel();
+			const handlerPromise = (async (): Promise<ModelRouteResponseP> => {
+				const { provider = "", modelId = "", requestJson = "" } = call.request;
+				const model = getRegistrations(api).virtualModels.get(virtualModelKey(provider, modelId));
+				if (!model) throw new Error(`Virtual model ${provider}/${modelId} is not registered.`);
+				const request = JSON.parse(requestJson || "{}") as { state?: unknown };
+				const state = request.state;
+				const route = await model.route(
+					{ ...request, signal: controller.signal },
+					buildContext({ host, cwd, pluginName, signal: controller.signal }),
+				);
+				if (!route?.model?.provider || !route.model.id)
+					throw new Error(`Virtual model ${provider}/${modelId} returned no model.`);
+				// Returning request.state (or nothing) keeps the stored state.
+				const kept = route.state === undefined || route.state === state;
+				return {
+					provider: route.model.provider,
+					modelId: route.model.id,
+					thinkingLevel: route.thinkingLevel ?? "",
+					stateJson: kept ? "" : JSON.stringify(route.state),
+					error: "",
+				};
+			})();
+			handlerPromise.then(
+				(response) => callback(null, response),
+				(e: unknown) =>
+					callback(null, {
+						provider: "",
+						modelId: "",
+						thinkingLevel: "",
+						stateJson: "",
+						error: e instanceof Error ? e.message : String(e),
+					}),
+			);
+			track(handlerPromise.finally(() => call.removeListener?.("cancelled", cancel)));
 		},
 
 		OnTerminalInput(call, callback) {
@@ -327,7 +497,11 @@ export interface StartServerOptions {
 export async function startServer(options: StartServerOptions): Promise<Server> {
 	const { sockPath, pluginService, onBound } = options;
 	const credentialsObj = options.mtls
-		? ServerCredentials.createSsl(options.mtls.rootCerts, options.mtls.keyCertPairs, options.mtls.checkClientCertificate)
+		? ServerCredentials.createSsl(
+				options.mtls.rootCerts,
+				options.mtls.keyCertPairs,
+				options.mtls.checkClientCertificate,
+			)
 		: ServerCredentials.createInsecure();
 
 	const { PluginService } = loadProto();

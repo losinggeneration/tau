@@ -3,12 +3,18 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/losinggeneration/tau/ai"
+	"github.com/stretchr/testify/require"
 )
 
 func testProxyModel() *ai.Model {
@@ -781,5 +787,379 @@ func TestStreamProxyResponseMalformedJSONEmitsTerminalError(t *testing.T) {
 	}
 	if !foundError {
 		t.Error("expected StreamError event for malformed JSON line")
+	}
+}
+
+func TestStreamProxyResponseTerminalOutcomesMatchUpstream(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name, body, message string
+		ctx                 context.Context
+		reason              ai.StopReason
+		done                bool
+	}{
+		{name: "unterminated final done", body: "data: {\"type\":\"start\"}\ndata: {\"type\":\"done\",\"reason\":\"stop\"}", reason: ai.StopReasonStop, done: true},
+		{name: "closed early", body: "data: {\"type\":\"start\"}\n", reason: ai.StopReasonError, message: "connection closed by proxy server before the response completed"},
+		{name: "canceled", ctx: canceled, body: "data: {\"type\":\"start\"}\n", reason: ai.StopReasonAborted, message: "request aborted by user"},
+		{name: "malformed", body: "data: nope\n", reason: ai.StopReasonError, message: "proxy: malformed event"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := tc.ctx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			var terminal []ai.StreamEvent
+			_ = streamProxyResponse(ctx, testProxyModel(), strings.NewReader(tc.body), func(_ context.Context, event ai.StreamEvent) {
+				switch event.(type) {
+				case ai.Done, ai.StreamError:
+					terminal = append(terminal, event)
+				}
+			})
+			if len(terminal) != 1 {
+				t.Fatalf("terminal = %#v, want one", terminal)
+			}
+			switch e := terminal[0].(type) {
+			case ai.Done:
+				if !tc.done || e.Reason != tc.reason {
+					t.Fatalf("done %s, want %s %q", e.Reason, tc.reason, tc.message)
+				}
+			case ai.StreamError:
+				if tc.done || e.Msg.StopReason != tc.reason || !strings.HasPrefix(e.Msg.ErrorMessage, tc.message) {
+					t.Fatalf("error %s %q, want %s %q", e.Msg.StopReason, e.Msg.ErrorMessage, tc.reason, tc.message)
+				}
+			}
+		})
+	}
+}
+
+func TestStreamProxyRequestFailureEmitsTerminalError(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	server.Close()
+	var failures []ai.StreamError
+	err := StreamProxy(context.Background(), testProxyModel(), &ai.Context{}, func(_ context.Context, event ai.StreamEvent) {
+		if e, ok := event.(ai.StreamError); ok {
+			failures = append(failures, e)
+		}
+	}, server.URL, "")
+	if err == nil || len(failures) != 1 || failures[0].Msg.StopReason != ai.StopReasonError || failures[0].Msg.ErrorMessage != err.Error() {
+		t.Fatalf("err=%v failures=%+v", err, failures)
+	}
+}
+
+func TestExtractSimpleStreamOptionsForwardsSamplingParams(t *testing.T) {
+	options := extractSimpleStreamOptions([]ai.Option{ai.WithSamplingParams(map[string]any{"top_k": 40})})
+	params, ok := options["samplingParams"].(map[string]any)
+	if !ok || params["top_k"] != 40 {
+		t.Fatalf("options = %v, want samplingParams forwarded", options)
+	}
+	if options := extractSimpleStreamOptions([]ai.Option{ai.WithTransport(ai.TransportWS)}); options["transport"] != ai.TransportWS {
+		t.Fatalf("options = %v, want transport forwarded", options)
+	}
+}
+
+func TestStreamProxyReconstructsIndexedContentAndFinalMetadata(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"start"}`,
+		`data: {"type":"text_start","contentIndex":0}`,
+		`data: {"type":"text_delta","contentIndex":0,"delta":"discard"}`,
+		`data: {"type":"text_start","contentIndex":0}`,
+		`data: {"type":"text_delta","contentIndex":0,"delta":"kept"}`,
+		`data: {"type":"text_end","contentIndex":0,"contentSignature":"text-sig"}`,
+		`data: {"type":"toolcall_start","contentIndex":1,"id":"first","toolName":"read"}`,
+		`data: {"type":"toolcall_start","contentIndex":2,"id":"second","toolName":"write"}`,
+		`data: {"type":"toolcall_delta","contentIndex":1,"delta":"{\"path\":\"a\"}"}`,
+		`data: {"type":"toolcall_delta","contentIndex":2,"delta":"{\"path\":\"b\"}"}`,
+		`data: {"type":"toolcall_end","contentIndex":2}`,
+		`data: {"type":"toolcall_end","contentIndex":1,"toolCall":{"id":"final-first","name":"lookup","arguments":{"path":"final"}}}`,
+		`data: {"type":"done","reason":"toolUse","providerThinkingLevel":"high","usage":{"totalTokens":17}}`,
+	}, "\n")
+	var done ai.Done
+	var calls []ai.ToolCall
+	err := streamProxyResponse(t.Context(), testProxyModel(), strings.NewReader(body), func(_ context.Context, event ai.StreamEvent) {
+		switch e := event.(type) {
+		case ai.Done:
+			done = e
+		case ai.ToolCallEnd:
+			calls = append(calls, e.ToolCall)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(done.Message.Content) != 3 || len(calls) != 2 {
+		t.Fatalf("content=%+v calls=%+v", done.Message.Content, calls)
+	}
+	content := done.Message.Content
+	if content[0].Text != "kept" || content[0].TextSignature != "text-sig" ||
+		content[1].ID != "final-first" || content[1].Name != "lookup" || string(content[1].Arguments) != `{"path":"final"}` ||
+		content[2].ID != "second" || string(content[2].Arguments) != `{"path":"b"}` ||
+		calls[0].ID != "second" || calls[1].ID != "final-first" ||
+		done.Message.ProviderThinkingLevel != "high" || done.Message.Usage.TotalTokens != 17 {
+		t.Fatalf("done=%+v calls=%+v", done, calls)
+	}
+}
+
+func TestStreamProxyRejectsInvalidContentEvents(t *testing.T) {
+	for _, event := range []string{
+		`{"type":"text_delta","contentIndex":-1,"delta":"bad"}`,
+		`{"type":"thinking_start","contentIndex":-1}`,
+		`{"type":"toolcall_start","contentIndex":-1}`,
+		`{"type":"text_start","contentIndex":2147483647}`,
+		`{"type":"text_delta","contentIndex":1,"delta":"bad"}`,
+		`{"type":"text_end","contentIndex":1}`,
+		`{"type":"thinking_delta","contentIndex":0,"delta":"bad"}`,
+		`{"type":"thinking_end","contentIndex":0}`,
+		`{"type":"toolcall_delta","contentIndex":0,"delta":"{}"}`,
+		`{"type":"toolcall_end","contentIndex":0}`,
+		`{"type":"done","reason":"error"}`,
+		`{"type":"error","reason":"stop"}`,
+	} {
+		t.Run(event, func(t *testing.T) {
+			body := "data: {\"type\":\"text_start\",\"contentIndex\":0}\ndata: " + event + "\ndata: {\"type\":\"done\",\"reason\":\"stop\"}\n"
+			var terminal []ai.StreamEvent
+			err := streamProxyResponse(t.Context(), testProxyModel(), strings.NewReader(body), func(_ context.Context, event ai.StreamEvent) {
+				switch event.(type) {
+				case ai.Done, ai.StreamError:
+					terminal = append(terminal, event)
+				}
+			})
+			if err == nil || len(terminal) != 1 {
+				t.Fatalf("err=%v terminal=%+v", err, terminal)
+			}
+			failure, ok := terminal[0].(ai.StreamError)
+			if !ok || failure.Msg.StopReason != ai.StopReasonError {
+				t.Fatalf("terminal=%+v", terminal)
+			}
+		})
+	}
+}
+
+func TestStreamProxyStopsAtFirstTerminalEvent(t *testing.T) {
+	for _, terminal := range []string{
+		`{"type":"done","reason":"stop","providerThinkingLevel":"high"}`,
+		`{"type":"error","reason":"aborted","errorMessage":"stopped","providerThinkingLevel":"low"}`,
+	} {
+		t.Run(terminal, func(t *testing.T) {
+			body := "data: \n\ndata: " + terminal + "\ndata: NOT_JSON\n"
+			var events []ai.StreamEvent
+			err := streamProxyResponse(t.Context(), testProxyModel(), strings.NewReader(body), func(_ context.Context, event ai.StreamEvent) {
+				events = append(events, event)
+			})
+			if err != nil || len(events) != 1 {
+				t.Fatalf("err=%v events=%+v", err, events)
+			}
+			switch e := events[0].(type) {
+			case ai.Done:
+				if e.Message.ProviderThinkingLevel != "high" {
+					t.Fatalf("done=%+v", e)
+				}
+			case ai.StreamError:
+				if e.Msg.ProviderThinkingLevel != "low" || e.Msg.ErrorMessage != "stopped" {
+					t.Fatalf("error=%+v", e)
+				}
+			default:
+				t.Fatalf("event=%T", events[0])
+			}
+		})
+	}
+}
+
+type proxyTestBody struct {
+	io.Reader
+	closeErr error
+	closed   int
+}
+
+func (b *proxyTestBody) Close() error {
+	b.closed++
+	return b.closeErr
+}
+
+func TestStreamProxyRetainsCleanupAndCancellationCauses(t *testing.T) {
+	closeErr := errors.New("proxy body close failed")
+	cancelErr := errors.New("proxy caller stopped")
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		cancel     bool
+	}{
+		{name: "success", status: http.StatusOK, body: `data: {"type":"done","reason":"stop"}`},
+		{name: "http failure", status: http.StatusForbidden, body: "denied"},
+		{name: "parser failure", status: http.StatusOK, body: "data: nope"},
+		{name: "cancelled read", status: http.StatusOK, cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			reader := io.Reader(strings.NewReader(tc.body))
+			if tc.cancel {
+				reader = iotest.ErrReader(io.ErrUnexpectedEOF)
+			}
+			body := &proxyTestBody{Reader: reader, closeErr: closeErr}
+			withMockHTTPClient(t, roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				if tc.cancel {
+					cancel(cancelErr)
+				}
+				return &http.Response{StatusCode: tc.status, Body: body}, nil
+			}))
+			var events []ai.StreamEvent
+			err := StreamProxy(ctx, testProxyModel(), &ai.Context{}, func(_ context.Context, event ai.StreamEvent) {
+				events = append(events, event)
+			}, "https://proxy.invalid", "")
+			if !errors.Is(err, closeErr) || body.closed != 1 || len(events) != 1 {
+				t.Fatalf("err=%v closed=%d events=%+v", err, body.closed, events)
+			}
+			if tc.cancel && !errors.Is(err, cancelErr) {
+				t.Fatalf("err=%v, want cancellation cause", err)
+			}
+			if tc.name == "http failure" && !strings.Contains(err.Error(), "403") {
+				t.Fatalf("err=%v, want HTTP failure", err)
+			}
+		})
+	}
+}
+
+func TestStreamProxySetupFailuresEmitOneTerminalError(t *testing.T) {
+	for _, tc := range []struct {
+		name, url string
+		opts      []ai.Option
+	}{
+		{name: "bad URL", url: "://invalid"},
+		{name: "unserializable metadata", url: "https://proxy.invalid", opts: []ai.Option{ai.WithMetadata(map[string]any{"invalid": make(chan int)})}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var failures []ai.StreamError
+			err := StreamProxy(t.Context(), testProxyModel(), &ai.Context{}, func(_ context.Context, event ai.StreamEvent) {
+				if failure, ok := event.(ai.StreamError); ok {
+					failures = append(failures, failure)
+				}
+			}, tc.url, "", tc.opts...)
+			if err == nil || len(failures) != 1 || failures[0].Msg.ErrorMessage != err.Error() {
+				t.Fatalf("err=%v failures=%+v", err, failures)
+			}
+		})
+	}
+}
+
+func TestStreamProxyForwardsSerializableOptions(t *testing.T) {
+	var received map[string]json.RawMessage
+	withMockHTTPClient(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var request struct {
+			Options map[string]json.RawMessage `json:"options"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		received = request.Options
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`data: {"type":"done","reason":"stop"}`))}, nil
+	}))
+	_, err := CompleteProxy(t.Context(), testProxyModel(), &ai.Context{}, "https://proxy.invalid", "proxy-token",
+		ai.WithTemperature(0), ai.WithMaxTokens(128), ai.WithReasoning(ai.ReasoningOff),
+		ai.WithThinkingBudgets(&ai.ThinkingBudgets{Low: new(0), High: new(3000)}),
+		ai.WithCacheRetention("none"), ai.WithSessionID("session"),
+		ai.WithHeaders(map[string]string{"X-Provider": "value"}), ai.WithMetadata(map[string]any{"tag": "value"}),
+		ai.WithSamplingParams(map[string]any{"top_k": 3}), ai.WithTransport(ai.TransportSSE), ai.WithMaxRetryDelayMs(0),
+		ai.WithAPIKey("not-forwarded"), ai.WithPayloadCallback(func(payload any) any { return payload }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"thinkingBudgets": `{"low":0,"high":3000}`,
+		"temperature":     "0", "maxTokens": "128", "reasoning": `"off"`, "cacheRetention": `"none"`, "sessionId": `"session"`,
+		"headers": `{"X-Provider":"value"}`, "metadata": `{"tag":"value"}`, "samplingParams": `{"top_k":3}`, "transport": `"sse"`, "maxRetryDelayMs": "0",
+	}
+	if len(received) != len(want) {
+		t.Errorf("options=%s, want exactly %d serializable fields", received, len(want))
+	}
+	for key, value := range want {
+		if string(received[key]) != value {
+			t.Errorf("%s=%s, want %s", key, received[key], value)
+		}
+	}
+}
+
+func TestProxyOptionsForwardingAndSignalCancellation(t *testing.T) {
+	signal := make(chan struct{})
+	admitted := make(chan struct{})
+	withMockHTTPClient(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var request struct {
+			Options map[string]any `json:"options"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			return nil, err
+		}
+		if request.Options["sessionId"] != "wrapper-session" || request.Options["cacheRetention"] != "none" || request.Options["maxRetryDelayMs"] != float64(0) || !reflect.DeepEqual(request.Options["thinkingBudgets"], map[string]any{"low": float64(0), "high": float64(3000)}) {
+			t.Errorf("options=%+v", request.Options)
+		}
+		close(admitted)
+		<-r.Context().Done()
+		return nil, context.Cause(r.Context())
+	}))
+	finished := make(chan error, 1)
+	go func() {
+		_, err := CompleteProxyWithOptions(t.Context(), testProxyModel(), &ai.Context{}, ProxyStreamOptions{
+			ProxyURL: "https://proxy.invalid", Signal: signal, SessionID: "wrapper-session", CacheRetention: "none", MaxRetryDelayMs: new(0),
+			ThinkingBudgets: &ai.ThinkingBudgets{Low: new(0), High: new(3000)},
+		})
+		finished <- err
+	}()
+	select {
+	case <-admitted:
+	case <-time.After(time.Second):
+		t.Fatal("proxy request not admitted")
+	}
+	close(signal)
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err=%v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy signal did not cancel request")
+	}
+}
+
+func TestProxyClosedSignalRejectsRequestBeforeTransport(t *testing.T) {
+	signal := make(chan struct{})
+	close(signal)
+	withMockHTTPClient(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Context().Err() == nil {
+			t.Error("closed signal admitted uncancelled transport")
+		}
+		return nil, context.Cause(r.Context())
+	}))
+	var failures []ai.StreamError
+	err := StreamProxyWithOptions(t.Context(), testProxyModel(), &ai.Context{}, func(_ context.Context, event ai.StreamEvent) {
+		if failure, ok := event.(ai.StreamError); ok {
+			failures = append(failures, failure)
+		}
+	}, ProxyStreamOptions{ProxyURL: "https://proxy.invalid", Signal: signal})
+	if !errors.Is(err, context.Canceled) || len(failures) != 1 || failures[0].Msg.StopReason != ai.StopReasonAborted {
+		t.Fatalf("err=%v failures=%+v", err, failures)
+	}
+}
+
+func TestProxyToolNamespaceSurvivesReconstruction(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"toolcall_start","contentIndex":0,"id":"call","toolName":"lookup"}`,
+		`data: {"type":"toolcall_end","contentIndex":0,"toolCall":{"id":"call","name":"lookup","arguments":{},"namespace":"dynamic_tools"}}`,
+		`data: {"type":"done","reason":"toolUse"}`,
+	}, "\n\n")
+	var values []any
+	require.NoError(t, streamProxyResponse(t.Context(), testProxyModel(), strings.NewReader(body), func(_ context.Context, event ai.StreamEvent) {
+		switch e := event.(type) {
+		case ai.ToolCallEnd:
+			values = append(values, e.ToolCall, e.Partial.Content[0])
+		case ai.Done:
+			values = append(values, e.Message.Content[0])
+		}
+	}))
+	require.Len(t, values, 3)
+	for _, value := range values {
+		data, err := json.Marshal(value)
+		require.NoError(t, err)
+		require.Contains(t, string(data), `"namespace":"dynamic_tools"`)
 	}
 }

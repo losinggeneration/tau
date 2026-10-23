@@ -2,30 +2,44 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"sync"
+	"time"
 )
 
-// completeViaStream implements Completer.Complete by collecting the
-// terminal StreamEvent from the supplied Streamer. A Done event supplies
-// the returned AssistantMessage; a StreamError event (which providers
-// emit via emitTerminalStreamError and pair with Stream returning nil)
-// overwrites any prior result. This matches the historical per-provider
-// Complete semantics and is the centralized implementation every
-// standard provider's Complete method delegates to. Bedrock diverges
-// intentionally (it has a different error-shape contract) and continues
-// to maintain its own inline handler.
+// completeViaStream collects the first terminal assistant event and waits for
+// Stream to return so transport and cleanup errors remain observable.
 func completeViaStream(ctx context.Context, s Streamer, model *Model, prompt *Context, opts ...Option) (*AssistantMessage, error) {
+	started := time.Now()
 	var result AssistantMessage
+	var terminal bool
+	var mu sync.Mutex
 	handler := func(_ context.Context, event StreamEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		if terminal {
+			return
+		}
 		switch e := event.(type) {
 		case Done:
+			terminal = true
 			result = e.Message
 		case StreamError:
+			terminal = true
 			result = e.Msg
 		}
 	}
 	if err := s.Stream(ctx, model, prompt, handler, opts...); err != nil {
 		return nil, err
+	}
+	if !terminal {
+		return nil, fmt.Errorf("stream ended without a terminal assistant event")
+	}
+	if result.DurationMs == nil {
+		result.DurationMs = new(float64(time.Since(started)) / float64(time.Millisecond))
 	}
 	return &result, nil
 }
@@ -118,12 +132,13 @@ func Complete(ctx context.Context, modelArg any, prompt *Context, opts ...Option
 
 // StreamSimpleWithModel streams using a concrete model and simple defaults
 // configured via the provided SimpleStreamOptions. Passing nil applies default
-// options (notably a MaxTokens default of min(model.MaxTokens, 32000)).
+// options (notably a MaxTokens default of the model cap clamped to the
+// context room).
 func StreamSimpleWithModel(ctx context.Context, model *Model, prompt *Context, handler EventHandler, simple *SimpleStreamOptions) error {
 	if model == nil {
 		return fmt.Errorf("stream simple: model is nil")
 	}
-	return StreamWithModel(ctx, model, prompt, handler, BuildBaseOptions(model, simple)...)
+	return StreamWithModel(ctx, model, prompt, handler, BuildBaseOptions(model, prompt, simple)...)
 }
 
 // StreamSimpleProvider streams using the first known model for a provider.
@@ -132,7 +147,7 @@ func StreamSimpleProvider(ctx context.Context, provider string, prompt *Context,
 	if len(models) == 0 {
 		return fmt.Errorf("stream simple: no models available for provider: %s", provider)
 	}
-	return StreamWithModel(ctx, models[0], prompt, handler, BuildBaseOptions(models[0], simple)...)
+	return StreamWithModel(ctx, models[0], prompt, handler, BuildBaseOptions(models[0], prompt, simple)...)
 }
 
 // StreamSimple streams using either a *Model directly or the first known model
@@ -151,12 +166,13 @@ func StreamSimple(ctx context.Context, modelOrProvider any, prompt *Context, han
 
 // CompleteSimpleWithModel completes using a concrete model and simple defaults
 // configured via the provided SimpleStreamOptions. Passing nil applies default
-// options (notably a MaxTokens default of min(model.MaxTokens, 32000)).
+// options (notably a MaxTokens default of the model cap clamped to the
+// context room).
 func CompleteSimpleWithModel(ctx context.Context, model *Model, prompt *Context, simple *SimpleStreamOptions) (*AssistantMessage, error) {
 	if model == nil {
 		return nil, fmt.Errorf("complete simple: model is nil")
 	}
-	return CompleteWithModel(ctx, model, prompt, BuildBaseOptions(model, simple)...)
+	return CompleteWithModel(ctx, model, prompt, BuildBaseOptions(model, prompt, simple)...)
 }
 
 // CompleteSimpleProvider completes using the first known model for a provider.
@@ -165,7 +181,7 @@ func CompleteSimpleProvider(ctx context.Context, provider string, prompt *Contex
 	if len(models) == 0 {
 		return nil, fmt.Errorf("complete simple: no models available for provider: %s", provider)
 	}
-	return CompleteWithModel(ctx, models[0], prompt, BuildBaseOptions(models[0], simple)...)
+	return CompleteWithModel(ctx, models[0], prompt, BuildBaseOptions(models[0], prompt, simple)...)
 }
 
 // CompleteSimple completes using either a *Model directly or the first known
@@ -180,4 +196,84 @@ func CompleteSimple(ctx context.Context, modelOrProvider any, prompt *Context, s
 		return nil, fmt.Errorf("complete simple: unsupported model argument type %T", modelOrProvider)
 	}
 	return CompleteSimpleProvider(ctx, provider, prompt, simple)
+}
+
+func timedEventHandler(handler EventHandler) EventHandler {
+	started := time.Now()
+	var mu sync.Mutex
+	var settled bool
+	return func(ctx context.Context, event StreamEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		if settled {
+			return
+		}
+		duration := float64(time.Since(started)) / float64(time.Millisecond)
+		switch terminal := event.(type) {
+		case Done:
+			settled = true
+			if terminal.Message.DurationMs == nil {
+				terminal.Message.DurationMs = new(duration)
+			}
+			event = terminal
+		case StreamError:
+			settled = true
+			if terminal.Msg.DurationMs == nil {
+				terminal.Msg.DurationMs = new(duration)
+			}
+			event = terminal
+		}
+		handler(ctx, event)
+	}
+}
+
+type cancelResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelCauseFunc
+}
+
+func (b *cancelResponseBody) Close() error {
+	defer b.cancel(nil)
+	return b.ReadCloser.Close()
+}
+
+func doHeaderRequest(req *http.Request, timeout time.Duration, label string) (*http.Response, error) {
+	return doClientHeaderRequest(http.DefaultClient, req, timeout, label)
+}
+
+// doClientHeaderRequest bounds only the wait for response headers. A successful
+// response's body releases the timed context when closed.
+func doClientHeaderRequest(client *http.Client, req *http.Request, timeout time.Duration, label string) (*http.Response, error) {
+	return headerTimeoutRoundTrip(client.Do, req, timeout, label)
+}
+
+// headerTimeoutTransport applies a header-only timeout to each round trip.
+type headerTimeoutTransport struct {
+	base    http.RoundTripper
+	timeout time.Duration
+	label   string
+}
+
+func (t *headerTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return headerTimeoutRoundTrip(t.base.RoundTrip, req, t.timeout, t.label)
+}
+
+func headerTimeoutRoundTrip(do func(*http.Request) (*http.Response, error), req *http.Request, timeout time.Duration, label string) (*http.Response, error) {
+	if timeout <= 0 {
+		return do(req)
+	}
+	ctx, cancel := context.WithCancelCause(req.Context())
+	deadline := fmt.Errorf("%s: response headers timed out: %w", label, context.DeadlineExceeded)
+	timer := time.AfterFunc(timeout, func() { cancel(deadline) })
+	resp, err := do(req.WithContext(ctx))
+	timer.Stop()
+	if err != nil {
+		if errors.Is(context.Cause(ctx), deadline) {
+			err = deadline
+		}
+		cancel(nil)
+		return nil, err
+	}
+	resp.Body = &cancelResponseBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
 }

@@ -382,7 +382,7 @@ func TestIntegrationCompactionHook(t *testing.T) {
 	// Register a compaction hook handler.
 	mgr.RegisterEventHandler("compaction_request", EventHandler{
 		PluginName: "test-plugin",
-		Handler: func(name string, payload json.RawMessage, sessionID string) EventResponse {
+		Handler: func(_ context.Context, name string, payload json.RawMessage, sessionID string) EventResponse {
 			// Return a mock compaction result.
 			return EventResponse{
 				Compaction: &proto.CompactionHookResult{
@@ -394,7 +394,7 @@ func TestIntegrationCompactionHook(t *testing.T) {
 	})
 
 	// Dispatch the compaction hook.
-	result := mgr.DispatchCompactionHook("transcript content", 1000, "session-1")
+	result := mgr.DispatchCompactionHook(t.Context(), "transcript content", 1000, "session-1")
 
 	// Verify the result is returned.
 	if result.Summary == "" {
@@ -552,11 +552,15 @@ func (m *mockPluginClient) Shutdown(ctx context.Context, req *proto.ShutdownRequ
 	return &proto.ShutdownResponse{Graceful: m.gracefulResponse}, nil
 }
 
+func (m *mockPluginClient) RouteModel(context.Context, *proto.ModelRouteRequest, ...grpc.CallOption) (*proto.ModelRouteResponse, error) {
+	return &proto.ModelRouteResponse{}, nil
+}
+
 func TestIntegrationCompactionHookNoHandler(t *testing.T) {
 	mgr := NewManager(t.TempDir(), nil, nil)
 
 	// Dispatch the compaction hook without any handlers.
-	result := mgr.DispatchCompactionHook("transcript content", 1000, "session-1")
+	result := mgr.DispatchCompactionHook(t.Context(), "transcript content", 1000, "session-1")
 
 	// Verify empty result is returned.
 	if result.Summary != "" {
@@ -712,7 +716,7 @@ func TestIntegrationCompactionHookFirstWins(t *testing.T) {
 	// Register first handler (should win).
 	mgr.RegisterEventHandler("compaction_request", EventHandler{
 		PluginName: "first-plugin",
-		Handler: func(name string, payload json.RawMessage, sessionID string) EventResponse {
+		Handler: func(_ context.Context, name string, payload json.RawMessage, sessionID string) EventResponse {
 			return EventResponse{
 				Compaction: &proto.CompactionHookResult{
 					Summary:          "First handler summary",
@@ -725,7 +729,7 @@ func TestIntegrationCompactionHookFirstWins(t *testing.T) {
 	// Register second handler (should be ignored).
 	mgr.RegisterEventHandler("compaction_request", EventHandler{
 		PluginName: "second-plugin",
-		Handler: func(name string, payload json.RawMessage, sessionID string) EventResponse {
+		Handler: func(_ context.Context, name string, payload json.RawMessage, sessionID string) EventResponse {
 			return EventResponse{
 				Compaction: &proto.CompactionHookResult{
 					Summary:          "Second handler summary",
@@ -736,7 +740,7 @@ func TestIntegrationCompactionHookFirstWins(t *testing.T) {
 	})
 
 	// Dispatch the compaction hook.
-	result := mgr.DispatchCompactionHook("transcript content", 1000, "session-1")
+	result := mgr.DispatchCompactionHook(t.Context(), "transcript content", 1000, "session-1")
 
 	// Verify first handler's result is returned.
 	if result.Summary != "First handler summary" {
@@ -951,7 +955,7 @@ func TestIntegrationReverseHostRPC(t *testing.T) {
 		mu                sync.Mutex
 		configCalls       []string
 		stateValues       = make(map[string]string)
-		toolProgressCalls []proto.ToolProgressEvent
+		toolProgressCalls []*proto.ToolProgressEvent
 	)
 
 	// Create a mock HostServer to record calls from the "plugin".
@@ -979,7 +983,7 @@ func TestIntegrationReverseHostRPC(t *testing.T) {
 		onToolProgress: func(ctx context.Context, req *proto.ToolProgressEvent) (*proto.ToolProgressResponse, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			toolProgressCalls = append(toolProgressCalls, *req)
+			toolProgressCalls = append(toolProgressCalls, req)
 			return &proto.ToolProgressResponse{}, nil
 		},
 	}
@@ -1188,8 +1192,8 @@ func TestIntegrationEndToEndReverseRPCFromExecuteTool(t *testing.T) {
 		mu             sync.Mutex
 		configKeys     []string
 		stateValues    = make(map[string]string)
-		confirmCalls   []proto.UIConfirmRequest
-		sessionAppends []proto.SessionAppendRequest
+		confirmCalls   []*proto.UIConfirmRequest
+		sessionAppends []*proto.SessionAppendRequest
 	)
 
 	// Create a mock HostServer that records all calls.
@@ -1217,13 +1221,13 @@ func TestIntegrationEndToEndReverseRPCFromExecuteTool(t *testing.T) {
 		onUIConfirm: func(ctx context.Context, req *proto.UIConfirmRequest) (*proto.UIConfirmResponse, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			confirmCalls = append(confirmCalls, *req)
+			confirmCalls = append(confirmCalls, req)
 			return &proto.UIConfirmResponse{Confirmed: true}, nil
 		},
 		onSessionAppend: func(ctx context.Context, req *proto.SessionAppendRequest) (*proto.SessionAppendResponse, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			sessionAppends = append(sessionAppends, *req)
+			sessionAppends = append(sessionAppends, req)
 			return &proto.SessionAppendResponse{EntryId: "entry-123"}, nil
 		},
 		onSessionScan: func(ctx context.Context, req *proto.SessionScanRequest) (*proto.SessionScanResponse, error) {
@@ -1327,4 +1331,8 @@ func TestIntegrationEndToEndReverseRPCFromExecuteTool(t *testing.T) {
 	if len(sessionAppends) == 0 {
 		t.Error("SessionAppend not recorded")
 	}
+}
+
+func (m *mockPluginClient) ReachTools(ctx context.Context, req *proto.ToolCall, opts ...grpc.CallOption) (*proto.ReachToolsResponse, error) {
+	return &proto.ReachToolsResponse{Names: []string{"docs"}}, ctx.Err()
 }

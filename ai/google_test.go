@@ -1,9 +1,17 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
-	"strings"
+	"errors"
+	"iter"
+	"net/http"
+	"reflect"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	genai "google.golang.org/genai"
 )
 
 // TestBuildGoogleToolCallIDDedup tests P7-GG06: tool call ID generation with dedup
@@ -261,122 +269,51 @@ func TestBuildGoogleToolConfigFunctionCallingConfig(t *testing.T) {
 	}
 }
 
-// TestBuildGoogleThinkingConfigIncludeThoughts tests P7-GG02: ThinkingConfig.includeThoughts
-// Reference: pi-mono google.ts line 367
-// - includeThoughts: true should be set whenever thinking is enabled
-func TestBuildGoogleThinkingConfigIncludeThoughts(t *testing.T) {
+func TestGoogleThinkingConfigsMatchUpstream(t *testing.T) {
+	str := func(value string) *string { return &value }
+	pro25 := &Model{ID: "gemini-2.5-pro", Reasoning: true}
+	pro3 := &Model{ID: "gemini-3.1-pro-preview", Reasoning: true, ThinkingLevelMap: map[string]*string{"minimal": nil, "off": nil, "xhigh": nil, "max": nil}}
+	mapped := &Model{ID: "gemini-3-flash", Reasoning: true, ThinkingLevelMap: map[string]*string{"low": str("medium")}}
 	tests := []struct {
-		name            string
-		thinkingEnabled bool
-		modelReasoning  bool
-		wantInclude     bool
+		name  string
+		model *Model
+		opts  []Option
+		want  *genai.ThinkingConfig
 	}{
-		{
-			name:            "thinking enabled on reasoning model",
-			thinkingEnabled: true,
-			modelReasoning:  true,
-			wantInclude:     true,
-		},
-		{
-			name:            "thinking disabled on reasoning model",
-			thinkingEnabled: false,
-			modelReasoning:  true,
-			wantInclude:     false, // getDisabledThinkingConfig is used instead
-		},
-		{
-			name:            "thinking enabled on non-reasoning model",
-			thinkingEnabled: true,
-			modelReasoning:  false,
-			wantInclude:     false, // should not enable thinking on non-reasoning models
-		},
+		{"unset disables thinking", pro25, nil, &genai.ThinkingConfig{ThinkingBudget: new(int32(0))}},
+		{"budget model level", pro25, []Option{WithReasoning(ReasoningHigh)}, &genai.ThinkingConfig{IncludeThoughts: true, ThinkingBudget: new(int32(32768))}},
+		{"configured budget wins", pro25, []Option{WithReasoning(ReasoningHigh), WithThinkingBudgetTokens(5000)}, &genai.ThinkingConfig{IncludeThoughts: true, ThinkingBudget: new(int32(5000))}},
+		{"other models choose dynamically", &Model{ID: "gemini-2.0-flash-thinking", Reasoning: true}, []Option{WithReasoning(ReasoningLow)}, &genai.ThinkingConfig{IncludeThoughts: true, ThinkingBudget: new(int32(-1))}},
+		{"level model clamps up", pro3, []Option{WithReasoning(ReasoningMinimal)}, &genai.ThinkingConfig{IncludeThoughts: true, ThinkingLevel: genai.ThinkingLevelLow}},
+		{"level model off keeps its lowest level", pro3, []Option{WithReasoning(ReasoningOff)}, &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow}},
+		{"thinking map", mapped, []Option{WithReasoning(ReasoningLow)}, &genai.ThinkingConfig{IncludeThoughts: true, ThinkingLevel: genai.ThinkingLevelMedium}},
+		{"non-reasoning model", &Model{ID: "gemini-2.5-pro"}, []Option{WithReasoning(ReasoningHigh)}, nil},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Simulate pi-mono's includeThoughts logic
-			includeThoughts := tt.thinkingEnabled && tt.modelReasoning
-
-			if includeThoughts != tt.wantInclude {
-				t.Errorf("includeThoughts = %v, want %v", includeThoughts, tt.wantInclude)
+			got, err := buildGenAIThinkingConfig(tt.model, applyOptions(tt.opts))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("config = %+v, want %+v", got, tt.want)
 			}
 		})
 	}
-}
 
-// TestBuildGoogleThinkingLevelMapping tests P7-GG03: ThinkingConfig.thinkingLevel mapping
-// Reference: pi-mono google.ts lines 368-372
-// - thinkingLevel enum mapping for Gemini 3
-func TestBuildGoogleThinkingLevelMapping(t *testing.T) {
-	tests := []struct {
-		modelID   string
-		effort    string
-		wantLevel string
-	}{
-		// Gemini 3 Pro
-		{"gemini-3-pro", "minimal", "LOW"},
-		{"gemini-3-pro", "low", "LOW"},
-		{"gemini-3-pro", "medium", "HIGH"},
-		{"gemini-3-pro", "high", "HIGH"},
-		// Gemma 4
-		{"gemma-4", "minimal", "MINIMAL"},
-		{"gemma-4", "low", "MINIMAL"},
-		{"gemma-4", "medium", "HIGH"},
-		{"gemma-4", "high", "HIGH"},
-		// Default mapping
-		{"gemini-2-flash", "minimal", "MINIMAL"},
-		{"gemini-2-flash", "low", "LOW"},
-		{"gemini-2-flash", "medium", "MEDIUM"},
-		{"gemini-2-flash", "high", "HIGH"},
+	bad := &Model{ID: "gemini-3-pro", Provider: "google", Reasoning: true, ThinkingLevelMap: map[string]*string{"high": str("ultra")}}
+	if _, err := buildGenAIThinkingConfig(bad, applyOptions([]Option{WithReasoning(ReasoningHigh)})); err == nil {
+		t.Fatal("unsupported thinking map value accepted")
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.modelID+"_"+tt.effort, func(t *testing.T) {
-			// This tests the desired behavior - actual implementation is in google.go
-			level := mapEffortToThinkingLevel(tt.modelID, tt.effort)
-			if level != tt.wantLevel {
-				t.Errorf("level = %q, want %q", level, tt.wantLevel)
-			}
-		})
+	// Gemini CLI shares the resolver: unset reasoning no longer turns thinking on.
+	request, err := BuildGeminiCLIRequest(pro25, &Context{}, "project", nil, false)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-// mapEffortToThinkingLevel maps effort levels to thinking levels per model
-func mapEffortToThinkingLevel(modelID, effort string) string {
-	lower := strings.ToLower(modelID)
-
-	// Gemini 3 Pro mapping
-	if strings.Contains(lower, "gemini-3") && strings.Contains(lower, "pro") {
-		switch effort {
-		case "minimal", "low":
-			return "LOW"
-		case "medium", "high":
-			return "HIGH"
-		}
+	if config := request.Request.GenerationConfig.ThinkingConfig; config == nil || config.IncludeThoughts || config.ThinkingBudget == nil || *config.ThinkingBudget != 0 {
+		t.Fatalf("gemini cli unset thinking = %+v", config)
 	}
-
-	// Gemma 4 mapping
-	if strings.Contains(lower, "gemma-4") || strings.Contains(lower, "gemma4") {
-		switch effort {
-		case "minimal", "low":
-			return "MINIMAL"
-		case "medium", "high":
-			return "HIGH"
-		}
-	}
-
-	// Default mapping
-	switch effort {
-	case "minimal":
-		return "MINIMAL"
-	case "low":
-		return "LOW"
-	case "medium":
-		return "MEDIUM"
-	case "high":
-		return "HIGH"
-	}
-
-	return "MEDIUM"
 }
 
 func TestRequiresToolCallID(t *testing.T) {
@@ -772,4 +709,140 @@ func TestResolveThoughtSignature(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGoogleStreamTerminalOutcomesMatchUpstream(t *testing.T) {
+	text := &genai.GenerateContentResponse{Candidates: []*genai.Candidate{{Content: genai.NewContentFromText("hi", genai.RoleModel)}}}
+	call := &genai.GenerateContentResponse{Candidates: []*genai.Candidate{{Content: &genai.Content{Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{Name: "read", Args: map[string]any{}}}}}}}}
+	finish := func(reason genai.FinishReason) *genai.GenerateContentResponse {
+		return &genai.GenerateContentResponse{Candidates: []*genai.Candidate{{FinishReason: reason}}}
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		chunks  []*genai.GenerateContentResponse
+		err     error
+		reason  StopReason
+		message string
+	}{
+		{name: "stop", chunks: []*genai.GenerateContentResponse{text, finish(genai.FinishReasonStop)}, reason: StopReasonStop},
+		{name: "tool use needs finish", chunks: []*genai.GenerateContentResponse{call, finish(genai.FinishReasonStop)}, reason: StopReasonToolUse},
+		{name: "tool then safety", chunks: []*genai.GenerateContentResponse{call, finish(genai.FinishReasonSafety)}, reason: StopReasonError, message: "Provider stopped with: SAFETY"},
+		{name: "no finish", chunks: []*genai.GenerateContentResponse{call}, reason: StopReasonError, message: "google stream ended without a finish reason"},
+		{name: "transport error", chunks: []*genai.GenerateContentResponse{text}, err: errors.New("connection reset"), reason: StopReasonError, message: "connection reset"},
+		{name: "canceled", ctx: canceled, chunks: []*genai.GenerateContentResponse{text, finish(genai.FinishReasonStop)}, reason: StopReasonAborted, message: "request was aborted: context canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := tc.ctx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			chunks := func(yield func(*genai.GenerateContentResponse, error) bool) {
+				for _, chunk := range tc.chunks {
+					if !yield(chunk, nil) {
+						return
+					}
+				}
+				if tc.err != nil {
+					yield(nil, tc.err)
+				}
+			}
+			reason, message := streamTerminal(t, func(handler EventHandler) {
+				if err := streamGoogleChunks(ctx, &Model{ID: "gemini"}, chunks, handler); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if reason != tc.reason || message != tc.message {
+				t.Fatalf("got %s %q, want %s %q", reason, message, tc.reason, tc.message)
+			}
+		})
+	}
+}
+
+func TestRetryGoogleStreamRetriesOnlyInitialFailures(t *testing.T) {
+	chunk := &genai.GenerateContentResponse{}
+	later := errors.New("stream reset")
+	for _, tc := range []struct {
+		name    string
+		opts    []Option
+		first   error
+		calls   int
+		status  int
+		wantErr error
+	}{
+		{name: "default makes one attempt", first: genai.APIError{Code: 503}, calls: 1, status: 503},
+		{name: "server error", opts: []Option{WithMaxRetries(1)}, first: genai.APIError{Code: 503}, calls: 2},
+		{name: "network failure", opts: []Option{WithMaxRetries(1)}, first: errors.New("connection reset"), calls: 2},
+		{name: "bad request", opts: []Option{WithMaxRetries(1)}, first: genai.APIError{Code: 400}, calls: 1, status: 400},
+		{name: "mid-stream failure", opts: []Option{WithMaxRetries(1)}, calls: 1, wantErr: later},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			previous := providerRetryBase
+			providerRetryBase = 0
+			t.Cleanup(func() { providerRetryBase = previous })
+			calls := 0
+			stream := retryGoogleStream(t.Context(), applyOptions(tc.opts), func() iter.Seq2[*genai.GenerateContentResponse, error] {
+				calls++
+				return func(yield func(*genai.GenerateContentResponse, error) bool) {
+					if calls == 1 && tc.first != nil {
+						yield(nil, tc.first)
+						return
+					}
+					if yield(chunk, nil) && tc.wantErr != nil {
+						yield(nil, tc.wantErr)
+					}
+				}
+			})
+			var (
+				chunks int
+				err    error
+			)
+			for got, gotErr := range stream {
+				if gotErr != nil {
+					err = gotErr
+					continue
+				}
+				require.Same(t, chunk, got)
+				chunks++
+			}
+			require.Equal(t, tc.calls, calls)
+			if tc.status != 0 {
+				apiErr, ok := errors.AsType[genai.APIError](err)
+				require.True(t, ok, "%v", err)
+				require.Equal(t, tc.status, apiErr.Code)
+				return
+			}
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, 1, chunks)
+		})
+	}
+}
+
+func TestGoogleHeaderTimeout(t *testing.T) {
+	previous := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	t.Cleanup(func() { http.DefaultClient = previous })
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	model := &Model{ID: "gemini-test", API: APIGoogleGenerativeAI, Provider: ProviderGoogle, BaseURL: "https://test.invalid"}
+	client, err := newGoogleClient(model)
+	require.NoError(t, err)
+	var timeoutErr error
+	require.NoError(t, client.Stream(ctx, model, &Context{}, func(_ context.Context, event StreamEvent) {
+		if failure, ok := event.(StreamError); ok {
+			timeoutErr = failure.Err
+		}
+	}, WithAPIKey("key"), WithTimeout(time.Millisecond)))
+	require.ErrorIs(t, timeoutErr, context.DeadlineExceeded)
+	require.ErrorContains(t, timeoutErr, "response headers timed out")
+	require.NoError(t, ctx.Err())
 }

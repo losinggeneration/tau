@@ -2,12 +2,15 @@ package agent
 
 import (
 	"bytes"
+	"encoding/base64"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
 	"strings"
 	"testing"
+
+	"github.com/losinggeneration/tau/ai"
 )
 
 // makeTestPNG builds an in-memory PNG of the given dimensions filled with
@@ -197,5 +200,43 @@ func TestIsSupportedImageMime(t *testing.T) {
 		if isSupportedImageMime(m) {
 			t.Errorf("isSupportedImageMime(%q) = true, want false", m)
 		}
+	}
+}
+
+func TestResizeImageBlockRejectsInvalidPayload(t *testing.T) {
+	profile := &ai.ModelImageResizeOptions{MaxBytes: 1}
+	if _, err := ResizeImageBlock(ai.ContentBlock{Type: ai.ContentBlockImage, Data: "not-base64"}, profile); err == nil {
+		t.Fatal("invalid base64 accepted")
+	}
+	if _, err := ResizeImageBlock(ai.ContentBlock{Type: ai.ContentBlockImage, Data: base64.StdEncoding.EncodeToString([]byte("oversized"))}, profile); err == nil {
+		t.Fatal("oversized payload accepted")
+	}
+}
+
+func TestResizeImageBlockUsesJPEGQuality(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 32, 32))
+	for y := range 32 {
+		for x := range 32 {
+			img.SetNRGBA(x, y, color.NRGBA{R: uint8(x * 7), G: uint8(y * 7), B: uint8(x * y), A: 255})
+		}
+	}
+	data, err := encodeImage(img, "image/jpeg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := ai.ContentBlock{Type: ai.ContentBlockImage, MimeType: "image/jpeg", Data: base64.StdEncoding.EncodeToString(data)}
+	low, err := ResizeImageBlock(block, &ai.ModelImageResizeOptions{MaxWidth: 16, MaxHeight: 16, JPEGQuality: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	high, err := ResizeImageBlock(block, &ai.ModelImageResizeOptions{MaxWidth: 16, MaxHeight: 16, JPEGQuality: 95})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(low.Data) >= len(high.Data) {
+		t.Fatal("JPEG quality ignored")
+	}
+	if _, err := ResizeImageBlock(block, &ai.ModelImageResizeOptions{JPEGQuality: 101}); err == nil {
+		t.Fatal("invalid JPEG quality accepted")
 	}
 }

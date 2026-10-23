@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestFauxProviderSupportsMultipleModels(t *testing.T) {
@@ -193,5 +195,64 @@ func TestFauxProviderRespectsPacing(t *testing.T) {
 	}
 	if time.Since(start) <= 0 {
 		t.Fatal("expected non-zero streaming duration")
+	}
+}
+
+func TestFauxCacheEstimateComparesMessagesThenCharacters(t *testing.T) {
+	p := RegisterFauxProvider()
+	defer p.Unregister()
+	p.SetResponses([]AssistantMessage{FauxAssistantMessage("a"), FauxAssistantMessage("b"), FauxAssistantMessage("c")})
+
+	prompt := func(last string) *Context {
+		return &Context{SystemPrompt: "Be concise.", Messages: []Message{
+			{Role: "user", Content: "keep", Timestamp: 1},
+			{Role: "user", Content: last, Timestamp: 2},
+		}}
+	}
+	opts := []Option{WithSessionID("prefix"), WithCacheRetention(string(CacheRetentionShort))}
+	if _, err := Complete(t.Context(), p.model, prompt("hello world"), opts...); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Complete(t.Context(), p.model, prompt("hello there"), opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached := len("system:Be concise.\n\nuser:keep\n\nuser:hello ")
+	whole := len("system:Be concise.\n\nuser:keep\n\nuser:hello there")
+	if second.Usage.CacheRead != (cached+3)/4 || second.Usage.CacheWrite != (whole-cached+3)/4 {
+		t.Fatalf("usage = %+v, want cacheRead %d and cacheWrite %d", second.Usage, (cached+3)/4, (whole-cached+3)/4)
+	}
+
+	none, err := Complete(t.Context(), p.model, prompt("hello there"), WithSessionID("prefix"), WithCacheRetention(string(CacheRetentionNone)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.Usage.CacheRead != 0 || none.Usage.CacheWrite != 0 {
+		t.Fatalf("cache retention none usage = %+v", none.Usage)
+	}
+}
+
+func TestFauxToolNamespaceSurvivesStreaming(t *testing.T) {
+	p := RegisterFauxProvider()
+	defer p.Unregister()
+	var response AssistantMessage
+	require.NoError(t, json.Unmarshal([]byte(`{"role":"assistant","stopReason":"toolUse","content":[{"type":"toolCall","id":"call","name":"lookup","arguments":{},"namespace":"dynamic_tools"}]}`), &response))
+	p.SetResponses([]AssistantMessage{response})
+	var values []any
+	require.NoError(t, Stream(t.Context(), p.model, &Context{Messages: []Message{{Role: "user", Content: "lookup"}}}, func(_ context.Context, event StreamEvent) {
+		switch e := event.(type) {
+		case ToolCallStart:
+			values = append(values, e.Partial.Content[0])
+		case ToolCallEnd:
+			values = append(values, e.ToolCall, e.Partial.Content[0])
+		case Done:
+			values = append(values, e.Message.Content[0])
+		}
+	}))
+	require.Len(t, values, 4)
+	for _, value := range values {
+		data, err := json.Marshal(value)
+		require.NoError(t, err)
+		require.Contains(t, string(data), `"namespace":"dynamic_tools"`)
 	}
 }

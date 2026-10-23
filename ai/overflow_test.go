@@ -220,3 +220,21 @@ func TestGetOverflowPatterns(t *testing.T) {
 		}
 	}
 }
+
+func TestLengthStopOverflowAndRecovery(t *testing.T) {
+	if !IsContextOverflow("length", "", OverflowUsage{Input: 1000, CacheHit: 197_000}, 200_000) {
+		t.Fatal("a zero-output length stop that fills the window is an overflow")
+	}
+	if IsContextOverflow("length", "", OverflowUsage{Input: 100}, 200_000) {
+		t.Fatal("a zero-output length stop far below the window is not an overflow")
+	}
+	if IsContextOverflow("length", "", OverflowUsage{Input: 199_000, Output: 4096}, 200_000) {
+		t.Fatal("a length stop with output is not an overflow")
+	}
+	if !IsRecoverableLength("length", 16, 128_000) || !IsRecoverableLength("length", 0, 128_000) {
+		t.Fatal("a length stop below the desired output limit is recoverable")
+	}
+	if IsRecoverableLength("length", 1024, 1024) || IsRecoverableLength("stop", 0, 1024) || IsRecoverableLength("length", 0, 0) {
+		t.Fatal("only length stops below a known limit are recoverable")
+	}
+}

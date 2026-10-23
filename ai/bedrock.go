@@ -9,6 +9,8 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -93,6 +95,7 @@ func newBedrockClientForModel(model *Model) (*bedrockClientImpl, error) {
 //     existing callers. Bedrock can be migrated to the helper when its
 //     error model is revisited; for now it keeps its inline handler.
 func (c *bedrockClientImpl) Complete(ctx context.Context, model *Model, prompt *Context, opts ...Option) (*AssistantMessage, error) {
+	started := time.Now()
 	var result *AssistantMessage
 	err := c.Stream(ctx, model, prompt, func(_ context.Context, event StreamEvent) {
 		if done, ok := event.(Done); ok {
@@ -114,10 +117,23 @@ func (c *bedrockClientImpl) Complete(ctx context.Context, model *Model, prompt *
 	if result == nil {
 		return nil, errors.New("bedrock: stream completed without result")
 	}
+	if result.DurationMs == nil {
+		result.DurationMs = new(float64(time.Since(started)) / float64(time.Millisecond))
+	}
 	return result, nil
 }
 
-func (c *bedrockClientImpl) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) error {
+func (c *bedrockClientImpl) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	if model == nil {
 		return errors.New("bedrock: model is nil")
 	}
@@ -155,14 +171,14 @@ func (c *bedrockClientImpl) Stream(ctx context.Context, model *Model, prompt *Co
 		StopReason: StopReasonStop,
 		Timestamp:  time.Now().UnixMilli(),
 	}
-	blocks := make([]*bedrockStreamBlock, 0)
-
 	resp, err := client.ConverseStream(ctx, input)
 	if err != nil {
 		return fmt.Errorf("bedrock: failed to start stream: %s", formatBedrockError(err))
 	}
 	defer func() {
-		_ = resp.GetStream().Close()
+		if closeErr := resp.GetStream().Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("bedrock: close stream: %w", closeErr))
+		}
 	}()
 
 	if hasResponseCallback(o) {
@@ -171,7 +187,15 @@ func (c *bedrockClientImpl) Stream(ctx context.Context, model *Model, prompt *Co
 		})
 	}
 
-	for event := range resp.GetStream().Events() {
+	return streamBedrockEvents(ctx, model, resp.GetStream().Events(), resp.GetStream().Err, output, handler)
+}
+
+// streamBedrockEvents converts a ConverseStream event channel into Tau stream
+// events; streamErr reports the transport error once the channel closes.
+func streamBedrockEvents(ctx context.Context, model *Model, events <-chan bedrocktypes.ConverseStreamOutput, streamErr func() error, output AssistantMessage, handler EventHandler) error {
+	blocks := make([]*bedrockStreamBlock, 0)
+	var stopped bool
+	for event := range events {
 		switch e := event.(type) {
 		case *bedrocktypes.ConverseStreamOutputMemberMessageStart:
 			if e.Value.Role != bedrocktypes.ConversationRoleAssistant {
@@ -189,33 +213,24 @@ func (c *bedrockClientImpl) Stream(ctx context.Context, model *Model, prompt *Co
 			handleBedrockContentBlockStop(ctx, &e.Value, blocks, &output, handler)
 
 		case *bedrocktypes.ConverseStreamOutputMemberMessageStop:
-			output.StopReason = mapBedrockStopReason(e.Value.StopReason)
+			stopped = true
+			output.StopReason, output.ErrorMessage = mapBedrockStopReason(e.Value.StopReason)
 
 		case *bedrocktypes.ConverseStreamOutputMemberMetadata:
 			handleBedrockMetadata(&e.Value, model, &output)
 		}
 
-		select {
-		case <-ctx.Done():
-			err := ctx.Err()
-			if err == nil {
-				err = errors.New("request aborted")
-			}
-			emitTerminalStreamError(ctx, handler, output, err, StopReasonAborted)
-			return nil
-		default:
+		if ctx.Err() != nil {
+			break
 		}
 	}
 
-	if err := resp.GetStream().Err(); err != nil {
+	if err := streamErr(); err != nil && ctx.Err() == nil {
 		emitTerminalStreamError(ctx, handler, output, fmt.Errorf("bedrock: stream error: %s", formatBedrockError(err)), StopReasonError)
 		return nil
 	}
-	if output.StopReason == StopReasonError || output.StopReason == StopReasonAborted {
-		emitTerminalStreamError(ctx, handler, output, errors.New(output.ErrorMessage), output.StopReason)
-		return nil
-	}
-	handler(ctx, Done{Reason: output.StopReason, Message: output})
+	finishStream(ctx, handler, output, stopped, "bedrock stream ended without a stop reason")
+
 	return nil
 }
 
@@ -237,14 +252,22 @@ func newBedrockRuntimeClient(ctx context.Context, o *options) (*bedrockruntime.C
 		if o == nil {
 			return
 		}
+		if o.maxRetries != nil {
+			options.RetryMaxAttempts = *o.maxRetries + 1
+		}
+		transport := http.DefaultTransport
 		if len(o.headers) > 0 || o.bedrockBearerToken != "" {
-			options.HTTPClient = &http.Client{
-				Transport: &bedrockHeaderRoundTripper{
-					base:        http.DefaultTransport,
-					headers:     cloneStringMap(o.headers),
-					bearerToken: resolveBedrockBearerToken(o),
-				},
+			transport = &bedrockHeaderRoundTripper{
+				base:        transport,
+				headers:     cloneStringMap(o.headers),
+				bearerToken: resolveBedrockBearerToken(o),
 			}
+		}
+		if o.timeout > 0 {
+			transport = &headerTimeoutTransport{base: transport, timeout: o.timeout, label: "bedrock"}
+		}
+		if transport != http.DefaultTransport {
+			options.HTTPClient = &http.Client{Transport: transport}
 		}
 	})
 
@@ -291,7 +314,13 @@ func buildBedrockConverseInput(model *Model, prompt *Context, o *options) (*bedr
 		topP := float32(*o.topP)
 		inferenceConfig.TopP = &topP
 	}
-	if maxTokens := getMaxTokens(o, model); maxTokens > 0 {
+	maxTokens := getMaxTokens(o, model)
+	if budget := bedrockThinkingBudget(model, o); budget > 0 {
+		fitted := *o
+		maxTokens, fitted.thinkingBudgetTokens = fitThinkingBudget(model, prompt, maxTokens, budget)
+		o = &fitted
+	}
+	if maxTokens > 0 {
 		mt := int32(maxTokens)
 		inferenceConfig.MaxTokens = &mt
 	}
@@ -303,7 +332,7 @@ func buildBedrockConverseInput(model *Model, prompt *Context, o *options) (*bedr
 	if err != nil {
 		return nil, err
 	}
-	toolConfig, err := buildBedrockToolConfig(prompt.Tools, o.toolChoice)
+	toolConfig, err := buildBedrockToolConfig(model, prompt.Tools, o.toolChoice)
 	if err != nil {
 		return nil, err
 	}
@@ -525,7 +554,7 @@ func buildBedrockSystemPrompt(systemPrompt string, model *Model, cacheRetention 
 	return blocks, nil
 }
 
-func buildBedrockToolConfig(tools []Tool, choice any) (*bedrocktypes.ToolConfiguration, error) {
+func buildBedrockToolConfig(model *Model, tools []Tool, choice any) (*bedrocktypes.ToolConfiguration, error) {
 	if len(tools) == 0 {
 		return nil, nil
 	}
@@ -537,21 +566,25 @@ func buildBedrockToolConfig(tools []Tool, choice any) (*bedrocktypes.ToolConfigu
 		Tools: make([]bedrocktypes.Tool, 0, len(tools)),
 	}
 	for _, tool := range tools {
+		parameters, strict, err := strictToolParameters(tool, supportsStrictMode(model, false), nil)
+		if err != nil {
+			return nil, fmt.Errorf("bedrock: %w", err)
+		}
 		var schema any
-		if len(tool.Parameters) > 0 {
-			if err := json.Unmarshal(tool.Parameters, &schema); err != nil {
+		if len(parameters) > 0 {
+			if err := json.Unmarshal(parameters, &schema); err != nil {
 				return nil, fmt.Errorf("bedrock: decode tool schema: %w", err)
 			}
 		}
-		strict := false
-		out.Tools = append(out.Tools, &bedrocktypes.ToolMemberToolSpec{
-			Value: bedrocktypes.ToolSpecification{
-				Name:        aws.String(tool.Name),
-				Description: aws.String(tool.Description),
-				InputSchema: &bedrocktypes.ToolInputSchemaMemberJson{Value: bedrockDocumentOrNil(schema)},
-				Strict:      aws.Bool(strict),
-			},
-		})
+		spec := bedrocktypes.ToolSpecification{
+			Name:        aws.String(tool.Name),
+			Description: aws.String(tool.Description),
+			InputSchema: &bedrocktypes.ToolInputSchemaMemberJson{Value: bedrockDocumentOrNil(schema)},
+		}
+		if strict {
+			spec.Strict = aws.Bool(true)
+		}
+		out.Tools = append(out.Tools, &bedrocktypes.ToolMemberToolSpec{Value: spec})
 	}
 
 	switch v := choice.(type) {
@@ -582,12 +615,29 @@ func buildBedrockToolConfig(tools []Tool, choice any) (*bedrocktypes.ToolConfigu
 	return out, nil
 }
 
+// bedrockThinkingBudget is the budget for Claude models that think on a
+// token budget rather than adaptively, or zero when none applies.
+func bedrockThinkingBudget(model *Model, o *options) int {
+	if o.reasoning == "" || o.reasoning == ReasoningOff || !model.Reasoning ||
+		!strings.Contains(strings.ToLower(model.ID), "claude") || supportsAdaptiveThinking(model.ID) {
+		return 0
+	}
+	if o.thinkingBudgetTokens > 0 {
+		return o.thinkingBudgetTokens
+	}
+	budgets := o.bedrockThinkingBudgets
+	if budgets == nil {
+		budgets = o.thinkingBudgets
+	}
+	return ThinkingBudgetForLevel(o.reasoning, budgets)
+}
+
 func buildBedrockAdditionalModelRequestFields(model *Model, o *options) (any, error) {
 	if model == nil || o == nil || o.reasoning == "" || o.reasoning == ReasoningOff || !model.Reasoning {
 		return nil, nil
 	}
 	if !strings.Contains(strings.ToLower(model.ID), "claude") {
-		return nil, nil
+		return bedrockOpenAIReasoningFields(model, o.reasoning), nil
 	}
 
 	display := o.thinkingDisplay
@@ -607,7 +657,7 @@ func buildBedrockAdditionalModelRequestFields(model *Model, o *options) (any, er
 		}, nil
 	}
 
-	budget := ThinkingBudgetForLevel(o.reasoning, o.bedrockThinkingBudgets)
+	budget := bedrockThinkingBudget(model, o)
 	result := map[string]any{
 		"thinking": map[string]any{
 			"type":          "enabled",
@@ -621,11 +671,44 @@ func buildBedrockAdditionalModelRequestFields(model *Model, o *options) (any, er
 	return result, nil
 }
 
+// bedrockOpenAIReasoningFields gives gpt-oss a flat reasoning_effort limited
+// to low, medium, and high, and other OpenAI GPT models a nested
+// reasoning.effort that rejects minimal.
+func bedrockOpenAIReasoningFields(model *Model, level ReasoningLevel) any {
+	var candidates []string
+	for _, value := range []string{model.ID, model.Name} {
+		if value == "" {
+			continue
+		}
+		lower := strings.ToLower(value)
+		candidates = append(candidates, lower, bedrockSeparators.ReplaceAllString(lower, "-"))
+	}
+	matches := func(part string) bool {
+		return slices.ContainsFunc(candidates, func(candidate string) bool { return strings.Contains(candidate, part) })
+	}
+	effort := string(level)
+	if level == ReasoningMinimal {
+		effort = "low"
+	}
+	switch {
+	case matches("gpt-oss"):
+		if level == ReasoningXHigh || level == ReasoningMax {
+			effort = "high"
+		}
+		return map[string]any{"reasoning_effort": effort}
+	case matches("gpt-"):
+		if mapped := model.ThinkingLevelMap[string(level)]; mapped != nil {
+			effort = *mapped
+		}
+		return map[string]any{"reasoning": map[string]any{"effort": effort}}
+	}
+	return nil
+}
+
+var bedrockSeparators = regexp.MustCompile(`[\s_.:]+`)
+
 func supportsAdaptiveThinking(modelID string) bool {
-	id := strings.ToLower(modelID)
-	return strings.Contains(id, "opus-4-6") || strings.Contains(id, "opus-4.6") ||
-		strings.Contains(id, "opus-4-7") || strings.Contains(id, "opus-4.7") ||
-		strings.Contains(id, "sonnet-4-6") || strings.Contains(id, "sonnet-4.6")
+	return isAdaptiveThinkingModel(modelID)
 }
 
 func supportsBedrockPromptCaching(model *Model) bool {
@@ -636,7 +719,7 @@ func supportsBedrockPromptCaching(model *Model) bool {
 	if !strings.Contains(id, "claude") {
 		return os.Getenv("AWS_BEDROCK_FORCE_CACHE") == "1"
 	}
-	return strings.Contains(id, "-4-") || strings.Contains(id, "-4.") ||
+	return isClaude55Model(model.ID) || strings.Contains(id, "-4-") || strings.Contains(id, "-4.") ||
 		strings.Contains(id, "claude-3-7-sonnet") || strings.Contains(id, "claude-3-5-haiku")
 }
 
@@ -654,7 +737,12 @@ func mapBedrockThinkingEffort(level ReasoningLevel, modelID string) string {
 		return "low"
 	case ReasoningMedium:
 		return "medium"
+	case ReasoningMax:
+		return "max"
 	case ReasoningXHigh:
+		if isClaude55Model(modelID) {
+			return "xhigh"
+		}
 		lower := strings.ToLower(modelID)
 		if strings.Contains(lower, "opus-4-6") || strings.Contains(lower, "opus-4.6") {
 			return "max"
@@ -810,16 +898,18 @@ func handleBedrockMetadata(event *bedrocktypes.ConverseStreamMetadataEvent, mode
 	output.Usage.CalculateCost(model.Cost)
 }
 
-func mapBedrockStopReason(reason bedrocktypes.StopReason) StopReason {
+func mapBedrockStopReason(reason bedrocktypes.StopReason) (StopReason, string) {
 	switch reason {
 	case bedrocktypes.StopReasonEndTurn, bedrocktypes.StopReasonStopSequence:
-		return StopReasonStop
+		return StopReasonStop, ""
 	case bedrocktypes.StopReasonMaxTokens, bedrocktypes.StopReasonModelContextWindowExceeded:
-		return StopReasonLength
+		return StopReasonLength, ""
 	case bedrocktypes.StopReasonToolUse:
-		return StopReasonToolUse
+		return StopReasonToolUse, ""
+	case "":
+		return StopReasonError, ""
 	default:
-		return StopReasonError
+		return StopReasonError, "Provider stopped with: " + string(reason)
 	}
 }
 

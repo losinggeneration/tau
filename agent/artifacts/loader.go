@@ -16,11 +16,13 @@ import (
 // It implements the headless `tau reload` behavior: re-discover all artifacts
 // and atomically swap each registry, then trigger a plugin reload pass.
 type Loader struct {
-	skills  *SkillRegistry
-	prompts *PromptRegistry
-	themes  *ThemeRegistry
-	log     *slog.Logger
-	mu      sync.RWMutex // protects skills, prompts, themes for atomic reload
+	themeValidator func([]byte) error
+	skills         *SkillRegistry
+	prompts        *PromptRegistry
+	themes         *ThemeRegistry
+	log            *slog.Logger
+	mu             sync.RWMutex // protects skills, prompts, themes for atomic reload
+	commitMu       sync.Mutex   // serializes registry swaps with command registration
 	// commandSources tracks artifact source paths that have registered slash commands.
 	commandSources map[string]struct{}
 
@@ -37,6 +39,7 @@ type Loader struct {
 
 // LoaderOptions configures a Loader.
 type LoaderOptions struct {
+	ThemeValidator func([]byte) error
 	// Log is used for warnings during discovery and reload. May be nil.
 	Log *slog.Logger
 	// PluginReloader is called after artifact reloading to trigger a plugin
@@ -86,6 +89,7 @@ func NewLoader(opts LoaderOptions) (*Loader, error) {
 	}
 
 	l := &Loader{
+		themeValidator:   opts.ThemeValidator,
 		skills:           NewSkillRegistry(opts.Log),
 		prompts:          NewPromptRegistry(opts.Log),
 		themes:           NewThemeRegistry(opts.Log),
@@ -95,6 +99,8 @@ func NewLoader(opts LoaderOptions) (*Loader, error) {
 		commandsRegistry: opts.CommandsRegistry,
 		commandSources:   make(map[string]struct{}),
 	}
+
+	l.themes.validate = opts.ThemeValidator
 
 	if err := l.skills.Load(entries); err != nil {
 		return nil, fmt.Errorf("load skills: %w", err)
@@ -133,53 +139,93 @@ func (l *Loader) ThemeRegistry() *ThemeRegistry {
 	return l.themes
 }
 
-// Reload re-discovers all artifacts, atomically reloads each registry,
-// and then calls the plugin reloader if one is registered.
-// The atomic swap ensures that reads see either the old or new state,
-// never a partially updated state. Commands are re-registered after
-// the registries are swapped so handlers always reference the current set.
+// Reload re-discovers all artifacts with the current discovery inputs,
+// atomically swaps the registries, and then calls the plugin reloader if one
+// is registered.
 func (l *Loader) Reload(ctx context.Context) error {
-	entries, err := Walk(*l.cfg)
+	l.mu.RLock()
+	opts := ReloadOptions{SettingsPaths: l.cfg.SettingsPaths, UserDirs: l.cfg.UserDirs}
+	l.mu.RUnlock()
+	prepared, err := l.Prepare(opts)
 	if err != nil {
 		return err
 	}
-
-	// Create new registries to hold the reloaded state.
-	// This ensures atomic swap: readers either see the old or new state.
-	newSkills := NewSkillRegistry(l.log)
-	newPrompts := NewPromptRegistry(l.log)
-	newThemes := NewThemeRegistry(l.log)
-
-	// Load entries into the new registries.
-	if err := newSkills.Load(entries); err != nil {
-		return fmt.Errorf("load skills: %w", err)
-	}
-	if err := newPrompts.Load(entries); err != nil {
-		return fmt.Errorf("load prompts: %w", err)
-	}
-	if err := newThemes.Load(entries); err != nil {
-		return fmt.Errorf("load themes: %w", err)
-	}
-
-	// Atomic swap: update the fields. No reader sees partial state.
-	l.mu.Lock()
-	l.skills = newSkills
-	l.prompts = newPrompts
-	l.themes = newThemes
-	l.mu.Unlock()
-
-	// Re-register commands from the reloaded registries.
-	// This also happens atomically with respect to the registry update.
-	l.registerCommands()
-
-	// Trigger plugin reload pass per the extension spec.
+	prepared.Commit()
 	if l.pluginReloader != nil {
-		if err := l.pluginReloader(ctx); err != nil {
-			return err
-		}
+		return l.pluginReloader(ctx)
 	}
-
 	return nil
+}
+
+// ReloadOptions carries the settings-derived discovery inputs for a reload.
+type ReloadOptions struct {
+	// SettingsPaths are explicit paths from settings.json.
+	SettingsPaths map[ArtifactKind][]string
+	// UserDirs overrides the user-global artifact directories per kind.
+	UserDirs map[ArtifactKind]string
+}
+
+// PreparedReload holds re-discovered registries that have not yet replaced
+// the loader's state, so a caller can validate other reload steps first.
+type PreparedReload struct {
+	loader  *Loader
+	cfg     DiscoveryConfig
+	skills  *SkillRegistry
+	prompts *PromptRegistry
+	themes  *ThemeRegistry
+}
+
+// Prepare discovers and parses artifacts using opts without changing the
+// loader. A failure leaves the current registries and discovery inputs intact.
+func (l *Loader) Prepare(opts ReloadOptions) (*PreparedReload, error) {
+	l.mu.RLock()
+	cfg := *l.cfg
+	l.mu.RUnlock()
+	cfg.SettingsPaths = opts.SettingsPaths
+	cfg.UserDirs = opts.UserDirs
+
+	entries, err := Walk(cfg)
+	if err != nil {
+		return nil, err
+	}
+	p := &PreparedReload{
+		loader:  l,
+		cfg:     cfg,
+		skills:  NewSkillRegistry(l.log),
+		prompts: NewPromptRegistry(l.log),
+		themes:  NewThemeRegistry(l.log),
+	}
+	p.themes.validate = l.themeValidator
+	if err := p.skills.Load(entries); err != nil {
+		return nil, fmt.Errorf("load skills: %w", err)
+	}
+	if err := p.prompts.Load(entries); err != nil {
+		return nil, fmt.Errorf("load prompts: %w", err)
+	}
+	if err := p.themes.Load(entries); err != nil {
+		return nil, fmt.Errorf("load themes: %w", err)
+	}
+	return p, nil
+}
+
+// ThemeDiagnostics reports the themes the prepared reload could not load.
+func (p *PreparedReload) ThemeDiagnostics() []string {
+	return p.themes.Diagnostics()
+}
+
+// Commit swaps the prepared registries and discovery inputs into the loader
+// and re-registers artifact slash commands. It does not reload plugins.
+func (p *PreparedReload) Commit() {
+	l := p.loader
+	l.commitMu.Lock()
+	defer l.commitMu.Unlock()
+	l.mu.Lock()
+	*l.cfg = p.cfg
+	l.skills = p.skills
+	l.prompts = p.prompts
+	l.themes = p.themes
+	l.mu.Unlock()
+	l.registerCommands()
 }
 
 // registerCommands registers prompts and skills into the commands registry.
@@ -200,7 +246,7 @@ func (l *Loader) registerCommands() {
 	currentSources := make(map[string]struct{})
 
 	// Register prompts as slash commands.
-	for _, prompt := range l.prompts.List() {
+	for _, prompt := range l.PromptRegistry().List() {
 		cmdName := prompt.ID // ID is the filename without .md
 		info := commands.Info{
 			Name:         cmdName,
@@ -213,7 +259,7 @@ func (l *Loader) registerCommands() {
 		// The actual dispatch (e.g., sending to LLM) is up to the caller;
 		// we return the expanded content as output for now.
 		handler := commands.Handler(func(ctx context.Context, args string, ui commands.CommandUI, sess commands.CommandSession) (commands.Result, error) {
-			expanded, ok := l.prompts.Expand(prompt.ID, args)
+			expanded, ok := l.PromptRegistry().Expand(prompt.ID, args)
 			if !ok {
 				return commands.Result{}, fmt.Errorf("prompt %q not found", prompt.ID)
 			}
@@ -230,7 +276,7 @@ func (l *Loader) registerCommands() {
 	// Register skills as /skill:<id> slash commands. The handler returns the
 	// XML-wrapped invocation body so callers inject it as a user message
 	// verbatim. Matches the TS reference _expandSkillCommand contract.
-	for _, skill := range l.skills.List() {
+	for _, skill := range l.SkillRegistry().List() {
 		cmdName := "skill:" + skill.ID
 		info := commands.Info{
 			Name:        cmdName,

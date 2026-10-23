@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
@@ -454,5 +456,226 @@ func TestHandleBedrockStreamEventsProducesStructuredOutput(t *testing.T) {
 	}
 	if string(toolEnd.ToolCall.Arguments) != `{"text":"hi"}` {
 		t.Fatalf("toolEnd.ToolCall.Arguments = %s", string(toolEnd.ToolCall.Arguments))
+	}
+}
+
+func TestBedrock55UsesNativeEffortAndCaching(t *testing.T) {
+	model := &Model{ID: "anthropic.claude-haiku-5-5", Reasoning: true}
+	if !supportsAdaptiveThinking(model.ID) || !supportsBedrockPromptCaching(model) || mapBedrockThinkingEffort(ReasoningXHigh, model.ID) != "xhigh" {
+		t.Fatal("Claude 5.5 metadata not applied")
+	}
+}
+
+func TestBedrockOpenAIReasoningRequestShapes(t *testing.T) {
+	fields := func(model *Model, level ReasoningLevel) any {
+		t.Helper()
+		got, err := buildBedrockAdditionalModelRequestFields(model, applyOptions([]Option{WithReasoning(level)}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	oss := &Model{ID: "openai.gpt-oss-120b-1:0", Reasoning: true}
+	for level, want := range map[ReasoningLevel]string{ReasoningMinimal: "low", ReasoningMedium: "medium", ReasoningXHigh: "high", ReasoningMax: "high"} {
+		if got := fields(oss, level); !reflect.DeepEqual(got, map[string]any{"reasoning_effort": want}) {
+			t.Errorf("gpt-oss %s = %v, want flat reasoning_effort %s", level, got, want)
+		}
+	}
+	gpt := &Model{ID: "openai.gpt-5.6", Name: "GPT 5.6", Reasoning: true, ThinkingLevelMap: map[string]*string{"high": new("max")}}
+	for level, want := range map[ReasoningLevel]string{ReasoningMinimal: "low", ReasoningXHigh: "xhigh", ReasoningMax: "max", ReasoningHigh: "max"} {
+		if got := fields(gpt, level); !reflect.DeepEqual(got, map[string]any{"reasoning": map[string]any{"effort": want}}) {
+			t.Errorf("gpt %s = %v, want nested reasoning.effort %s", level, got, want)
+		}
+	}
+	if got := fields(&Model{ID: "meta.llama3", Reasoning: true}, ReasoningHigh); got != nil {
+		t.Errorf("other models get no reasoning fields: %v", got)
+	}
+}
+
+func TestStreamBedrockEventsTerminalOutcomesMatchUpstream(t *testing.T) {
+	start := &bedrocktypes.ConverseStreamOutputMemberMessageStart{Value: bedrocktypes.MessageStartEvent{Role: bedrocktypes.ConversationRoleAssistant}}
+	stop := func(reason bedrocktypes.StopReason) bedrocktypes.ConverseStreamOutput {
+		return &bedrocktypes.ConverseStreamOutputMemberMessageStop{Value: bedrocktypes.MessageStopEvent{StopReason: reason}}
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name      string
+		ctx       context.Context
+		events    []bedrocktypes.ConverseStreamOutput
+		streamErr error
+		reason    StopReason
+		message   string
+	}{
+		{name: "end turn", events: []bedrocktypes.ConverseStreamOutput{start, stop(bedrocktypes.StopReasonEndTurn)}, reason: StopReasonStop},
+		{name: "context window", events: []bedrocktypes.ConverseStreamOutput{start, stop(bedrocktypes.StopReasonModelContextWindowExceeded)}, reason: StopReasonLength},
+		{name: "guardrail", events: []bedrocktypes.ConverseStreamOutput{start, stop(bedrocktypes.StopReasonGuardrailIntervened)}, reason: StopReasonError, message: "Provider stopped with: guardrail_intervened"},
+		{name: "no stop", events: []bedrocktypes.ConverseStreamOutput{start}, reason: StopReasonError, message: "bedrock stream ended without a stop reason"},
+		{name: "stream error", events: []bedrocktypes.ConverseStreamOutput{start}, streamErr: errors.New("reset"), reason: StopReasonError, message: "bedrock: stream error: reset"},
+		{name: "canceled", ctx: canceled, events: []bedrocktypes.ConverseStreamOutput{start, stop(bedrocktypes.StopReasonEndTurn)}, streamErr: context.Canceled, reason: StopReasonAborted, message: "request was aborted: context canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := tc.ctx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			events := make(chan bedrocktypes.ConverseStreamOutput, len(tc.events))
+			for _, event := range tc.events {
+				events <- event
+			}
+			close(events)
+			reason, message := streamTerminal(t, func(handler EventHandler) {
+				err := streamBedrockEvents(ctx, &Model{ID: "m"}, events, func() error { return tc.streamErr }, AssistantMessage{Role: "assistant", StopReason: StopReasonStop}, handler)
+				if err != nil {
+					t.Fatal(err)
+				}
+			})
+			if reason != tc.reason || message != tc.message {
+				t.Fatalf("got %s %q, want %s %q", reason, message, tc.reason, tc.message)
+			}
+		})
+	}
+}
+
+func TestBedrockBudgetThinkingFitsResponseCeilingLikeUpstream(t *testing.T) {
+	model := &Model{ID: "anthropic.claude-sonnet-4-5-v1:0", Provider: ProviderAmazonBedrock, API: APIBedrockConverseStream, Reasoning: true, MaxTokens: 8192}
+	for _, tc := range []struct {
+		opts                []Option
+		wantMax, wantBudget int
+	}{
+		{[]Option{WithReasoning(ReasoningMedium), WithMaxTokens(8192)}, 8192, 7168},
+		{[]Option{WithReasoning(ReasoningMedium), WithMaxTokens(4000), WithThinkingBudgetTokens(3000)}, 7000, 3000},
+	} {
+		input, err := buildBedrockConverseInput(model, &Context{Messages: []Message{{Role: "user", Content: "hi"}}}, applyOptions(tc.opts))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := input.AdditionalModelRequestFields.MarshalSmithyDocument()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields struct {
+			Thinking struct {
+				BudgetTokens int `json:"budget_tokens"`
+			} `json:"thinking"`
+		}
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatal(err)
+		}
+		budget := fields.Thinking.BudgetTokens
+		if *input.InferenceConfig.MaxTokens != int32(tc.wantMax) || budget != tc.wantBudget {
+			t.Fatalf("maxTokens=%d budget=%d, want %d and %d", *input.InferenceConfig.MaxTokens, budget, tc.wantMax, tc.wantBudget)
+		}
+	}
+}
+
+func TestBedrockStrictToolsMatchUpstream(t *testing.T) {
+	tool := func(strict string) Tool {
+		return Tool{Name: "lookup", Parameters: json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`), ConstrainedSampling: json.RawMessage(`{"type":"json_schema","strict":"` + strict + `"}`)}
+	}
+	spec := func(model *Model, tools ...Tool) bedrocktypes.ToolSpecification {
+		t.Helper()
+		config, err := buildBedrockToolConfig(model, tools, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return config.Tools[0].(*bedrocktypes.ToolMemberToolSpec).Value
+	}
+	unsupported := &Model{ID: "m"}
+	if got := spec(unsupported, tool("prefer")); got.Strict != nil {
+		t.Fatalf("strict sent without support: %v", *got.Strict)
+	}
+	if _, err := buildBedrockToolConfig(unsupported, []Tool{tool("require")}, nil); err == nil {
+		t.Fatal("required strictness accepted without support")
+	}
+	supported := &Model{ID: "m", Compat: &CompatibilitySettings{SupportsStrictMode: new(true)}}
+	got := spec(supported, tool("require"))
+	if got.Strict == nil || !*got.Strict {
+		t.Fatal("strict missing for a supported model")
+	}
+	if spec(supported, Tool{Name: "plain", Parameters: json.RawMessage(`{"type":"object"}`)}).Strict != nil {
+		t.Fatal("strict sent for a tool that did not ask for it")
+	}
+}
+
+func TestBedrockClientConsumesProviderRetriesAndTimeout(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	client, err := newBedrockRuntimeClient(t.Context(), applyOptions(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options := client.Options(); options.RetryMaxAttempts != 0 {
+		t.Fatalf("default retry attempts changed: %d", options.RetryMaxAttempts)
+	}
+	client, err = newBedrockRuntimeClient(t.Context(), applyOptions([]Option{WithMaxRetries(0), WithTimeout(time.Second), WithBedrockBearerToken("token")}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := client.Options()
+	if options.RetryMaxAttempts != 1 {
+		t.Fatalf("retry attempts = %d, want 1", options.RetryMaxAttempts)
+	}
+	httpClient, ok := options.HTTPClient.(*http.Client)
+	if !ok {
+		t.Fatalf("http client = %T", options.HTTPClient)
+	}
+	timeout, ok := httpClient.Transport.(*headerTimeoutTransport)
+	if !ok || timeout.timeout != time.Second {
+		t.Fatalf("header timeout transport = %#v", httpClient.Transport)
+	}
+	if _, ok := timeout.base.(*bedrockHeaderRoundTripper); !ok {
+		t.Fatalf("bearer transport dropped: %T", timeout.base)
+	}
+}
+
+func TestBedrockSharedThinkingBudgets(t *testing.T) {
+	model := &Model{ID: "anthropic.claude-sonnet-4-5", Reasoning: true, MaxTokens: 16000}
+	for _, tc := range []struct {
+		level ReasoningLevel
+		want  int
+	}{{ReasoningLow, 0}, {ReasoningXHigh, 3000}, {ReasoningMax, 3000}, {ReasoningOff, 0}} {
+		t.Run(string(tc.level), func(t *testing.T) {
+			opts := applyOptions([]Option{WithReasoning(tc.level), WithThinkingBudgets(&ThinkingBudgets{Low: new(0), High: new(3000)})})
+			if got := bedrockThinkingBudget(model, opts); got != tc.want {
+				t.Fatalf("budget=%d want=%d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBedrockSharedThinkingBudgetRequestAndOverrides(t *testing.T) {
+	model := &Model{ID: "anthropic.claude-sonnet-4-5", Reasoning: true, MaxTokens: 16000}
+	for _, tc := range []struct {
+		name  string
+		extra []Option
+		want  int
+	}{
+		{"shared", nil, 3000},
+		{"provider override", []Option{WithBedrockThinkingBudgets(&ThinkingBudgets{High: new(2000)})}, 2000},
+		{"token override", []Option{WithThinkingBudgetTokens(1000)}, 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := []Option{WithReasoning(ReasoningXHigh), WithMaxTokens(4000), WithThinkingBudgets(&ThinkingBudgets{High: new(3000)})}
+			input, err := buildBedrockConverseInput(model, &Context{}, applyOptions(append(opts, tc.extra...)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := input.AdditionalModelRequestFields.MarshalSmithyDocument()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields struct {
+				Thinking struct {
+					Budget int `json:"budget_tokens"`
+				} `json:"thinking"`
+			}
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if fields.Thinking.Budget != tc.want || *input.InferenceConfig.MaxTokens != int32(4000+tc.want) {
+				t.Fatalf("fields=%s max=%d", data, *input.InferenceConfig.MaxTokens)
+			}
+		})
 	}
 }

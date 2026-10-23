@@ -2,6 +2,9 @@ package artifacts
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -90,4 +93,89 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func TestLoaderUsesThemeValidatorOnStartupAndReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "theme.json")
+	if err := os.WriteFile(path, []byte(`{"name":"valid"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	loader, err := NewLoader(LoaderOptions{CWD: t.TempDir(), CLIPaths: map[ArtifactKind][]string{KindTheme: {path}}, DisableSkills: true, DisablePrompts: true, ThemeValidator: func(raw []byte) error {
+		calls++
+		if strings.Contains(string(raw), "invalid") {
+			return errors.New("invalid colors")
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.ThemeRegistry().Get("valid"); !ok {
+		t.Fatal("valid theme absent")
+	}
+	before := calls
+	if err := os.WriteFile(path, []byte(`{"name":"invalid"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if calls <= before {
+		t.Fatal("reload bypassed validator")
+	}
+	if _, ok := loader.ThemeRegistry().Get("invalid"); ok {
+		t.Fatal("invalid theme registered")
+	}
+}
+
+func TestLoaderPrepareCommitsSettingsPathsOnlyOnCommit(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"old", "new"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name, name+".md"), []byte("body"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg := commands.NewInMemoryRegistry()
+	loader, err := NewLoader(LoaderOptions{
+		CWD:              t.TempDir(),
+		UserDirs:         map[ArtifactKind]string{KindPrompt: filepath.Join(dir, "none")},
+		SettingsPaths:    map[ArtifactKind][]string{KindPrompt: {filepath.Join(dir, "old")}},
+		DisableSkills:    true,
+		DisableThemes:    true,
+		CommandsRegistry: reg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := loader.Prepare(ReloadOptions{SettingsPaths: map[ArtifactKind][]string{KindPrompt: {filepath.Join(dir, "new")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.PromptRegistry().Get("new"); ok {
+		t.Fatal("prepare replaced prompts before commit")
+	}
+	if _, _, ok := reg.Lookup("old"); !ok {
+		t.Fatal("prepare removed the old command before commit")
+	}
+	prepared.Commit()
+	if _, ok := loader.PromptRegistry().Get("old"); ok {
+		t.Fatal("commit kept prompts from the old settings paths")
+	}
+	if _, _, ok := reg.Lookup("new"); !ok {
+		t.Fatal("commit did not register the new prompt command")
+	}
+	if _, _, ok := reg.Lookup("old"); ok {
+		t.Fatal("commit kept the old prompt command")
+	}
+	if err := loader.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.PromptRegistry().Get("new"); !ok {
+		t.Fatal("reload did not keep the committed settings paths")
+	}
 }

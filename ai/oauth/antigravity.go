@@ -74,7 +74,7 @@ func (p *antigravityProvider) Login(ctx context.Context, callbacks LoginCallback
 
 	callbacks.OnAuth(authURL, "Complete login in your browser. Paste the final redirect URL here if authenticating on another machine.")
 
-	code, _, err := server.WaitForCode(ctx)
+	code, err := waitForAuthorizationCode(ctx, callbacks, server, verifier)
 	if err != nil {
 		return nil, fmt.Errorf("wait for code: %w", err)
 	}

@@ -26,6 +26,9 @@ type Credential struct {
 
 	// APIKey holds the key when Type == CredentialTypeAPIKey.
 	APIKey string `json:"key,omitempty"`
+	// Env supplies variables for "$NAME" references in APIKey ahead of the
+	// process environment.
+	Env map[string]string `json:"env,omitempty"`
 
 	// OAuth fields are populated when Type == CredentialTypeOAuth.
 	AccessToken  string         `json:"access_token,omitempty"`

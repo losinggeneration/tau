@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -11,14 +12,31 @@ import (
 
 const shimStatusKey = "pi-ext-shim"
 
-// ShimReady returns a channel that resolves when startup shim maintenance has finished.
-// Nil means no pi-ext-shim setup is pending.
-func (m *Manager) ShimReady() <-chan error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.shimReady
+type shimSetup struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+	err    error
 }
 
+// ShimReady returns an independent result subscription for the latest shim setup.
+// Nil means no pi-ext-shim setup has been started.
+func (m *Manager) ShimReady() <-chan error {
+	m.mu.RLock()
+	setup := m.shimSetup
+	m.mu.RUnlock()
+	if setup == nil {
+		return nil
+	}
+	ready := make(chan error, 1)
+	go func() {
+		<-setup.done
+		ready <- setup.err
+		close(ready)
+	}()
+	return ready
+}
+
+// prepareShimIfNeeded inspects discovered manifests with m.mu held.
 func (m *Manager) prepareShimIfNeeded(ctx context.Context) {
 	if !m.hasShimManifestLocked() {
 		return
@@ -28,16 +46,6 @@ func (m *Manager) prepareShimIfNeeded(ctx context.Context) {
 		return
 	}
 	m.startShimEnsureLocked(ctx, shimDir)
-}
-
-func (m *Manager) shimStatus(message string) {
-	if m.shimStatusFn != nil {
-		m.shimStatusFn(message)
-		return
-	}
-	if m.ui != nil {
-		m.ui.SetStatus(shimStatusKey, message)
-	}
 }
 
 func (m *Manager) hasShimManifestLocked() bool {
@@ -51,47 +59,86 @@ func (m *Manager) hasShimManifestLocked() bool {
 	return false
 }
 
+// waitForShimReady releases m.mu while waiting and reacquires it before returning.
+// Caller must hold m.mu.
 func (m *Manager) waitForShimReady(ctx context.Context, manifest *Manifest) error {
 	if !manifestNeedsManagedShim(manifest) {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("wait for pi-ext-shim setup: %w", err)
+	}
+	if m.shimClosed {
+		return errors.New("pi-ext-shim setup manager is shut down")
+	}
 	m.startShimEnsureLocked(ctx, m.shimDir())
-	ready := m.shimReady
-	if ready == nil {
-		return nil
-	}
+	setup := m.shimSetup
+	m.mu.Unlock()
 	select {
-	case err := <-ready:
-		return err
+	case <-setup.done:
 	case <-ctx.Done():
-		return fmt.Errorf("wait for pi-ext-shim setup: %w", ctx.Err())
 	}
+	m.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("wait for pi-ext-shim setup: %w", err)
+	}
+	if m.shimClosed {
+		return errors.New("pi-ext-shim setup manager is shut down")
+	}
+	return setup.err
 }
 
 func (m *Manager) startShimEnsureLocked(ctx context.Context, shimDir string) {
-	if m.shimReady != nil && !m.shimReadyClosed {
+	if m.shimClosed {
 		return
 	}
-	ready := make(chan error, 1)
-	m.shimReady = ready
-	m.shimReadyClosed = false
+	if m.shimSetup != nil {
+		select {
+		case <-m.shimSetup.done:
+		default:
+			return
+		}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	setup := &shimSetup{done: make(chan struct{}), cancel: cancel}
+	m.shimSetup = setup
+	status := m.shimStatusFn
+	if status == nil {
+		status = func(message string) { m.uiSetStatus(shimStatusKey, message) }
+	}
 	install := m.shimInstallFn
-	status := m.shimStatus
-	status("Setting up pi-ext-shim…")
 	go func() {
-		err := error(nil)
-		_, err = piext.EnsureShim(ctx, shimDir, install, status)
-		if err != nil {
+		defer close(setup.done)
+		defer cancel()
+		status("Setting up pi-ext-shim…")
+		_, setup.err = piext.EnsureShim(ctx, shimDir, install, status)
+		if setup.err != nil {
 			status("pi-ext-shim setup failed")
 		} else {
 			status("")
 		}
-		ready <- err
-		close(ready)
-		m.mu.Lock()
-		m.shimReadyClosed = true
-		m.mu.Unlock()
 	}()
+}
+
+// stopShimSetupLocked closes admission and joins setup outside m.mu so status
+// publication and existing waiters can finish during shutdown.
+func (m *Manager) stopShimSetupLocked(ctx context.Context) error {
+	m.shimClosed = true
+	setup := m.shimSetup
+	if setup == nil {
+		return nil
+	}
+	setup.cancel()
+	m.mu.Unlock()
+	defer m.mu.Lock()
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.cleanupGrace)
+	defer cancel()
+	select {
+	case <-setup.done:
+		return setup.err
+	case <-waitCtx.Done():
+		return fmt.Errorf("pi-ext-shim setup still running: %w", waitCtx.Err())
+	}
 }
 
 func (m *Manager) shimDir() string {

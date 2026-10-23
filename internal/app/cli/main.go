@@ -734,38 +734,24 @@ func (c *loginCallbacks) OnAuth(url string, instructions string) {
 	fmt.Fprintf(os.Stderr, "\n%s\n\n%s\n", url, instructions)
 }
 
-func (c *loginCallbacks) OnPrompt(message string, placeholder string) (string, error) {
+func (c *loginCallbacks) OnPrompt(ctx context.Context, message string, placeholder string) (string, error) {
 	if !c.interactive {
-		return "", errors.New("cannot prompt in non-interactive mode")
+		return "", fmt.Errorf("non-interactive mode: %w", oauth.ErrPromptUnavailable)
 	}
 	fmt.Fprint(os.Stderr, message)
-	scanner := bufio.NewScanner(os.Stdin)
-	if scanner.Scan() {
-		return scanner.Text(), nil
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", io.EOF
+	return oauth.ReadStdinLine(ctx)
 }
 
 func (c *loginCallbacks) OnProgress(message string) {
 	fmt.Fprintln(os.Stderr, message)
 }
 
-func (c *loginCallbacks) OnManualCodeInput() (string, error) {
+func (c *loginCallbacks) OnManualCodeInput(ctx context.Context) (string, error) {
 	if !c.interactive {
-		return "", errors.New("cannot prompt in non-interactive mode")
+		return "", fmt.Errorf("non-interactive mode: %w", oauth.ErrPromptUnavailable)
 	}
 	fmt.Fprint(os.Stderr, "Enter authorization code or redirect URL: ")
-	scanner := bufio.NewScanner(os.Stdin)
-	if scanner.Scan() {
-		return scanner.Text(), nil
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", io.EOF
+	return oauth.ReadStdinLine(ctx)
 }
 
 // runLogout handles the `tau logout` command.
@@ -939,7 +925,7 @@ func checkProvider(ctx context.Context, model *ai.Model, cred ai.Credential) (bo
 		return false, fmt.Errorf("provider %s does not support no-credential login", model.Provider)
 	default:
 		var err error
-		apiKey, err = store.APIKeyFromCredential(model.Provider, cred)
+		apiKey, err = store.APIKeyFromCredential(ctx, model.Provider, cred)
 		if err != nil {
 			return false, err
 		}
@@ -1125,7 +1111,7 @@ func runModelsDiscover(ctx context.Context, cmd *cli.Command) (err error) {
 
 // getAPIKeyFromCredential extracts an API key from a credential.
 func getAPIKeyFromCredential(ctx context.Context, providerKey string, cred ai.Credential, fb *store.FileBackend) (string, error) {
-	return store.APIKeyFromCredential(providerKey, cred)
+	return store.APIKeyFromCredential(ctx, providerKey, cred)
 }
 
 // runSetModel handles the `tau set-model` command.
@@ -2969,7 +2955,7 @@ func runPluginDoctor(ctx context.Context, cmd *cli.Command) error {
 		writeLine(os.Stdout, "Error: %v\n", err)
 		return nil
 	}
-	defer result.Close()
+	defer func() { reportShutdownError(result.Close()) }()
 
 	writeLine(os.Stdout, "Handshake: OK\n")
 	writeLine(os.Stdout, "Name: %s\n", result.Name)
@@ -3645,7 +3631,7 @@ func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) Sessio
 		if err != nil {
 			sessionFlags.SelectionError = fmt.Errorf("resolve --models: %w", err)
 		} else {
-			rtOpts.ExplicitModel = spec.String()
+			rtOpts.ExplicitModel = spec.Model.String()
 		}
 	}
 
@@ -4487,5 +4473,11 @@ func themeColorLookup(loader *artifacts.Loader) tui.ThemeColorLookup {
 			return nil, false
 		}
 		return colors, true
+	}
+}
+
+func reportShutdownError(err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tau shutdown error: %v\n", err)
 	}
 }

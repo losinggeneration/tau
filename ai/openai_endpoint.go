@@ -2,9 +2,7 @@ package ai
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"strings"
@@ -20,7 +18,7 @@ import (
 const chatCompletionsPath = "/chat/completions"
 
 var (
-	// chatCompletionsMaxRetries bounds 5xx retries. With the doubling base
+	// chatCompletionsMaxRetries is the default retry count. With the doubling base
 	// delay below the full schedule runs ~128s, so a hard-down provider
 	// still fails in about two minutes.
 	chatCompletionsMaxRetries = 10
@@ -77,11 +75,11 @@ func openAIRequestHeaders(model *Model, o *options) map[string]string {
 	headers := make(map[string]string, len(o.headers)+2)
 
 	if model.GetCompat().SendSessionAffinityHeaders {
-		maps.Copy(headers, sessionHeaders(o))
+		maps.Copy(headers, sessionHeaders(model, o))
 	}
 
 	maps.Copy(headers, providerRequestHeaders(model.Provider))
-	maps.Copy(headers, o.headers)
+	copyConfiguredHeaders(headers, o.headers)
 
 	return headers
 }
@@ -105,22 +103,24 @@ func newOpenAIChatCompletionsTransport(model *Model) (*HTTPTransport, error) {
 // withRequestOptions layers a single request's API key, credential-refresh
 // options and headers onto a base transport.
 func (t *HTTPTransport) withRequestOptions(model *Model, o *options) *HTTPTransport {
-	apiKey := resolveOpenAIAPIKey(model, o)
-	headers := openAIRequestHeaders(model, o)
-
-	if o.transportOpts != nil {
-		return NewTransportWithOptions(t.baseURL, apiKey, t.headers, TransportOptions{
-			RefreshCreds: o.transportOpts.RefreshCreds,
-			Provider:     o.transportOpts.Provider,
-		}).withHeaders(headers)
+	clone := t.withHeaders(openAIRequestHeaders(model, o))
+	if apiKey := resolveOpenAIAPIKey(model, o); apiKey != "" {
+		clone.apiKey = apiKey
 	}
+	if baseURL := requestBaseURL(model, clone.apiKey); baseURL != "" {
+		clone.baseURL = baseURL
+	}
+	if o.transportOpts != nil {
+		clone.refreshCreds, clone.provider = o.transportOpts.RefreshCreds, o.transportOpts.Provider
+	}
+	clone.timeout = o.timeout
 
-	return t.withAPIKey(apiKey).withHeaders(headers)
+	return clone
 }
 
 // chatCompletionsRetryDelay returns the backoff before retry attempt+1.
 func chatCompletionsRetryDelay(attempt int) time.Duration {
-	return chatCompletionsRetryBase * time.Duration(1<<attempt)
+	return chatCompletionsRetryBase * time.Duration(1<<min(attempt, 9))
 }
 
 // doOpenAIChatCompletions posts a chat/completions request and returns the
@@ -129,47 +129,31 @@ func chatCompletionsRetryDelay(attempt int) time.Duration {
 // else fails immediately. On success the caller owns closing the body; on any
 // error the body is already closed.
 func doOpenAIChatCompletions(ctx context.Context, model *Model, o *options, transport *HTTPTransport, body string) (*http.Response, error) {
-	for attempt := 0; ; attempt++ {
-		resp, err := transport.Do(ctx, http.MethodPost, chatCompletionsPath, body)
-		if err != nil {
-			return nil, fmt.Errorf("%s: request: %w", model.Provider, err)
-		}
-
-		if hasResponseCallback(o) {
-			invokeResponseCallback(o, model, responseMetadata(resp))
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			return resp, nil
-		}
-
-		respBody, readErr := io.ReadAll(resp.Body)
-		closeErr := resp.Body.Close()
-		if readErr != nil {
-			err := fmt.Errorf("read error response body: %w", readErr)
-			if closeErr != nil {
-				err = errors.Join(err, fmt.Errorf("close error response body: %w", closeErr))
-			}
-			return nil, fmt.Errorf("%s: status %d: %w", model.Provider, resp.StatusCode, err)
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("%s: close error response body: %w", model.Provider, closeErr)
-		}
-
+	// Unless retries are configured, keep Tau's original policy of retrying only 5xx responses.
+	var retryable func(int) bool
+	if o.maxRetries == nil {
+		retryable = func(status int) bool { return status >= http.StatusInternalServerError }
+	}
+	resp, err := sendProviderRequest(ctx, o, providerRequest{
+		label:     model.Provider,
+		retryable: retryable,
+		retries:   chatCompletionsMaxRetries,
+		backoff:   chatCompletionsRetryDelay,
 		// z.ai reports an exhausted usage window as a 429 whose message
 		// carries the reset time in Beijing time; restate it in local time.
-		if usageErr := parseZAIUsageLimitError(model.Provider, resp.StatusCode, respBody); usageErr != nil {
-			return nil, usageErr
-		}
-
-		if attempt < chatCompletionsMaxRetries && resp.StatusCode >= http.StatusInternalServerError {
-			if sleepErr := sleepWithContext(ctx, chatCompletionsRetryDelay(attempt)); sleepErr == nil {
-				continue
-			} else {
-				return nil, fmt.Errorf("%s: request: %w", model.Provider, sleepErr)
+		permanent: func(rejected *providerStatusError) error {
+			if usageErr := parseZAIUsageLimitError(model.Provider, rejected.status, rejected.body); usageErr != nil {
+				return usageErr
 			}
-		}
-
-		return nil, fmt.Errorf("%s: status %d: %s", model.Provider, resp.StatusCode, string(respBody))
+			return nil
+		},
+		send: func() (*http.Response, error) { return transport.Do(ctx, http.MethodPost, chatCompletionsPath, body) },
+	})
+	if err != nil {
+		return nil, err
 	}
+	if hasResponseCallback(o) {
+		invokeResponseCallback(o, model, responseMetadata(resp))
+	}
+	return resp, nil
 }

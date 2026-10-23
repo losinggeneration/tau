@@ -2,6 +2,7 @@ package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -53,7 +54,30 @@ func transformMessages(messages []Message, model *Model, messageModels []ModelIn
 // transformMessage transforms a single message for the target model.
 // This is the first pass of the transform algorithm.
 func transformMessage(msg Message, model *Model, info *ModelInfo, toolCallIDMap map[string]string, normalizeToolCallID ToolCallIDNormalizer) Message {
-	// User messages pass through unchanged
+	role := normalizeMessageRole(msg.Role)
+	if (role == "user" || role == "toolResult") && !model.SupportsInput(InputImage) {
+		if blocks, ok := msg.Content.([]ContentBlock); ok && len(blocks) > 0 {
+			placeholder := "(image omitted: model does not support images)"
+			if role == "toolResult" {
+				placeholder = "(tool image omitted: model does not support images)"
+			}
+			content := make([]ContentBlock, 0, len(blocks))
+			var previousWasPlaceholder bool
+			for _, block := range blocks {
+				if block.Type == ContentBlockImage {
+					if !previousWasPlaceholder {
+						content = append(content, ContentBlock{Type: ContentBlockText, Text: placeholder})
+					}
+					previousWasPlaceholder = true
+					continue
+				}
+				content = append(content, block)
+				previousWasPlaceholder = block.Type == ContentBlockText && block.Text == placeholder
+			}
+			msg.Content = content
+		}
+	}
+
 	if msg.Role == "user" {
 		return msg
 	}
@@ -128,16 +152,12 @@ func transformContentBlock(block ContentBlock, isSameModel bool, model *Model, a
 		if isSameModel && block.ThoughtSignature != "" {
 			return []ContentBlock{block}
 		}
-		if isSameModel && block.Thinking != "" {
-			return []ContentBlock{block}
-		}
-
 		// Skip empty thinking blocks, convert others to plain text for cross-model
 		thinking := block.Thinking
 		if thinking == "" {
 			thinking = block.Text
 		}
-		if thinking == "" {
+		if strings.TrimSpace(thinking) == "" {
 			return nil
 		}
 
@@ -203,6 +223,7 @@ func insertSyntheticToolResults(messages []Message, toolCallIDMap map[string]str
 	result := make([]Message, 0, len(messages))
 	pendingToolCalls := make([]ContentBlock, 0)
 	existingToolResultIDs := make(map[string]bool)
+	var heldSystemMessages []Message
 
 	insertSynthetic := func() {
 		if len(pendingToolCalls) > 0 {
@@ -221,10 +242,12 @@ func insertSyntheticToolResults(messages []Message, toolCallIDMap map[string]str
 			pendingToolCalls = pendingToolCalls[:0]
 			existingToolResultIDs = make(map[string]bool)
 		}
+		result = append(result, heldSystemMessages...)
+		heldSystemMessages = nil
 	}
 
 	for _, msg := range messages {
-		switch msg.Role {
+		switch normalizeMessageRole(msg.Role) {
 		case "assistant":
 			// If we have pending orphaned tool calls from a previous assistant, insert synthetic results now
 			insertSynthetic()
@@ -251,6 +274,14 @@ func insertSyntheticToolResults(messages []Message, toolCallIDMap map[string]str
 			// Mark this tool result ID as existing
 			existingToolResultIDs[msg.ToolCallID] = true
 			result = append(result, msg)
+
+		case "system":
+			// Keep real and synthetic results together before applying system updates.
+			if len(pendingToolCalls) > 0 {
+				heldSystemMessages = append(heldSystemMessages, msg)
+			} else {
+				result = append(result, msg)
+			}
 
 		case "user":
 			// User message interrupts tool flow - insert synthetic results for orphaned calls
@@ -293,7 +324,8 @@ func DeserializeContext(data []byte) (*Context, error) {
 	return &ctx, nil
 }
 
-// CloneContext creates a deep copy of a context.
+// CloneContext copies the context and message slice. Nested content and tool
+// declarations are shared and must be treated as immutable.
 func CloneContext(ctx *Context) *Context {
 	if ctx == nil {
 		return nil
@@ -301,14 +333,8 @@ func CloneContext(ctx *Context) *Context {
 
 	messages := make([]Message, len(ctx.Messages))
 	for i, msg := range ctx.Messages {
-		messages[i] = Message{
-			Role:       normalizeMessageRole(msg.Role),
-			Content:    msg.Content, // Content is any, shallow copy is fine for immutability
-			ToolCallID: msg.ToolCallID,
-			ToolName:   msg.ToolName,
-			IsError:    msg.IsError,
-			Timestamp:  msg.Timestamp,
-		}
+		messages[i] = msg
+		messages[i].Role = normalizeMessageRole(msg.Role)
 	}
 
 	return &Context{
@@ -327,19 +353,14 @@ func TruncateContext(ctx *Context, model *Model, maxMessages int) *Context {
 
 	result := &Context{
 		SystemPrompt: ctx.SystemPrompt,
-		Messages:     make([]Message, 0, maxMessages),
 		Tools:        ctx.Tools,
 	}
-
-	// Work backwards from the end to find messages that fit
-	start := len(ctx.Messages)
-	if start > maxMessages {
-		start = maxMessages
-	}
-
-	// Copy the last maxMessages
-	for i := len(ctx.Messages) - start; i < len(ctx.Messages); i++ {
-		result.Messages = append(result.Messages, ctx.Messages[i])
+	cut := len(ctx.Messages) - min(len(ctx.Messages), max(0, maxMessages))
+	for i, message := range ctx.Messages {
+		// Prompt and tool declarations remain effective after earlier turns are removed.
+		if i >= cut || message.Role == "system" {
+			result.Messages = append(result.Messages, message)
+		}
 	}
 
 	return result

@@ -26,15 +26,21 @@ export interface ProtoGrpcType {
     ListRegistrationsRequest: MessageTypeDefinition
     LogRequest: MessageTypeDefinition
     LogResponse: MessageTypeDefinition
+    ModelRouteRequest: MessageTypeDefinition
+    ModelRouteResponse: MessageTypeDefinition
     Plugin: SubtypeConstructor<typeof grpc.Client, _plugins_PluginClient> & { service: _plugins_PluginDefinition }
+    ReachToolsResponse: MessageTypeDefinition
     Registrations: MessageTypeDefinition
     SessionAppendRequest: MessageTypeDefinition
     SessionAppendResponse: MessageTypeDefinition
+    SessionCompactRequest: MessageTypeDefinition
+    SessionCompactResponse: MessageTypeDefinition
     SessionEntry: MessageTypeDefinition
     SessionGetLabelRequest: MessageTypeDefinition
     SessionGetLabelResponse: MessageTypeDefinition
     SessionScanRequest: MessageTypeDefinition
     SessionScanResponse: MessageTypeDefinition
+    SessionSendCustomMessageRequest: MessageTypeDefinition
     SessionSendUserMessageRequest: MessageTypeDefinition
     SessionSendUserMessageResponse: MessageTypeDefinition
     SessionSetLabelRequest: MessageTypeDefinition
@@ -52,6 +58,8 @@ export interface ProtoGrpcType {
     TerminalInput: MessageTypeDefinition
     TerminalInputResponse: MessageTypeDefinition
     ToolCall: MessageTypeDefinition
+    ToolDiscoveryRequest: MessageTypeDefinition
+    ToolDiscoveryResponse: MessageTypeDefinition
     ToolProgressEvent: MessageTypeDefinition
     ToolProgressResponse: MessageTypeDefinition
     ToolRegistration: MessageTypeDefinition
@@ -74,6 +82,7 @@ export interface ProtoGrpcType {
     UISetToolsExpandedResponse: MessageTypeDefinition
     UISetWidgetRequest: MessageTypeDefinition
     UISetWidgetResponse: MessageTypeDefinition
+    VirtualModelRegistration: MessageTypeDefinition
   }
 }
 

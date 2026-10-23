@@ -2,30 +2,46 @@ package ai // import "github.com/losinggeneration/tau/ai"
 
 import (
 	"context"
+	"encoding/json"
 	"maps"
+	"math"
 	"os"
+	"strings"
+	"time"
+	"unicode/utf8"
 )
+
+// WithTimeout bounds the wait for response headers, not streaming body delivery.
+func WithTimeout(timeout time.Duration) Option {
+	return func(o *options) { o.timeout = timeout; o.timeoutSet = true }
+}
 
 // Option configures streaming or completion options.
 type Option func(*options)
 
 type options struct {
+	maxRetries                 *int
+	timeout                    time.Duration
+	timeoutSet                 bool
 	apiKey                     string
 	preferredTransport         Transport
 	transportOpts              *TransportOption
 	reasoning                  ReasoningLevel
 	thinkingEnabled            bool
 	thinkingBudgetTokens       int
+	thinkingBudgets            *ThinkingBudgets
 	googleThinkingLevel        GoogleThinkingLevel
 	thinkingDisplay            string // "summarized" | "omitted"
 	effort                     string // "low" | "medium" | "high" | "xhigh" | "max"
 	thinkingType               string // "adaptive" | "enabled" | "disabled"
 	maxTokens                  int
 	topP                       *float64
+	samplingParams             map[string]any
 	temperature                *float64
 	cacheRetention             string
 	sessionID                  string
 	maxRetryDelayMs            int
+	maxRetryDelaySet           bool
 	metadata                   map[string]any
 	onPayload                  func(any) any
 	onPayloadWithModel         func(any, *Model) any
@@ -88,6 +104,11 @@ func WithThinkingBudgetTokens(tokens int) Option {
 	}
 }
 
+// WithThinkingBudgets sets per-level budgets for token-based thinking providers.
+func WithThinkingBudgets(budgets *ThinkingBudgets) Option {
+	return func(o *options) { o.thinkingBudgets = budgets }
+}
+
 // WithThinkingDisplay sets the thinking display mode ("summarized" | "omitted").
 func WithThinkingDisplay(display string) Option {
 	return func(o *options) {
@@ -113,6 +134,16 @@ func WithMaxTokens(tokens int) Option {
 func WithTemperature(temp float64) Option {
 	return func(o *options) {
 		o.temperature = &temp
+	}
+}
+
+// WithSamplingParams merges arbitrary sampling parameters (for example
+// top_k, min_p, or repetition_penalty) into OpenAI-compatible request bodies
+// after the named fields, over the model's own sampling parameters. Other
+// APIs ignore them.
+func WithSamplingParams(params map[string]any) Option {
+	return func(o *options) {
+		o.samplingParams = maps.Clone(params)
 	}
 }
 
@@ -164,6 +195,7 @@ func WithSessionID(id string) Option {
 func WithMaxRetryDelayMs(delay int) Option {
 	return func(o *options) {
 		o.maxRetryDelayMs = delay
+		o.maxRetryDelaySet = true
 	}
 }
 
@@ -278,16 +310,32 @@ func cacheSessionID(o *options) string {
 	return o.sessionID
 }
 
-func sessionHeaders(o *options) map[string]string {
+func sessionHeaders(model *Model, o *options) map[string]string {
 	sessionID := cacheSessionID(o)
 	if sessionID == "" {
 		return nil
 	}
-
-	return map[string]string{
-		"session_id":          sessionID,
-		"x-client-request-id": sessionID,
+	var format string
+	if model.Compat != nil {
+		format = model.Compat.SessionAffinityFormat
 	}
+	if format == "" {
+		format = "openai"
+		if model.Provider == ProviderOpenRouter || strings.Contains(model.BaseURL, "openrouter.ai") {
+			format = "openrouter"
+		}
+	}
+	if format == "openrouter" {
+		return map[string]string{"x-session-id": sessionID}
+	}
+	headers := map[string]string{"x-client-request-id": sessionID}
+	if format == "openai" {
+		headers["session_id"] = sessionID
+	}
+	if model.API == APIOpenAICompletions || model.API == APIOpenAICompatible {
+		headers["x-session-affinity"] = sessionID
+	}
+	return headers
 }
 
 // getMaxTokens returns the max tokens to use based on options and model defaults.
@@ -303,6 +351,9 @@ var DefaultThinkingBudgets = ThinkingBudgets{
 // supports xhigh reasoning (see SupportsXhigh). Pass nil for model to force
 // the legacy collapse unconditionally.
 func ClampReasoningForModel(level ReasoningLevel, model *Model) ReasoningLevel {
+	if level == ReasoningMax {
+		return ReasoningLevel(ClampThinkingLevel(model, string(level)))
+	}
 	if level == ReasoningXHigh && !SupportsXhigh(model) {
 		return ReasoningHigh
 	}
@@ -343,7 +394,7 @@ func ThinkingBudgetForLevel(level ReasoningLevel, customBudgets *ThinkingBudgets
 		return *budgets.Low
 	case ReasoningMedium:
 		return *budgets.Medium
-	case ReasoningHigh, ReasoningXHigh:
+	case ReasoningHigh, ReasoningXHigh, ReasoningMax:
 		return *budgets.High
 	default:
 		return 0
@@ -360,11 +411,22 @@ func AdjustMaxTokensForThinkingForModel(baseMaxTokens int, modelMaxTokens int, l
 
 	maxTokens := min(baseMaxTokens+budget, modelMaxTokens)
 	if maxTokens <= budget {
-		// Ensure at least 1024 tokens for output
-		budget = max(0, maxTokens-1024)
+		budget = max(0, maxTokens-minAnswerTokens)
 	}
 
 	return maxTokens, budget
+}
+
+// fitThinkingBudget grows the response ceiling by the thinking budget up to
+// the model cap and the context room, then trims the budget so the answer
+// keeps minAnswerTokens, as upstream's budget-based thinking does.
+func fitThinkingBudget(model *Model, prompt *Context, maxTokens, budget int) (int, int) {
+	maxTokens += budget
+	if model.MaxTokens > 0 {
+		maxTokens = min(maxTokens, model.MaxTokens)
+	}
+	maxTokens = ClampMaxTokensToContext(model, prompt, maxTokens)
+	return maxTokens, min(budget, max(0, maxTokens-minAnswerTokens))
 }
 
 // AdjustMaxTokensForThinking computes the adjusted maxTokens and thinkingBudget
@@ -562,60 +624,51 @@ func WithInterleavedThinking(enabled bool) Option {
 // SimpleStreamOptions holds the simple-stream options that can be forwarded.
 // This is used by the agent proxy to extract options for forwarding.
 type SimpleStreamOptions struct {
-	Temperature     *float64
-	MaxTokens       int
-	Reasoning       ReasoningLevel
-	APIKey          string
-	CacheRetention  string
-	SessionID       string
-	Headers         map[string]string
-	OnPayload       func(any) any
-	OnPayloadModel  func(any, *Model) any
-	OnResponse      func(ProviderResponse)
-	OnResponseModel func(ProviderResponse, *Model)
-	MaxRetryDelayMs int
-	Metadata        map[string]any
+	Timeout          *time.Duration
+	MaxRetries       *int
+	MaxRetryDelaySet bool
+	Temperature      *float64
+	MaxTokens        int
+	Reasoning        ReasoningLevel
+	ThinkingBudgets  *ThinkingBudgets
+	APIKey           string
+	CacheRetention   string
+	SessionID        string
+	Transport        Transport
+	Headers          map[string]string
+	OnPayload        func(any) any
+	OnPayloadModel   func(any, *Model) any
+	OnResponse       func(ProviderResponse)
+	OnResponseModel  func(ProviderResponse, *Model)
+	MaxRetryDelayMs  int
+	Metadata         map[string]any
+	SamplingParams   map[string]any
 }
 
-// BuildBaseOptions builds a []Option from SimpleStreamOptions.
-// This mirrors the TypeScript buildBaseOptions function from simple-options.ts.
-//
-// It applies the following defaults:
-// - maxTokens: opts.MaxTokens if set, otherwise min(model.MaxTokens, 32000)
-//
-// Used internally by StreamSimple / CompleteSimple helpers to convert the
-// *SimpleStreamOptions input into the []Option list accepted by
-// StreamWithModel / CompleteWithModel. Also exported so callers (including
-// the agent proxy path) can construct a base option set from a simple-options
-// struct without going through the public simple helpers.
-func BuildBaseOptions(model *Model, opts *SimpleStreamOptions) []Option {
-	result := []Option{}
-
+// BuildBaseOptions builds a []Option from SimpleStreamOptions, mirroring
+// upstream buildBaseOptions. maxTokens defaults to the model cap, and either
+// value is clamped to the room prompt leaves in the context window.
+func BuildBaseOptions(model *Model, prompt *Context, opts *SimpleStreamOptions) []Option {
 	if opts == nil {
-		// Apply default maxTokens: min(model.maxTokens, 32000)
-		maxTokens := model.MaxTokens
-		if maxTokens > 32000 {
-			maxTokens = 32000
-		}
-		return append(result, WithMaxTokens(maxTokens))
+		opts = &SimpleStreamOptions{}
 	}
+	maxTokens := opts.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = model.MaxTokens
+	}
+	result := []Option{WithMaxTokens(ClampMaxTokensToContext(model, prompt, maxTokens))}
 
 	if opts.Temperature != nil {
 		result = append(result, WithTemperature(*opts.Temperature))
 	}
-
-	if opts.MaxTokens > 0 {
-		result = append(result, WithMaxTokens(opts.MaxTokens))
-	} else {
-		// Default to min(model.maxTokens, 32000)
-		maxTokens := model.MaxTokens
-		if maxTokens > 32000 {
-			maxTokens = 32000
-		}
-		result = append(result, WithMaxTokens(maxTokens))
+	if len(opts.SamplingParams) > 0 {
+		result = append(result, WithSamplingParams(opts.SamplingParams))
 	}
 
-	if opts.Reasoning != ReasoningOff && opts.Reasoning != "" {
+	if opts.ThinkingBudgets != nil {
+		result = append(result, WithThinkingBudgets(opts.ThinkingBudgets))
+	}
+	if opts.Reasoning != "" {
 		result = append(result, WithReasoning(opts.Reasoning))
 	}
 	if opts.APIKey != "" {
@@ -626,6 +679,9 @@ func BuildBaseOptions(model *Model, opts *SimpleStreamOptions) []Option {
 	}
 	if opts.SessionID != "" {
 		result = append(result, WithSessionID(opts.SessionID))
+	}
+	if opts.Transport != "" {
+		result = append(result, WithTransport(opts.Transport))
 	}
 	if len(opts.Headers) > 0 {
 		result = append(result, WithHeaders(opts.Headers))
@@ -642,7 +698,13 @@ func BuildBaseOptions(model *Model, opts *SimpleStreamOptions) []Option {
 	if opts.OnResponseModel != nil {
 		result = append(result, WithResponseCallbackForModel(opts.OnResponseModel))
 	}
-	if opts.MaxRetryDelayMs > 0 {
+	if opts.Timeout != nil {
+		result = append(result, WithTimeout(*opts.Timeout))
+	}
+	if opts.MaxRetries != nil {
+		result = append(result, WithMaxRetries(*opts.MaxRetries))
+	}
+	if opts.MaxRetryDelaySet || opts.MaxRetryDelayMs > 0 {
 		result = append(result, WithMaxRetryDelayMs(opts.MaxRetryDelayMs))
 	}
 	if len(opts.Metadata) > 0 {
@@ -659,6 +721,7 @@ func ExtractSimpleStreamOptions(opts []Option) SimpleStreamOptions {
 
 	result := SimpleStreamOptions{
 		Reasoning:       o.reasoning,
+		ThinkingBudgets: o.thinkingBudgets,
 		APIKey:          o.apiKey,
 		OnPayload:       o.onPayload,
 		OnPayloadModel:  o.onPayloadWithModel,
@@ -672,19 +735,28 @@ func ExtractSimpleStreamOptions(opts []Option) SimpleStreamOptions {
 	if o.maxTokens > 0 {
 		result.MaxTokens = o.maxTokens
 	}
+	if len(o.samplingParams) > 0 {
+		result.SamplingParams = maps.Clone(o.samplingParams)
+	}
 	if o.cacheRetention != "" {
 		result.CacheRetention = o.cacheRetention
 	}
 	if o.sessionID != "" {
 		result.SessionID = o.sessionID
 	}
+	result.Transport = o.preferredTransport
 	if len(o.headers) > 0 {
 		result.Headers = make(map[string]string, len(o.headers))
 		for k, v := range o.headers {
 			result.Headers[k] = v
 		}
 	}
-	if o.maxRetryDelayMs > 0 {
+	if o.timeoutSet {
+		result.Timeout = new(o.timeout)
+	}
+	result.MaxRetries = o.maxRetries
+	result.MaxRetryDelaySet = o.maxRetryDelaySet
+	if o.maxRetryDelaySet || o.maxRetryDelayMs > 0 {
 		result.MaxRetryDelayMs = o.maxRetryDelayMs
 	}
 	if len(o.metadata) > 0 {
@@ -695,4 +767,130 @@ func ExtractSimpleStreamOptions(opts []Option) SimpleStreamOptions {
 	}
 
 	return result
+}
+
+// responsesReasoningEffort returns the requested Responses effort mapped
+// through the model's thinking map, or "" when reasoning is off or unset.
+func responsesReasoningEffort(model *Model, config *options) string {
+	effort := config.reasoningEffort
+	// Explicit off is the agent's "no reasoning", so it is never clamped up
+	// to the model's lowest level.
+	if effort == "" && config.reasoning != "" && config.reasoning != ReasoningOff {
+		effort = ClampThinkingLevel(model, string(config.reasoning))
+	}
+	if effort == "" || effort == "off" {
+		return ""
+	}
+	if mapped := model.ThinkingLevelMap[effort]; mapped != nil {
+		return *mapped
+	}
+	return effort
+}
+
+// responsesOffEffort returns the effort that turns reasoning off, and false
+// when the model's thinking map marks off unsupported.
+func responsesOffEffort(model *Model) (string, bool) {
+	mapped, ok := model.ThinkingLevelMap["off"]
+	switch {
+	case !ok:
+		return "none", true
+	case mapped == nil:
+		return "", false
+	default:
+		return *mapped, true
+	}
+}
+
+// resolveSamplingParams merges model, thinking-level, and request sampling
+// parameters per key, later sources winning. Nil means none apply.
+func resolveSamplingParams(model *Model, config *options) map[string]any {
+	level := string(config.reasoning)
+	if level == "" {
+		level = "off"
+	}
+	levelParams := model.SamplingParamsByThinkingLevel[ClampThinkingLevel(model, level)]
+	if len(model.SamplingParams) == 0 && len(levelParams) == 0 && len(config.samplingParams) == 0 {
+		return nil
+	}
+	params := maps.Clone(model.SamplingParams)
+	if params == nil {
+		params = make(map[string]any)
+	}
+	maps.Copy(params, levelParams)
+	maps.Copy(params, config.samplingParams)
+	return params
+}
+
+// WithMaxRetries sets the retry limit for providers that support request retries.
+func WithMaxRetries(count int) Option {
+	return func(o *options) { o.maxRetries = new(max(0, count)) }
+}
+
+const (
+	charsPerToken        = 3.5
+	estimatedImageChars  = 4800
+	contextSafetyTokens  = 4096
+	minResponseMaxTokens = 1
+	// minAnswerTokens is always left for the answer when a thinking budget
+	// shares the response ceiling.
+	minAnswerTokens = 1024
+)
+
+// ClampMaxTokensToContext caps a response at the context window left after
+// the estimated prompt and a fixed safety reserve, never below one token.
+func ClampMaxTokensToContext(model *Model, prompt *Context, maxTokens int) int {
+	if model.ContextWindow <= 0 {
+		return max(minResponseMaxTokens, maxTokens)
+	}
+	available := model.ContextWindow - EstimateContextTokens(prompt) - contextSafetyTokens
+	return min(maxTokens, max(minResponseMaxTokens, available))
+}
+
+// EstimateContextTokens estimates prompt tokens at 3.5 characters per token,
+// counting each image as 4800 characters. It is the request-budget heuristic;
+// compaction keeps its own.
+// ponytail: ai messages carry no usage, so this never anchors on the last
+// reported usage like upstream; add it if requests start overflowing.
+func EstimateContextTokens(prompt *Context) int {
+	var tokens int
+	for _, message := range NormalizeContext(prompt).Messages {
+		tokens += estimateMessageTokens(message)
+	}
+	return tokens
+}
+
+func estimateMessageTokens(message Message) int {
+	estimate := func(chars int) int { return int(math.Ceil(float64(chars) / charsPerToken)) }
+	if message.Role == "system" {
+		chars := utf8.RuneCountInString(transcriptText(message.Content))
+		for _, section := range message.Sections {
+			if section != nil {
+				chars += utf8.RuneCountInString(*section)
+			}
+		}
+		tokens := estimate(chars)
+		for _, tools := range []any{message.ToolsAdded, message.ToolsRemoved} {
+			if data, err := json.Marshal(tools); err == nil && string(data) != "null" && string(data) != "[]" {
+				tokens += estimate(utf8.RuneCount(data))
+			}
+		}
+		return tokens
+	}
+	if text, ok := message.Content.(string); ok {
+		return estimate(utf8.RuneCountInString(text))
+	}
+	var chars int
+	for _, block := range message.ContentBlocks() {
+		switch block.Type {
+		case ContentBlockImage:
+			chars += estimatedImageChars
+		case ContentBlockThinking:
+			chars += utf8.RuneCountInString(block.Thinking)
+		case ContentBlockToolCall:
+			chars += utf8.RuneCountInString(block.Name) + utf8.RuneCount(block.Arguments)
+		default:
+			chars += utf8.RuneCountInString(block.Text)
+		}
+	}
+	return estimate(chars)
 }

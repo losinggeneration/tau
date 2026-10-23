@@ -49,18 +49,8 @@ func EntryScannerToMessages(scanner EntryScanner) []*AgentMessage {
 			continue
 		}
 
-		// Only include message entries
-		if entry.Type != "message" && entry.Type != "custom_message" {
-			continue
-		}
-
-		msg, err := ParseAgentMessage(entry.Message)
+		msg, err := parseScannerMessage(entry)
 		if err != nil || msg == nil {
-			continue
-		}
-
-		// Skip tool results - context is in assistant's tool call
-		if msg.Role == RoleTool {
 			continue
 		}
 
@@ -96,9 +86,11 @@ func PrepareCompaction(pathEntries []ScannerEntry, settings Settings) *Preparati
 	if prevCompactionIndex >= 0 {
 		// Get previous summary
 		prevEntry := pathEntries[prevCompactionIndex]
-		compMsg, _ := ParseAgentMessage(prevEntry.Message)
-		if compMsg != nil {
-			previousSummary = compMsg.Summary
+		previousSummary = prevEntry.Summary
+		if previousSummary == "" {
+			if compMsg, err := ParseAgentMessage(prevEntry.Message); err == nil && compMsg != nil {
+				previousSummary = compMsg.Summary
+			}
 		}
 
 		// Find boundary start. Prefer the previous compaction's recorded
@@ -123,9 +115,9 @@ func PrepareCompaction(pathEntries []ScannerEntry, settings Settings) *Preparati
 	var tokensBefore int
 	for i := boundaryStart; i < boundaryEnd; i++ {
 		entry := &pathEntries[i]
-		if entry.Type == "message" || entry.Type == "custom_message" {
-			msg, err := ParseAgentMessage(entry.Message)
-			if err == nil && msg != nil && msg.Role != RoleTool {
+		if entry.Type == "message" || entry.Type == "custom_message" || entry.Type == "branch_summary" {
+			msg, err := parseScannerMessage(entry)
+			if err == nil && msg != nil {
 				tokensBefore += EstimateTokens(msg)
 			}
 		}
@@ -156,9 +148,9 @@ func PrepareCompaction(pathEntries []ScannerEntry, settings Settings) *Preparati
 	var messagesToSummarize []*AgentMessage
 	for i := boundaryStart; i < historyEnd; i++ {
 		entry := &pathEntries[i]
-		if entry.Type == "message" || entry.Type == "custom_message" {
-			msg, err := ParseAgentMessage(entry.Message)
-			if err == nil && msg != nil && msg.Role != RoleTool {
+		if entry.Type == "message" || entry.Type == "custom_message" || entry.Type == "branch_summary" {
+			msg, err := parseScannerMessage(entry)
+			if err == nil && msg != nil {
 				messagesToSummarize = append(messagesToSummarize, msg)
 			}
 		}
@@ -169,13 +161,17 @@ func PrepareCompaction(pathEntries []ScannerEntry, settings Settings) *Preparati
 	if cutPoint.IsSplitTurn && cutPoint.TurnStartIndex >= 0 {
 		for i := boundaryStart + cutPoint.TurnStartIndex; i < firstKeptIndex; i++ {
 			entry := &pathEntries[i]
-			if entry.Type == "message" || entry.Type == "custom_message" {
-				msg, err := ParseAgentMessage(entry.Message)
-				if err == nil && msg != nil && msg.Role != RoleTool {
+			if entry.Type == "message" || entry.Type == "custom_message" || entry.Type == "branch_summary" {
+				msg, err := parseScannerMessage(entry)
+				if err == nil && msg != nil {
 					turnPrefixMessages = append(turnPrefixMessages, msg)
 				}
 			}
 		}
+	}
+
+	if len(messagesToSummarize) == 0 && len(turnPrefixMessages) == 0 {
+		return nil
 	}
 
 	// Extract file operations

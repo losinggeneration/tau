@@ -78,7 +78,7 @@ func (p *geminiCLIProvider) Login(ctx context.Context, callbacks LoginCallbacks)
 
 	callbacks.OnAuth(authURL, "Complete login in your browser. Paste the final redirect URL here if authenticating on another machine.")
 
-	code, _, err := server.WaitForCode(ctx)
+	code, err := waitForAuthorizationCode(ctx, callbacks, server, verifier)
 	if err != nil {
 		return nil, fmt.Errorf("wait for code: %w", err)
 	}
@@ -156,7 +156,7 @@ type TokenInfo struct {
 }
 
 // GetTokenInfo retrieves token information from Google.
-func GetTokenInfo(ctx context.Context, accessToken string) (*TokenInfo, error) {
+func GetTokenInfo(ctx context.Context, accessToken string) (_ *TokenInfo, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://oauth2.googleapis.com/tokeninfo", nil)
 	if err != nil {
 		return nil, err

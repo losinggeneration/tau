@@ -11,4 +11,6 @@ var (
 	ErrCannotContinueAssistant     = errors.New("cannot continue from message role: assistant")
 	ErrCannotContinueNoMessages    = errors.New("cannot continue: no messages in context")
 	ErrCannotContinueFromAssistant = errors.New("cannot continue from assistant message")
+	// ErrListenerPanic wraps a panic recovered from an event listener.
+	ErrListenerPanic = errors.New("agent event listener panicked")
 )

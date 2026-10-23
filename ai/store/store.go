@@ -100,10 +100,17 @@ func OAuthProviderRefreshFuncs(providers ...oauth.Provider) map[string]RefreshFu
 // APIKeyFromCredential converts a stored credential into the bearer/API key
 // expected by the given provider. OAuth credentials are delegated to the
 // provider's GetAPIKey hook so provider-specific formats stay centralized.
-func APIKeyFromCredential(provider string, cred ai.Credential) (string, error) {
+func APIKeyFromCredential(ctx context.Context, provider string, cred ai.Credential) (string, error) {
 	switch cred.Type {
 	case ai.CredentialTypeAPIKey:
-		return cred.APIKey, nil
+		if cred.APIKey == "" {
+			return "", nil
+		}
+		key, err := ai.ResolveConfigValue(ctx, cred.APIKey, cred.Env)
+		if err != nil {
+			return "", fmt.Errorf("resolve stored API key for %s: %w", provider, err)
+		}
+		return key, nil
 	case ai.CredentialTypeOAuth:
 		oauthProvider, ok := oauth.GetProvider(oauth.ProviderID(provider))
 		if !ok {
@@ -138,6 +145,9 @@ func NewMemoryBackend(opts Options) *MemoryBackend {
 // credKey returns the storage key for a provider. Flat auth storage is
 // keyed by provider only — there is no per-account dimension.
 func credKey(provider string) string {
+	if provider == "azure-openai-responses" {
+		return ai.ProviderAzureOpenAI
+	}
 	return provider
 }
 

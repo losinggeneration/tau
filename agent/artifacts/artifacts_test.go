@@ -68,7 +68,7 @@ func TestThemeRegistry(t *testing.T) {
 		assert.GreaterOrEqual(t, len(themes), 1)
 
 		themes = registry.ListByTier(TierBuiltin)
-		assert.Equal(t, 0, len(themes))
+		assert.Equal(t, 1, len(themes))
 	})
 
 	t.Run("Reload", func(t *testing.T) {
@@ -83,7 +83,7 @@ func TestThemeRegistry(t *testing.T) {
 		require.NoError(t, registry.Reload(entries))
 
 		themes := registry.List()
-		assert.Equal(t, 1, len(themes))
+		assert.Equal(t, 2, len(themes))
 
 		_, ok := registry.Get("dark")
 		assert.False(t, ok) // Old entries should be cleared

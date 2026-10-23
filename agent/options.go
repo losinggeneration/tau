@@ -1,6 +1,10 @@
 package agent // import "github.com/losinggeneration/tau/agent"
 
-import "github.com/losinggeneration/tau/ai"
+import (
+	"slices"
+
+	"github.com/losinggeneration/tau/ai"
+)
 
 // Option configures an agent.
 type Option func(*Config)
@@ -173,4 +177,9 @@ func NewConfig(opts ...Option) Config {
 	}
 
 	return cfg
+}
+
+// WithRequestOptions configures provider options for each assistant request.
+func WithRequestOptions(opts ...ai.Option) Option {
+	return func(c *Config) { c.RequestOptions = slices.Clone(opts) }
 }

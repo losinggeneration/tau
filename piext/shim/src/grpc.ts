@@ -90,7 +90,9 @@ export type HostMethod =
 	| "sessionScan"
 	| "sessionSetLabel"
 	| "sessionGetLabel"
-	| "sessionSendUserMessage";
+	| "sessionSendUserMessage"
+	| "sessionSendCustomMessage"
+	| "toolDiscovery";
 
 /** Names of the Plugin service methods. */
 export type PluginMethod =
@@ -100,6 +102,7 @@ export type PluginMethod =
 	| "executeTool"
 	| "executeCommand"
 	| "onTerminalInput"
+	| "routeModel"
 	| "shutdown";
 
 /**

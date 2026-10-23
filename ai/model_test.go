@@ -463,12 +463,22 @@ func TestResolveModelPatterns_ConfiguredExactAndFuzzy(t *testing.T) {
 		DefaultModel:    "gpt-5.4",
 	}
 
-	spec, err := ResolveModelPatterns([]string{"gpt-5.4"}, settings)
+	scoped, err := ResolveModelPatterns([]string{"gpt-5.4"}, settings)
 	if err != nil {
 		t.Fatalf("ResolveModelPatterns exact: %v", err)
 	}
-	if got, want := spec.String(), "openai/gpt-5.4"; got != want {
+	if got, want := scoped.Model.String(), "openai/gpt-5.4"; got != want {
 		t.Fatalf("exact match = %q, want %q", got, want)
+	}
+
+	for _, pattern := range []string{"gpt-5.4:high", "openai/gpt-5.4:high"} {
+		scoped, err = ResolveModelPatterns([]string{pattern}, settings)
+		if err != nil {
+			t.Fatalf("ResolveModelPatterns %q: %v", pattern, err)
+		}
+		if scoped.Model.String() != "openai/gpt-5.4" || scoped.ThinkingLevel != "high" {
+			t.Fatalf("%q = %+v, want openai/gpt-5.4 at high", pattern, scoped)
+		}
 	}
 }
 
@@ -480,11 +490,11 @@ func TestResolveModelPatterns_UsesEnvBackedCandidates(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "sk-env")
 	settings := &Settings{}
 
-	spec, err := ResolveModelPatterns([]string{"gpt-4o"}, settings)
+	scoped, err := ResolveModelPatterns([]string{"gpt-4o"}, settings)
 	if err != nil {
 		t.Fatalf("ResolveModelPatterns env-backed: %v", err)
 	}
-	if got, want := spec.String(), "openai/gpt-4o"; got != want {
+	if got, want := scoped.Model.String(), "openai/gpt-4o"; got != want {
 		t.Fatalf("env-backed match = %q, want %q", got, want)
 	}
 }
@@ -594,14 +604,14 @@ func TestIsAliasModelID(t *testing.T) {
 
 func TestDefaultModelPerProvider(t *testing.T) {
 	// Verify it contains expected entries
-	if DefaultModelPerProvider["anthropic"] != "claude-opus-4-6" {
-		t.Errorf("anthropic default: got %q, want %q", DefaultModelPerProvider["anthropic"], "claude-opus-4-6")
+	if DefaultModelPerProvider["anthropic"] != "claude-opus-4-8" {
+		t.Errorf("anthropic default: got %q, want %q", DefaultModelPerProvider["anthropic"], "claude-opus-4-8")
 	}
-	if DefaultModelPerProvider["openai"] != "gpt-5.4" {
-		t.Errorf("openai default: got %q, want %q", DefaultModelPerProvider["openai"], "gpt-5.4")
+	if DefaultModelPerProvider["openai"] != "gpt-5.5" {
+		t.Errorf("openai default: got %q, want %q", DefaultModelPerProvider["openai"], "gpt-5.5")
 	}
-	if DefaultModelPerProvider["google"] != "gemini-2.5-pro" {
-		t.Errorf("google default: got %q, want %q", DefaultModelPerProvider["google"], "gemini-2.5-pro")
+	if DefaultModelPerProvider["google"] != "gemini-3.1-pro-preview" {
+		t.Errorf("google default: got %q, want %q", DefaultModelPerProvider["google"], "gemini-3.1-pro-preview")
 	}
 
 	// Every default must resolve against the generated registry. A dangling

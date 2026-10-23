@@ -51,6 +51,8 @@ var EnvVarRegistry = map[string]string{
 	ProviderCloudflareWorkersAI: "CLOUDFLARE_API_KEY",
 	ProviderCloudflareAIGateway: "CLOUDFLARE_API_KEY",
 	ProviderXiaomi:              "XIAOMI_API_KEY",
+	ProviderRadius:              "RADIUS_API_KEY",
+	ProviderLlamaCpp:            "LLAMA_API_KEY",
 	ProviderXiaomiTokenPlanCN:   "XIAOMI_TOKEN_PLAN_CN_API_KEY",
 	ProviderXiaomiTokenPlanAMS:  "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
 	ProviderXiaomiTokenPlanSGP:  "XIAOMI_TOKEN_PLAN_SGP_API_KEY",

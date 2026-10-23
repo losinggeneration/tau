@@ -877,3 +877,10 @@ func TestLSToolUsesInjectedLsOps(t *testing.T) {
 		t.Fatal("injected LsOps.Ls was not called")
 	}
 }
+
+func TestToolResultNormalizedContentPreservesExplicitEmptyBlocks(t *testing.T) {
+	result := &ToolResult{Content: "stale", ContentBlocks: []ai.ContentBlock{}}
+	if got := result.NormalizedContent(); got == nil || len(got) != 0 {
+		t.Fatalf("explicit empty content replaced: %+v", got)
+	}
+}

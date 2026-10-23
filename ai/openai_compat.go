@@ -1,12 +1,12 @@
 package ai
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 )
 
 // mapReasoningEffort applies the optional effort mapping.
@@ -40,45 +40,6 @@ func hasOpenRouterRouting(routing *OpenRouterRouting) bool {
 		routing.PreferredMaxLatency != nil
 }
 
-// maybeAddOpenRouterAnthropicCacheControl adds Anthropic-style cache_control
-// to the last text content part when routing through OpenRouter to Anthropic.
-// This enables prompt caching on the Anthropic provider path.
-func maybeAddOpenRouterAnthropicCacheControl(model *Model, messages []map[string]any) {
-	if model.Provider != ProviderOpenRouter || !strings.HasPrefix(model.ID, "anthropic/") {
-		return
-	}
-
-	// Walk backwards from the end to find the last user/assistant message with text
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		role, _ := msg["role"].(string)
-		if role != "user" && role != "assistant" {
-			continue
-		}
-
-		content := msg["content"]
-		switch c := content.(type) {
-		case string:
-			if c != "" {
-				msg["content"] = []map[string]any{
-					{"type": "text", "text": c, "cache_control": map[string]any{"type": "ephemeral"}},
-				}
-				return
-			}
-		case []any:
-			// Find last text part and add cache_control
-			for j := len(c) - 1; j >= 0; j-- {
-				if part, ok := c[j].(map[string]any); ok {
-					if partType, _ := part["type"].(string); partType == "text" {
-						part["cache_control"] = map[string]any{"type": "ephemeral"}
-						return
-					}
-				}
-			}
-		}
-	}
-}
-
 // OpenAICompatProvider handles the shared OpenAI-compatible transport used by
 // several provider families. Support for a provider family still depends on the
 // public support taxonomy rather than this shared implementation alone.
@@ -99,7 +60,13 @@ func (p *OpenAICompatProvider) NewClient(model *Model) (Client, error) {
 
 // openAICompatClient implements Client for OpenAI-compatible providers.
 type openAICompatClient struct {
-	model *Model
+	model         *Model
+	transportOpts *TransportOption
+}
+
+// SetTransportOption implements the SDK's transport option injection interface.
+func (c *openAICompatClient) SetTransportOption(opts TransportOption) {
+	c.transportOpts = &opts
 }
 
 // Capabilities implements CapableProvider.
@@ -116,6 +83,16 @@ func (c *openAICompatClient) Complete(ctx context.Context, model *Model, prompt 
 
 // Stream implements Client.Streamer.
 func (c *openAICompatClient) Stream(ctx context.Context, model *Model, prompt *Context, handler EventHandler, opts ...Option) (err error) {
+	resolvedOptions, resolveErr := resolveRequestOptions(ctx, model, opts)
+	if resolveErr != nil {
+		return resolveErr
+	}
+	opts = resolvedOptions
+	handler = timedEventHandler(handler)
+	if err := ValidateContextLimits(model, prompt); err != nil {
+		return err
+	}
+	prompt = providerContext(prompt)
 	var o options
 	o.apply(opts)
 
@@ -129,7 +106,10 @@ func (c *openAICompatClient) Stream(ctx context.Context, model *Model, prompt *C
 	}
 
 	// Build request body
-	body := buildOpenAICompatRequestBody(model, prompt, &o)
+	body, err := buildOpenAICompatRequestBody(model, prompt, &o)
+	if err != nil {
+		return fmt.Errorf("%s: build request: %w", c.model.Provider, err)
+	}
 	if hasPayloadCallback(&o) {
 		if next := invokePayloadCallback(&o, model, body); next != nil {
 			if replacement, ok := next.(map[string]any); ok {
@@ -143,6 +123,7 @@ func (c *openAICompatClient) Stream(ctx context.Context, model *Model, prompt *C
 		return fmt.Errorf("%s: marshal request: %w", c.model.Provider, err)
 	}
 
+	o.transportOpts = cmp.Or(o.transportOpts, c.transportOpts)
 	resp, err := doOpenAIChatCompletions(ctx, model, &o, transport.withRequestOptions(c.model, &o), string(bodyBytes))
 	if err != nil {
 		return err
@@ -154,12 +135,16 @@ func (c *openAICompatClient) Stream(ctx context.Context, model *Model, prompt *C
 	}()
 
 	// Stream response
-	return streamOpenAIResponseWithAPI(ctx, model, resp.Body, handler, APIOpenAICompatible, c.model.Provider)
+	grammar, err := grammarInputProperties(prompt.Tools, model.GetCompat().SupportsOpenAIGrammarTools)
+	if err != nil {
+		return err
+	}
+	return streamOpenAIResponseWithAPI(ctx, model, resp.Body, handler, grammar, APIOpenAICompatible, c.model.Provider)
 }
 
 // streamOpenAICompatResponse streams the SSE response.
 func streamOpenAICompatResponse(ctx context.Context, model *Model, body io.Reader, handler EventHandler, provider string) error {
-	return streamOpenAIResponseWithAPI(ctx, model, body, handler, APIOpenAICompatible, provider)
+	return streamOpenAIResponseWithAPI(ctx, model, body, handler, nil, APIOpenAICompatible, provider)
 }
 
 // mapOpenAICompatStopReason maps OpenAI finish_reason to StopReason, matching pi-mono's mapStopReason.
@@ -169,144 +154,31 @@ func mapOpenAICompatStopReason(reason string) (StopReason, string) {
 }
 
 // buildOpenAICompatRequestBody builds the request body.
-func buildOpenAICompatRequestBody(model *Model, aiCtx *Context, o *options) map[string]any {
+func buildOpenAICompatRequestBody(model *Model, aiCtx *Context, o *options) (map[string]any, error) {
 	req, err := buildOpenAIChatCompletionsRequest(model, aiCtx, o)
 	if err != nil {
-		// Preserve the old helper's best-effort behavior for callers/tests that use
-		// it as an inspection helper rather than as the actual provider path.
-		req = &openAIRequest{Model: model.ID, Stream: true}
+		return nil, err
 	}
 	return openAIRequestToMap(req)
 }
 
-func openAIRequestToMap(req *openAIRequest) map[string]any {
-	body := map[string]any{
-		"model":    req.Model,
-		"messages": openAIMessagesToMaps(req.Messages),
-		"stream":   req.Stream,
+// openAIRequestToMap renders the request as a map for payload callbacks.
+func openAIRequestToMap(req *openAIRequest) (map[string]any, error) {
+	encoded, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	if len(req.Tools) > 0 {
-		body["tools"] = openAIToolsToMaps(req.Tools)
-	} else if req.Tools != nil {
+	var body map[string]any
+	if err := json.Unmarshal(encoded, &body); err != nil {
+		return nil, fmt.Errorf("decode request: %w", err)
+	}
+	if req.Tools != nil && len(req.Tools) == 0 {
 		body["tools"] = []any{}
 	}
-	if req.Metadata != nil {
-		body["metadata"] = req.Metadata
-	}
-	if req.Store != nil {
-		body["store"] = *req.Store
-	}
-	if req.MaxTokens != 0 {
-		body["max_tokens"] = req.MaxTokens
-	}
-	if req.MaxCompletionTokens != 0 {
-		body["max_completion_tokens"] = req.MaxCompletionTokens
-	}
-	if req.ReasoningEffort != "" {
-		body["reasoning_effort"] = req.ReasoningEffort
-	}
-	if req.EnableThinking != nil {
-		body["enable_thinking"] = *req.EnableThinking
-	}
-	if req.Thinking != nil {
-		thinking := map[string]any{"type": req.Thinking.Type}
-		if req.Thinking.BudgetTokens > 0 {
-			thinking["budget_tokens"] = req.Thinking.BudgetTokens
-		}
-		body["thinking"] = thinking
-	}
-	if len(req.ChatTemplate_kwargs) > 0 {
-		chatTemplate := make(map[string]any, len(req.ChatTemplate_kwargs))
-		for k, v := range req.ChatTemplate_kwargs {
-			chatTemplate[k] = v
-		}
-		body["chat_template_kwargs"] = chatTemplate
-	}
-	if req.Reasoning != nil {
-		body["reasoning"] = map[string]any{"effort": req.Reasoning.Effort}
-	}
-	if req.Provider != nil {
-		body["provider"] = req.Provider
-	}
 	if req.ProviderOptions != nil {
-		body["provider_options"] = req.ProviderOptions
-		body["providerOptions"] = req.ProviderOptions
+		body["providerOptions"] = body["provider_options"]
 	}
-	if req.ToolChoice != nil {
-		body["tool_choice"] = req.ToolChoice
-	}
-	if req.ToolStream {
-		body["tool_stream"] = true
-	}
-	if req.StreamOptions != nil {
-		body["stream_options"] = map[string]bool{"include_usage": req.StreamOptions.IncludeUsage}
-	}
-	return body
-}
-
-func openAIMessagesToMaps(messages []openAIMessage) []map[string]any {
-	result := make([]map[string]any, 0, len(messages))
-	for _, msg := range messages {
-		entry := map[string]any{"role": msg.Role}
-		if msg.Content != nil {
-			entry["content"] = msg.Content
-		}
-		if msg.Name != "" {
-			entry["name"] = msg.Name
-		}
-		if msg.ToolCallID != "" {
-			entry["tool_call_id"] = msg.ToolCallID
-		}
-		if len(msg.ToolCalls) > 0 {
-			entry["tool_calls"] = openAIToolCallsToMaps(msg.ToolCalls)
-		}
-		if len(msg.ReasoningDetails) > 0 {
-			details := make([]any, len(msg.ReasoningDetails))
-			for i, detail := range msg.ReasoningDetails {
-				details[i] = detail
-			}
-			entry["reasoning_details"] = details
-		}
-		result = append(result, entry)
-	}
-	return result
-}
-
-func openAIToolCallsToMaps(toolCalls []toolCall) []map[string]any {
-	result := make([]map[string]any, len(toolCalls))
-	for i, tc := range toolCalls {
-		var args any
-		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			args = tc.Function.Arguments
-		}
-		result[i] = map[string]any{
-			"id":   tc.ID,
-			"type": tc.Type,
-			"function": map[string]any{
-				"name":      tc.Function.Name,
-				"arguments": args,
-			},
-		}
-	}
-	return result
-}
-
-func openAIToolsToMaps(tools []toolDefinition) []map[string]any {
-	result := make([]map[string]any, len(tools))
-	for i, tool := range tools {
-		function := map[string]any{
-			"name":        tool.Function.Name,
-			"description": tool.Function.Description,
-			"parameters":  tool.Function.Parameters,
-		}
-		entry := map[string]any{"type": tool.Type, "function": function}
-		if tool.Function.Strict != nil {
-			entry["strict"] = *tool.Function.Strict
-			function["strict"] = *tool.Function.Strict
-		}
-		result[i] = entry
-	}
-	return result
+	return body, nil
 }
 
 func convertMessagesForOpenAICompat(aiCtx *Context, model *Model, compat *OpenAICompletionsCompat) []map[string]any {
@@ -315,7 +187,18 @@ func convertMessagesForOpenAICompat(aiCtx *Context, model *Model, compat *OpenAI
 	if err != nil {
 		return nil
 	}
-	return openAIMessagesToMaps(messages)
+	body, err := openAIRequestToMap(&openAIRequest{Messages: messages})
+	if err != nil {
+		return nil
+	}
+	items, _ := body["messages"].([]any)
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if entry, ok := item.(map[string]any); ok {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 // convertMessageForOpenAICompat converts a single Message to OpenAI-compatible format.

@@ -2,8 +2,12 @@ package agent // import "github.com/losinggeneration/tau/agent"
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,26 +27,37 @@ type Agent struct {
 	// (ReplaceMessages/Reset) so a running loop can detect and rebase onto it.
 	messagesVersion uint64
 
+	toolRegistryBaseline []Tool
+	toolRegistryChanged  bool
+	pendingActiveTools   []string
+	activeToolsChanged   bool
+
 	// Event listeners
 	listeners      []eventListener
 	nextListenerID int
 
 	// Queues
-	steeringQueue []*Message
-	followUpQueue []*Message
+	steeringQueue         []*Message
+	followUpQueue         []*Message
+	pendingCustomMessages []*Message
 
 	// Control
 	activeRun    *activeRun
+	settlingRuns map[*activeRun]struct{}
 	steeringMode QueueMode
 	followUpMode QueueMode
 }
 
 // activeRun represents an ongoing agent run.
 type activeRun struct {
+	ctx       context.Context
 	promise   chan struct{}
 	abortCtrl context.CancelFunc
+	failCtrl  context.CancelCauseFunc
 	abortCh   chan struct{}
 	aborted   bool
+	// listenerErrs holds recovered listener panics; the first one ends the run.
+	listenerErrs []error
 }
 
 type runExecutor func(ctx context.Context) error
@@ -54,6 +69,27 @@ type eventListener struct {
 
 // New creates a new agent with the given configuration.
 func New(config Config) (*Agent, error) {
+	if initial := config.InitialState; initial != nil {
+		config.Model = initial.Model
+		config.SystemPrompt = initial.SystemPrompt
+		config.InitialMessages = initial.Messages
+		config.Tools = initial.Tools
+		config.ThinkingLevel = initial.ThinkingLevel
+	}
+	if len(config.InitialMessages) > 0 && config.InitialMessages[0] != nil && config.InitialMessages[0].Role == RoleSystem && !config.InitialMessages[0].ExcludeFromContext {
+		config.SystemPrompt = ""
+	}
+
+	if (config.SystemPrompt != "" || len(config.Tools) > 0) && (len(config.InitialMessages) == 0 || config.InitialMessages[0] == nil || config.InitialMessages[0].Role != RoleSystem || config.InitialMessages[0].ExcludeFromContext) {
+		declarations, err := visibleToolDeclarations(config.Tools)
+		if err != nil {
+			return nil, fmt.Errorf("initial tool declarations: %w", err)
+		}
+		baseline := &Message{Role: RoleSystem, Timestamp: time.UnixMilli(0), Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: config.SystemPrompt}}, ToolsAdded: declarations}
+		config.InitialMessages = append([]*Message{baseline}, config.InitialMessages...)
+		config.SystemPrompt = ""
+	}
+
 	// Set defaults
 	if config.ToolExecution == "" {
 		config.ToolExecution = ToolExecutionParallel
@@ -98,95 +134,26 @@ func (a *Agent) convertToLlm(ctx context.Context, messages []*Message) ([]ai.Mes
 	return defaultConvertToLlm(ctx, messages)
 }
 
-// safeConvertToLlm wraps a ConvertToLlmFunc so that internal errors return
-// an empty message list (the spec's safe fallback for the conversion
-// callback). The agent loop relies on this so a buggy user-supplied
-// converter cannot abort the run.
-func safeConvertToLlm(convert ConvertToLlmFunc) ConvertToLlmFunc {
-	if convert == nil {
-		return nil
-	}
-	return func(ctx context.Context, messages []*Message) ([]ai.Message, error) {
-		result, err := convert(ctx, messages)
-		if err != nil {
-			return []ai.Message{}, nil
-		}
-		return result, nil
-	}
-}
-
-// safeTransformContext wraps a TransformContextFunc so that internal
-// errors return the original messages (the spec's safe fallback for the
-// context-transform callback). The agent loop relies on this so a buggy
-// user-supplied transform cannot abort the run.
-func safeTransformContext(transform TransformContextFunc) TransformContextFunc {
-	if transform == nil {
-		return nil
-	}
-	return func(ctx context.Context, messages []*Message) ([]*Message, error) {
-		result, err := transform(ctx, messages)
-		if err != nil {
-			return messages, nil
-		}
-		return result, nil
-	}
-}
-
-// safeAPIKeyProvider wraps a dynamic API-key provider so that internal
-// errors return the empty string (the spec's safe fallback for an
-// absent key). The agent loop relies on this so a buggy user-supplied
-// provider cannot abort the run.
-func safeAPIKeyProvider(provider func(ctx context.Context, providerName string) (string, error)) func(ctx context.Context, providerName string) (string, error) {
-	if provider == nil {
-		return nil
-	}
-	return func(ctx context.Context, providerName string) (string, error) {
-		key, err := provider(ctx, providerName)
-		if err != nil {
-			return "", nil
-		}
-		return key, nil
-	}
-}
-
-// safeMessageSupplier wraps a MessageSupplierFunc (steering or follow-up)
-// so that internal errors return an empty list (the spec's safe fallback
-// for queue providers). The agent loop relies on this so a buggy
-// user-supplied supplier cannot abort the run.
-func safeMessageSupplier(supplier MessageSupplierFunc) MessageSupplierFunc {
-	if supplier == nil {
-		return nil
-	}
-	return func(ctx context.Context) ([]*Message, error) {
-		messages, err := supplier(ctx)
-		if err != nil {
-			return nil, nil
-		}
-		return messages, nil
-	}
-}
-
 // defaultConvertToLlm converts agent messages to LLM format (filters out non-LLM message types).
-func defaultConvertToLlm(_ context.Context, messages []*Message) ([]ai.Message, error) {
+func defaultConvertToLlm(ctx context.Context, messages []*Message) ([]ai.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	result := make([]ai.Message, 0, len(messages))
 	for _, msg := range messages {
-		if msg.ExcludeFromContext {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if msg == nil || msg.ExcludeFromContext {
 			continue
 		}
-		role := string(msg.Role)
-		if msg.Role == RoleTool {
-			role = "toolResult"
-		}
 		switch msg.Role {
-		case RoleUser, RoleAssistant, RoleTool, RoleSystem:
-			result = append(result, ai.Message{
-				Role:       role,
-				Content:    msg.Content,
-				ToolCallID: msg.ToolCallID,
-				ToolName:   msg.ToolName,
-				IsError:    msg.IsError,
-				Timestamp:  msg.Timestamp.UnixMilli(),
-			})
+		case RoleCustom:
+			converted := messageToAI(msg)
+			converted.Role = "user"
+			result = append(result, converted)
+		case RoleUser, RoleAssistant, RoleTool, "toolResult", RoleSystem:
+			result = append(result, messageToAI(msg))
 		}
 	}
 	return result, nil
@@ -212,31 +179,66 @@ func (a *Agent) Subscribe(listener func(event Event, signal <-chan struct{})) (u
 	}
 }
 
-// emit sends an event to all listeners.
-func (a *Agent) emit(event Event) {
+// emit sends an event to all listeners. A panicking listener stops delivery of
+// this event to later listeners.
+func (a *Agent) emit(event Event) error {
 	a.mu.RLock()
-	listeners := a.listeners
-	signal := a.currentAbortSignal()
+	listeners := slices.Clone(a.listeners)
+	var signal <-chan struct{}
+	if a.activeRun != nil {
+		signal = a.activeRun.abortCh
+	}
 	handler := a.handler
 	a.mu.RUnlock()
 
 	if handler != nil {
-		handler(event)
+		if err := callListener(func() { handler(event) }); err != nil {
+			return err
+		}
 	}
 
 	for _, listener := range listeners {
-		listener.fn(event, signal)
-	}
-}
-
-// currentAbortSignal returns the current abort signal if a run is active.
-func (a *Agent) currentAbortSignal() <-chan struct{} {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if a.activeRun != nil {
-		return a.activeRun.abortCh
+		if err := callListener(func() { listener.fn(event, signal) }); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func callListener(fn func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = fmt.Errorf("%w: %w", ErrListenerPanic, e)
+			} else {
+				err = fmt.Errorf("%w: %v", ErrListenerPanic, r)
+			}
+		}
+	}()
+	fn()
+	return nil
+}
+
+// recordListenerFailure ends the active run at its next cancellation boundary.
+// Outside a run, the caller's own publication path reports the error instead.
+func (a *Agent) recordListenerFailure(err error) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	run := a.activeRun
+	if run == nil {
+		return false
+	}
+	run.listenerErrs = append(run.listenerErrs, err)
+	if len(run.listenerErrs) == 1 {
+		run.failCtrl(err)
+	}
+	return true
+}
+
+func (a *Agent) runListenerErrs(run *activeRun) []error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return slices.Clone(run.listenerErrs)
 }
 
 type promptOptions struct {
@@ -302,17 +304,28 @@ func (a *Agent) Continue(ctx context.Context) error {
 		return ErrAlreadyProcessing
 	}
 
+	if err := ctx.Err(); err != nil {
+		a.mu.Unlock()
+		return errors.Join(err, context.Cause(ctx))
+	}
+
 	// Failed/aborted assistant messages are never replayed to the model, so
 	// a run that ended on one resumes from the message before it.
 	for n := len(a.state.Messages); n > 0; n = len(a.state.Messages) {
 		last := a.state.Messages[n-1]
+		if last == nil {
+			a.state.Messages = a.state.Messages[:n-1]
+			continue
+		}
 		if last.Role != RoleAssistant || (last.StopReason != ai.StopReasonError && last.StopReason != ai.StopReasonAborted) {
 			break
 		}
 		a.state.Messages = a.state.Messages[:n-1]
 	}
 
-	if len(a.state.Messages) == 0 {
+	if len(a.state.Messages) == 0 || !slices.ContainsFunc(a.state.Messages, func(message *Message) bool {
+		return message != nil && message.Role != RoleSystem
+	}) {
 		a.mu.Unlock()
 		return ErrNoMessagesToContinue
 	}
@@ -356,6 +369,75 @@ func (a *Agent) FollowUp(msg *Message) {
 	a.followUpQueue = append(a.followUpQueue, msg)
 }
 
+// AppendCustomMessage appends context without starting a provider request. During a
+// run, delivery waits until the current assistant turn and its tools finish.
+func (a *Agent) AppendCustomMessage(ctx context.Context, message *Message) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("append custom message: %w", err)
+	}
+	if message == nil || message.Role != RoleCustom {
+		return errors.New("append custom message: custom role required")
+	}
+	a.mu.Lock()
+	if a.activeRun != nil {
+		a.pendingCustomMessages = append(a.pendingCustomMessages, message)
+		a.mu.Unlock()
+		return nil
+	}
+	a.state.Messages = append(a.state.Messages, message)
+	a.messagesVersion++
+	a.mu.Unlock()
+	if err := a.emitCustomMessages([]*Message{message}); err != nil {
+		return fmt.Errorf("append custom message: %w", err)
+	}
+	return nil
+}
+
+// QueueCustomMessage admits context only while a run owns the turn boundary.
+// A false result leaves delivery to the caller's idle publication path.
+func (a *Agent) QueueCustomMessage(ctx context.Context, message *Message) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("queue custom message: %w", err)
+	}
+	if message == nil || message.Role != RoleCustom {
+		return false, errors.New("queue custom message: custom role required")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeRun == nil {
+		return false, nil
+	}
+	a.pendingCustomMessages = append(a.pendingCustomMessages, message)
+	return true, nil
+}
+
+func (a *Agent) flushCustomMessages() {
+	a.mu.Lock()
+	messages := a.takeCustomMessagesLocked()
+	a.mu.Unlock()
+	if err := a.emitCustomMessages(messages); err != nil {
+		a.recordListenerFailure(err)
+	}
+}
+
+func (a *Agent) takeCustomMessagesLocked() []*Message {
+	messages := a.pendingCustomMessages
+	a.pendingCustomMessages = nil
+	if len(messages) > 0 {
+		a.state.Messages = append(a.state.Messages, messages...)
+		a.messagesVersion++
+	}
+	return messages
+}
+
+func (a *Agent) emitCustomMessages(messages []*Message) error {
+	var errs []error
+	for _, message := range messages {
+		errs = append(errs, a.emit(MessageStart{Message: message}), a.emit(MessageEnd{Message: message}))
+	}
+	return errors.Join(errs...)
+}
+
 // ClearSteeringQueue removes all queued steering messages.
 func (a *Agent) ClearSteeringQueue() {
 	a.mu.Lock()
@@ -391,6 +473,13 @@ func (a *Agent) QueueSizes() (steering, followUp int) {
 	return len(a.steeringQueue), len(a.followUpQueue)
 }
 
+// PeekQueuedMessages returns queue snapshots without consuming pending messages.
+func (a *Agent) PeekQueuedMessages() (steering, followUp []*Message) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return slicesClone(a.steeringQueue), slicesClone(a.followUpQueue)
+}
+
 // Signal returns the active abort signal for the current run, if any.
 func (a *Agent) Signal() <-chan struct{} {
 	a.mu.RLock()
@@ -418,20 +507,55 @@ func (a *Agent) Abort() {
 
 // WaitForIdle blocks until the current run finishes.
 func (a *Agent) WaitForIdle() {
-	a.mu.RLock()
-	promise := a.activeRun
-	a.mu.RUnlock()
-
-	if promise != nil {
-		<-promise.promise
+	for {
+		a.mu.RLock()
+		run := a.activeRun
+		if run == nil {
+			for settling := range a.settlingRuns {
+				run = settling
+				break
+			}
+		}
+		a.mu.RUnlock()
+		if run == nil {
+			return
+		}
+		<-run.promise
 	}
 }
 
-// Reset clears transcript state, runtime state, and queued messages.
-func (a *Agent) Reset() {
+// Reset clears transcript state, runtime state, and queued messages when idle.
+func (a *Agent) Reset() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.activeRun != nil {
+		return ErrAlreadyProcessing
+	}
+	var transcript []ai.Message
+	for _, message := range a.state.Messages {
+		if message != nil && message.Role == RoleSystem && !message.ExcludeFromContext {
+			transcript = append(transcript, messageToAI(message))
+		}
+	}
 	a.state.Messages = nil
+	if baseline := ai.CurrentSystemMessage(transcript); baseline != nil {
+		// Keep removals relative to the separate executor registry across reset.
+		removed := make(map[string]bool)
+		for _, message := range transcript {
+			for _, tool := range message.ToolsRemoved {
+				removed[tool.Name] = true
+			}
+			for _, tool := range message.ToolsAdded {
+				delete(removed, tool.Name)
+			}
+		}
+		var removals []ai.ToolReference
+		for name := range removed {
+			removals = append(removals, ai.ToolReference{Name: name})
+		}
+		slices.SortFunc(removals, func(a, b ai.ToolReference) int { return strings.Compare(a.Name, b.Name) })
+		a.state.Messages = []*Message{{Role: RoleSystem, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: baseline.Content.(string)}}, Sections: baseline.Sections, ToolsAdded: baseline.ToolsAdded, ToolsRemoved: removals, Timestamp: time.UnixMilli(baseline.Timestamp)}}
+	}
 	a.messagesVersion++
 	a.state.IsStreaming = false
 	a.state.StreamingMessage = nil
@@ -440,13 +564,18 @@ func (a *Agent) Reset() {
 	a.state.ErrorMessage = ""
 	a.steeringQueue = nil
 	a.followUpQueue = nil
+	a.pendingCustomMessages = nil
+	return nil
 }
 
 // State returns the current agent state.
 func (a *Agent) State() State {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return *a.state.Clone()
+	state := a.state.Clone()
+	transcript := ai.NormalizeContext(&ai.Context{SystemPrompt: state.SystemPrompt, Messages: ConvertMessagesToAI(state.Messages)})
+	state.SystemPrompt = ai.CurrentSystemPrompt(transcript.Messages)
+	return *state
 }
 
 // Messages returns a copy of messages.
@@ -532,44 +661,73 @@ func (a *Agent) runContinuation(ctx context.Context) error {
 	})
 }
 
-func (a *Agent) runWithLifecycle(ctx context.Context, exec runExecutor) error {
-	runCtx, run := a.beginRun(ctx)
+func (a *Agent) runWithLifecycle(ctx context.Context, exec runExecutor) (runErr error) {
+	runCtx, run, err := a.beginRun(ctx)
+	if err != nil {
+		return err
+	}
 
-	var runErr error
 	defer func() {
-		a.finishRun(run, runErr)
+		runErr = errors.Join(runErr, a.finishRun(run, runErr))
 	}()
 
 	runErr = exec(runCtx)
-	if runErr != nil {
-		a.emitRunFailure(runErr)
+	if listenerErrs := a.runListenerErrs(run); len(listenerErrs) > 0 {
+		// A listener failure cancels the run to stop the loop; that
+		// cancellation is not a user abort, so only other loop errors are kept.
+		if runErr != nil && !errors.Is(runErr, context.Canceled) {
+			listenerErrs = append(listenerErrs, runErr)
+		}
+		runErr = errors.Join(listenerErrs...)
+	} else if runErr != nil {
+		if err := runCtx.Err(); err != nil {
+			runErr = errors.Join(runErr, err, context.Cause(runCtx))
+		}
+	}
+	if runErr == nil {
+		return nil
 	}
 
+	failed := len(a.runListenerErrs(run))
+	a.emitRunFailure(runCtx, runErr)
+	if later := a.runListenerErrs(run)[failed:]; len(later) > 0 {
+		runErr = errors.Join(append([]error{runErr}, later...)...)
+	}
 	return runErr
 }
 
-func (a *Agent) beginRun(ctx context.Context) (context.Context, *activeRun) {
-	runCtx, abortCtrl := context.WithCancel(ctx)
+func (a *Agent) beginRun(ctx context.Context) (context.Context, *activeRun, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeRun != nil {
+		return nil, nil, ErrAlreadyProcessing
+	}
+	runCtx, cancel := context.WithCancelCause(ctx)
 	run := &activeRun{
+		ctx:       runCtx,
 		promise:   make(chan struct{}),
-		abortCtrl: abortCtrl,
+		abortCtrl: func() { cancel(nil) },
+		failCtrl:  cancel,
 		abortCh:   make(chan struct{}),
 	}
 
-	a.mu.Lock()
 	a.activeRun = run
 	a.state.IsStreaming = true
 	a.state.StreamingMessage = nil
 	a.state.Error = nil
 	a.state.ErrorMessage = ""
 	a.state.PendingToolIDs = make(map[string]struct{})
-	a.mu.Unlock()
 
-	return runCtx, run
+	return runCtx, run, nil
 }
 
-func (a *Agent) finishRun(run *activeRun, runErr error) {
+func (a *Agent) finishRun(run *activeRun, runErr error) (err error) {
 	a.mu.Lock()
+	messages := a.takeCustomMessagesLocked()
+	if a.settlingRuns == nil {
+		a.settlingRuns = make(map[*activeRun]struct{})
+	}
+	a.settlingRuns[run] = struct{}{}
 	a.activeRun = nil
 	a.state.IsStreaming = false
 	a.state.StreamingMessage = nil
@@ -578,10 +736,34 @@ func (a *Agent) finishRun(run *activeRun, runErr error) {
 		a.state.Error = runErr
 		a.state.ErrorMessage = runErr.Error()
 	}
+	sessionID := a.state.SessionID
 	a.mu.Unlock()
 
-	close(run.promise)
-	run.abortCtrl()
+	defer func() {
+		a.mu.Lock()
+		delete(a.settlingRuns, run)
+		close(run.promise)
+		a.mu.Unlock()
+	}()
+	defer run.abortCtrl()
+	if err = a.emitCustomMessages(messages); err != nil {
+		a.mu.Lock()
+		a.state.Error = errors.Join(a.state.Error, err)
+		a.state.ErrorMessage = a.state.Error.Error()
+		a.mu.Unlock()
+	}
+	if a.config.EventDispatcher != nil {
+		payload, marshalErr := json.Marshal(map[string]any{"aborted": errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)})
+		if marshalErr != nil {
+			a.mu.Lock()
+			a.state.Error = marshalErr
+			a.state.ErrorMessage = marshalErr.Error()
+			a.mu.Unlock()
+			return err
+		}
+		a.config.EventDispatcher(run.ctx, "agent_settled", payload, sessionID)
+	}
+	return err
 }
 
 // slicesClone clones a slice of messages.
@@ -595,6 +777,8 @@ func slicesClone[T any](s []T) []T {
 }
 
 func (a *Agent) createContextSnapshot() *AgentContext {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return &AgentContext{
 		Model:           a.state.Model,
 		SystemPrompt:    a.state.SystemPrompt,
@@ -607,6 +791,8 @@ func (a *Agent) createContextSnapshot() *AgentContext {
 }
 
 func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform TransformContextFunc, systemAddendum string) AgentLoopConfig {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	skipInitial := skipInitialSteeringPoll
 	mergedAddendum := a.config.SystemAddendum
 	if systemAddendum != "" {
@@ -618,16 +804,24 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform Transfo
 	}
 
 	return AgentLoopConfig{
-		Model:            a.state.Model,
-		ClientFactory:    a.config.ClientFactory,
-		StreamFn:         a.config.StreamFn,
-		ConvertToLlm:     safeConvertToLlm(a.convertToLlm),
-		SystemAddendum:   mergedAddendum,
-		GetAPIKey:        safeAPIKeyProvider(a.config.APIKeyProvider),
-		TransformContext: safeTransformContext(composeTransforms(transform, a.config.TransformContext)),
-		OnPayload:        a.config.OnPayload,
-		OnResponse:       a.config.OnResponse,
-		ToolExecution:    a.config.ToolExecution,
+		deferFailureEnd:       true,
+		GetStartupMessages:    a.config.GetStartupMessages,
+		RequestOptions:        slices.Clone(a.config.RequestOptions),
+		FlushContextMessages:  a.flushCustomMessages,
+		PrepareNextTurn:       a.config.PrepareNextTurn,
+		OnProviderStreamEvent: a.config.OnProviderStreamEvent,
+		FinishTurn:            a.config.FinishTurn,
+		PrepareRequest:        a.prepareRequest,
+		Model:                 a.state.Model,
+		ClientFactory:         a.config.ClientFactory,
+		StreamFn:              a.config.StreamFn,
+		ConvertToLlm:          a.convertToLlm,
+		SystemAddendum:        mergedAddendum,
+		GetAPIKey:             a.config.APIKeyProvider,
+		TransformContext:      composeTransforms(transform, a.config.TransformContext),
+		OnPayload:             a.config.OnPayload,
+		OnResponse:            a.config.OnResponse,
+		ToolExecution:         a.config.ToolExecution,
 		BeforeToolCall: func(callCtx context.Context, ctx ToolCallContext) (BeforeToolCallResult, error) {
 			if a.config.BeforeToolCall == nil {
 				return BeforeToolCallResult{}, nil
@@ -646,20 +840,26 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform Transfo
 		SessionID:       a.state.SessionID,
 		APIKey:          "",
 		MaxRetryDelayMs: a.config.MaxRetryDelayMs,
-		GetSteeringMessages: safeMessageSupplier(func(ctx context.Context) ([]*Message, error) {
+		GetSteeringMessages: func(ctx context.Context) ([]*Message, error) {
 			if skipInitial {
 				skipInitial = false
 				return nil, nil
 			}
 			a.mu.Lock()
 			defer a.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return a.drainSteering(), nil
-		}),
-		GetFollowUpMessages: safeMessageSupplier(func(ctx context.Context) ([]*Message, error) {
+		},
+		GetFollowUpMessages: func(ctx context.Context) ([]*Message, error) {
 			a.mu.Lock()
 			defer a.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return a.drainFollowUp(), nil
-		}),
+		},
 		RebasedMessages: func(seenVersion uint64) ([]*Message, uint64, bool) {
 			a.mu.Lock()
 			defer a.mu.Unlock()
@@ -676,17 +876,20 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform Transfo
 }
 
 // emitRunFailure emits run failure events and adds the failure message to state.Messages.
-func (a *Agent) emitRunFailure(err error) {
+func (a *Agent) emitRunFailure(ctx context.Context, err error) {
 	stopReason := ai.StopReasonError
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		stopReason = ai.StopReasonAborted
 	}
 	var apiName, providerName, modelID string
+	a.mu.RLock()
 	if a.state.Model != nil {
 		apiName = a.state.Model.API
 		providerName = a.state.Model.Provider
 		modelID = a.state.Model.ID
 	}
+	config := AgentLoopConfig{EventDispatcher: a.config.EventDispatcher, SessionID: a.state.SessionID}
+	a.mu.RUnlock()
 
 	msg := &Message{
 		Role:         RoleAssistant,
@@ -701,12 +904,26 @@ func (a *Agent) emitRunFailure(err error) {
 	}
 
 	a.mu.Lock()
-	a.state.Messages = append(a.state.Messages, msg)
 	a.state.Error = err
 	a.state.ErrorMessage = err.Error()
 	a.mu.Unlock()
 
-	a.processEvent(AgentEnd{Messages: []*Message{msg}})
+	emit := withPluginEventDispatch(ctx, config, a.processEvent)
+	var published *publishedStreamFailure
+	if errors.As(err, &published) {
+		msg = published.message
+	} else {
+		emit(MessageStart{Message: msg})
+		emit(MessageEnd{Message: msg})
+	}
+	emit(TurnEnd{Message: msg})
+	if config.EventDispatcher != nil {
+		config.EventDispatcher(ctx, "turn_end", nil, config.SessionID)
+	}
+	emit(AgentEnd{Messages: []*Message{msg}})
+	if config.EventDispatcher != nil {
+		config.EventDispatcher(ctx, "agent_end", nil, config.SessionID)
+	}
 }
 
 func composeTransforms(primary, secondary TransformContextFunc) TransformContextFunc {
@@ -723,6 +940,9 @@ func composeTransforms(primary, secondary TransformContextFunc) TransformContext
 			return nil, err
 		}
 
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return secondary(ctx, transformed)
 	}
 }
@@ -741,9 +961,6 @@ func (a *Agent) processEvent(event Event) {
 		a.state.StreamingMessage = e.Message
 	case MessageEnd:
 		if e.Message != nil {
-			if e.Message.Role == RoleAssistant && isEmptyAssistantResponse(e.Message) {
-				break
-			}
 			a.state.Messages = append(a.state.Messages, e.Message)
 			if e.Message.Role == RoleAssistant {
 				a.state.StreamingMessage = nil
@@ -757,13 +974,16 @@ func (a *Agent) processEvent(event Event) {
 	}
 	a.mu.Unlock()
 
-	a.emit(event)
+	if err := a.emit(event); err != nil {
+		a.recordListenerFailure(err)
+	}
 }
 
 // AddTools adds tools to the agent.
 func (a *Agent) AddTools(tools ...Tool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.markToolRegistryChange()
 	a.state.Tools = append(a.state.Tools, tools...)
 }
 
@@ -778,14 +998,166 @@ func (a *Agent) SetModel(model *ai.Model) {
 func (a *Agent) SetTools(tools ...Tool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.markToolRegistryChange()
 	a.state.Tools = append([]Tool(nil), tools...)
+	if a.activeToolsChanged {
+		a.pendingActiveTools = slices.DeleteFunc(a.pendingActiveTools, func(name string) bool {
+			return !slices.ContainsFunc(tools, func(tool Tool) bool { return tool.Name == name && modelDeclarable(tool) })
+		})
+	}
+}
+
+func (a *Agent) markToolRegistryChange() {
+	if !a.toolRegistryChanged {
+		a.toolRegistryBaseline = slices.Clone(a.state.Tools)
+		a.toolRegistryChanged = true
+	}
+}
+
+func (a *Agent) prepareRequest(ctx context.Context, request PrepareRequestContext) (*AgentRequestUpdate, error) {
+	var update *AgentRequestUpdate
+	if a.config.PrepareRequest != nil {
+		var err error
+		update, err = a.config.PrepareRequest(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	current := request.Context
+	if update != nil && update.Context != nil {
+		current = update.Context
+	}
+	a.mu.Lock()
+	tools := slices.Clone(a.state.Tools)
+	if update != nil && update.Context != nil {
+		tools = slices.Clone(current.Tools)
+	}
+	var delta *Message
+	if a.toolRegistryChanged {
+		before, err := visibleToolDeclarations(a.toolRegistryBaseline)
+		if err != nil {
+			a.mu.Unlock()
+			return nil, fmt.Errorf("previous tool registry: %w", err)
+		}
+		after, err := requestToolDeclarations(tools, current.Messages)
+		if err != nil {
+			a.mu.Unlock()
+			return nil, fmt.Errorf("updated tool registry: %w", err)
+		}
+		delta = &Message{Role: RoleSystem, Timestamp: time.Now()}
+		for _, old := range before {
+			if !slices.ContainsFunc(after, func(tool ai.Tool) bool { return tool.Name == old.Name }) {
+				delta.ToolsRemoved = append(delta.ToolsRemoved, ai.ToolReference{Name: old.Name})
+			}
+		}
+		hasHistory := hasToolDeclarationHistory(current.Messages)
+		baseline := ai.CurrentSystemMessage(ConvertMessagesToAI(current.Messages))
+		removed := make(map[string]bool)
+		for _, message := range current.Messages {
+			if message == nil || message.Role != RoleSystem || message.ExcludeFromContext {
+				continue
+			}
+			for _, tool := range message.ToolsRemoved {
+				removed[tool.Name] = true
+			}
+			for _, tool := range message.ToolsAdded {
+				delete(removed, tool.Name)
+			}
+		}
+		for _, next := range after {
+			if removed[next.Name] {
+				continue
+			}
+			index := slices.IndexFunc(before, func(tool ai.Tool) bool { return tool.Name == next.Name })
+			declaredIndex := -1
+			if baseline != nil {
+				declaredIndex = slices.IndexFunc(baseline.ToolsAdded, func(tool ai.Tool) bool { return tool.Name == next.Name })
+			}
+			if !hasHistory || index < 0 || (declaredIndex >= 0 && !reflect.DeepEqual(baseline.ToolsAdded[declaredIndex], next)) {
+				delta.ToolsAdded = append(delta.ToolsAdded, next)
+			}
+		}
+	}
+
+	if a.activeToolsChanged {
+		// An explicit loadout replaces registration defaults from this boundary.
+		delta = &Message{Role: RoleSystem, Timestamp: time.Now()}
+		baseline := ai.CurrentSystemMessage(ConvertMessagesToAI(current.Messages))
+		if baseline != nil {
+			for _, old := range baseline.ToolsAdded {
+				if !slices.Contains(a.pendingActiveTools, old.Name) {
+					delta.ToolsRemoved = append(delta.ToolsRemoved, ai.ToolReference{Name: old.Name})
+				}
+			}
+		}
+		for _, name := range a.pendingActiveTools {
+			for _, tool := range tools {
+				if tool.Name == name && modelDeclarable(tool) {
+					declaration, err := agentToolToAITool(tool)
+					if err != nil {
+						a.mu.Unlock()
+						return nil, fmt.Errorf("activate tool: %w", err)
+					}
+					delta.ToolsAdded = append(delta.ToolsAdded, declaration)
+				}
+			}
+		}
+		a.activeToolsChanged = false
+		a.pendingActiveTools = nil
+	}
+	a.toolRegistryChanged = false
+	a.toolRegistryBaseline = nil
+	a.mu.Unlock()
+	snapshot := *current
+	snapshot.Tools = tools
+	if update == nil {
+		update = &AgentRequestUpdate{}
+	}
+	if delta != nil && (len(delta.ToolsAdded) > 0 || len(delta.ToolsRemoved) > 0) {
+		update.Messages = append(update.Messages, delta)
+	}
+	update.Context = &snapshot
+	return update, nil
+}
+
+func visibleToolDeclarations(tools []Tool) ([]ai.Tool, error) {
+	var declarations []ai.Tool
+	for _, tool := range tools {
+		if (tool.DefaultActive != nil && !*tool.DefaultActive) || (tool.Exposure != "" && tool.Exposure != ToolDirect && tool.Exposure != ToolModelOnly) {
+			continue
+		}
+		declaration, err := agentToolToAITool(tool)
+		if err != nil {
+			return nil, fmt.Errorf("tool %s: %w", tool.Name, err)
+		}
+		declarations = append(declarations, declaration)
+	}
+	return declarations, nil
 }
 
 // SetSystemPrompt sets the system prompt.
 func (a *Agent) SetSystemPrompt(prompt string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.state.SystemPrompt = prompt
+	for i, message := range a.state.Messages {
+		if message == nil || message.Role != RoleSystem || message.ExcludeFromContext {
+			continue
+		}
+		replacement := *message
+		replacement.Content = nil
+		replacement.Sections = nil
+		a.state.Messages[i] = &replacement
+	}
+	a.state.SystemPrompt = ""
+	a.state.Messages = append(a.state.Messages, &Message{
+		Role:      RoleSystem,
+		Content:   []ai.ContentBlock{{Type: ai.ContentBlockText, Text: prompt}},
+		Timestamp: time.Now(),
+	})
+	a.messagesVersion++
 }
 
 // SetThinkingLevel sets the thinking level.
@@ -799,7 +1171,22 @@ func (a *Agent) SetThinkingLevel(level ThinkingLevel) {
 func (a *Agent) ReplaceMessages(messages []*Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if len(a.state.Messages) > 0 && a.state.Messages[0] != nil && a.state.Messages[0].Role == RoleSystem {
+		a.state.SystemPrompt = ai.CurrentSystemPrompt(ConvertMessagesToAI(a.state.Messages[:1]))
+	}
 	a.state.Messages = slicesClone(messages)
+	if len(messages) > 0 && messages[0] != nil && messages[0].Role == RoleSystem && !messages[0].ExcludeFromContext {
+		a.state.SystemPrompt = ""
+	}
+	a.messagesVersion++
+}
+
+// RestoreMessages installs a persisted branch without inheriting in-memory prompt state.
+func (a *Agent) RestoreMessages(messages []*Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.Messages = slices.Clone(messages)
+	a.state.SystemPrompt = ""
 	a.messagesVersion++
 }
 
@@ -822,4 +1209,25 @@ func Complete(ctx context.Context, prompt string, tools ...Tool) (*State, error)
 
 	state := agent.State()
 	return &state, nil
+}
+
+// SetThinkingBudgets replaces per-level thinking budgets for future turns.
+func (a *Agent) SetThinkingBudgets(budgets *ai.ThinkingBudgets) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.config.ThinkingBudgets = budgets
+}
+
+// SetTransport sets the preferred provider transport for subsequent runs.
+func (a *Agent) SetTransport(transport ai.Transport) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.config.Transport = transport
+}
+
+// SetRequestOptions replaces provider options for subsequent agent runs.
+func (a *Agent) SetRequestOptions(opts ...ai.Option) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.config.RequestOptions = slices.Clone(opts)
 }

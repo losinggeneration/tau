@@ -158,17 +158,13 @@ func SerializeConversation(messages []LLMMessage) string {
 			}
 
 		case "assistant":
-			var textParts, thinkingParts, toolCalls []string
+			var textParts, toolCalls []string
 
 			for _, block := range msg.Content {
 				switch block.Type {
 				case "text":
 					if block.Text != "" {
 						textParts = append(textParts, block.Text)
-					}
-				case "thinking":
-					if block.Thinking != "" {
-						thinkingParts = append(thinkingParts, block.Thinking)
 					}
 				case "toolCall":
 					if block.Name != "" {
@@ -178,9 +174,6 @@ func SerializeConversation(messages []LLMMessage) string {
 				}
 			}
 
-			if len(thinkingParts) > 0 {
-				parts = append(parts, fmt.Sprintf("[Assistant thinking]: %s", strings.Join(thinkingParts, "\n")))
-			}
 			if len(textParts) > 0 {
 				parts = append(parts, fmt.Sprintf("[Assistant]: %s", strings.Join(textParts, "\n")))
 			}

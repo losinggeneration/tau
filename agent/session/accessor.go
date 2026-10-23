@@ -307,16 +307,6 @@ func (s *SessionStoreAccessor) GetSessionName(ctx context.Context, sessionID str
 // position_change entry. New entries will be children of that entry.
 // This is equivalent to TypeScript's SessionManager.branch().
 func (s *SessionStoreAccessor) Branch(ctx context.Context, sessionID string, branchFromID string) error {
-	// First verify the entry exists
-	r, err := s.storage.Open(sessionID)
-	if err != nil {
-		return fmt.Errorf("open session: %w", err)
-	}
-
-	if r.FindByID(branchFromID) == nil && branchFromID != r.Header().ID {
-		return fmt.Errorf("entry %q not found", branchFromID)
-	}
-
 	return s.storage.BranchTo(sessionID, branchFromID)
 }
 

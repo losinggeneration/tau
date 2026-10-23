@@ -8,7 +8,9 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -49,7 +51,8 @@ type authCredential struct {
 	Type ai.CredentialType `json:"type"`
 
 	// api_key
-	Key string `json:"key,omitempty"`
+	Key string            `json:"key,omitempty"`
+	Env map[string]string `json:"env,omitempty"`
 
 	// oauth (Pi-compatible field names and millisecond expiry)
 	Access    string         `json:"access,omitempty"`
@@ -70,6 +73,7 @@ func credentialToAuthCredential(cred ai.Credential) authCredential {
 	switch cred.Type {
 	case ai.CredentialTypeAPIKey:
 		out.Key = cred.APIKey
+		out.Env = cred.Env
 	case ai.CredentialTypeOAuth:
 		out.Access = cred.AccessToken
 		out.Refresh = cred.RefreshToken
@@ -89,6 +93,7 @@ func authCredentialToCredential(wire authCredential) ai.Credential {
 	switch wire.Type {
 	case ai.CredentialTypeAPIKey:
 		cred := ai.NewAPIKeyCredential(wire.Key)
+		cred.Env = wire.Env
 		cred.NeedsReauth = wire.NeedsReauth
 		return cred
 	case ai.CredentialTypeOAuth:
@@ -189,13 +194,13 @@ func (f *FileBackend) Get(ctx context.Context, provider string) (ai.Credential, 
 	if err != nil {
 		if isErrCredentialNeedsReauth(err) {
 			cred.NeedsReauth = true
-			_ = f.writeCredential(key, cred)
+			_ = f.writeCredential(ctx, key, cred)
 			return cred, err
 		}
 		return cred, fmt.Errorf("refresh %s: %w", key, err)
 	}
 
-	if writeErr := f.writeCredential(key, refreshed); writeErr != nil {
+	if writeErr := f.writeCredential(ctx, key, refreshed); writeErr != nil {
 		return refreshed, fmt.Errorf("persist refreshed credential: %w", writeErr)
 	}
 
@@ -203,19 +208,22 @@ func (f *FileBackend) Get(ctx context.Context, provider string) (ai.Credential, 
 }
 
 // Set stores a credential.
-func (f *FileBackend) Set(_ context.Context, provider string, cred ai.Credential) error {
-	return f.writeCredential(credKey(provider), cred)
+func (f *FileBackend) Set(ctx context.Context, provider string, cred ai.Credential) error {
+	return f.writeCredential(ctx, credKey(provider), cred)
 }
 
 // Delete removes a credential.
-func (f *FileBackend) Delete(_ context.Context, provider string) error {
+func (f *FileBackend) Delete(ctx context.Context, provider string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := os.Stat(f.path); os.IsNotExist(err) {
 		return nil
 	}
 	// Routed through mutate for the same reason Set is: deleting one key by
 	// rewriting the whole map from a stale read drops every credential another
 	// process added in the meantime.
-	return f.mutate(func(af authFile) {
+	return f.mutate(ctx, func(af authFile) {
 		delete(af, credKey(provider))
 	})
 }
@@ -277,7 +285,7 @@ func (f *FileBackend) RefreshOAuth(ctx context.Context, provider string, oauthPr
 		// Check for terminal error
 		if isErrCredentialNeedsReauth(err) {
 			cred.NeedsReauth = true
-			_ = f.writeCredential(key, cred)
+			_ = f.writeCredential(ctx, key, cred)
 			return cred, ai.ErrCredentialNeedsReauth{Provider: provider}
 		}
 		return cred, fmt.Errorf("refresh %s: %w", key, err)
@@ -285,7 +293,7 @@ func (f *FileBackend) RefreshOAuth(ctx context.Context, provider string, oauthPr
 
 	// Convert back and store
 	cred = CredentialFromOAuth(refreshed)
-	if err := f.writeCredential(key, cred); err != nil {
+	if err := f.writeCredential(ctx, key, cred); err != nil {
 		return cred, fmt.Errorf("persist refreshed credential: %w", err)
 	}
 
@@ -308,8 +316,8 @@ func (f *FileBackend) readCredential(key string) (ai.Credential, error) {
 	return authCredentialToCredential(cred), nil
 }
 
-func (f *FileBackend) writeCredential(key string, cred ai.Credential) error {
-	return f.mutate(func(af authFile) {
+func (f *FileBackend) writeCredential(ctx context.Context, key string, cred ai.Credential) error {
+	return f.mutate(ctx, func(af authFile) {
 		af[key] = credentialToAuthCredential(cred)
 	})
 }
@@ -322,7 +330,10 @@ func (f *FileBackend) writeCredential(key string, cred ai.Credential) error {
 // finishes second erases the other's credential. Re-reading from disk under the
 // lock (rather than from cache) is the other half — a cached copy taken before
 // the lock was acquired is exactly the stale base that causes the loss.
-func (f *FileBackend) mutate(fn func(authFile)) error {
+func (f *FileBackend) mutate(ctx context.Context, fn func(authFile)) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -330,11 +341,15 @@ func (f *FileBackend) mutate(fn func(authFile)) error {
 		return fmt.Errorf("ensure auth dir: %w", err)
 	}
 
-	unlock, err := f.lockForWrite()
+	unlock, err := f.lockForWrite(ctx)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer func() {
+		if closeErr := unlock(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 
 	af, err := f.readFileFromDisk()
 	if err != nil {
@@ -345,17 +360,48 @@ func (f *FileBackend) mutate(fn func(authFile)) error {
 	}
 
 	fn(af)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return f.writeFileLocked(af)
 }
 
 // lockForWrite acquires the advisory lock that coordinates writers across
 // processes. The returned func releases it.
-func (f *FileBackend) lockForWrite() (func(), error) {
+func (f *FileBackend) lockForWrite(ctx context.Context) (func() error, error) {
 	fl := flock.New(f.path + ".lock")
-	if err := fl.Lock(); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := acquireCredentialLock(ctx, runtime.GOOS, func() error {
+		_, err := fl.TryLockContext(ctx, 10*time.Millisecond)
+		return err
+	}); err != nil {
 		return nil, fmt.Errorf("acquire lock: %w", err)
 	}
-	return func() { _ = fl.Unlock() }, nil
+	return fl.Unlock, nil
+}
+
+func acquireCredentialLock(ctx context.Context, platform string, lock func() error) error {
+	for attempt := range 6 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := lock()
+		if err == nil {
+			return nil
+		}
+		if platform != "windows" || !errors.Is(err, syscall.EPERM) || attempt == 5 {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(10<<attempt) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return errors.New("credential lock retries exhausted")
 }
 
 // readFile returns the stored credentials, serving a cached copy when the file
@@ -412,6 +458,12 @@ func parseAuthFile(path string) (authFile, error) {
 	}
 	if af == nil {
 		af = make(authFile)
+	}
+	if legacy, exists := af["azure-openai-responses"]; exists {
+		if _, exists := af[ai.ProviderAzureOpenAI]; !exists {
+			af[ai.ProviderAzureOpenAI] = legacy
+		}
+		delete(af, "azure-openai-responses")
 	}
 	return af, nil
 }

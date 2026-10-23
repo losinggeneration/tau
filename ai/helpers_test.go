@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -150,9 +152,9 @@ func TestCompleteViaStream(t *testing.T) {
 			wantErr:   true,
 		},
 		{
-			name:        "no events returns zero-value message",
-			events:      nil,
-			wantContent: "",
+			name:    "no terminal event returns error",
+			events:  nil,
+			wantErr: true,
 		},
 	}
 
@@ -403,5 +405,74 @@ func TestCompleteWithModelAndOptions(t *testing.T) {
 
 	if msg == nil {
 		t.Fatal("msg is nil")
+	}
+}
+
+func TestCompleteViaStreamRecordsDuration(t *testing.T) {
+	msg, err := completeViaStream(context.Background(), &mockClient{}, &Model{}, &Context{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.DurationMs == nil || *msg.DurationMs < 0 {
+		t.Fatalf("missing duration: %#v", msg.DurationMs)
+	}
+}
+
+func TestCompleteViaStreamRetainsFirstTerminal(t *testing.T) {
+	first := AssistantMessage{Role: "assistant", Content: []ContentBlock{{Type: ContentBlockText, Text: "first"}}, Usage: Usage{Input: 7}, DurationMs: new(12.5)}
+	late := AssistantMessage{Role: "assistant", Content: []ContentBlock{{Type: ContentBlockText, Text: "late"}}, Usage: Usage{Input: 99}}
+	for _, failed := range []bool{false, true} {
+		for _, cleanup := range []bool{false, true} {
+			t.Run(fmt.Sprintf("failed=%t/cleanup=%t", failed, cleanup), func(t *testing.T) {
+				var terminal StreamEvent = Done{Message: first}
+				if failed {
+					terminal = StreamError{Msg: first, Err: errors.New("first failure")}
+				}
+				s := &stubStreamer{events: []StreamEvent{terminal, Start{Partial: late}, Done{Message: late}, StreamError{Msg: late}}}
+				failure := errors.New("cleanup failed")
+				if cleanup {
+					s.streamErr = failure
+				}
+				got, err := completeViaStream(t.Context(), s, &Model{}, &Context{})
+				if cleanup {
+					if !errors.Is(err, failure) || got != nil {
+						t.Fatalf("got=%+v err=%v", got, err)
+					}
+					return
+				}
+				if err != nil || got == nil || !reflect.DeepEqual(*got, first) {
+					t.Fatalf("got=%+v err=%v; want first terminal %+v", got, err, first)
+				}
+			})
+		}
+	}
+}
+
+func TestTimedEventHandlerIgnoresEventsAfterTerminal(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprint(failed), func(t *testing.T) {
+			var got []StreamEvent
+			handler := timedEventHandler(func(_ context.Context, event StreamEvent) { got = append(got, event) })
+			handler(t.Context(), Start{})
+			first := AssistantMessage{Role: "assistant", DurationMs: new(12.5)}
+			var terminal StreamEvent = Done{Message: first}
+			if failed {
+				terminal = StreamError{Msg: first}
+			}
+			handler(t.Context(), terminal)
+			var workers sync.WaitGroup
+			for range 8 {
+				workers.Go(func() {
+					handler(t.Context(), Start{})
+					handler(t.Context(), TextDelta{Delta: "late"})
+					handler(t.Context(), Done{})
+					handler(t.Context(), StreamError{})
+				})
+			}
+			workers.Wait()
+			if len(got) != 2 || !reflect.DeepEqual(got[1], terminal) {
+				t.Fatalf("received %d events; want start and original terminal", len(got))
+			}
+		})
 	}
 }

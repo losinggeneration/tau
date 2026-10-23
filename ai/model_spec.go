@@ -14,7 +14,7 @@ import (
 // The order is meaningful: it is the ladder the app.thinking.cycle action steps
 // through and the order the settings list offers them in, so both read it from
 // here rather than each keeping a copy that can drift.
-var ThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh"}
+var ThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 // ValidThinkingLevels contains all valid thinking level values, derived from
 // ThinkingLevels so the set and the ladder cannot disagree.
@@ -28,29 +28,49 @@ var ValidThinkingLevels = func() map[string]bool {
 
 // DefaultModelPerProvider maps each known provider to their default model ID.
 var DefaultModelPerProvider = map[string]string{
-	"amazon-bedrock":         "us.anthropic.claude-opus-4-6-v1",
-	"anthropic":              "claude-opus-4-6",
-	"openai":                 "gpt-5.4",
-	"azure-openai-responses": "gpt-5.2",
-	"openai-codex":           "gpt-6-astra",
-	"google":                 "gemini-2.5-pro",
-	"google-gemini-cli":      "gemini-2.5-pro",
-	"google-antigravity":     "gemini-3.1-pro-high",
-	"google-vertex":          "gemini-3-pro-preview",
-	"github-copilot":         "gpt-5-mini",
-	"openrouter":             "openai/gpt-5.1-codex",
-	"vercel-ai-gateway":      "anthropic/claude-opus-4.6",
-	"xai":                    "grok-4.20-0309-non-reasoning",
-	"groq":                   "openai/gpt-oss-120b",
-	"cerebras":               "gpt-oss-120b",
-	"zai":                    "glm-5.3",
-	"mistral":                "devstral-medium-latest",
-	"minimax":                "MiniMax-M3",
-	"minimax-cn":             "MiniMax-M3",
-	"huggingface":            "moonshotai/Kimi-K2.5",
-	"opencode":               "claude-opus-4-6",
-	"opencode-go":            "kimi-k2.7-code",
-	"kimi-coding":            "kimi-for-coding",
+	"amazon-bedrock":             "us.anthropic.claude-opus-4-6-v1",
+	"ant-ling":                   "Ring-2.6-1T",
+	"anthropic":                  "claude-opus-4-8",
+	"openai":                     "gpt-5.5",
+	"azure":                      "gpt-5.4",
+	"openai-codex":               "gpt-6.1-sol",
+	"radius":                     "balanced",
+	"nvidia":                     "nvidia/nemotron-3-ultra-550b-a55b",
+	"deepseek":                   "deepseek-v4-pro",
+	"google":                     "gemini-3.1-pro-preview",
+	"google-vertex":              "gemini-3.1-pro-preview",
+	"github-copilot":             "gpt-5.4",
+	"openrouter":                 "moonshotai/kimi-k2.6",
+	"vercel-ai-gateway":          "zai/glm-5.1",
+	"xai":                        "grok-4.7",
+	"groq":                       "openai/gpt-oss-120b",
+	"cerebras":                   "gpt-oss-120b",
+	"zai":                        "glm-5.3",
+	"zai-coding-cn":              "glm-5.3",
+	"mistral":                    "devstral-medium-latest",
+	"minimax":                    "MiniMax-M2.7",
+	"minimax-cn":                 "MiniMax-M2.7",
+	"moonshotai":                 "kimi-k2.6",
+	"moonshotai-cn":              "kimi-k2.6",
+	"huggingface":                "moonshotai/Kimi-K2.6",
+	"fireworks":                  "accounts/fireworks/models/kimi-k3",
+	"together":                   "moonshotai/Kimi-K3",
+	"baseten":                    "zai-org/GLM-5.2",
+	"opencode":                   "kimi-k2.6",
+	"opencode-go":                "kimi-k3",
+	"kimi-coding":                "kimi-for-coding",
+	"meta":                       "muse-spark-1.3",
+	"cloudflare-workers-ai":      "@cf/moonshotai/kimi-k2.6",
+	"cloudflare-ai-gateway":      "workers-ai/@cf/moonshotai/kimi-k2.6",
+	"qwen-token-plan":            "qwen3.7-max",
+	"qwen-token-plan-cn":         "qwen3.7-max",
+	"qwen-token-plan-individual": "qwen3.8-max",
+	"xiaomi":                     "mimo-v2.5-pro",
+	"xiaomi-token-plan-cn":       "mimo-v2.5-pro",
+	"xiaomi-token-plan-ams":      "mimo-v2.5-pro",
+	"xiaomi-token-plan-sgp":      "mimo-v2.5-pro",
+	"google-gemini-cli":          "gemini-2.5-pro",
+	"google-antigravity":         "gemini-3.1-pro-high",
 }
 var errNoModelPatternMatch = errors.New("no models matched pattern")
 
@@ -274,9 +294,9 @@ func ParseModelSpec(spec string) (ModelSpec, error) {
 	switch len(parts) {
 	case 3:
 		// Legacy three-segment form: drop the middle (account) segment.
-		return ModelSpec{Provider: parts[0], Model: parts[2]}, nil
+		return ModelSpec{Provider: canonicalProvider(parts[0]), Model: parts[2]}, nil
 	case 2:
-		return ModelSpec{Provider: parts[0], Model: parts[1]}, nil
+		return ModelSpec{Provider: canonicalProvider(parts[0]), Model: parts[1]}, nil
 	case 1:
 		return ModelSpec{Model: parts[0]}, nil
 	default:
@@ -341,19 +361,24 @@ func ResolveShortModel(modelName string, settings *Settings) (ModelSpec, error) 
 // glob-style patterns, or case-insensitive substring matches.
 //
 // Resolution prefers exact matches over glob matches and glob matches over
-// substring matches. Bare-model ambiguity remains an error.
-func ResolveModelPatterns(patterns []string, settings *Settings) (ModelSpec, error) {
+// substring matches. Bare-model ambiguity remains an error. A ":level"
+// thinking suffix is returned with the model rather than matched.
+func ResolveModelPatterns(patterns []string, settings *Settings) (ScopedModel, error) {
 	if len(patterns) == 0 {
-		return ModelSpec{}, fmt.Errorf("no model patterns provided")
+		return ScopedModel{}, fmt.Errorf("no model patterns provided")
 	}
 
 	candidates := buildModelPatternCandidates(settings)
 	if len(candidates) == 0 {
-		return ModelSpec{}, fmt.Errorf("no configured or environment-backed model candidates available")
+		return ScopedModel{}, fmt.Errorf("no configured or environment-backed model candidates available")
 	}
 
 	for _, pattern := range patterns {
 		pattern = strings.TrimSpace(pattern)
+		var level string
+		if i := strings.LastIndex(pattern, ":"); i >= 0 && IsValidThinkingLevel(strings.ToLower(pattern[i+1:])) {
+			pattern, level = pattern[:i], strings.ToLower(pattern[i+1:])
+		}
 		if pattern == "" {
 			continue
 		}
@@ -361,19 +386,19 @@ func ResolveModelPatterns(patterns []string, settings *Settings) (ModelSpec, err
 		// Fully-qualified non-pattern input wins immediately. This preserves
 		// explicit user intent even if the configured candidate set is narrower.
 		if spec, err := ParseModelSpec(pattern); err == nil && spec.IsFullyQualified() && !hasGlobMeta(pattern) {
-			return spec, nil
+			return ScopedModel{Model: spec, ThinkingLevel: level}, nil
 		}
 
 		match, err := matchModelPattern(pattern, candidates)
 		if err == nil {
-			return match.Spec, nil
+			return ScopedModel{Model: match.Spec, ThinkingLevel: level}, nil
 		}
 		if !errors.Is(err, errNoModelPatternMatch) {
-			return ModelSpec{}, err
+			return ScopedModel{}, err
 		}
 	}
 
-	return ModelSpec{}, fmt.Errorf("no models matched patterns: %s", strings.Join(patterns, ", "))
+	return ScopedModel{}, fmt.Errorf("no models matched patterns: %s", strings.Join(patterns, ", "))
 }
 
 type modelPatternCandidate struct {
@@ -491,6 +516,57 @@ func ambiguousModelPatternError(pattern string, matches []modelPatternCandidate)
 
 func hasGlobMeta(pattern string) bool {
 	return strings.ContainsAny(pattern, "*?[")
+}
+
+// ExpandModelScope resolves enabledModels or --models patterns against
+// "provider/id" keys, in pattern order and without duplicates. A pattern may
+// carry a ":level" thinking suffix, which the first match of each model keeps.
+// Globs match the full key or the bare id; other patterns match a key or id
+// exactly, then a unique substring.
+func ExpandModelScope(patterns, keys []string) []ScopedModel {
+	var scope []ScopedModel
+	for _, pattern := range patterns {
+		pattern = strings.ToLower(strings.TrimSpace(pattern))
+		var level string
+		if i := strings.LastIndex(pattern, ":"); i >= 0 && IsValidThinkingLevel(pattern[i+1:]) {
+			pattern, level = pattern[:i], pattern[i+1:]
+		}
+		if pattern == "" {
+			continue
+		}
+		add := func(key string) {
+			provider, id, _ := strings.Cut(key, "/")
+			spec := ModelSpec{Provider: provider, Model: id}
+			if !slices.ContainsFunc(scope, func(m ScopedModel) bool { return m.Model == spec }) {
+				scope = append(scope, ScopedModel{Model: spec, ThinkingLevel: level})
+			}
+		}
+		matches := func(match func(key, id string) bool) []string {
+			var out []string
+			for _, key := range keys {
+				lower := strings.ToLower(key)
+				_, id, _ := strings.Cut(lower, "/")
+				if match(lower, id) {
+					out = append(out, key)
+				}
+			}
+			return out
+		}
+		if exact := matches(func(key, id string) bool { return key == pattern || id == pattern }); len(exact) > 0 {
+			add(exact[0])
+			continue
+		}
+		if hasGlobMeta(pattern) {
+			for _, key := range matches(func(key, id string) bool { return globMatch(pattern, key) || globMatch(pattern, id) }) {
+				add(key)
+			}
+			continue
+		}
+		if partial := matches(func(key, _ string) bool { return strings.Contains(key, pattern) }); len(partial) == 1 {
+			add(partial[0])
+		}
+	}
+	return scope
 }
 
 func globMatch(pattern, value string) bool {

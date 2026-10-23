@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -80,5 +81,98 @@ func TestWriterMarkDeleted(t *testing.T) {
 	}
 	if got := r.CurrentPosition(); got != m3.ID {
 		t.Errorf("CurrentPosition = %q, want %q", got, m3.ID)
+	}
+}
+
+func TestUniqueFilenamePropagatesStatErrors(t *testing.T) {
+	for _, blocked := range []string{"session.jsonl", "session-2.jsonl"} {
+		t.Run(blocked, func(t *testing.T) {
+			dir := t.TempDir()
+			if blocked != "session.jsonl" {
+				if err := os.WriteFile(filepath.Join(dir, "session.jsonl"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(dir, blocked)
+			if err := os.Symlink(blocked, path); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); err == nil || os.IsNotExist(err) {
+				t.Fatalf("fixture needs a non-not-exist stat error, got %v", err)
+			}
+			if name, err := uniqueFilename(dir, "session.jsonl"); err == nil {
+				t.Fatalf("ignored stat error and selected %q", name)
+			}
+		})
+	}
+}
+
+func TestRenameSessionPreservesExistingDestination(t *testing.T) {
+	dir := t.TempDir()
+	header := NewHeader("/test", nil, nil, "original")
+	header.ID = "12345678-abcd-1234-abcd-123456789abc"
+	writer, err := CreateSessionFile(dir, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writer.Path()
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	other := header
+	other.ID = "12345678-abcd-1234-abcd-987654321abc"
+	other.Name = "renamed"
+	writer, err = CreateSessionFile(dir, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	occupied := writer.Path()
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(occupied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := RenameSession(path, "renamed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(occupied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("rename overwrote another session")
+	}
+	if renamed == occupied {
+		t.Fatal("rename selected occupied destination")
+	}
+	reader, err := ReadFile(renamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.Header().ID != header.ID {
+		t.Fatal("renamed session lost its identity")
+	}
+}
+
+func TestWriterCloseReleasesOwnerAfterFileCloseFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	writer, err := NewWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ClaimOwner(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("close error = %v", err)
+	}
+	if _, err := os.Stat(path + ".owner"); !os.IsNotExist(err) {
+		t.Fatalf("owner remains after failed close: %v", err)
 	}
 }

@@ -6,9 +6,12 @@
 //   - Google Gemini CLI
 //   - OpenAI Codex
 //   - Google Antigravity
+//   - Radius
+//   - OpenRouter
 package oauth
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,12 +21,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	airoot "github.com/losinggeneration/tau/ai"
-	"github.com/losinggeneration/tau/logging"
 	"golang.org/x/oauth2"
 )
 
@@ -68,19 +71,27 @@ func (c *Credentials) IsExpired(buffer time.Duration) bool {
 }
 
 // LoginCallbacks provides callbacks for interactive OAuth flows.
+//
+// OnPrompt and OnManualCodeInput must return once their context ends: a login
+// withdraws a pending manual prompt when the browser callback wins, and waits
+// for the prompt to return.
 type LoginCallbacks interface {
 	OnAuth(url string, instructions string)
-	OnPrompt(message string, placeholder string) (string, error)
+	OnPrompt(ctx context.Context, message string, placeholder string) (string, error)
 	OnProgress(message string)
-	OnManualCodeInput() (string, error)
+	OnManualCodeInput(ctx context.Context) (string, error)
 }
+
+// ErrPromptUnavailable reports that a login cannot prompt, such as a
+// non-interactive login. A browser callback can still finish the login.
+var ErrPromptUnavailable = errors.New("cannot prompt for input")
 
 // DefaultLoginCallbacks provides console-based implementations of LoginCallbacks.
 type DefaultLoginCallbacks struct {
 	FnAuth            func(url string, instructions string)
-	FnPrompt          func(message string, placeholder string) (string, error)
+	FnPrompt          func(ctx context.Context, message string, placeholder string) (string, error)
 	FnProgress        func(message string)
-	FnManualCodeInput func() (string, error)
+	FnManualCodeInput func(ctx context.Context) (string, error)
 }
 
 func (c *DefaultLoginCallbacks) OnAuth(url string, instructions string) {
@@ -91,17 +102,12 @@ func (c *DefaultLoginCallbacks) OnAuth(url string, instructions string) {
 	}
 }
 
-func (c *DefaultLoginCallbacks) OnPrompt(message string, placeholder string) (string, error) {
+func (c *DefaultLoginCallbacks) OnPrompt(ctx context.Context, message string, placeholder string) (string, error) {
 	if c.FnPrompt != nil {
-		return c.FnPrompt(message, placeholder)
+		return c.FnPrompt(ctx, message, placeholder)
 	}
-
 	fmt.Print(message)
-
-	var input string
-	_, _ = fmt.Scanln(&input)
-
-	return input, nil
+	return ReadStdinLine(ctx)
 }
 
 func (c *DefaultLoginCallbacks) OnProgress(message string) {
@@ -112,17 +118,130 @@ func (c *DefaultLoginCallbacks) OnProgress(message string) {
 	}
 }
 
-func (c *DefaultLoginCallbacks) OnManualCodeInput() (string, error) {
+func (c *DefaultLoginCallbacks) OnManualCodeInput(ctx context.Context) (string, error) {
 	if c.FnManualCodeInput != nil {
-		return c.FnManualCodeInput()
+		return c.FnManualCodeInput(ctx)
 	}
-
 	fmt.Print("Enter authorization code or redirect URL: ")
+	return ReadStdinLine(ctx)
+}
 
-	var input string
-	_, _ = fmt.Scanln(&input)
+// lineReader reads lines on one goroutine, so a prompt can stop waiting when
+// its context ends without abandoning a read that would swallow the next line.
+type lineReader struct {
+	r     io.Reader
+	once  sync.Once
+	lines chan string
+	err   error
+}
 
-	return input, nil
+func (l *lineReader) read(ctx context.Context) (string, error) {
+	l.once.Do(func() {
+		l.lines = make(chan string)
+		go func() {
+			scanner := bufio.NewScanner(l.r)
+			for scanner.Scan() {
+				l.lines <- scanner.Text()
+			}
+			l.err = scanner.Err()
+			if l.err == nil {
+				l.err = fmt.Errorf("%w: %w", ErrPromptUnavailable, io.EOF)
+			}
+			close(l.lines)
+		}()
+	})
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	select {
+	case line, ok := <-l.lines:
+		if !ok {
+			return "", l.err
+		}
+		return line, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// ponytail: the stdin reader goroutine lives until stdin closes; a terminal
+// read cannot be interrupted portably.
+var stdinLines = &lineReader{r: os.Stdin}
+
+// ReadStdinLine reads one line from standard input, or returns when ctx ends.
+func ReadStdinLine(ctx context.Context) (string, error) {
+	return stdinLines.read(ctx)
+}
+
+// waitForCallbackOrManualInput waits for the browser callback while the user
+// may paste the code or redirect URL instead, for when the browser cannot
+// reach the loopback server. The losing side is cancelled and joined before
+// returning. A nil wait waits for the pasted input alone.
+func waitForCallbackOrManualInput(ctx context.Context, callbacks LoginCallbacks, wait func(context.Context) (string, error)) (code, input string, err error) {
+	type result struct {
+		value string
+		err   error
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	manual := make(chan result, 1)
+	go func() {
+		value, err := callbacks.OnManualCodeInput(ctx)
+		manual <- result{value, err}
+	}()
+	var callback chan result
+	if wait != nil {
+		callback = make(chan result, 1)
+		go func() {
+			value, err := wait(ctx)
+			callback <- result{value, err}
+		}()
+	}
+	pendingManual, pendingCallback := true, wait != nil
+	defer func() {
+		cancel()
+		if pendingManual {
+			<-manual
+		}
+		if pendingCallback {
+			<-callback
+		}
+	}()
+	for {
+		select {
+		case r := <-callback:
+			pendingCallback = false
+			return r.value, "", r.err
+		case r := <-manual:
+			pendingManual = false
+			if errors.Is(r.err, ErrPromptUnavailable) && pendingCallback {
+				manual = nil
+				continue
+			}
+			return "", r.value, r.err
+		}
+	}
+}
+
+// waitForAuthorizationCode races a CallbackServer against a pasted code or
+// redirect URL, whose state must match when present. A nil server waits for
+// the pasted input alone.
+func waitForAuthorizationCode(ctx context.Context, callbacks LoginCallbacks, server *CallbackServer, state string) (string, error) {
+	var wait func(context.Context) (string, error)
+	if server != nil {
+		wait = func(ctx context.Context) (string, error) {
+			code, _, err := server.WaitForCode(ctx)
+			return code, err
+		}
+	}
+	code, input, err := waitForCallbackOrManualInput(ctx, callbacks, wait)
+	if err != nil || code != "" {
+		return code, err
+	}
+	code, err = parseAuthorizationInput(input, state)
+	if err == nil && code == "" {
+		err = errors.New("missing authorization code")
+	}
+	return code, err
 }
 
 // ProviderInfo represents information about an OAuth provider.
@@ -161,6 +280,8 @@ func builtInProviders() []Provider {
 		GeminiCLIOAuthProvider,
 		AntigravityOAuthProvider,
 		OpenAICodexOAuthProvider,
+		RadiusOAuthProvider,
+		OpenRouterOAuthProvider,
 	}
 }
 
@@ -417,6 +538,7 @@ func OAuthErrorHTML(message string, details string) string {
 // CallbackServer handles OAuth callback requests.
 type CallbackServer struct {
 	server   *http.Server
+	done     chan struct{}
 	port     int
 	expected string
 	code     chan string
@@ -439,27 +561,50 @@ func newCallbackServer(expectedState string, port int) *CallbackServer {
 }
 
 func (s *CallbackServer) Start() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", s.handleCallback)
-	mux.HandleFunc("/auth/callback", s.handleCallback)
-
-	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
-
-	listener, err := net.Listen("tcp", addr)
+	host := callbackHost()
+	listener, err := net.Listen("tcp", net.JoinHostPort(host, fmt.Sprint(s.port)))
 	if err != nil {
 		// Try any available port
-		listener, err = net.Listen("tcp", "127.0.0.1:0")
+		listener, err = net.Listen("tcp", net.JoinHostPort(host, "0"))
 		if err != nil {
 			return fmt.Errorf("failed to listen: %w", err)
 		}
 	}
 
+	return s.serve(listener)
+}
+
+// callbackHost is the loopback callback listen address, PI_OAUTH_CALLBACK_HOST
+// when set, so the port can be forwarded into containers or over SSH.
+func callbackHost() string {
+	if host := os.Getenv("PI_OAUTH_CALLBACK_HOST"); host != "" {
+		return host
+	}
+	return "127.0.0.1"
+}
+
+func (s *CallbackServer) startFixed(ctx context.Context) error {
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", net.JoinHostPort(callbackHost(), fmt.Sprint(s.port)))
+	if err != nil {
+		return fmt.Errorf("listen for oauth callback: %w", err)
+	}
+	return s.serve(listener)
+}
+
+func (s *CallbackServer) serve(listener net.Listener) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", s.handleCallback)
+	mux.HandleFunc("/auth/callback", s.handleCallback)
+	mux.HandleFunc("/oauth/callback", s.handleCallback)
+
 	s.port = listener.Addr().(*net.TCPAddr).Port
 	s.ready <- s.port
 
 	s.server = &http.Server{Handler: mux}
+	s.done = make(chan struct{})
 
 	go func() {
+		defer close(s.done)
 		if err := s.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			select {
 			case s.err <- err:
@@ -505,7 +650,7 @@ func (s *CallbackServer) WaitForCode(ctx context.Context) (code, state string, e
 			return "", "", errors.New("cancelled")
 		}
 
-		return code, "", nil
+		return code, s.expected, nil
 	case err = <-s.err:
 		return "", "", err
 	case <-ctx.Done():
@@ -517,7 +662,9 @@ func (s *CallbackServer) Stop() error {
 	s.CancelWait()
 
 	if s.server != nil {
-		return s.server.Close()
+		err := s.server.Close()
+		<-s.done
+		return err
 	}
 
 	return nil
@@ -527,65 +674,36 @@ func (s *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.handled {
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte(OAuthSuccessHTML("Authentication already handled. You can close this window."))); err != nil {
-			logging.Discard().Warn("oauth callback write response failed", "error", err)
-		}
+	if r.Method != http.MethodGet {
+		writeOAuthPage(w, http.StatusNotFound, OAuthErrorHTML("Callback route not found.", ""))
 		return
 	}
-
 	query := r.URL.Query()
-
-	if errMsg := query.Get("error"); errMsg != "" {
-		w.WriteHeader(http.StatusBadRequest)
-		if _, err := w.Write([]byte(OAuthErrorHTML("Authentication did not complete.", "Error: "+errMsg))); err != nil {
-			logging.Discard().Warn("oauth callback write error response failed", "error", err)
-		}
-
-		s.err <- fmt.Errorf("oauth error: %s", errMsg)
-
-		s.handled = true
-
+	if query.Get("state") != s.expected {
+		writeOAuthPage(w, http.StatusBadRequest, OAuthErrorHTML("State mismatch.", ""))
 		return
 	}
-
+	if s.handled {
+		writeOAuthPage(w, http.StatusConflict, OAuthErrorHTML("This sign-in has already been handled.", ""))
+		return
+	}
+	if oauthErr := query.Get("error"); oauthErr != "" {
+		description := query.Get("error_description")
+		if description == "" {
+			description = oauthErr
+		}
+		writeOAuthPage(w, http.StatusBadRequest, OAuthErrorHTML("Authentication did not complete.", description))
+		s.err <- fmt.Errorf("oauth error: %s", description)
+		s.handled = true
+		return
+	}
 	code := query.Get("code")
-	state := query.Get("state")
-
-	if code == "" || state == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		if _, err := w.Write([]byte(OAuthErrorHTML("Missing code or state parameter.", ""))); err != nil {
-			logging.Discard().Warn("oauth callback write missing params response failed", "error", err)
-		}
-
-		s.err <- errors.New("missing code or state")
-
-		s.handled = true
-
+	if code == "" {
+		writeOAuthPage(w, http.StatusBadRequest, OAuthErrorHTML("Missing authorization code.", ""))
 		return
 	}
-
-	if state != s.expected {
-		w.WriteHeader(http.StatusBadRequest)
-		if _, err := w.Write([]byte(OAuthErrorHTML("State mismatch.", ""))); err != nil {
-			logging.Discard().Warn("oauth callback write state mismatch response failed", "error", err)
-		}
-
-		s.err <- errors.New("state mismatch")
-
-		s.handled = true
-
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write([]byte(OAuthSuccessHTML("Authentication completed. You can close this window."))); err != nil {
-		logging.Discard().Warn("oauth callback write success response failed", "error", err)
-	}
-
+	writeOAuthPage(w, http.StatusOK, OAuthSuccessHTML("Authentication completed. You can close this window."))
 	s.code <- code
-
 	s.handled = true
 }
 
@@ -604,13 +722,25 @@ func ExchangeCode(ctx context.Context, tokenURL string, params map[string]string
 	for k, v := range params {
 		data.Set(k, v)
 	}
+	return postTokenRequest(ctx, tokenURL, "application/x-www-form-urlencoded", data.Encode())
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(data.Encode()))
+// exchangeCodeJSON is ExchangeCode for token endpoints that take a JSON body.
+func exchangeCodeJSON(ctx context.Context, tokenURL string, params map[string]string) (*Credentials, error) {
+	body, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("encode token request: %w", err)
+	}
+	return postTokenRequest(ctx, tokenURL, "application/json", string(body))
+}
+
+func postTokenRequest(ctx context.Context, tokenURL, contentType, payload string) (_ *Credentials, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}

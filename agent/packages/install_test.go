@@ -1,6 +1,7 @@
 package packages
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -88,5 +89,21 @@ func TestParseNpmSpec(t *testing.T) {
 				t.Errorf("Pinned: got %v, want %v", result.Pinned, tc.expected.Pinned)
 			}
 		})
+	}
+}
+
+func TestNPMCommandUsesConfiguredArgvPrefix(t *testing.T) {
+	if got := npmCommand(t.Context(), nil, "install", "x").Args; !slices.Equal(got, []string{"npm", "install", "x"}) {
+		t.Fatalf("default args = %q", got)
+	}
+	configured := make([]string, 5, 8)
+	copy(configured, []string{"mise", "exec", "node@20", "--", "npm"})
+	first := npmCommand(t.Context(), configured, "pack", "a")
+	second := npmCommand(t.Context(), configured, "uninstall", "b", "-g")
+	if want := []string{"mise", "exec", "node@20", "--", "npm", "pack", "a"}; !slices.Equal(first.Args, want) {
+		t.Fatalf("first args = %q, want %q", first.Args, want)
+	}
+	if want := []string{"mise", "exec", "node@20", "--", "npm", "uninstall", "b", "-g"}; !slices.Equal(second.Args, want) {
+		t.Fatalf("second args = %q, want %q", second.Args, want)
 	}
 }

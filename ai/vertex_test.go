@@ -2,8 +2,24 @@ package ai
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStreamVertexResponseEmitsStructuredEvents(t *testing.T) {
@@ -134,19 +150,6 @@ func TestStreamVertexResponseDeduplicatesToolCallsByCallID(t *testing.T) {
 	}
 }
 
-func TestGetGoogleCloudCredentialsWithAPIKey(t *testing.T) {
-	// Set VERTEXAI_API_KEY
-	t.Setenv("VERTEXAI_API_KEY", "test-api-key-12345")
-
-	token, err := getGoogleCloudCredentials(context.Background())
-	if err != nil {
-		t.Fatalf("getGoogleCloudCredentials with VERTEXAI_API_KEY: %v", err)
-	}
-	if token.APIKey != "test-api-key-12345" {
-		t.Fatalf("token.APIKey = %q, want %q", token.APIKey, "test-api-key-12345")
-	}
-}
-
 func TestStreamVertexResponseCapturesThoughtSignature(t *testing.T) {
 	// Simulate a response with thoughtSignature in the text part
 	stream := strings.Join([]string{
@@ -176,90 +179,21 @@ func TestStreamVertexResponseCapturesThoughtSignature(t *testing.T) {
 	_ = capturedThoughtSignature // Field exists and is accessible
 }
 
-// TestGetGoogleCloudCredentialsPrecedenceOrder tests P7-VX01: ADC auth chain priority order
-func TestGetGoogleCloudCredentialsPrecedenceOrder(t *testing.T) {
-	// Test that priority order is: GOOGLE_ACCESS_TOKEN > VERTEXAI_API_KEY > service account > gcloud > metadata
-	t.Setenv("GOOGLE_ACCESS_TOKEN", "")
-	t.Setenv("VERTEXAI_API_KEY", "")
-	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-
-	// No credentials should fail
-	_, err := getGoogleCloudCredentials(context.Background())
-	if err == nil {
-		t.Fatal("expected error when no credentials are available")
-	}
-}
-
-// TestGetGoogleCloudCredentialsWithEnvToken tests P7-VX01: GOOGLE_ACCESS_TOKEN takes priority
-func TestGetGoogleCloudCredentialsWithEnvToken(t *testing.T) {
-	t.Setenv("GOOGLE_ACCESS_TOKEN", "env-access-token")
-	defer t.Setenv("GOOGLE_ACCESS_TOKEN", "")
-
-	// GOOGLE_ACCESS_TOKEN should be returned directly
-	token, err := getGoogleCloudCredentials(context.Background())
-	if err != nil {
-		t.Fatalf("getGoogleCloudCredentials: %v", err)
-	}
-	if token.BearerToken != "env-access-token" {
-		t.Fatalf("token.BearerToken = %q, want %q", token.BearerToken, "env-access-token")
-	}
-}
-
-// TestGetGoogleCloudCredentialsWithAPIVertexKey tests P7-VX01: VERTEXAI_API_KEY fallback
-func TestGetGoogleCloudCredentialsWithAPIVertexKey(t *testing.T) {
-	t.Setenv("GOOGLE_ACCESS_TOKEN", "")
-	t.Setenv("VERTEXAI_API_KEY", "vertex-api-key")
-	defer t.Setenv("VERTEXAI_API_KEY", "")
-
-	token, err := getGoogleCloudCredentials(context.Background())
-	if err != nil {
-		t.Fatalf("getGoogleCloudCredentials: %v", err)
-	}
-	if token.APIKey != "vertex-api-key" {
-		t.Fatalf("token.APIKey = %q, want %q", token.APIKey, "vertex-api-key")
-	}
-}
-
-// TestGetGoogleCloudCredentialsWithServiceAccount tests P7-VX01: service account file
-// Note: Full service account testing requires file system mocking which is not currently
-// injectable. This test verifies the env var is recognized. The actual token refresh
-// behavior is tested via integration tests when credentials are available.
-func TestGetGoogleCloudCredentialsWithServiceAccount(t *testing.T) {
-	t.Setenv("GOOGLE_ACCESS_TOKEN", "")
-	t.Setenv("VERTEXAI_API_KEY", "")
-	// Set a non-existent credentials file path to verify env var is checked
-	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "/nonexistent/path/credentials.json")
-
-	// Should attempt to read the file and fail gracefully
-	// This verifies the auth chain reaches service account when higher priority creds are empty
-	token, err := getGoogleCloudCredentials(context.Background())
-	// Expect error since file doesn't exist, but the key point is that
-	// GOOGLE_APPLICATION_CREDENTIALS was recognized in the auth chain
-	if err == nil {
-		// If no error, token should be empty (no valid credentials)
-		if token.APIKey != "" || token.BearerToken != "" {
-			t.Logf("Note: got auth %+v with no credentials file", token)
-		}
-	}
-	// This test mainly verifies the auth chain order works correctly
-	// The service account path is reached when GOOGLE_ACCESS_TOKEN and VERTEXAI_API_KEY are empty
-}
-
-// TestBuildVertexRequestBodyWithGemma4Model tests P7-VX02, P7-VX03, P7-GG13: Gemma 4 thinking config
+// TestBuildVertexRequestBodyWithGemma4Model checks a level-controlled model
+// gets its mapped level, and its lowest level when reasoning is off.
 func TestBuildVertexRequestBodyWithGemma4Model(t *testing.T) {
-	body, _ := buildVertexRequestBody(&Model{ID: "gemma-4-2b-it", Reasoning: true}, &Context{
-		Messages: []Message{
-			{Role: "user", Content: []ContentBlock{{Type: ContentBlockText, Text: "hi"}}},
-		},
-	}, &options{thinkingBudgetTokens: 1000})
-
-	thinkingConfig, ok := body["thinkingConfig"].(map[string]any)
-	if !ok {
-		t.Fatal("expected thinkingConfig for Gemma 4 reasoning model")
-	}
-	// Gemma 4 uses MINIMAL level
-	if thinkingConfig["thinkingLevel"] != "MINIMAL" {
-		t.Fatalf("thinkingConfig.thinkingLevel = %v, want MINIMAL", thinkingConfig["thinkingLevel"])
+	model := &Model{ID: "gemma-4-31b-it", Reasoning: true, ThinkingLevelMap: map[string]*string{"high": new("HIGH"), "low": nil, "medium": nil, "minimal": new("MINIMAL"), "off": nil}}
+	for reasoning, want := range map[ReasoningLevel]map[string]any{
+		ReasoningMedium: {"thinkingLevel": "HIGH", "includeThoughts": true},
+		ReasoningOff:    {"thinkingLevel": "MINIMAL"},
+	} {
+		body, err := buildVertexRequestBody(model, &Context{Messages: []Message{{Role: "user", Content: "hi"}}}, &options{reasoning: reasoning})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := body["thinkingConfig"]; !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s thinkingConfig = %v, want %v", reasoning, got, want)
+		}
 	}
 }
 
@@ -446,18 +380,19 @@ func TestStreamVertexResponseWithErrorFinishReason(t *testing.T) {
 		t.Fatalf("streamVertexResponse: %v", err)
 	}
 
-	// Find the done event
-	var doneReason StopReason
+	// Upstream fails every non-stop finish reason as a provider error; only
+	// caller cancellation ends as aborted.
+	var failure *StreamError
 	for _, e := range events {
-		if d, ok := e.(Done); ok {
-			doneReason = d.Reason
-			break
+		switch e := e.(type) {
+		case Done:
+			t.Fatal("finish reason SAFETY ended with Done")
+		case StreamError:
+			failure = &e
 		}
 	}
-
-	// SAFETY finish reason should map to error
-	if doneReason != StopReasonError {
-		t.Fatalf("stop reason = %v, want error for SAFETY", doneReason)
+	if failure == nil || failure.Msg.StopReason != StopReasonError || failure.Msg.ErrorMessage != "Provider stopped with: SAFETY" {
+		t.Fatalf("failure = %+v, want error for SAFETY", failure)
 	}
 }
 
@@ -478,19 +413,19 @@ func TestStreamVertexResponseWithAbortedFinishReason(t *testing.T) {
 		t.Fatalf("streamVertexResponse: %v", err)
 	}
 
-	// Find the done event
-	var doneReason StopReason
+	// Upstream fails every non-stop finish reason as a provider error; only
+	// caller cancellation ends as aborted.
+	var failure *StreamError
 	for _, e := range events {
-		if d, ok := e.(Done); ok {
-			doneReason = d.Reason
-			break
+		switch e := e.(type) {
+		case Done:
+			t.Fatal("finish reason ABORTED ended with Done")
+		case StreamError:
+			failure = &e
 		}
 	}
-
-	// ABORTED should map to aborted so agent/session callers can distinguish user
-	// cancellation from provider failures.
-	if doneReason != StopReasonAborted {
-		t.Fatalf("stop reason = %v, want aborted for ABORTED", doneReason)
+	if failure == nil || failure.Msg.StopReason != StopReasonError || failure.Msg.ErrorMessage != "Provider stopped with: ABORTED" {
+		t.Fatalf("failure = %+v, want error for ABORTED", failure)
 	}
 }
 
@@ -591,5 +526,199 @@ func TestBuildVertexRequestBodySystemPrompt(t *testing.T) {
 	sysInst := body["systemInstruction"].(map[string]any)
 	if sysInst["role"] != "system" {
 		t.Fatalf("systemInstruction.role = %v, want system", sysInst["role"])
+	}
+}
+
+func TestStreamVertexResponseRequiresFinishReason(t *testing.T) {
+	stream := `data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{}}}]}}]}` + "\n\n"
+	reason, message := streamTerminal(t, func(handler EventHandler) {
+		if err := streamVertexResponse(context.Background(), strings.NewReader(stream), &Model{}, handler); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if reason != StopReasonError || message != "google vertex stream ended without a finish reason" {
+		t.Fatalf("got %s %q", reason, message)
+	}
+}
+
+func TestVertexHeaderTimeout(t *testing.T) {
+	t.Setenv("GOOGLE_ACCESS_TOKEN", "test-token")
+	previous := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	t.Cleanup(func() { http.DefaultClient = previous })
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	_, err := (&vertexClient{model: &Model{ID: "test"}}).Complete(ctx, &Model{ID: "test", BaseURL: "https://test.invalid"}, &Context{}, WithVertexProject("test"), WithVertexLocation("test"), WithTimeout(time.Millisecond))
+	if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil || !strings.Contains(err.Error(), "response headers timed out") {
+		t.Fatalf("header timeout ignored or lost: %v", err)
+	}
+}
+
+func TestVertexHeaderTimeoutDoesNotLimitBody(t *testing.T) {
+	t.Setenv("GOOGLE_ACCESS_TOKEN", "test-token")
+	for _, timeout := range []time.Duration{0, time.Millisecond} {
+		for _, status := range []int{http.StatusOK, http.StatusBadRequest} {
+			t.Run(fmt.Sprintf("%s/%d", timeout, status), func(t *testing.T) {
+				var body *codexTestBody
+				previous := http.DefaultClient
+				http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if timeout == 0 {
+						timer := time.NewTimer(10 * time.Millisecond)
+						defer timer.Stop()
+						select {
+						case <-req.Context().Done():
+							return nil, req.Context().Err()
+						case <-timer.C:
+						}
+					}
+					payload := "rejected"
+					if status == http.StatusOK {
+						payload = `data: {"candidates":[{"finishReason":"STOP"}]}` + "\n\n"
+					}
+					body = &codexTestBody{Reader: strings.NewReader(payload), ctx: req.Context(), delay: 10 * time.Millisecond}
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: body}, nil
+				})}
+				t.Cleanup(func() { http.DefaultClient = previous })
+				message, err := (&vertexClient{model: &Model{ID: "test"}}).Complete(t.Context(), &Model{ID: "test", BaseURL: "https://test.invalid"}, &Context{}, WithVertexProject("test"), WithVertexLocation("test"), WithTimeout(timeout))
+				if status == http.StatusOK {
+					if err != nil || message == nil || message.StopReason != StopReasonStop {
+						t.Fatalf("body timed out: message=%#v err=%v", message, err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), "status 400: rejected") {
+					t.Fatalf("error body timed out: %v", err)
+				}
+				if body == nil || !body.closed {
+					t.Fatal("body not closed")
+				}
+				if timeout > 0 && body.ctx.Err() == nil {
+					t.Fatal("request context not released")
+				}
+			})
+		}
+	}
+}
+
+func TestVertexBodyCancellationAndCleanupCauses(t *testing.T) {
+	t.Setenv("GOOGLE_ACCESS_TOKEN", "test-token")
+	readFailure := errors.New("read failed")
+	closeFailure := errors.New("close failed")
+	for _, status := range []int{http.StatusOK, http.StatusBadRequest} {
+		for _, cancelBody := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/cancel=%v", status, cancelBody), func(t *testing.T) {
+				body := &codexTestBody{Reader: strings.NewReader("rejected"), readErr: readFailure, closeErr: closeFailure}
+				if cancelBody {
+					body.delay = time.Hour
+				}
+				previous := http.DefaultClient
+				http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					body.ctx = req.Context()
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: body}, nil
+				})}
+				t.Cleanup(func() { http.DefaultClient = previous })
+				ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+				defer cancel()
+				var terminal *StreamError
+				err := (&vertexClient{model: &Model{ID: "test"}}).Stream(ctx, &Model{ID: "test", BaseURL: "https://test.invalid"}, &Context{}, func(_ context.Context, event StreamEvent) {
+					if failure, ok := event.(StreamError); ok {
+						terminal = &failure
+					}
+				}, WithVertexProject("test"), WithVertexLocation("test"), WithTimeout(time.Millisecond))
+				if !body.closed || body.ctx.Err() == nil || !errors.Is(err, closeFailure) {
+					t.Fatalf("cleanup lost: closed=%v err=%v", body.closed, err)
+				}
+				cause := readFailure
+				if cancelBody {
+					cause = context.DeadlineExceeded
+					if ctx.Err() == nil {
+						t.Fatal("provider timeout interrupted body")
+					}
+				}
+				if status == http.StatusOK {
+					if terminal == nil || !errors.Is(terminal.Err, cause) {
+						t.Fatalf("terminal cause lost: %#v", terminal)
+					}
+				} else if !errors.Is(err, cause) {
+					t.Fatalf("body cause lost: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestVertexEndpointsAndAuthMatchUpstream(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	serviceAccount := filepath.Join(t.TempDir(), "service-account.json")
+	data, err := json.Marshal(map[string]string{
+		"type":         "service_account",
+		"client_email": "sa@example.invalid",
+		"private_key":  string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})),
+		"token_uri":    "https://token.invalid/token",
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(serviceAccount, data, 0o600))
+	const (
+		regional = "https://{location}-aiplatform.googleapis.com"
+		path     = "/publishers/google/models/gemini-test:streamGenerateContent?alt=sse"
+	)
+	for _, tc := range []struct {
+		name, baseURL, apiKey, envKey, project, location, accessToken, credentials string
+		wantURL, wantKey, wantBearer, wantErr                                      string
+	}{
+		{name: "api key needs no project", baseURL: regional, apiKey: "key", wantURL: "https://aiplatform.googleapis.com/v1" + path, wantKey: "key"},
+		{name: "env api key", baseURL: regional, envKey: "env-key", project: "proj", location: "us-central1", wantURL: "https://aiplatform.googleapis.com/v1" + path, wantKey: "env-key"},
+		{name: "placeholder key uses credentials", baseURL: regional, apiKey: "<authenticated>", project: "proj", location: "us-central1", accessToken: "token", wantURL: "https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1" + path, wantBearer: "token"},
+		{name: "marker key uses global endpoint", baseURL: regional, apiKey: "gcp-vertex-credentials", project: "proj", location: "global", accessToken: "token", wantURL: "https://aiplatform.googleapis.com/v1/projects/proj/locations/global" + path, wantBearer: "token"},
+		{name: "multi-region endpoint", baseURL: regional, project: "proj", location: "eu", accessToken: "token", wantURL: "https://aiplatform.eu.rep.googleapis.com/v1/projects/proj/locations/eu" + path, wantBearer: "token"},
+		{name: "custom base is a collection", baseURL: "https://proxy.invalid/vertex/", project: "proj", location: "us-central1", accessToken: "token", wantURL: "https://proxy.invalid/vertex/v1" + path, wantBearer: "token"},
+		{name: "custom base keeps its version", baseURL: "https://proxy.invalid/v1beta1", apiKey: "key", wantURL: "https://proxy.invalid/v1beta1" + path, wantKey: "key"},
+		{name: "service account", baseURL: regional, project: "proj", location: "us-central1", credentials: serviceAccount, wantURL: "https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1" + path, wantBearer: "sa-token"},
+		{name: "missing project", baseURL: regional, location: "us-central1", accessToken: "token", wantErr: "missing project"},
+		{name: "missing location", baseURL: regional, project: "proj", accessToken: "token", wantErr: "missing location"},
+		{name: "unreadable credentials", baseURL: regional, project: "proj", location: "us-central1", credentials: filepath.Join(t.TempDir(), "missing.json"), wantErr: "get credentials"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOOGLE_CLOUD_API_KEY", tc.envKey)
+			t.Setenv("VERTEXAI_API_KEY", "")
+			t.Setenv("GOOGLE_CLOUD_PROJECT", tc.project)
+			t.Setenv("GCLOUD_PROJECT", "")
+			t.Setenv("GOOGLE_CLOUD_LOCATION", tc.location)
+			t.Setenv("GOOGLE_ACCESS_TOKEN", tc.accessToken)
+			t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", tc.credentials)
+			var got *http.Request
+			previous := http.DefaultClient
+			http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Host == "token.invalid" {
+					assert.NoError(t, req.ParseForm())
+					assert.Equal(t, "urn:ietf:params:oauth:grant-type:jwt-bearer", req.Form.Get("grant_type"))
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"access_token":"sa-token","token_type":"Bearer","expires_in":3600}`))}, nil
+				}
+				got = req
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`data: {"candidates":[{"finishReason":"STOP"}]}` + "\n\n"))}, nil
+			})}
+			t.Cleanup(func() { http.DefaultClient = previous })
+			var opts []Option
+			if tc.apiKey != "" {
+				opts = append(opts, WithAPIKey(tc.apiKey))
+			}
+			model := &Model{ID: "gemini-test", BaseURL: tc.baseURL}
+			_, err := (&vertexClient{model: model}).Complete(t.Context(), model, &Context{}, opts...)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantURL, got.URL.String())
+			assert.Equal(t, tc.wantKey, got.Header.Get("x-goog-api-key"))
+			if tc.wantBearer == "" {
+				assert.Empty(t, got.Header.Get("Authorization"))
+			} else {
+				assert.Equal(t, "Bearer "+tc.wantBearer, got.Header.Get("Authorization"))
+			}
+		})
 	}
 }

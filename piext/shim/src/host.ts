@@ -22,7 +22,7 @@ import type {
 	UIInputResponseP,
 	UISelectResponseP,
 } from "./proto-types.ts";
-import type { NotifyLevel } from "./pi-types.ts";
+import type { NotifyLevel, NestedToolCall } from "./pi-types.ts";
 import fs from "node:fs";
 
 // Per-call deadline (under tau's 5s on_event budget; leave headroom).
@@ -74,6 +74,26 @@ export class HostClient {
 		}
 		return callUnary<TReq, TRes>(client, method, request, this.metadata(), {
 			deadline: Date.now() + deadlineMs,
+		});
+	}
+
+	async toolDiscovery(
+		operation: string,
+		options: { names?: string[]; query?: string; namespace?: string; limit?: number } = {},
+	): Promise<unknown> {
+		const response = await this.call<unknown, { resultJson?: string }>("toolDiscovery", { operation, ...options });
+		return JSON.parse(response.resultJson ?? "null");
+	}
+
+	async toolProgress(update: {
+		toolCallId: string;
+		content: string;
+		isError?: boolean;
+		nestedCalls?: NestedToolCall[];
+	}): Promise<void> {
+		await this.call("toolProgress", {
+			...update,
+			nestedCalls: update.nestedCalls === undefined ? "" : JSON.stringify(update.nestedCalls.slice(-128)),
 		});
 	}
 
@@ -169,8 +189,22 @@ export class HostClient {
 
 	// --- Message sending ----------------------------------------------------
 
-	sessionSendUserMessage(text: string, deliverAs: "" | "steer" | "followUp" = ""): Promise<SessionSendUserMessageResponseP> {
+	sessionSendUserMessage(
+		text: string,
+		deliverAs: "" | "steer" | "followUp" = "",
+	): Promise<SessionSendUserMessageResponseP> {
 		return this.call("sessionSendUserMessage", { text, deliverAs });
+	}
+
+	sessionSendCustomMessage(
+		message: Record<string, unknown>,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<SessionSendUserMessageResponseP> {
+		return this.call("sessionSendCustomMessage", {
+			messageJson: JSON.stringify(message),
+			triggerTurn: options?.triggerTurn,
+			deliverAs: options?.deliverAs ?? "",
+		});
 	}
 
 	/** Close the underlying gRPC client (tests). */
