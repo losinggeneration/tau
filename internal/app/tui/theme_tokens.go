@@ -1,6 +1,10 @@
 package tui
 
 import (
+	"maps"
+	"math"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -11,15 +15,15 @@ import (
 // Views resolve every colour through a token instead of a literal so switching
 // themes is one swap and no surface is left behind on the previous palette.
 //
-// Tokens are colours, not styles: attributes (bold, italic) describe what a
-// component is doing with a row, not what the theme is, so they stay with the
-// component. The rovel Palette underneath remains the toolkit-level vocabulary
-// for generic widgets; these tokens are the tau-specific roles it has no name
-// for (per-tool-state backgrounds, per-thinking-level accents).
+// Component attributes stay with the component; faint foreground metadata is
+// retained alongside colors so attribute-only changes invalidate render caches.
 // The field names below match the spec's token names (app.md §11) so a theme
 // file written against the spec applies. Two fields are tau extensions, marked
 // as such; everything else is one of the 51 required tokens.
 type themeTokens struct {
+	// A stable token bitset keeps attribute-only changes in the cache identity.
+	dimTokens uint64
+
 	// Surface is a tau extension. The spec assumes the terminal's own
 	// background shows through; tau paints an explicit background on every
 	// chat row so provenance cues span the full width, which needs a colour
@@ -84,6 +88,7 @@ type themeTokens struct {
 	ThinkingMedium  tauui.Color
 	ThinkingHigh    tauui.Color
 	ThinkingXHigh   tauui.Color
+	ThinkingMax     tauui.Color
 
 	// BashMode tints shell execution chrome: the bash tool's border title and
 	// its command line. Pi also uses it for the editor border while the prompt
@@ -103,6 +108,35 @@ type themeTokens struct {
 	// CustomMessageText.
 	CompactionFallbackBg    tauui.Color
 	CompactionFallbackLabel tauui.Color
+}
+
+var nativeTokenNames = func() []string {
+	tokens := defaultThemeTokens()
+	return slices.Sorted(maps.Keys(tokens.tokenTargets()))
+}()
+
+func (t *themeTokens) withDim(names []string) themeTokens {
+	out := *t
+	out.dimTokens = 0
+	for _, name := range names {
+		name = normalizeTokenName(name)
+		if name == "surface" || strings.HasSuffix(name, "bg") {
+			continue
+		}
+		if index, found := slices.BinarySearch(nativeTokenNames, name); found {
+			out.dimTokens |= 1 << index
+		}
+	}
+	return out
+}
+
+func (t *themeTokens) foreground(name string, color tauui.Color, base tauui.Style) tauui.Style {
+	base.FG = color
+	base.Attr &^= tauui.AttrDim
+	if index, found := slices.BinarySearch(nativeTokenNames, normalizeTokenName(name)); found && t.dimTokens&(1<<index) != 0 {
+		base.Attr |= tauui.AttrDim
+	}
+	return base
 }
 
 // defaultThemeTokens is the dark token set every unnamed/unknown theme
@@ -170,6 +204,7 @@ func defaultThemeTokens() themeTokens {
 		ThinkingMedium:  tauui.ColorRGB(130, 130, 210),
 		ThinkingHigh:    tauui.ColorRGB(180, 120, 210),
 		ThinkingXHigh:   tauui.ColorRGB(215, 110, 175),
+		ThinkingMax:     tauui.ColorRGB(240, 80, 140),
 
 		BashMode:   tauui.ColorRGB(220, 180, 80),
 		SystemText: tauui.ColorRGB(190, 170, 220),
@@ -296,6 +331,7 @@ func (t *themeTokens) tokenTargets() map[string]*tauui.Color {
 		"thinkingmedium":  &t.ThinkingMedium,
 		"thinkinghigh":    &t.ThinkingHigh,
 		"thinkingxhigh":   &t.ThinkingXHigh,
+		"thinkingmax":     &t.ThinkingMax,
 
 		"bashmode": &t.BashMode,
 
@@ -342,8 +378,16 @@ func normalizeTokenName(name string) string {
 	return b.String()
 }
 
-// parseThemeColor accepts "#rgb", "#rrggbb", "rgb(r,g,b)", a 0-255 palette
-// index, or "default" for the terminal's own colour.
+const themeNumber = `[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?`
+
+var (
+	oklchPattern = regexp.MustCompile(`^oklch\(\s*(` + themeNumber + `)(%)?\s+(` + themeNumber + `)\s+(` + themeNumber + `)(?:deg)?\s*\)$`)
+	okhslPattern = regexp.MustCompile(`^okhsl\(\s*(` + themeNumber + `)(?:deg)?\s+(` + themeNumber + `)(%)?\s+(` + themeNumber + `)(%)?\s*\)$`)
+)
+
+// parseThemeColor accepts "#rgb", "#rrggbb", "oklch(L C H)", "okhsl(H S L)",
+// "rgb(r,g,b)", a 0-255 palette index, or "default" for the terminal's own
+// colour.
 func parseThemeColor(raw string) (tauui.Color, bool) {
 	s := strings.ToLower(strings.TrimSpace(raw))
 	if s == "" {
@@ -351,6 +395,31 @@ func parseThemeColor(raw string) (tauui.Color, bool) {
 	}
 	if s == "default" {
 		return tauui.ColorDefault, true
+	}
+	if m := oklchPattern.FindStringSubmatch(s); m != nil {
+		l, c, h := themeFloat(m[1]), themeFloat(m[3]), themeFloat(m[4])
+		if m[2] != "" {
+			l /= 100
+		}
+		if !finite(l, c, h) || l < 0 || l > 1 || c < 0 {
+			return tauui.ColorDefault, false
+		}
+		rgb := oklchToRGB(l, c, h)
+		return tauui.ColorRGB(rgb[0], rgb[1], rgb[2]), true
+	}
+	if m := okhslPattern.FindStringSubmatch(s); m != nil {
+		h, sat, l := themeFloat(m[1]), themeFloat(m[2]), themeFloat(m[4])
+		if m[3] != "" {
+			sat /= 100
+		}
+		if m[5] != "" {
+			l /= 100
+		}
+		if !finite(h, sat, l) || sat < 0 || sat > 1 || l < 0 || l > 1 {
+			return tauui.ColorDefault, false
+		}
+		rgb := okhslToRGB(h, sat, l)
+		return tauui.ColorRGB(rgb[0], rgb[1], rgb[2]), true
 	}
 	if rest, ok := strings.CutPrefix(s, "#"); ok {
 		return parseHexColor(rest)
@@ -378,6 +447,24 @@ func parseThemeColor(raw string) (tauui.Color, bool) {
 		return tauui.ColorIndex(uint8(index)), true
 	}
 	return tauui.ColorDefault, false
+}
+
+// themeFloat parses a value the colour patterns already matched as a number.
+func themeFloat(text string) float64 {
+	v, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return math.NaN()
+	}
+	return v
+}
+
+func finite(values ...float64) bool {
+	for _, v := range values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return false
+		}
+	}
+	return true
 }
 
 func parseHexColor(hex string) (tauui.Color, bool) {
@@ -413,25 +500,26 @@ func parseHexColor(hex string) (tauui.Color, bool) {
 // before drawing text, so the provenance cue spans the full terminal width.
 func (t *themeTokens) chatPalette() chatPalette {
 	return chatPalette{
-		user:       tauui.Style{FG: t.UserMessageText, BG: t.UserMessageBg},
-		assistant:  tauui.Style{FG: t.Text, BG: t.Surface},
-		thinking:   tauui.Style{FG: t.ThinkingText, BG: t.Surface, Attr: tauui.AttrItalic},
-		toolCall:   tauui.Style{FG: t.ToolTitle, BG: t.ToolPendingBg, Attr: tauui.AttrBold},
-		toolResult: tauui.Style{FG: t.ToolOutput, BG: t.ToolSuccessBg},
-		toolError:  tauui.Style{FG: t.Error, BG: t.ToolErrorBg},
-		errorRole:  tauui.Style{FG: t.Error, BG: t.Surface},
-		system:     tauui.Style{FG: t.SystemText, BG: t.Surface},
-		dim:        tauui.Style{FG: t.Muted, BG: t.Surface},
-		spacer:     tauui.Style{FG: t.Text, BG: t.Surface},
+		tokens:     *t,
+		user:       t.foreground("UserMessageText", t.UserMessageText, tauui.Style{BG: t.UserMessageBg}),
+		assistant:  t.foreground("Text", t.Text, tauui.Style{BG: t.Surface}),
+		thinking:   t.foreground("ThinkingText", t.ThinkingText, tauui.Style{BG: t.Surface, Attr: tauui.AttrItalic}),
+		toolCall:   t.foreground("ToolTitle", t.ToolTitle, tauui.Style{BG: t.ToolPendingBg, Attr: tauui.AttrBold}),
+		toolResult: t.foreground("ToolOutput", t.ToolOutput, tauui.Style{BG: t.ToolSuccessBg}),
+		toolError:  t.foreground("Error", t.Error, tauui.Style{BG: t.ToolErrorBg}),
+		errorRole:  t.foreground("Error", t.Error, tauui.Style{BG: t.Surface}),
+		system:     t.foreground("SystemText", t.SystemText, tauui.Style{BG: t.Surface}),
+		dim:        t.foreground("Muted", t.Muted, tauui.Style{BG: t.Surface}),
+		spacer:     t.foreground("Text", t.Text, tauui.Style{BG: t.Surface}),
 
 		// Custom messages get their own background rather than borrowing the
 		// tool-success one. A compaction summary is not a successful tool call,
 		// and reusing that green said it was.
-		custom:      tauui.Style{FG: t.CustomMessageText, BG: t.CustomMessageBg},
-		customLabel: tauui.Style{FG: t.CustomMessageLabel, BG: t.CustomMessageBg, Attr: tauui.AttrBold},
+		custom:      t.foreground("CustomMessageText", t.CustomMessageText, tauui.Style{BG: t.CustomMessageBg}),
+		customLabel: t.foreground("CustomMessageLabel", t.CustomMessageLabel, tauui.Style{BG: t.CustomMessageBg, Attr: tauui.AttrBold}),
 
-		compactionFallback:      tauui.Style{FG: t.CustomMessageText, BG: t.CompactionFallbackBg},
-		compactionFallbackLabel: tauui.Style{FG: t.CompactionFallbackLabel, BG: t.CompactionFallbackBg, Attr: tauui.AttrBold},
+		compactionFallback:      t.foreground("CustomMessageText", t.CustomMessageText, tauui.Style{BG: t.CompactionFallbackBg}),
+		compactionFallbackLabel: t.foreground("CompactionFallbackLabel", t.CompactionFallbackLabel, tauui.Style{BG: t.CompactionFallbackBg, Attr: tauui.AttrBold}),
 
 		bashMode:    t.BashMode,
 		diffAdded:   t.ToolDiffAdded,
@@ -469,9 +557,8 @@ func (t *themeTokens) dynamicBorderColor(state tauui.DynamicBorderState) tauui.C
 	}
 }
 
-// editorBorderColor resolves the prompt editor's rule colour from the session's
-// thinking level. An unset or "off" level uses the neutral border token, so the
-// coloured rule reads as "reasoning is on" at a glance.
+// editorBorderColor resolves the prompt editor's rule color from the session's
+// thinking level. Unset and unrecognized levels use thinkingOff.
 func (t *themeTokens) editorBorderColor(thinkingLevel string) tauui.Color {
 	switch strings.ToLower(strings.TrimSpace(thinkingLevel)) {
 	case "minimal":
@@ -484,7 +571,56 @@ func (t *themeTokens) editorBorderColor(thinkingLevel string) tauui.Color {
 		return t.ThinkingHigh
 	case "xhigh":
 		return t.ThinkingXHigh
+	case "max":
+		return t.ThinkingMax
 	default:
-		return t.Border
+		return t.ThinkingOff
+	}
+}
+
+func (t *themeTokens) editorBorderStyle(level string) tauui.Style {
+	name := "thinkingOff"
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "minimal", "low", "medium", "high", "xhigh", "max":
+		name = "thinking" + strings.ToLower(strings.TrimSpace(level))
+	}
+	return t.foreground(name, t.editorBorderColor(level), tauui.Style{BG: t.Surface})
+}
+
+// nativeTheme keeps editor content, pickers, and clear cells on the same palette
+// as the transcript without changing the application's Unicode chrome.
+func (t *themeTokens) nativeTheme() tauui.Theme {
+	theme := appTheme()
+	base := t.foreground("text", t.Text, tauui.Style{BG: t.Surface})
+	theme.Base = base
+	theme.Palette.Surface = base
+	theme.Palette.SurfaceMuted = base
+	theme.Palette.Text = base
+	theme.Palette.TextMuted = t.foreground("Muted", t.Muted, base)
+	theme.Palette.Border = t.foreground("Border", t.Border, base)
+	theme.Palette.BorderMuted = t.foreground("BorderMuted", t.BorderMuted, base)
+	theme.Palette.Focus = t.foreground("Accent", t.Accent, base)
+	theme.Palette.Selection = base.WithBG(t.SelectedBg)
+	theme.Palette.Accent = t.foreground("Accent", t.Accent, base)
+	theme.Palette.Placeholder = t.foreground("Muted", t.Muted, base)
+	theme.Palette.Success = t.foreground("Success", t.Success, base)
+	theme.Palette.Warning = t.foreground("Warning", t.Warning, base)
+	theme.Palette.Danger = t.foreground("Error", t.Error, base)
+	theme.Palette.Disabled = t.foreground("Dim", t.Dim, base)
+	return theme
+}
+
+func (t *themeTokens) markdownTheme() tauui.MarkdownTheme {
+	return tauui.MarkdownTheme{
+		Heading:         t.foreground("mdHeading", t.MdHeading, tauui.Style{}),
+		Link:            t.foreground("mdLink", t.MdLink, tauui.Style{}),
+		LinkURL:         t.foreground("mdLinkUrl", t.MdLinkURL, tauui.Style{}),
+		Code:            t.foreground("mdCode", t.MdCode, tauui.Style{}),
+		CodeBlock:       t.foreground("mdCodeBlock", t.MdCodeBlock, tauui.Style{}),
+		CodeBlockBorder: t.foreground("mdCodeBlockBorder", t.MdCodeBlockBorder, tauui.Style{}),
+		Quote:           t.foreground("mdQuote", t.MdQuote, tauui.Style{}),
+		QuoteBorder:     t.foreground("mdQuoteBorder", t.MdQuoteBorder, tauui.Style{}),
+		HR:              t.foreground("mdHr", t.MdHr, tauui.Style{}),
+		ListBullet:      t.foreground("mdListBullet", t.MdListBullet, tauui.Style{}),
 	}
 }

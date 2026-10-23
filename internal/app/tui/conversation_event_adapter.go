@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"encoding/json"
 	"strings"
+
+	"github.com/losinggeneration/tau/ai"
 
 	"github.com/losinggeneration/tau/sdk"
 )
@@ -101,7 +104,12 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 		isErr, _ := plBool(ev.Payload, "is_error")
 		toolCallID, _ := plStringAny(ev.Payload, "tool_call_id", "toolCallId")
 		details := payloadValue(ev.Payload, "details")
-		app.conv.AddToolResultWithDetails(toolCallID, "", output, isErr, details)
+		excluded, _ := plBool(ev.Payload, "excludeFromContext")
+		content, _ := payloadValue(ev.Payload, "content").([]ai.ContentBlock)
+		structured, _ := payloadValue(ev.Payload, "structuredContent").(json.RawMessage)
+		nested, _ := payloadValue(ev.Payload, "nestedCalls").([]ai.NestedToolCall)
+		usage, _ := payloadValue(ev.Payload, "toolUsage").(*ai.Usage)
+		app.conv.addToolResult(toolCallID, "", output, isErr, details, payloadDurationMs(ev.Payload), excluded, ToolExecutionComponent{Content: content, StructuredContent: structured, NestedCalls: nested, ToolUsage: usage})
 	case "command_result":
 		app.resetEmptyAssistantResponses()
 		app.conv.ClearThinking()
@@ -111,6 +119,9 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 			app.conv.AddError(output)
 		} else if strings.TrimRight(output, "\n") != "" {
 			app.conv.AddSystem(output)
+		}
+		if command, _ := plString(ev.Payload, "command"); command == "reload" && !isErr {
+			app.reapplySessionSettings()
 		}
 	case "tool_cancelled", "tool_canceled":
 		app.resetEmptyAssistantResponses()
@@ -257,4 +268,16 @@ func plStringAny(payload any, keys ...string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func payloadDurationMs(payload any) *float64 {
+	switch value := payloadValue(payload, "durationMs").(type) {
+	case float64:
+		return new(value)
+	case *float64:
+		if value != nil {
+			return new(*value)
+		}
+	}
+	return nil
 }

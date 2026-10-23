@@ -2,12 +2,14 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/ai/oauth"
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
@@ -443,6 +445,9 @@ func cmdNew(app *App, _ string) {
 		app.refreshChat()
 		return
 	}
+	if app.extensionDialog != nil || app.loginDialog != nil {
+		app.dismissDialog()
+	}
 	if err := app.sess.Close(app.ctxOrBackground()); err != nil {
 		app.conv.AddError("new: close current session: " + err.Error())
 		app.refreshChat()
@@ -479,6 +484,12 @@ func (a *App) replaceConversation(conv *ConversationModel) {
 func (a *App) replaceConversationWithMode(conv *ConversationModel, clearChat bool) {
 	if a == nil || conv == nil {
 		return
+	}
+	if a.extensionDialog != nil || a.loginDialog != nil {
+		a.dismissDialog()
+	}
+	if a.app != nil {
+		a.app.ResetMouseState()
 	}
 	a.conv = conv
 	if a.chat != nil {
@@ -592,6 +603,9 @@ func cmdResume(app *App, args string) {
 		return
 	}
 	if current != nil {
+		if app.extensionDialog != nil || app.loginDialog != nil {
+			app.dismissDialog()
+		}
 		if err := current.Close(app.ctxOrBackground()); err != nil {
 			if closeErr := newSess.Close(app.ctxOrBackground()); closeErr != nil {
 				app.conv.AddError("resume: cleanup replacement session: " + closeErr.Error())
@@ -633,13 +647,41 @@ func appendSDKMessageToConversation(conv *ConversationModel, msg sdk.Message) {
 		return
 	}
 
+	if role == "custom" && msg.CustomType == sdk.BashExecutionCustomType {
+		if raw, err := json.Marshal(msg.Details); err == nil {
+			var execution sdk.BashExecution
+			if json.Unmarshal(raw, &execution) == nil && execution.Command != "" {
+				args, err := json.Marshal(map[string]any{"command": execution.Command, "exclude_from_context": execution.ExcludeFromContext})
+				if err == nil {
+					conv.AddToolCallWithID("", "bash", string(args))
+					addUserBashResult(conv, "", execution)
+					return
+				}
+			}
+		}
+	}
+
+	if role == "tool" || role == "toolResult" {
+		legacy := false
+		for _, block := range msg.Content {
+			if block.Type == ai.ContentBlockToolResult {
+				legacy = true
+				break
+			}
+		}
+		if !legacy {
+			conv.addToolResult(msg.ToolCallID, msg.ToolName, msg.Text, msg.IsError, msg.Details, msg.DurationMs, msg.ExcludeFromContext, ToolExecutionComponent{Content: msg.Content, StructuredContent: msg.StructuredContent, NestedCalls: msg.NestedCalls, ToolUsage: msg.ToolUsage})
+			return
+		}
+	}
+
 	if len(msg.Content) > 0 {
 		appendContentBlocksToConversation(conv, role, msg.Content, msg)
 		return
 	}
 
 	text := strings.TrimRight(msg.Text, "\n")
-	if text == "" {
+	if text == "" && role != "tool" && role != "toolResult" {
 		return
 	}
 	switch role {
@@ -650,7 +692,7 @@ func appendSDKMessageToConversation(conv *ConversationModel, msg sdk.Message) {
 	case "system":
 		conv.AddSystem(text)
 	case "tool", "toolResult":
-		conv.AddToolResultWithName(msg.ToolCallID, msg.ToolName, text, msg.IsError)
+		conv.addToolResult(msg.ToolCallID, msg.ToolName, text, msg.IsError, msg.Details, msg.DurationMs, msg.ExcludeFromContext)
 	default:
 		conv.AddMessage(Role(role), text)
 	}
@@ -658,6 +700,7 @@ func appendSDKMessageToConversation(conv *ConversationModel, msg sdk.Message) {
 
 func appendContentBlocksToConversation(conv *ConversationModel, role string, blocks []ai.ContentBlock, msg sdk.Message) {
 	var text strings.Builder
+	var hasToolResult bool
 	for _, block := range blocks {
 		switch block.Type {
 		case ai.ContentBlockText:
@@ -679,11 +722,12 @@ func appendContentBlocksToConversation(conv *ConversationModel, role string, blo
 			}
 			conv.AddToolCallWithID(block.ID, block.Name, string(block.Arguments))
 		case ai.ContentBlockToolResult:
+			hasToolResult = true
 			if strings.TrimRight(text.String(), "\n") != "" {
 				conv.AddAssistantMessage(text.String())
 				text.Reset()
 			}
-			conv.AddToolResultWithName(block.ToolCallID, block.ToolName, toolResultBlockText(block), msg.IsError)
+			conv.addToolResult(block.ToolCallID, block.ToolName, toolResultBlockText(block), msg.IsError, msg.Details, msg.DurationMs, msg.ExcludeFromContext)
 		case ai.ContentBlockImage:
 			if strings.TrimRight(text.String(), "\n") != "" {
 				addRoleText(conv, role, text.String(), msg.IsError)
@@ -694,7 +738,7 @@ func appendContentBlocksToConversation(conv *ConversationModel, role string, blo
 	}
 
 	remaining := strings.TrimRight(text.String(), "\n")
-	if remaining == "" {
+	if remaining == "" && (hasToolResult || role != "tool" && role != "toolResult") {
 		return
 	}
 	switch role {
@@ -705,7 +749,7 @@ func appendContentBlocksToConversation(conv *ConversationModel, role string, blo
 	case "system":
 		conv.AddSystem(remaining)
 	case "tool", "toolResult":
-		conv.AddToolResultWithName(msg.ToolCallID, msg.ToolName, remaining, msg.IsError)
+		conv.addToolResult(msg.ToolCallID, msg.ToolName, remaining, msg.IsError, msg.Details, msg.DurationMs, msg.ExcludeFromContext)
 	default:
 		conv.AddMessage(Role(role), remaining)
 	}
@@ -887,6 +931,9 @@ func cmdLogout(app *App, args string) {
 		app.refreshChat()
 		return
 	}
+	if app.loginDialog != nil {
+		app.dismissDialog()
+	}
 	if err := app.authStore.Delete(app.ctxOrBackground(), provider); err != nil {
 		app.conv.AddError("logout: " + err.Error())
 		app.refreshChat()
@@ -915,6 +962,15 @@ func cmdLogin(app *App, args string) {
 		app.conv.AddError("login: credential store unavailable")
 		app.refreshChat()
 		return
+	}
+	if apiKey == "" && !ai.ProviderAllowsNoCredential(provider) {
+		if p, ok := oauth.GetProvider(oauth.ProviderID(provider)); ok {
+			app.startOAuthLogin(p)
+			return
+		}
+	}
+	if app.loginDialog != nil {
+		app.dismissDialog()
 	}
 	var cred ai.Credential
 	if apiKey != "" {

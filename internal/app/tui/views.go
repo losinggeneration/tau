@@ -30,7 +30,6 @@ type footerData struct {
 	cacheReadTokens  int
 	cacheWriteTokens int
 	costUSD          float64
-	costKnown        bool
 	// totalTokens is retained as a fallback for sessions that only expose
 	// aggregate usage.
 	totalTokens   int
@@ -139,7 +138,7 @@ func (f *Footer) baseStyle(ctx *tauui.Ctx) tauui.Style {
 	}
 	if f != nil && f.tokens != nil {
 		tokens := f.tokens()
-		st = tauui.Style{FG: tokens.Dim, BG: tokens.Surface}
+		st = tokens.foreground("dim", tokens.Dim, tauui.Style{BG: tokens.Surface})
 	}
 	return st
 }
@@ -155,6 +154,12 @@ func (f *Footer) contextStyle(base tauui.Style) tauui.Style {
 	if f.tokens != nil {
 		tokens := f.tokens()
 		warn, err = tokens.Warning, tokens.Error
+		switch {
+		case f.data.contextUsedPct >= 90:
+			return tokens.foreground("error", tokens.Error, base)
+		case f.data.contextUsedPct >= 70:
+			return tokens.foreground("warning", tokens.Warning, base)
+		}
 	}
 	switch {
 	case f.data.contextUsedPct >= 90:
@@ -278,7 +283,7 @@ func (f *Footer) statsSpans(base tauui.Style) footerRow {
 	if d.cacheWriteTokens > 0 {
 		add("W" + formatTokenCount(d.cacheWriteTokens))
 	}
-	if d.costKnown || d.costUSD > 0 {
+	if d.costUSD > 0 {
 		cost := formatCostUSD(d.costUSD)
 		if d.oauthSubscription {
 			cost += " (sub)"

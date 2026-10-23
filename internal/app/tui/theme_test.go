@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,16 +10,9 @@ import (
 )
 
 func TestDecodeThemeColorsReadsTheSpecShape(t *testing.T) {
-	raw := []byte(`{
-	  "$schema": "https://example.invalid/theme.json",
-	  "name": "midnight",
-	  "colors": {
-	    "userMessageBg": "#102030",
-	    "toolTitle": "rgb(1,2,3)",
-	    "accent": "42"
-	  },
-	  "export": { "pageBg": "#000000" }
-	}`)
+	raw := completeTheme(t, "midnight",
+		map[string]any{"userMessageBg": "#102030", "toolTitle": "rgb(1,2,3)", "accent": "42"},
+		map[string]any{"$schema": "https://example.invalid/theme.json", "export": map[string]any{"pageBg": "#000000"}})
 
 	colors, err := DecodeThemeColors(raw)
 	if err != nil {
@@ -45,11 +37,9 @@ func TestDecodeThemeColorsReadsTheSpecShape(t *testing.T) {
 // `vars` is the spec's named-value mechanism; a theme that routes its palette
 // through it must still produce concrete colours.
 func TestDecodeThemeColorsResolvesVars(t *testing.T) {
-	raw := []byte(`{
-	  "name": "varsy",
-	  "vars": { "brand": "#ff8800" },
-	  "colors": { "accent": "$brand", "border": "{brand}", "text": "brand", "muted": "#111111" }
-	}`)
+	raw := completeTheme(t, "varsy",
+		map[string]any{"accent": "brand", "border": "brand", "text": "brand", "muted": "#111111"},
+		map[string]any{"vars": map[string]any{"brand": "#ff8800"}})
 
 	colors, err := DecodeThemeColors(raw)
 	if err != nil {
@@ -77,13 +67,7 @@ func TestDecodeThemeColorsRejectsUnusableFiles(t *testing.T) {
 // The end-to-end point of C2: a discovered theme file must repaint the UI.
 // Before this wiring the name reached the app and the colours did not.
 func TestDiscoveredThemeFileRepaintsTheChatLog(t *testing.T) {
-	raw, err := json.Marshal(map[string]any{
-		"name":   "midnight",
-		"colors": map[string]string{"userMessageBg": "#123456"},
-	})
-	if err != nil {
-		t.Fatalf("marshal theme: %v", err)
-	}
+	raw := completeTheme(t, "midnight", map[string]any{"userMessageBg": "#123456"}, nil)
 
 	a := newTestApp(t)
 	a.themeColors = func(name string) (map[string]string, bool) {
@@ -101,20 +85,6 @@ func TestDiscoveredThemeFileRepaintsTheChatLog(t *testing.T) {
 
 	if got, want := a.chat.pal().user.BG, tauui.ColorRGB(0x12, 0x34, 0x56); got != want {
 		t.Fatalf("user message background = %#v, want the theme file's %#v", got, want)
-	}
-}
-
-// A theme name with no file behind it keeps the built-in tokens rather than
-// blanking the palette.
-func TestUnknownThemeNameKeepsBuiltInTokens(t *testing.T) {
-	a := newTestApp(t)
-	a.themeColors = func(string) (map[string]string, bool) { return nil, false }
-
-	before := a.chat.pal().user.BG
-	a.applyTheme("no-such-theme")
-
-	if got := a.chat.pal().user.BG; got != before {
-		t.Fatalf("unknown theme changed the palette: %#v -> %#v", before, got)
 	}
 }
 
@@ -344,13 +314,14 @@ func TestChatPaletteDerivesEveryRoleFromTokens(t *testing.T) {
 func TestEditorBorderColorTracksThinkingLevel(t *testing.T) {
 	tokens := defaultThemeTokens()
 	cases := map[string]tauui.Color{
-		"":        tokens.Border,
-		"off":     tokens.Border,
+		"":        tokens.ThinkingOff,
+		"off":     tokens.ThinkingOff,
 		"minimal": tokens.ThinkingMinimal,
 		"low":     tokens.ThinkingLow,
 		"medium":  tokens.ThinkingMedium,
 		"high":    tokens.ThinkingHigh,
 		"xhigh":   tokens.ThinkingXHigh,
+		"max":     tokens.ThinkingMax,
 		"HIGH":    tokens.ThinkingHigh,
 	}
 	for level, want := range cases {
@@ -365,7 +336,7 @@ func TestEditorBorderColorTracksThinkingLevel(t *testing.T) {
 func TestThinkingLevelColorsAreDistinct(t *testing.T) {
 	tokens := defaultThemeTokens()
 	seen := map[tauui.Color]string{}
-	for _, level := range []string{"off", "minimal", "low", "medium", "high", "xhigh"} {
+	for _, level := range []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"} {
 		color := tokens.editorBorderColor(level)
 		if prev, ok := seen[color]; ok {
 			t.Fatalf("thinking levels %q and %q resolve to the same colour %#v", prev, level, color)

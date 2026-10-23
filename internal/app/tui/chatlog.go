@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -20,9 +21,9 @@ import (
 // before drawing text, so the provenance cue spans the full terminal width.
 //
 // bashMode and the diff colours stay as colours rather than styles: they are
-// applied with WithFG over whatever background the surrounding component
-// already established.
+// applied over the surrounding background with their own foreground attributes.
 type chatPalette struct {
+	tokens                                                                                     themeTokens
 	user, assistant, thinking, toolCall, toolResult, toolError, errorRole, system, dim, spacer tauui.Style
 
 	// custom is the background block a custom message renders on;
@@ -47,7 +48,18 @@ func (p *chatPalette) borderStyle(state tauui.DynamicBorderState, bg tauui.Color
 	if int(state) >= len(p.borderColors) {
 		state = tauui.DynamicBorderNeutral
 	}
-	return tauui.Style{FG: p.borderColors[state], BG: bg}
+	name := "border"
+	switch state {
+	case tauui.DynamicBorderRunning:
+		name = "accent"
+	case tauui.DynamicBorderSuccess:
+		name = "success"
+	case tauui.DynamicBorderError:
+		name = "error"
+	case tauui.DynamicBorderCancelled:
+		name = "warning"
+	}
+	return p.tokens.foreground(name, p.borderColors[state], tauui.Style{BG: bg})
 }
 
 // defaultHiddenThinkingLabel stands in for thinking content that is collapsed,
@@ -107,11 +119,12 @@ type chatLogSelection struct {
 }
 
 type chatLogRenderRequest struct {
-	revision   uint64
-	width      int
-	snapshot   ChatSnapshot
-	components []ChatComponent
-	wrap       chatLogWrapFunc
+	conversation *ConversationModel
+	revision     uint64
+	width        int
+	snapshot     ChatSnapshot
+	components   []ChatComponent
+	wrap         chatLogWrapFunc
 }
 
 type chatLogMessageSpan struct {
@@ -122,6 +135,7 @@ type chatLogMessageSpan struct {
 }
 
 type renderCacheKey struct {
+	outputPad   int
 	componentID string
 	revision    uint64
 	width       int
@@ -188,8 +202,9 @@ type chatLogWrapFunc func(context.Context, []ChatComponent, int) chatLogRenderSt
 // immutable results; applyPreparedRender installs them on the app loop before
 // the owning app invalidates layout and paint.
 type ChatLog struct {
-	id   tauui.ID
-	conv *ConversationModel
+	outputPad int
+	id        tauui.ID
+	conv      *ConversationModel
 
 	// palette is read by the render worker on every component and by Paint on
 	// the app loop, while SetLookName replaces it from whichever goroutine
@@ -215,7 +230,9 @@ type ChatLog struct {
 	// hideThinkingBlock drops thinking components from the rendered log
 	// entirely; hiddenThinkingLabel stands in for thinking whose text is
 	// collapsed or absent. Both guarded by mu.
-	hideThinkingBlock   bool
+	hideThinkingBlock bool
+	// codeBlockIndent overrides the markdown code block indent when set.
+	codeBlockIndent     *string
 	hiddenThinkingLabel string
 
 	// hideImages renders image components as their text placeholder instead
@@ -287,12 +304,13 @@ type ChatLog struct {
 func NewChatLog(conv *ConversationModel) *ChatLog {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &ChatLog{
-		id:     tauui.NewID(),
-		conv:   conv,
-		tokens: defaultThemeTokens(),
-		wake:   make(chan struct{}, 1),
-		cancel: cancel,
-		done:   make(chan struct{}),
+		outputPad: 1,
+		id:        tauui.NewID(),
+		conv:      conv,
+		tokens:    defaultThemeTokens(),
+		wake:      make(chan struct{}, 1),
+		cancel:    cancel,
+		done:      make(chan struct{}),
 	}
 	c.setPalette(c.tokens.chatPalette())
 	c.wrapMessagesFunc = c.wrapComponents
@@ -320,6 +338,22 @@ func (c *ChatLog) setRenderNotifier(notify chatLogRenderNotifier) {
 	if shouldNotify {
 		c.sendRenderReady(notify)
 	}
+}
+
+// SetOutputPad sets horizontal padding for output rows and renderer contexts.
+func (c *ChatLog) SetOutputPad(padding int) {
+	c.mu.Lock()
+	c.outputPad = max(0, padding)
+	c.renderCache = nil
+	c.renderCacheOrder = nil
+	c.mu.Unlock()
+	c.scheduleCurrentSnapshot()
+}
+
+func (c *ChatLog) outputPadding(width int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return min(c.outputPad, max(0, (width-1)/2))
 }
 
 // MarkDirty schedules the latest conversation snapshot at the current width.
@@ -357,6 +391,10 @@ func (c *ChatLog) SetLookName(name string) {
 // unknown keys and unparseable colours are ignored so a bad plugin theme costs
 // one token rather than the whole UI. Safe to call from any goroutine.
 func (c *ChatLog) SetTheme(name string, values map[string]string) {
+	c.setThemeDefinition(name, ThemeDefinition{Values: values})
+}
+
+func (c *ChatLog) setThemeDefinition(name string, definition ThemeDefinition) {
 	if c == nil {
 		return
 	}
@@ -366,7 +404,8 @@ func (c *ChatLog) SetTheme(name string, values map[string]string) {
 		look = chatLogLookTau
 	}
 	base := themeTokensFor(name)
-	tokens := base.withOverrides(values)
+	tokens := base.withOverrides(definition.Values)
+	tokens = tokens.withDim(definition.Dim)
 
 	c.mu.Lock()
 	changed := c.look != look || c.themeName != name || c.tokens != tokens
@@ -467,21 +506,19 @@ func (c *ChatLog) setConversation(conv *ConversationModel, clearRendered bool) {
 		c.activeCancel = nil
 	}
 	c.revision++
+	c.selection = chatLogSelection{}
 	if clearRendered {
 		c.renderedRevision = c.revision
 		c.renderedState = chatLogRenderState{width: c.desiredWidth, snapshot: conv.Snapshot()}
 		c.lines = nil
 		c.lineCount = 0
 		c.wrapWidth = 0
-		c.selection = chatLogSelection{}
 		c.visibleStart = 0
 		c.visibleEnd = 0
 	}
-	if clearRendered {
-		c.renderCache = nil
-		c.renderCacheOrder = nil
-		c.expanded = nil
-	}
+	c.renderCache = nil
+	c.renderCacheOrder = nil
+	c.expanded = nil
 	c.mu.Unlock()
 
 	unsubscribe()
@@ -780,11 +817,12 @@ func (c *ChatLog) scheduleCurrentSnapshot() {
 		c.activeCancel()
 	}
 	c.pending = &chatLogRenderRequest{
-		revision:   c.revision,
-		width:      width,
-		snapshot:   snapshot,
-		components: components,
-		wrap:       c.wrapMessagesFunc,
+		conversation: c.conv,
+		revision:     c.revision,
+		width:        width,
+		snapshot:     snapshot,
+		components:   components,
+		wrap:         c.wrapMessagesFunc,
 	}
 	c.mu.Unlock()
 
@@ -798,6 +836,7 @@ func (c *ChatLog) renderWorker(ctx context.Context) {
 	defer close(c.done)
 
 	var previous *chatLogRenderState
+	var previousConversation *ConversationModel
 	for {
 		select {
 		case <-ctx.Done():
@@ -814,6 +853,15 @@ func (c *ChatLog) renderWorker(ctx context.Context) {
 				return
 			}
 
+			if req.conversation != previousConversation {
+				previous = nil
+				previousConversation = req.conversation
+				// An old render can finish after setConversation clears the cache.
+				c.mu.Lock()
+				c.renderCache = nil
+				c.renderCacheOrder = nil
+				c.mu.Unlock()
+			}
 			reqCtx, cancelReq := context.WithCancel(ctx)
 			state, incremental := c.tryIncrementalComponentRender(previous, req.snapshot, req.components, req.width)
 			if !incremental {
@@ -1417,7 +1465,7 @@ func componentFromMessage(msg Message, revision uint64) ChatComponent {
 			output = rest
 		}
 		component.Kind = ChatComponentToolExecution
-		component.ToolExecution = ToolExecutionComponent{CallID: msg.ToolCallID, Name: msg.ToolName, Args: msg.ToolArgs, Output: output, State: state, IsError: msg.IsError}
+		component.ToolExecution = ToolExecutionComponent{ExcludeFromContext: msg.ExcludeFromContext || excludedShellArgs(msg.ToolName, msg.ToolArgs), DurationMs: msg.DurationMs, CallID: msg.ToolCallID, Name: msg.ToolName, Args: msg.ToolArgs, Output: output, State: state, IsError: msg.IsError}
 	}
 	if msg.Role == RoleError {
 		component.ToolExecution.IsError = msg.IsError
@@ -1437,6 +1485,7 @@ func (c *ChatLog) renderComponent(ctx context.Context, component ChatComponent, 
 	key := renderCacheKey{componentID: component.ID, revision: component.Revision, width: width}
 	if key.componentID != "" && key.revision != 0 {
 		c.mu.Lock()
+		key.outputPad = c.outputPad
 		key.expanded = c.expanded[component.ID]
 		entry, ok := c.renderCache[key]
 		if ok {
@@ -1549,6 +1598,7 @@ func (c *ChatLog) applyPluginComponent(component ChatComponent, width int) ([]re
 	if r == nil {
 		return nil, false, 0
 	}
+	component.ToolExecution.OutputPad = c.outputPadding(width)
 	rows, replace := r.applyPluginRenderers(component, width)
 	if !replace || len(rows) == 0 {
 		return nil, false, 0
@@ -1630,7 +1680,23 @@ func sameMessage(a, b Message) bool {
 		a.ToolArgs == b.ToolArgs &&
 		a.ToolCallID == b.ToolCallID &&
 		a.IsError == b.IsError &&
+		a.ExcludeFromContext == b.ExcludeFromContext &&
+		sameDuration(a.DurationMs, b.DurationMs) &&
 		slices.Equal(a.Images, b.Images)
+}
+
+func sameDuration(a, b *float64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func toolDurationLabel(tool ToolExecutionComponent) string {
+	if tool.State == toolExecutionExecuting || tool.DurationMs == nil || *tool.DurationMs < 0 || math.IsNaN(*tool.DurationMs) || math.IsInf(*tool.DurationMs, 0) {
+		return ""
+	}
+	return fmt.Sprintf("%.1fms", *tool.DurationMs)
 }
 
 func sameComponentIdentity(a, b ChatComponent) bool {
@@ -2054,6 +2120,29 @@ func (c *ChatLog) SetThinkingDisplay(hide bool, label string) {
 	}
 }
 
+// SetCodeBlockIndent sets the prefix of markdown code block lines, backing
+// the markdown.codeBlockIndent setting.
+func (c *ChatLog) SetCodeBlockIndent(indent string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	current := "  "
+	if c.codeBlockIndent != nil {
+		current = *c.codeBlockIndent
+	}
+	changed := current != indent
+	c.codeBlockIndent = &indent
+	if changed {
+		c.renderCache = nil
+		c.renderCacheOrder = nil
+	}
+	c.mu.Unlock()
+	if changed {
+		c.scheduleCurrentSnapshot()
+	}
+}
+
 // SetImageDisplay controls whether image components paint the picture or fall
 // back to their text placeholder. Backs the showImages setting. Safe to call
 // from any goroutine; drops the render cache because the setting changes the
@@ -2077,6 +2166,10 @@ func (c *ChatLog) SetImageDisplay(show bool) {
 
 func (c *ChatLog) renderToolExecutionComponent(ctx context.Context, component ChatComponent, width int) ([]renderLine, int, int) {
 	lines := c.appendToolExecution(ctx, nil, component, width)
+	for _, image := range component.Images {
+		imageLines, _, _ := c.renderImageComponent(ctx, ChatComponent{Image: image}, width)
+		lines = append(lines, imageLines...)
+	}
 	return lines, len(lines), len(component.Message().Text)
 }
 
@@ -2369,6 +2462,7 @@ func (c *ChatLog) toolRenderOverrides(tool ToolExecutionComponent, width int) to
 	c.mu.Lock()
 	r := c.pluginRenderers
 	c.mu.Unlock()
+	tool.OutputPad = c.outputPadding(width)
 	return r.toolOverrides(tool, width)
 }
 
@@ -2446,9 +2540,14 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 	if width <= 0 {
 		return out
 	}
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
 	tool := component.ToolExecution
 	st := c.toolStyle(tool)
-	commandStyle := st.WithFG(c.pal().bashMode).WithAttr(tauui.AttrBold)
+	commandStyle := c.pal().tokens.foreground("bashMode", c.pal().bashMode, st).WithAttr(tauui.AttrBold)
+	if tool.ExcludeFromContext {
+		commandStyle = c.pal().tokens.foreground("muted", c.pal().dim.FG, st).WithAttr(tauui.AttrDim)
+	}
 
 	out = append(out, renderLine{text: " ", st: c.pal().spacer})
 	cmd := bashCommandFromArgs(tool.Args)
@@ -2457,7 +2556,7 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 	}
 	if cmd != "" {
 		prefix := "$ " + expandChatLogTabs(cmd)
-		for i, row := range tauui.WrapLines(prefix, tauui.WrapOptions{Width: max(1, width-1), Mode: tauui.WrapWord}) {
+		for i, row := range tauui.WrapLines(prefix, tauui.WrapOptions{Width: max(1, width-2*pad), Mode: tauui.WrapWord}) {
 			if ctx.Err() != nil {
 				return out
 			}
@@ -2465,7 +2564,7 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 			if i == 0 {
 				lineStyle = commandStyle
 			}
-			line := renderLine{text: " " + wrappedSegment(prefix, row), st: lineStyle}
+			line := renderLine{text: inset + wrappedSegment(prefix, row), st: lineStyle}
 			if i > 0 {
 				line.join = joinSpace
 			}
@@ -2473,7 +2572,7 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 		}
 	}
 	if status := bashToolStatusSuffix(tool); status != "" {
-		out = append(out, renderLine{text: " " + status, st: c.pal().dim})
+		out = append(out, renderLine{text: inset + status, st: c.pal().dim})
 	}
 
 	limit := bashToolPreviewLines
@@ -2486,18 +2585,18 @@ func (c *ChatLog) appendBashToolExecutionPlain(ctx context.Context, out []render
 			if ctx.Err() != nil {
 				return out
 			}
-			cappedLine := tauui.TextTruncate(expandChatLogTabs(line), max(1, width-1), false)
-			out = append(out, renderLine{text: " " + cappedLine, st: st})
+			cappedLine := tauui.TextTruncate(expandChatLogTabs(line), max(1, width-2*pad), false)
+			out = append(out, renderLine{text: inset + cappedLine, st: st})
 		}
 		if truncated {
-			out = append(out, renderLine{text: " " + bashTruncatedText, st: c.pal().dim})
+			out = append(out, renderLine{text: inset + bashTruncatedText, st: c.pal().dim})
 		} else if limit == 0 {
-			out = append(out, renderLine{text: " " + collapseHintText, st: c.pal().dim})
+			out = append(out, renderLine{text: inset + collapseHintText, st: c.pal().dim})
 		}
 	} else if tool.State == toolExecutionComplete {
-		out = append(out, renderLine{text: " (no output)", st: c.pal().dim})
+		out = append(out, renderLine{text: inset + "(no output)", st: c.pal().dim})
 	} else if tool.State == toolExecutionExecuting {
-		out = append(out, renderLine{text: " running...", st: c.pal().dim})
+		out = append(out, renderLine{text: inset + "running...", st: c.pal().dim})
 	}
 	return out
 }
@@ -2508,11 +2607,15 @@ func (c *ChatLog) appendBashToolExecutionChrome(ctx context.Context, out []rende
 	}
 	tool := component.ToolExecution
 	st := c.toolStyle(tool)
-	commandStyle := st.WithFG(c.pal().bashMode).WithAttr(tauui.AttrBold)
+	commandStyle := c.pal().tokens.foreground("bashMode", c.pal().bashMode, st).WithAttr(tauui.AttrBold)
+	if tool.ExcludeFromContext {
+		commandStyle = c.pal().tokens.foreground("muted", c.pal().dim.FG, st).WithAttr(tauui.AttrDim)
+	}
 	dimStyle := c.pal().dim.WithBG(st.BG)
 	border := tauui.DynamicBorder{
-		Title: " bash · " + bashToolStateLabel(tool) + " ",
-		Width: width,
+		Title:    " bash · " + bashToolStateLabel(tool) + " ",
+		Width:    width,
+		PaddingX: new(c.outputPadding(width)),
 	}
 	// The border carries execution state; the command line inside carries the
 	// bash tint. Keeping those on separate colours means the box says "this
@@ -2581,11 +2684,13 @@ func (c *ChatLog) appendReadToolExecution(ctx context.Context, out []renderLine,
 	if width <= 0 {
 		return out
 	}
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
 	tool := component.ToolExecution
 	st := c.toolStyle(tool)
 	out = append(out, renderLine{text: " ", st: c.pal().spacer})
 	call := expandChatLogTabs(renderReadToolCall(tool, component.Text))
-	for i, row := range tauui.WrapLines(call, tauui.WrapOptions{Width: max(1, width-1), Mode: tauui.WrapWord}) {
+	for i, row := range tauui.WrapLines(call, tauui.WrapOptions{Width: max(1, width-2*pad), Mode: tauui.WrapWord}) {
 		if ctx.Err() != nil {
 			return out
 		}
@@ -2593,7 +2698,7 @@ func (c *ChatLog) appendReadToolExecution(ctx context.Context, out []renderLine,
 		if i == 0 {
 			lineStyle = st.WithAttr(tauui.AttrBold)
 		}
-		line := renderLine{text: " " + wrappedSegment(call, row), st: lineStyle}
+		line := renderLine{text: inset + wrappedSegment(call, row), st: lineStyle}
 		if i > 0 {
 			line.join = joinSpace
 		}
@@ -2615,12 +2720,12 @@ func (c *ChatLog) appendReadToolExecution(ctx context.Context, out []renderLine,
 		if ctx.Err() != nil {
 			return out
 		}
-		out = append(out, renderLine{text: chatLogRenderRow(" "+line, width), st: st})
+		out = append(out, renderLine{text: chatLogRenderRow(inset+line, width), st: st})
 	}
 	if truncated {
-		out = append(out, renderLine{text: chatLogRenderRow(" ... (read output truncated)", width), st: c.pal().dim})
+		out = append(out, renderLine{text: chatLogRenderRow(inset+"... (read output truncated)", width), st: c.pal().dim})
 	} else if limit == 0 && len(lines) > 0 {
-		out = append(out, renderLine{text: chatLogRenderRow(" "+collapseHintText, width), st: c.pal().dim})
+		out = append(out, renderLine{text: chatLogRenderRow(inset+collapseHintText, width), st: c.pal().dim})
 	}
 	return out
 }
@@ -2649,10 +2754,12 @@ func (c *ChatLog) appendEditToolExecution(ctx context.Context, out []renderLine,
 	if width <= 0 {
 		return out
 	}
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
 	tool := component.ToolExecution
 	st := c.toolStyle(tool)
 	out = append(out, renderLine{text: " ", st: c.pal().spacer})
-	out = append(out, renderLine{text: chatLogRenderRow(" "+renderEditToolCall(tool, component.Text), width), st: st.WithAttr(tauui.AttrBold)})
+	out = append(out, renderLine{text: chatLogRenderRow(inset+renderEditToolCall(tool, component.Text), width), st: st.WithAttr(tauui.AttrBold)})
 	if diff := editDiffFromDetails(component.ToolDetails); diff != "" {
 		out = append(out, renderLine{text: " ", st: st})
 		expanded := c.componentExpanded(component.ID)
@@ -2664,10 +2771,10 @@ func (c *ChatLog) appendEditToolExecution(ctx context.Context, out []renderLine,
 			if ctx.Err() != nil {
 				return out
 			}
-			out = append(out, renderLine{text: chatLogRenderRow(" "+line, width), st: c.editDiffLineStyle(line, st)})
+			out = append(out, renderLine{text: chatLogRenderRow(inset+line, width), st: c.editDiffLineStyle(line, st)})
 		}
 		if expanded && compactEditDiffTruncated(diff) {
-			out = append(out, renderLine{text: chatLogRenderRow(" "+collapseHintText, width), st: c.pal().dim})
+			out = append(out, renderLine{text: chatLogRenderRow(inset+collapseHintText, width), st: c.pal().dim})
 		}
 		return out
 	}
@@ -2676,7 +2783,7 @@ func (c *ChatLog) appendEditToolExecution(ctx context.Context, out []renderLine,
 			if ctx.Err() != nil {
 				return out
 			}
-			out = append(out, renderLine{text: chatLogRenderRow(" "+line, width), st: st})
+			out = append(out, renderLine{text: chatLogRenderRow(inset+line, width), st: st})
 		}
 	}
 	return out
@@ -2686,10 +2793,12 @@ func (c *ChatLog) appendWriteToolExecution(ctx context.Context, out []renderLine
 	if width <= 0 {
 		return out
 	}
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
 	tool := component.ToolExecution
 	st := c.toolStyle(tool)
 	out = append(out, renderLine{text: " ", st: c.pal().spacer})
-	out = append(out, renderLine{text: chatLogRenderRow(" "+renderWriteToolCall(tool, component.Text), width), st: st.WithAttr(tauui.AttrBold)})
+	out = append(out, renderLine{text: chatLogRenderRow(inset+renderWriteToolCall(tool, component.Text), width), st: st.WithAttr(tauui.AttrBold)})
 	limit := writeContentPreviewLines
 	if c.componentExpanded(component.ID) {
 		limit = 0
@@ -2700,10 +2809,10 @@ func (c *ChatLog) appendWriteToolExecution(ctx context.Context, out []renderLine
 			if ctx.Err() != nil {
 				return out
 			}
-			out = append(out, renderLine{text: chatLogRenderRow(" "+line, width), st: st})
+			out = append(out, renderLine{text: chatLogRenderRow(inset+line, width), st: st})
 		}
 		if limit == 0 {
-			out = append(out, renderLine{text: chatLogRenderRow(" "+collapseHintText, width), st: c.pal().dim})
+			out = append(out, renderLine{text: chatLogRenderRow(inset+collapseHintText, width), st: c.pal().dim})
 		}
 		return out
 	}
@@ -2712,7 +2821,7 @@ func (c *ChatLog) appendWriteToolExecution(ctx context.Context, out []renderLine
 			if ctx.Err() != nil {
 				return out
 			}
-			out = append(out, renderLine{text: chatLogRenderRow(" "+line, width), st: st})
+			out = append(out, renderLine{text: chatLogRenderRow(inset+line, width), st: st})
 		}
 	}
 	return out
@@ -2855,14 +2964,14 @@ func compactEditDiffTruncated(diff string) bool {
 
 func (c *ChatLog) editDiffLineStyle(line string, base tauui.Style) tauui.Style {
 	if strings.HasPrefix(line, "+") {
-		return base.WithFG(c.pal().diffAdded)
+		return c.pal().tokens.foreground("toolDiffAdded", c.pal().diffAdded, base)
 	}
 	if strings.HasPrefix(line, "-") {
-		return base.WithFG(c.pal().diffRemoved)
+		return c.pal().tokens.foreground("toolDiffRemoved", c.pal().diffRemoved, base)
 	}
 	// Context lines get their own token so added/removed stand out against
 	// them rather than against whatever the surrounding block happens to be.
-	return base.WithFG(c.pal().diffContext)
+	return c.pal().tokens.foreground("toolDiffContext", c.pal().diffContext, base)
 }
 
 // toolStyle resolves the state-background a tool execution renders on, from the
@@ -2880,30 +2989,41 @@ func (c *ChatLog) toolStyle(tool ToolExecutionComponent) tauui.Style {
 }
 
 func bashToolStatusSuffix(tool ToolExecutionComponent) string {
+	var label string
 	switch tool.State {
 	case toolExecutionExecuting:
-		return "(running)"
+		label = "running"
 	case toolExecutionError:
-		return "(failed)"
+		label = "failed"
 	case toolExecutionCancelled:
-		return "(cancelled)"
-	default:
+		label = "cancelled"
+	}
+	if duration := toolDurationLabel(tool); duration != "" {
+		if label != "" {
+			label += " · "
+		}
+		label += duration
+	}
+	if label == "" {
 		return ""
 	}
+	return "(" + label + ")"
 }
 
-// bashToolStateLabel names the execution state in the dynamic border's title.
 func bashToolStateLabel(tool ToolExecutionComponent) string {
+	label := "complete"
 	switch {
 	case tool.State == toolExecutionExecuting:
-		return "running"
+		label = "running"
 	case tool.State == toolExecutionCancelled:
-		return "cancelled"
+		label = "cancelled"
 	case tool.State == toolExecutionError || tool.IsError:
-		return "error"
-	default:
-		return "complete"
+		label = "error"
 	}
+	if duration := toolDurationLabel(tool); duration != "" {
+		label += " · " + duration
+	}
+	return label
 }
 
 func renderReadToolCall(tool ToolExecutionComponent, fallback string) string {
@@ -3003,6 +3123,9 @@ func renderToolStatusLine(tool ToolExecutionComponent, fallback string) string {
 	case toolExecutionCancelled:
 		prefix = "⊘ Cancelled"
 	}
+	if duration := toolDurationLabel(tool); duration != "" {
+		prefix += " (" + duration + ")"
+	}
 	if name == "bash" {
 		if cmd := bashCommandFromArgs(args); cmd != "" {
 			return prefix + " bash: " + cmd
@@ -3033,14 +3156,16 @@ func (c *ChatLog) appendAssistantMarkdownBlock(ctx context.Context, out []render
 
 func (c *ChatLog) appendAssistantMarkdownLine(ctx context.Context, out []renderLine, body string, width int, st tauui.Style, inFence *bool) []renderLine {
 	if strings.HasPrefix(strings.TrimSpace(body), "```") {
-		out = c.appendWrapped(ctx, out, body, width, st)
+		tokens := c.pal().tokens
+		out = c.appendWrapped(ctx, out, body, width, tokens.foreground("mdCodeBlockBorder", tokens.MdCodeBlockBorder, st))
 		if inFence != nil {
 			*inFence = !*inFence
 		}
 		return out
 	}
 	if inFence != nil && *inFence {
-		return c.appendWrapped(ctx, out, body, width, st)
+		tokens := c.pal().tokens
+		return c.appendWrapped(ctx, out, body, width, tokens.foreground("mdCodeBlock", tokens.MdCodeBlock, st))
 	}
 	return c.appendMarkdown(ctx, out, body, width, st)
 }
@@ -3151,8 +3276,12 @@ func assistantTableEnd(lines []string, start int) int {
 // like the tool chrome; other looks keep the plain grid.
 func (c *ChatLog) newChatMarkdown(body string) *tauui.Markdown {
 	md := tauui.NewMarkdown(body)
+	md.SetTheme(c.pal().tokens.markdownTheme())
 	c.mu.Lock()
 	tauLook := c.look == chatLogLookTau
+	if c.codeBlockIndent != nil {
+		md.SetCodeBlockIndent(*c.codeBlockIndent)
+	}
 	c.mu.Unlock()
 	if tauLook {
 		md.SetTableChrome(true)
@@ -3193,11 +3322,14 @@ type paddedBoxOptions struct {
 }
 
 func (c *ChatLog) appendPaddedMarkdownBox(ctx context.Context, out []renderLine, body string, width int, st tauui.Style, opts ...paddedBoxOptions) []renderLine {
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
+
 	if width <= 0 {
 		return out
 	}
 	out = append(out, renderLine{text: strings.Repeat(" ", width), st: st})
-	innerWidth := max(1, width-2)
+	innerWidth := max(1, width-2*pad)
 	rows := c.newChatMarkdown(body).RenderWrapped(innerWidth)
 	if len(rows) == 0 {
 		rows = []tauui.MarkdownRow{{}}
@@ -3216,7 +3348,7 @@ func (c *ChatLog) appendPaddedMarkdownBox(ctx context.Context, out []renderLine,
 		if ctx.Err() != nil {
 			return out
 		}
-		text := " " + strings.TrimRight(tauui.StripANSI(row.Text), " ")
+		text := inset + strings.TrimRight(row.Text, " ")
 		if tauui.TextWidth(text) < width {
 			text += strings.Repeat(" ", width-tauui.TextWidth(text))
 		}
@@ -3231,11 +3363,14 @@ func (c *ChatLog) appendPaddedMarkdownBox(ctx context.Context, out []renderLine,
 }
 
 func (c *ChatLog) appendPaddedTextBox(ctx context.Context, out []renderLine, body []string, width int, st tauui.Style) []renderLine {
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
+
 	if width <= 0 {
 		return out
 	}
 	out = append(out, renderLine{text: strings.Repeat(" ", width), st: st})
-	innerWidth := max(1, width-2)
+	innerWidth := max(1, width-2*pad)
 	for _, line := range body {
 		if ctx.Err() != nil {
 			return out
@@ -3245,7 +3380,7 @@ func (c *ChatLog) appendPaddedTextBox(ctx context.Context, out []renderLine, bod
 			rows = []string{""}
 		}
 		for i, row := range rows {
-			text := " " + strings.TrimRight(row, " ")
+			text := inset + strings.TrimRight(row, " ")
 			if tauui.TextWidth(text) < width {
 				text += strings.Repeat(" ", width-tauui.TextWidth(text))
 			}
@@ -3261,11 +3396,14 @@ func (c *ChatLog) appendPaddedTextBox(ctx context.Context, out []renderLine, bod
 }
 
 func (c *ChatLog) appendWrapped(ctx context.Context, out []renderLine, body string, width int, st tauui.Style) []renderLine {
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
+
 	body = strings.TrimRight(body, "\n")
 	if body == "" {
 		return append(out, renderLine{text: " ", st: st})
 	}
-	textWidth := width - 1 // one-cell left padding, matching Pi's chat rows
+	textWidth := width - 2*pad
 	if textWidth < 1 {
 		textWidth = 1
 	}
@@ -3282,7 +3420,7 @@ func (c *ChatLog) appendWrapped(ctx context.Context, out []renderLine, body stri
 			if ctx.Err() != nil {
 				return out
 			}
-			line := renderLine{text: " " + wrappedSegment(logicalLine, wl), st: st}
+			line := renderLine{text: inset + wrappedSegment(logicalLine, wl), st: st}
 			if i > 0 {
 				line.join = joinSpace
 			}

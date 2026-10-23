@@ -4,8 +4,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	sdk "github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/extensions"
 )
 
 // §9: compaction_end commits a summary message. It used to be unreachable —
@@ -281,4 +284,58 @@ func TestWiringSessionEventsToleratesAnOlderSession(t *testing.T) {
 	a := newTestApp(t)
 	a.sess = &sessionNoFollowUp{}
 	a.wireSessionEvents() // must not panic
+}
+
+// A failed compaction clears the indicator without committing a summary. A
+// manual failure is reported by /compact itself; an automatic one is reported
+// here, since nothing else will.
+func TestCompactionEndReportsFailedAttempts(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload map[string]any
+		want    int
+	}{
+		{"manual abort", map[string]any{"reason": "manual", "aborted": true}, 0},
+		{"manual error", map[string]any{"reason": "manual", "error_message": "boom"}, 0},
+		{"automatic abort", map[string]any{"reason": "threshold", "aborted": true}, 1},
+		{"automatic error", map[string]any{"reason": "threshold", "error_message": "boom"}, 1},
+	}
+	for _, tc := range cases {
+		a := newTestApp(t)
+		a.applySessionEvent(sdk.Event{Type: "compaction_start"})
+		a.applySessionEvent(sdk.Event{Type: "compaction_end", Payload: tc.payload})
+		_, running := a.statusEntries[compactionStatusKey]
+		assert.False(t, running, tc.name)
+		assert.False(t, a.compactionRunning, tc.name)
+		assert.Len(t, a.conv.Snapshot().Components, tc.want, tc.name)
+	}
+}
+
+func TestCompactionStatusPaintUsesActiveThemeWithoutChangingEditor(t *testing.T) {
+	a := newEditorChromeApp(t)
+	a.status = tauui.NewStatusEntriesView(5)
+	a.footer.data.thinkingLevel = "max"
+	a.applySessionEvent(sdk.Event{Type: "compaction_start"})
+	defer a.applySessionEvent(sdk.Event{Type: "compaction_end", Payload: map[string]any{"aborted": true}})
+	for _, values := range []map[string]string{
+		{"muted": "#123456", "accent": "#abcdef", "thinkingMax": "#102030"},
+		{"muted": "#654321", "accent": "#fedcba", "thinkingMax": "#304050"},
+	} {
+		a.applyThemeFromExtension(extensions.Theme{Name: "custom", Values: values, Dim: []string{"muted", "thinkingMax"}})
+		tokens := a.chat.ThemeTokens()
+		theme := tokens.nativeTheme()
+		a.status.Layout(tauui.Rect{W: 40, H: 1})
+		buf := tauui.NewBuffer(40, 1)
+		painter := tauui.NewRenderPainter(buf, tauui.Rect{W: 40, H: 1}, theme.Base)
+		a.status.Paint(tauui.NewDrawer(tauui.NewPainter(painter, theme.Base)), &tauui.Ctx{Theme: theme})
+		assert.Equal(t, tokens.Accent, buf.At(0, 0).Style.FG)
+		// The status value follows the key, separator, and one leading space.
+		message := buf.At(len(compactionStatusKey)+3, 0).Style
+		assert.Equal(t, tokens.Muted, message.FG)
+		assert.NotZero(t, message.Attr&tauui.AttrDim)
+		assert.Equal(t, tokens.Surface, message.BG)
+		editor := paintedRuleStyle(t, a.editor)
+		assert.Equal(t, tokens.ThinkingMax, editor.FG)
+		assert.NotZero(t, editor.Attr&tauui.AttrDim)
+	}
 }

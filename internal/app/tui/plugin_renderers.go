@@ -80,11 +80,12 @@ func (o toolRenderOverrides) partial() bool {
 // tool-name-keyed tool renderers. It is mutable from any goroutine (plugins
 // register from background goroutines) so all access goes through a mutex.
 type pluginRenderers struct {
-	mu               sync.RWMutex
-	messageByType    map[string]CustomMessageRenderer
-	toolByName       map[string]ToolRenderer
-	messageTypeOrder []string
-	toolOrder        []string
+	extensionRegistry *extensions.Registry
+	mu                sync.RWMutex
+	messageByType     map[string]CustomMessageRenderer
+	toolByName        map[string]ToolRenderer
+	messageTypeOrder  []string
+	toolOrder         []string
 }
 
 func newPluginRenderers() *pluginRenderers {
@@ -196,7 +197,13 @@ func (r *pluginRenderers) toolOverrides(exec ToolExecutionComponent, width int) 
 	}
 	r.mu.RLock()
 	renderer := r.toolByName[exec.Name]
+	registry := r.extensionRegistry
 	r.mu.RUnlock()
+	if renderer == nil && registry != nil {
+		if fn := registry.ToolRendererFor(exec.Name); fn != nil {
+			renderer = &extensionsToolAdapter{name: exec.Name, fn: fn}
+		}
+	}
 	if renderer == nil {
 		return toolRenderOverrides{}
 	}
@@ -334,6 +341,9 @@ func (r *pluginRenderers) ApplyExtensionsRegistry(reg *extensions.Registry) int 
 	if r == nil || reg == nil {
 		return 0
 	}
+	r.mu.Lock()
+	r.extensionRegistry = reg
+	r.mu.Unlock()
 	installed := 0
 	for _, kind := range reg.MessageKinds() {
 		if _, builtIn := builtInMessageKinds[strings.ToLower(strings.TrimSpace(kind))]; builtIn {

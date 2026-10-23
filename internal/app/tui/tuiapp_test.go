@@ -525,7 +525,7 @@ func TestChatLogMarkdownPreservesANSIControlSequencesForStyledPaint(t *testing.T
 	defer log.mu.Unlock()
 	foundInlineCode := false
 	for _, line := range log.lines {
-		if strings.Contains(line.text, "\x1b[7m") {
+		if strings.Contains(line.text, "\x1b[22;38;2;230;200;140m") {
 			foundInlineCode = true
 		}
 	}

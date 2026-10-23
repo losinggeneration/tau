@@ -237,8 +237,8 @@ func (h *Header) Paint(d tauui.Drawer, ctx *tauui.Ctx) {
 	accent := tauui.Style{FG: tauui.ColorWhite, Attr: tauui.AttrBold}
 	if tokenFn != nil {
 		tokens := tokenFn()
-		base = tauui.Style{FG: tokens.Dim, BG: tokens.Surface}
-		accent = tauui.Style{FG: tokens.Accent, BG: tokens.Surface, Attr: tauui.AttrBold}
+		base = tokens.foreground("dim", tokens.Dim, tauui.Style{BG: tokens.Surface})
+		accent = tokens.foreground("accent", tokens.Accent, tauui.Style{BG: tokens.Surface, Attr: tauui.AttrBold})
 	} else if ctx != nil && ctx.Theme.Base != (tauui.Style{}) {
 		base = ctx.Theme.Base.WithFG(tauui.ColorBrightBlack)
 		accent = ctx.Theme.Base.WithAttr(tauui.AttrBold)

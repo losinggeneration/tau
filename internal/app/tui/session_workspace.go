@@ -34,6 +34,7 @@ func cmdName(app *App, args string) {
 	if app.footer != nil && app.footer.data != nil {
 		app.footer.data.sessionName = name
 	}
+	app.refreshProgramStatus()
 	app.conv.AddSystem("name: " + name)
 	app.refreshChat()
 }

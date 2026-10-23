@@ -30,6 +30,7 @@ func (a *App) wireSessionEvents() {
 	if a == nil || a.sess == nil {
 		return
 	}
+	a.resetProgramStatus()
 	observer, ok := a.sess.(sdk.EventObserver)
 	if !ok {
 		return
@@ -46,6 +47,8 @@ func (a *App) onSessionEvent(e sdk.Event) {
 
 // applySessionEvent applies an out-of-band session event. Runs on the app loop.
 func (a *App) applySessionEvent(e sdk.Event) {
+	a.programStatus.handleEvent(e)
+	a.refreshProgramStatus()
 	switch e.Type {
 	case "compaction_start":
 		a.compactionRunning = true
@@ -58,9 +61,20 @@ func (a *App) applySessionEvent(e sdk.Event) {
 		if !a.isStreaming() {
 			a.stopThrobber()
 		}
-		if fallback || fallbackErr != "" {
+		fields, _ := e.Payload.(map[string]any)
+		aborted, _ := fields["aborted"].(bool)
+		errorMessage, _ := fields["error_message"].(string)
+		manual := fields["reason"] == nil || fields["reason"] == "manual"
+		switch {
+		// A failed manual compaction is reported by the command that ran it.
+		case (aborted || errorMessage != "") && manual:
+		case aborted:
+			a.conv.AddSystem("Auto-compaction cancelled")
+		case errorMessage != "":
+			a.conv.AddError(errorMessage)
+		case fallback || fallbackErr != "":
 			a.conv.AddFallbackCompactionSummary(summary, fallbackErr, tokensBefore)
-		} else {
+		default:
 			a.conv.AddCompactionSummary(summary, tokensBefore)
 		}
 		a.refreshChat()

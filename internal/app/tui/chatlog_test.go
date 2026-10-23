@@ -11,8 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/widgets"
+	"github.com/stretchr/testify/require"
 )
 
 // findStyledRow returns the index of the first rendered chat-log row that
@@ -464,11 +467,8 @@ func TestChatLogRapidUpdatesCoalesceToLatestSnapshot(t *testing.T) {
 	log.wrapMessagesFunc = func(ctx context.Context, components []ChatComponent, width int) chatLogRenderState {
 		if wraps.Add(1) == 1 {
 			close(started)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return chatLogRenderState{}
-			}
+			// Hold the worker until all snapshots are queued, even after cancellation.
+			<-release
 		}
 		return baseWrap(ctx, components, width)
 	}
@@ -1723,7 +1723,7 @@ func TestConversationProjectionMatchesFreshBuild(t *testing.T) {
 		got := second[i]
 		if got.ID != want.ID || got.Kind != want.Kind || got.Role != want.Role ||
 			got.Text != want.Text || got.Revision != want.Revision || got.Collapsed != want.Collapsed ||
-			got.ToolExecution != want.ToolExecution {
+			!reflect.DeepEqual(got.ToolExecution, want.ToolExecution) {
 			t.Fatalf("memoized component[%d] = %#v, want %#v", i, got, want)
 		}
 	}
@@ -2546,6 +2546,377 @@ func TestChatLogBashBorderColorIsUniform(t *testing.T) {
 			}
 			if sides == 0 {
 				t.Fatal("no side borders painted")
+			}
+		})
+	}
+}
+
+func TestToolStatusUsesRecordedDuration(t *testing.T) {
+	for _, name := range []string{"bash", "powershell", "lookup"} {
+		tool := ToolExecutionComponent{Name: name, State: toolExecutionComplete, DurationMs: new(12.5)}
+		if status := renderToolStatusLine(tool, ""); !strings.Contains(status, "12.5ms") {
+			t.Fatalf("duration missing: %q", status)
+		}
+		if name == "bash" {
+			if !strings.Contains(bashToolStateLabel(tool), "12.5ms") || !strings.Contains(bashToolStatusSuffix(tool), "12.5ms") {
+				t.Fatal("bash layouts lost duration")
+			}
+		}
+		tool.State = toolExecutionExecuting
+		if strings.Contains(renderToolStatusLine(tool, ""), "12.5ms") {
+			t.Fatal("running tool showed final duration")
+		}
+	}
+	if sameMessage(Message{DurationMs: new(12.5)}, Message{DurationMs: new(42.0)}) {
+		t.Fatal("duration change did not invalidate render cache")
+	}
+	if !sameMessage(Message{DurationMs: new(12.5)}, Message{DurationMs: new(12.5)}) {
+		t.Fatal("equal duration values invalidated render cache")
+	}
+}
+
+func TestExcludedBashCommandUsesDimStyle(t *testing.T) {
+	for _, look := range []string{"tau", "pi"} {
+		conv := NewConversationModel()
+		conv.AddToolCallWithID("call", "bash", `{"command":"pwd","exclude_from_context":true}`)
+		conv.AddToolProgress("call", "working")
+		log := newTestChatLog(t, conv)
+		log.SetLookName(look)
+		lines := log.appendBashToolExecution(context.Background(), nil, conv.Snapshot().Components[0], 40)
+		var found bool
+		for _, line := range lines {
+			if strings.Contains(line.text, "$ pwd") {
+				found = true
+				if line.st.FG != log.pal().dim.FG {
+					t.Fatalf("%s command not dimmed: %+v", look, line.st)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("command header missing")
+		}
+	}
+}
+
+func TestBashFragmentedANSIProducesNoEscapeSuffix(t *testing.T) {
+	for _, look := range []string{"tau", "pi"} {
+		conv := NewConversationModel()
+		conv.AddToolCallWithID("call", "bash", `{"command":"pwd"}`)
+		log := newTestChatLog(t, conv)
+		log.SetLookName(look)
+		for _, chunk := range []string{"\x1b[", "31mred", "\x1b", "[0m"} {
+			conv.AddToolProgress("call", chunk)
+		}
+		lines := log.appendBashToolExecution(context.Background(), nil, conv.Snapshot().Components[0], 40)
+		var output strings.Builder
+		for _, line := range lines {
+			output.WriteString(tauui.StripANSI(line.text))
+		}
+		if strings.Contains(output.String(), "31m") || strings.Contains(output.String(), "[0m") || !strings.Contains(output.String(), "red") {
+			t.Fatalf("%s ANSI fragments leaked: %q", look, output.String())
+		}
+	}
+}
+
+func TestOutputPaddingReachesRowsAndRendererContext(t *testing.T) {
+	for _, pad := range []int{0, 3} {
+		conv := NewConversationModel()
+		conv.AddToolCallWithID("call", "bash", `{"command":"pwd"}`)
+		conv.AddToolResultWithID("call", "output", false)
+		log := newTestChatLog(t, conv)
+		log.SetOutputPad(pad)
+		for _, look := range []string{"pi", "tau"} {
+			log.SetLookName(look)
+			rows := log.appendBashToolExecution(context.Background(), nil, conv.Snapshot().Components[0], 40)
+			var found bool
+			for _, row := range rows {
+				if strings.Contains(row.text, "$ pwd") {
+					found = true
+					prefix := strings.Repeat(" ", pad)
+					if look == "tau" {
+						prefix = "│" + prefix
+					}
+					if !strings.HasPrefix(row.text, prefix+"$ pwd") {
+						t.Fatalf("%s pad %d: %q", look, pad, row.text)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("missing shell header")
+			}
+		}
+		registry := newPluginRenderers()
+		registry.RegisterTool(&hookRenderer{name: "bash", shell: func(tool ToolExecutionComponent, _ int) ([]string, bool) {
+			if tool.OutputPad != pad {
+				t.Fatalf("renderer pad=%d want %d", tool.OutputPad, pad)
+			}
+			return nil, false
+		}})
+		log.pluginRenderers = registry
+		log.toolRenderOverrides(conv.Snapshot().Components[0].ToolExecution, 40)
+		rows := log.appendPaddedTextBox(context.Background(), nil, []string{"output"}, 40, tauui.Style{})
+		if !strings.HasPrefix(rows[1].text, strings.Repeat(" ", pad)+"output") {
+			t.Fatalf("generic padding: %q", rows[1].text)
+		}
+	}
+}
+
+// Text items render first and images follow, as upstream tool rows do.
+func TestRichToolResultRendersItemsInOrder(t *testing.T) {
+	conv := NewConversationModel()
+	blocks := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "first item"}, {Type: ai.ContentBlockImage, MimeType: "image/png", Data: "aW1hZ2U="}, {Type: ai.ContentBlockText, Text: "last item"}}
+	appendSDKMessageToConversation(conv, sdk.Message{Role: "tool", ToolCallID: "call", ToolName: "lookup", Content: blocks, IsError: true})
+	log := newTestChatLog(t, conv)
+	log.hideImages = true
+	rows, _, _ := log.renderToolExecutionComponent(context.Background(), conv.Snapshot().Components[0], 60)
+	var texts []string
+	for _, row := range rows {
+		texts = append(texts, row.text)
+	}
+	output := strings.Join(texts, "\n")
+	first, image, last := strings.Index(output, "first item"), strings.Index(output, "[image:"), strings.Index(output, "last item")
+	if first < 0 || last <= first || image <= last || strings.Count(output, "[image:") != 1 {
+		t.Fatalf("rich result order: %q", output)
+	}
+}
+
+func TestChatLogCodeBlockIndentSetting(t *testing.T) {
+	a := newTestApp(t)
+	render := func() string {
+		return tauui.StripANSI(strings.Join(a.chat.newChatMarkdown("```\nx\n```").Render(20), "\n"))
+	}
+	if got := render(); !strings.Contains(got, "\n  x") {
+		t.Fatalf("default render = %q, want two-space indent", got)
+	}
+	settings, err := ai.ParseSettings([]byte(`{"markdown":{"codeBlockIndent":""}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.chat.mu.Lock()
+	a.chat.renderCache = map[renderCacheKey]renderCacheEntry{}
+	a.chat.mu.Unlock()
+	a.chat.SetCodeBlockIndent("  ")
+	a.chat.mu.Lock()
+	kept := a.chat.renderCache != nil
+	a.chat.mu.Unlock()
+	if !kept {
+		t.Fatal("setting the default indent should keep rendered rows")
+	}
+	a.applyDisplaySettings(settings)
+	if got := render(); !strings.Contains(got, "\nx") || strings.Contains(got, " x") {
+		t.Fatalf("empty indent render = %q", got)
+	}
+	a.chat.mu.Lock()
+	a.chat.renderCache = map[renderCacheKey]renderCacheEntry{}
+	a.chat.mu.Unlock()
+	a.chat.SetCodeBlockIndent("    ")
+	a.chat.mu.Lock()
+	dropped := a.chat.renderCache == nil
+	a.chat.mu.Unlock()
+	if !dropped {
+		t.Fatal("changing the indent should drop rendered rows")
+	}
+}
+
+func TestChatLogFaintOnlyThemeChangeDropsRenderCache(t *testing.T) {
+	a := newTestApp(t)
+	a.chat.SetTheme("custom", map[string]string{"toolOutput": "default"})
+	before := a.chat.ThemeTokens()
+	a.chat.mu.Lock()
+	a.chat.renderCache = map[renderCacheKey]renderCacheEntry{}
+	a.chat.mu.Unlock()
+	a.chat.setThemeDefinition("custom", ThemeDefinition{Values: map[string]string{"toolOutput": "default"}, Dim: []string{"toolOutput"}})
+	after := a.chat.ThemeTokens()
+	if before == after {
+		t.Fatal("faint-only change did not change comparable tokens")
+	}
+	a.chat.mu.Lock()
+	dropped := a.chat.renderCache == nil
+	a.chat.mu.Unlock()
+	if !dropped {
+		t.Fatal("faint-only change retained cached render styles")
+	}
+	if got := a.chat.editDiffLineStyle("context", a.chat.pal().toolResult).Attr; got&tauui.AttrDim != 0 {
+		t.Fatal("foreground change inherited toolOutput faint")
+	}
+}
+
+func TestChatLogPaintKeepsFaintThinkingAcrossMarkdownResets(t *testing.T) {
+	conv := NewConversationModel()
+	log := newTestChatLog(t, conv)
+	definition := ThemeDefinition{Values: map[string]string{"text": "default", "thinkingText": "default", "userMessageText": "default", "surface": "default"}, Dim: []string{"thinkingText"}}
+	log.setThemeDefinition("faint", definition)
+	lines := log.appendMarkdown(t.Context(), nil, "plain **bold** tail", 40, log.pal().thinking)
+	log.mu.Lock()
+	log.lines = lines
+	log.rect = tauui.Rect{W: 40, H: len(lines)}
+	log.mu.Unlock()
+	buf := tauui.NewBuffer(40, len(lines))
+	base := tauui.Style{}
+	painter := tauui.NewRenderPainter(buf, tauui.Rect{W: 40, H: len(lines)}, base)
+	log.Paint(tauui.NewDrawer(tauui.NewPainter(painter, base)), &tauui.Ctx{Theme: appTheme()})
+	found := 0
+	for y := range len(lines) {
+		for x := range 40 {
+			cell := buf.At(x, y)
+			if cell.R == ' ' || cell.R == 0 {
+				continue
+			}
+			found++
+			if cell.Style.Attr&tauui.AttrDim == 0 || cell.Style.Attr&tauui.AttrItalic == 0 {
+				t.Fatalf("thinking cell (%d,%d) lost faint/italic: %+v", x, y, cell)
+			}
+		}
+	}
+	if found == 0 {
+		t.Fatal("no thinking content painted")
+	}
+}
+
+func TestConversationReplacementClearsSelectionWithRetainedRows(t *testing.T) {
+	for _, preserve := range []bool{false, true} {
+		t.Run(fmt.Sprintf("preserve=%t", preserve), func(t *testing.T) {
+			conv := NewConversationModel()
+			conv.AddAssistantMessage("Inline `code` here")
+			log := newTestChatLog(t, conv)
+			log.Layout(tauui.Rect{W: 40, H: 10})
+			waitForChatLog(t, log)
+			row := findStyledRow(t, log)
+			ctx := &tauui.Ctx{ClipboardWrite: func(string) { t.Fatal("stale selection copied after replacement") }}
+			log.Handle(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MousePress, X: 10, Y: row, ClickCount: 2}, nil)
+			log.mu.Lock()
+			active := log.selection.active
+			log.mu.Unlock()
+			if !active {
+				t.Fatal("selection not established")
+			}
+			replacement := NewConversationModel()
+			replacement.AddAssistantMessage("Replacement `text` here")
+			// Keep the completed old rows visible until this test applies the new result.
+			log.setRenderNotifier(func() error { return nil })
+			if preserve {
+				log.SetConversationPreserveRender(replacement)
+			} else {
+				log.SetConversation(replacement)
+			}
+			log.mu.Lock()
+			selection := log.selection
+			retained := len(log.lines) > 0
+			log.mu.Unlock()
+			if selection.active {
+				t.Fatal("replacement retained selection")
+			}
+			if retained != preserve {
+				t.Fatalf("retained rows = %t", retained)
+			}
+			if log.Handle(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease, X: 10, Y: row}, ctx) {
+				t.Fatal("stale release handled")
+			}
+			log.setRenderNotifier(func() error { log.applyPreparedRender(); return nil })
+			waitForChatLog(t, log)
+			log.mu.Lock()
+			defer log.mu.Unlock()
+			if log.selection.active {
+				t.Fatal("prepared replacement restored selection")
+			}
+			var replacementText strings.Builder
+			for _, line := range log.lines {
+				replacementText.WriteString(tauui.StripANSI(line.text))
+			}
+			if !strings.Contains(replacementText.String(), "Replacement text here") {
+				t.Fatalf("replacement rows = %q", replacementText.String())
+			}
+		})
+	}
+}
+
+func TestOutputPaddingSetterRewrapsCachedRows(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call", "bash", `{"command":"pwd"}`)
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{W: 20, H: 10})
+	waitForChatLog(t, log)
+	for _, padding := range []int{3, -1, 100, 1} {
+		log.SetOutputPad(padding)
+		waitForChatLog(t, log)
+		log.mu.Lock()
+		var command string
+		for _, line := range log.lines {
+			if strings.Contains(line.text, "$") {
+				command = tauui.StripANSI(line.text)
+				break
+			}
+		}
+		log.mu.Unlock()
+		want := strings.Repeat(" ", min(max(0, padding), 9)) + "$ pwd"
+		if padding == 100 {
+			want = strings.Repeat(" ", 9) + "$ "
+		}
+		if command != want {
+			t.Fatalf("padding %d: command = %q, want %q", padding, command, want)
+		}
+	}
+}
+
+func TestStreamingAppendPreservesTranscriptSelection(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddAssistantMessage("Inline `code` here")
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{W: 40, H: 10})
+	waitForChatLog(t, log)
+	row := findStyledRow(t, log)
+	log.Handle(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MousePress, X: 10, Y: row, ClickCount: 2}, nil)
+	conv.BeginAssistantMessage()
+	conv.AppendAssistantText("Streaming text")
+	waitForChatLog(t, log)
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if !log.selection.active || log.selectedTextLocked() != "code" {
+		t.Fatalf("streaming changed selection: %+v text=%q", log.selection, log.selectedTextLocked())
+	}
+}
+
+func TestChatMarkdownThemeReachesAssistantUserAndStreamingFences(t *testing.T) {
+	for _, kind := range []string{"assistant", "user", "fence"} {
+		t.Run(kind, func(t *testing.T) {
+			conv := NewConversationModel()
+			switch kind {
+			case "assistant":
+				conv.AddAssistantMessage("# title `code` tail")
+			case "user":
+				conv.AddUserMessage("# title `code` tail")
+			case "fence":
+				conv.BeginAssistantMessage()
+				conv.AppendAssistantText("```go\nplain")
+			}
+			log := newTestChatLog(t, conv)
+			log.Layout(tauui.Rect{W: 40, H: 10})
+			waitForChatLog(t, log)
+			for _, color := range []string{"#123456", "#abcdef"} {
+				t.Run(color, func(t *testing.T) {
+					log.setThemeDefinition("custom", ThemeDefinition{Values: map[string]string{"mdHeading": color, "mdCodeBlock": color, "mdCodeBlockBorder": "#556677"}, Dim: []string{"mdHeading", "mdCodeBlock"}})
+					waitForChatLog(t, log)
+					expected, ok := parseThemeColor(color)
+					require.True(t, ok)
+					buf := tauui.NewBuffer(40, 10)
+					base := tauui.Style{}
+					log.Paint(tauui.NewDrawer(tauui.NewPainter(tauui.NewRenderPainter(buf, tauui.Rect{W: 40, H: 10}, base), base)), &tauui.Ctx{Theme: appTheme()})
+					var found bool
+					for y := range 10 {
+						for x := range 40 {
+							cell := buf.At(x, y)
+							if cell.R == 't' || kind == "fence" && cell.R == 'p' {
+								found = true
+								require.Equal(t, expected, cell.Style.FG)
+								require.NotZero(t, cell.Style.Attr&tauui.AttrDim)
+								if kind == "user" {
+									require.Equal(t, log.pal().user.BG, cell.Style.BG)
+								}
+							}
+						}
+					}
+					require.True(t, found)
+				})
 			}
 		})
 	}

@@ -4,6 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
+	"github.com/losinggeneration/tau/ai"
 	tauui "github.com/losinggeneration/tau/tui"
 )
 
@@ -67,10 +70,6 @@ func TestSanitizeStatus(t *testing.T) {
 	}
 }
 
-// TestFooterRender exercises the field-stack rendering with various
-// footer data permutations. The render must include the new fields
-// (branch, used/window/pct, providers, extension statuses,
-// auto-compaction) when populated, and omit them when empty.
 func TestFooterStatsModelRowDetailedUsage(t *testing.T) {
 	f := NewFooter(&footerData{
 		cwd:              "/tmp",
@@ -91,29 +90,26 @@ func TestFooterStatsModelRowDetailedUsage(t *testing.T) {
 	}
 }
 
-func TestFooterApplyUsagePayload(t *testing.T) {
-	a := &App{footer: NewFooter(&footerData{})}
-	a.applyUsagePayload(map[string]any{
-		"this_call": map[string]any{
-			"input":      float64(100),
-			"output":     float64(20),
-			"cacheRead":  float64(5),
-			"cacheWrite": float64(3),
-			"cost": map[string]any{
-				"total": float64(0.012),
-			},
-		},
-	})
+func TestFooterUsageComesFromSessionStats(t *testing.T) {
+	a := newTestApp(t)
+	a.footer = NewFooter(&footerData{})
+	fs := a.sess.(*fakeSession)
+	fs.mu.Lock()
+	fs.usage = ai.Usage{Input: 100, Output: 20, CacheRead: 5, CacheWrite: 3, Cost: ai.Cost{Total: 0.012}}
+	fs.mu.Unlock()
+	a.refreshFooterStats(nil)
 	data := a.footer.data
-	if data.inputTokens != 100 || data.outputTokens != 20 || data.cacheReadTokens != 5 || data.cacheWriteTokens != 3 || data.costUSD != 0.012 {
-		t.Fatalf("footer usage = input:%d output:%d read:%d write:%d cost:%g", data.inputTokens, data.outputTokens, data.cacheReadTokens, data.cacheWriteTokens, data.costUSD)
-	}
+	assert.Equal(t, []int{100, 20, 5, 3}, []int{data.inputTokens, data.outputTokens, data.cacheReadTokens, data.cacheWriteTokens})
+	assert.InDelta(t, 0.012, data.costUSD, 1e-12)
+
+	fs.mu.Lock()
+	fs.usage = ai.Usage{Input: 7}
+	fs.mu.Unlock()
+	a.refreshFooterStats(nil)
+	assert.Equal(t, []int{7, 0, 0, 0}, []int{data.inputTokens, data.outputTokens, data.cacheReadTokens, data.cacheWriteTokens}, "totals follow the session, not earlier events")
+	assert.Zero(t, data.costUSD)
 }
 
-// TestFooterRender exercises the field-stack rendering with various
-// footer data permutations. The render must include the new fields
-// (branch, used/window/pct, providers, extension statuses,
-// auto-compaction) when populated, and omit them when empty.
 // The threshold recolours only the context span. Restyling the whole row —
 // what the previous implementation did — makes the cwd, token counts and model
 // all turn red at 90%, which is noise rather than a signal.
@@ -170,6 +166,10 @@ func TestFooterCwdRowIncludesSessionName(t *testing.T) {
 	}
 }
 
+// TestFooterRender exercises the field-stack rendering with various
+// footer data permutations. The render must include the new fields
+// (branch, used/window/pct, providers, extension statuses,
+// auto-compaction) when populated, and omit them when empty.
 func TestFooterRender(t *testing.T) {
 	st := func() tauui.Style { return tauui.Style{FG: tauui.ColorWhite, BG: tauui.ColorBrightBlack} }
 	_ = st // silence unused warning; style is captured by Paint but
@@ -390,12 +390,12 @@ func TestFooterStatsRowFollowsTheSpecGrammar(t *testing.T) {
 // An OAuth subscription marks the cost " (sub)" rather than reporting a dollar
 // figure the user is not actually being charged.
 func TestFooterMarksSubscriptionCost(t *testing.T) {
-	f := NewFooter(&footerData{cwd: "/tmp", costUSD: 0.42, costKnown: true, oauthSubscription: true})
+	f := NewFooter(&footerData{cwd: "/tmp", costUSD: 0.42, oauthSubscription: true})
 	if row := f.renderRows(200)[1]; !strings.Contains(row, "(sub)") {
 		t.Errorf("subscription cost not marked: %q", row)
 	}
 
-	plain := NewFooter(&footerData{cwd: "/tmp", costUSD: 0.42, costKnown: true})
+	plain := NewFooter(&footerData{cwd: "/tmp", costUSD: 0.42})
 	if row := plain.renderRows(200)[1]; strings.Contains(row, "(sub)") {
 		t.Errorf("non-subscription cost marked as one: %q", row)
 	}

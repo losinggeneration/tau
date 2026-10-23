@@ -890,6 +890,5 @@ func isImageExt(ext string) bool {
 
 // pluginsVersion returns the version string.
 func pluginsVersion() string {
-	// This will be set from cli.go's plugins package
-	return "dev"
+	return tauVersion()
 }

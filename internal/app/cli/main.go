@@ -207,8 +207,10 @@ func loadSettings() (*ai.Settings, error) {
 		return nil, fmt.Errorf("load user settings: %w", err)
 	}
 
-	// Try loading project settings from .tau/settings.json
-	projectSettings, _ := ai.LoadSettings(".tau/settings.json")
+	projectSettings, err := ai.LoadSettings(".tau/settings.json")
+	if err != nil {
+		return nil, fmt.Errorf("load project settings: %w", err)
+	}
 
 	return ai.MergeSettings(userSettings, projectSettings), nil
 }
@@ -222,6 +224,65 @@ func openStore() (*store.FileBackend, error) {
 		return nil, fmt.Errorf("ensure auth dir: %w", err)
 	}
 	return fb, nil
+}
+
+// reloadSession reloads settings, artifacts, plugins, and tools for /reload.
+// Settings files, artifact discovery, and session settings are validated
+// before anything is replaced, so those failures leave the previous state.
+// Plugin restarts happen after that commit and report their own failures.
+func reloadSession(ctx context.Context, plugin string, sess commands.CommandSession) (commands.Result, error) {
+	settings, err := loadSettings()
+	if err != nil {
+		return commands.Result{}, fmt.Errorf("reload settings: %w", err)
+	}
+	var prepared *artifacts.PreparedReload
+	if loader, ok := sdk.GlobalArtifactLoader.(*artifacts.Loader); ok {
+		prepared, err = loader.Prepare(artifacts.ReloadOptions{
+			SettingsPaths: getSettingsArtifactPaths(settings),
+			UserDirs:      artifactUserDirs(settings),
+		})
+		if err != nil {
+			return commands.Result{}, fmt.Errorf("reload artifacts: %w", err)
+		}
+	}
+	if reloader, ok := sess.(sdk.SettingsReloader); ok {
+		if err := reloader.ReloadSettings(ctx, settings); err != nil {
+			return commands.Result{}, fmt.Errorf("reload session settings: %w", err)
+		}
+	}
+	switch {
+	case prepared != nil:
+		prepared.Commit()
+	case sdk.GlobalArtifactLoader != nil:
+		if err := sdk.GlobalArtifactLoader.Reload(ctx); err != nil {
+			return commands.Result{}, fmt.Errorf("reload artifacts: %w", err)
+		}
+	}
+	if GlobalPluginManager != nil {
+		if plugin != "" {
+			err = GlobalPluginManager.ReloadNamed(ctx, plugin)
+		} else {
+			err = GlobalPluginManager.Reload(ctx)
+		}
+		if err != nil {
+			return commands.Result{}, fmt.Errorf("reload plugins: %w", err)
+		}
+	}
+	if reloader, ok := sess.(sdk.ToolRegistryReloader); ok {
+		if err := reloader.ReloadToolRegistry(ctx); err != nil {
+			return commands.Result{}, fmt.Errorf("reload tool registry: %w", err)
+		}
+	}
+	output := "reloaded settings, artifacts, and plugins"
+	if plugin != "" {
+		output = fmt.Sprintf("reloaded settings, artifacts, and plugin %q", plugin)
+	}
+	if prepared != nil {
+		for _, line := range prepared.ThemeDiagnostics() {
+			output += "\nwarning: invalid theme " + line
+		}
+	}
+	return commands.Result{Output: output}, nil
 }
 
 // registerBuiltInCommands registers the built-in tau commands into the registry.
@@ -261,27 +322,7 @@ func registerBuiltInCommands(reg *commands.InMemoryRegistry) {
 		ArgumentHint: "<plugin>",
 		Source:       commands.Builtin,
 	}, func(ctx context.Context, args string, ui commands.CommandUI, sess commands.CommandSession) (commands.Result, error) {
-		if sdk.GlobalArtifactLoader == nil {
-			return commands.Result{Output: "no artifact loader configured"}, nil
-		}
-		args = strings.TrimSpace(args)
-		if args != "" {
-			// Named plugin reload: reload artifacts first, then force-reload the named plugin.
-			if err := sdk.GlobalArtifactLoader.Reload(ctx); err != nil {
-				return commands.Result{}, fmt.Errorf("reload artifacts: %w", err)
-			}
-			if GlobalPluginManager != nil {
-				if err := GlobalPluginManager.ReloadNamed(ctx, args); err != nil {
-					return commands.Result{}, fmt.Errorf("reload plugin %q: %w", args, err)
-				}
-			}
-			return commands.Result{Output: fmt.Sprintf("reloaded artifacts and plugin %q", args)}, nil
-		}
-		// Full reload: artifacts + all plugins.
-		if err := sdk.GlobalArtifactLoader.Reload(ctx); err != nil {
-			return commands.Result{}, fmt.Errorf("reload: %w", err)
-		}
-		return commands.Result{Output: "reloaded artifacts and plugins"}, nil
+		return reloadSession(ctx, strings.TrimSpace(args), sess)
 	})
 
 	mustRegisterBuiltin(reg, commands.Info{
@@ -457,6 +498,7 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		}
 	}
 	loaderOpts := artifacts.LoaderOptions{
+		ThemeValidator:   func(raw []byte) error { _, err := tui.DecodeThemeColors(raw); return err },
 		Log:              nil,
 		CWD:              cwd,
 		SettingsPaths:    getSettingsArtifactPaths(settings),
@@ -478,6 +520,10 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to initialize artifacts: %v\n", err)
 		loader = nil
+	} else {
+		for _, line := range loader.ThemeRegistry().Diagnostics() {
+			recordStartupDiagnostic(ctx, "warning: invalid theme %s", line)
+		}
 	}
 
 	// Pass --skill flags as ID-based preloaded skills to the runtime.
@@ -553,13 +599,13 @@ func getSettingsArtifactPaths(settings *ai.Settings) map[artifacts.ArtifactKind]
 	result := make(map[artifacts.ArtifactKind][]string)
 
 	if settings.Skills != nil {
-		result[artifacts.KindSkill] = settings.Skills
+		result[artifacts.KindSkill] = settings.ResourcePaths("skills")
 	}
 	if settings.Prompts != nil {
-		result[artifacts.KindPrompt] = settings.Prompts
+		result[artifacts.KindPrompt] = settings.ResourcePaths("prompts")
 	}
 	if settings.Themes != nil {
-		result[artifacts.KindTheme] = settings.Themes
+		result[artifacts.KindTheme] = settings.ResourcePaths("themes")
 	}
 
 	if len(result) == 0 {
@@ -669,13 +715,11 @@ func runLogin(ctx context.Context, cmd *cli.Command) error {
 		cred = ai.NewNoneCredential()
 	} else if isOAuth && (apiKey == "" || useOAuth) {
 		callbacks := &loginCallbacks{interactive: interactive}
-		creds, err := oauthProvider.Login(ctx, callbacks)
+		var err error
+		cred, err = loginOAuthCredential(ctx, oauthProvider, callbacks)
 		if err != nil {
 			return cli.Exit(fmt.Sprintf("OAuth login failed: %v", err), ExitAuthError)
 		}
-
-		expiresAt := time.UnixMilli(creds.Expires)
-		cred = ai.NewOAuthCredential(creds.Access, creds.Refresh, expiresAt, "")
 		usedOAuth = true
 	} else if apiKey != "" {
 		cred = ai.NewAPIKeyCredential(apiKey)
@@ -723,6 +767,23 @@ func runLogin(ctx context.Context, cmd *cli.Command) error {
 		fmt.Fprintf(os.Stderr, "Configured %s (no credential required)\n", provider)
 	}
 	return nil
+}
+
+func loginOAuthCredential(ctx context.Context, provider oauth.Provider, callbacks oauth.LoginCallbacks) (ai.Credential, error) {
+	if err := ctx.Err(); err != nil {
+		return ai.Credential{}, fmt.Errorf("authenticate: %w", err)
+	}
+	creds, err := provider.Login(ctx, callbacks)
+	if err != nil {
+		return ai.Credential{}, fmt.Errorf("authenticate: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return ai.Credential{}, fmt.Errorf("authenticate: %w", err)
+	}
+	if creds == nil || creds.Access == "" {
+		return ai.Credential{}, errors.New("provider returned no access token")
+	}
+	return store.CredentialFromOAuth(creds), nil
 }
 
 // loginCallbacks implements oauth.LoginCallbacks for the CLI.
@@ -1208,6 +1269,11 @@ func runInstall(ctx context.Context, cmd *cli.Command) error {
 
 	userDir, projectDir := packagesDirs()
 	mgr := packages.NewInstallManager(userDir, projectDir)
+	settings, err := loadSettings()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	mgr.NPMCommand = settings.NPMCommand
 
 	mgr.ArtifactReloader = func(ctx context.Context) error {
 		if sdk.GlobalArtifactLoader != nil {
@@ -1295,6 +1361,11 @@ func runUninstall(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
+	settings, err := loadSettings()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	mgr.NPMCommand = settings.NPMCommand
 	// Use the Manager's Uninstall method which handles npm packages correctly
 	if err := mgr.Uninstall(ctx, name, scope); err != nil {
 		return cli.Exit(fmt.Sprintf("uninstall failed: %v", err), ExitSubsystemError)
@@ -1338,7 +1409,11 @@ func runUpdate(ctx context.Context, cmd *cli.Command) error {
 	}
 	updateMgr.PluginReloader = func(ctx context.Context, pluginName string) error {
 		rtOpts, pluginMgr, _, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil)
-		defer func() { _ = pluginMgr.Shutdown(ctx) }()
+		defer func() {
+			if pluginMgr != nil {
+				reportShutdownError(pluginMgr.Shutdown(ctx))
+			}
+		}()
 		if pluginMgr != nil {
 			if err := pluginMgr.ReloadNamed(ctx, pluginName); err != nil {
 				return err
@@ -1860,7 +1935,7 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create runtime: %v", err), ExitSubsystemError)
 	}
-	defer func() { _ = rt.Close(ctx) }()
+	defer func() { reportShutdownError(rt.Close(ctx)) }()
 
 	// Set up graceful shutdown.
 	interruptChan := make(chan struct{}, 1)
@@ -1894,7 +1969,7 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create session: %v", err), ExitSubsystemError)
 	}
-	defer func() { _ = sess.Close(ctx) }()
+	defer func() { reportShutdownError(sess.Close(ctx)) }()
 
 	var printMu sync.Mutex
 	printer := &eventPrinter{NoStream: rootCmdFromContext(ctx).Bool("no-stream")}
@@ -1925,6 +2000,9 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 			}
 		}
 	nextPrompt:
+		if printer.Err != nil {
+			return cli.Exit(printer.Err.Error(), ExitProviderError)
+		}
 	}
 
 	// Handle export if --export was provided.
@@ -1934,6 +2012,9 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
+	if err := printer.result(); err != nil {
+		return cli.Exit(err.Error(), ExitProviderError)
+	}
 	return nil
 }
 
@@ -1954,7 +2035,7 @@ func runSessionsRename(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("rename session: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Session %s renamed to %q\n", id[:8], newName)
+	fmt.Fprintf(os.Stderr, "Session %.8s renamed to %q\n", id, newName)
 	return nil
 }
 
@@ -1976,7 +2057,7 @@ func runSessionsMove(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("move session: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Session %s moved from %s to %s\n", id[:8], oldCWD, newCWD)
+	fmt.Fprintf(os.Stderr, "Session %.8s moved from %s to %s\n", id, oldCWD, newCWD)
 	return nil
 }
 
@@ -1996,7 +2077,7 @@ func runSessionsDelete(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("delete session: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Session %s moved to trash\n", id[:8])
+	fmt.Fprintf(os.Stderr, "Session %.8s moved to trash\n", id)
 	return nil
 }
 
@@ -2045,7 +2126,7 @@ func runSessionsRestore(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("restore session: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Session %s restored from trash\n", id[:8])
+	fmt.Fprintf(os.Stderr, "Session %.8s restored from trash\n", id)
 	return nil
 }
 
@@ -2065,7 +2146,7 @@ func runSessionsCompact(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("compact session: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Session %s compacted\n", id[:8])
+	fmt.Fprintf(os.Stderr, "Session %.8s compacted\n", id)
 	return nil
 }
 
@@ -2086,7 +2167,7 @@ func runSessionsSummarizeBranch(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("summarize branch: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Branch %s summarized\n", branchTip[:8])
+	fmt.Fprintf(os.Stderr, "Branch %.8s summarized\n", branchTip)
 	return nil
 }
 
@@ -2112,7 +2193,7 @@ func runSessionsFork(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("fork session: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Forked session %s -> %s\n", id[:8], newID[:8])
+	fmt.Fprintf(os.Stderr, "Forked session %.8s -> %.8s\n", id, newID)
 	return nil
 }
 
@@ -2139,7 +2220,7 @@ func runSessionsExport(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	if opts.Output != "" {
-		fmt.Fprintf(os.Stderr, "Exported session %s to %s\n", id[:8], opts.Output)
+		fmt.Fprintf(os.Stderr, "Exported session %.8s to %s\n", id, opts.Output)
 	}
 	return nil
 }
@@ -2163,7 +2244,7 @@ func runSessionsShare(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit(fmt.Sprintf("share session: %v", err), ExitSubsystemError)
 	}
 
-	fmt.Fprintf(os.Stderr, "Shared session %s: %s\n", id[:8], url)
+	fmt.Fprintf(os.Stderr, "Shared session %.8s: %s\n", id, url)
 	if isTTY() && copyToClipboard(url) {
 		fmt.Fprintln(os.Stderr, "(URL copied to clipboard)")
 	}
@@ -2208,7 +2289,7 @@ func runRPC(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create runtime: %v", err), ExitSubsystemError)
 	}
-	defer func() { _ = rt.Close(ctx) }()
+	defer func() { reportShutdownError(rt.Close(ctx)) }()
 
 	srv := server.NewServer(rt, reg, pluginMgr)
 
@@ -2267,7 +2348,7 @@ func runDaemon(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create runtime: %v", err), ExitSubsystemError)
 	}
-	defer func() { _ = rt.Close(ctx) }()
+	defer func() { reportShutdownError(rt.Close(ctx)) }()
 
 	path := cmd.String("socket")
 	if path == "" {
@@ -2432,17 +2513,6 @@ func piExtensionPackageLines(userDir, projectDir string) ([]string, error) {
 	return lines, nil
 }
 
-// runUpdateSelf handles the `tau update self`/`tau update pi` sub-commands.
-// Self-update is not yet implemented in tau; this command currently reports
-// a clear error and exits non-zero. The self-update mechanism is a follow-up.
-func runUpdateSelf(_ context.Context, _ *cli.Command) error {
-	return cli.Exit(
-		"tau self-update is not yet implemented; "+
-			"build from source or reinstall via your package manager",
-		ExitSubsystemError,
-	)
-}
-
 // runReload handles the `tau reload` command.
 func runReload(ctx context.Context, cmd *cli.Command) error {
 	args := cmd.Args().Slice()
@@ -2452,7 +2522,11 @@ func runReload(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	_, pluginMgr, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil)
-	defer func() { _ = pluginMgr.Shutdown(ctx) }()
+	defer func() {
+		if pluginMgr != nil {
+			reportShutdownError(pluginMgr.Shutdown(ctx))
+		}
+	}()
 
 	if pluginMgr != nil {
 		if pluginName != "" {
@@ -2724,6 +2798,13 @@ func runPromptsShow(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
+func themeSource(theme *artifacts.Theme) string {
+	if theme.ID == "system" && theme.SourcePath == "" {
+		return "generated from terminal colors"
+	}
+	return theme.SourcePath
+}
+
 // runThemesList handles the `tau themes list` subcommand.
 func runThemesList(ctx context.Context, cmd *cli.Command) error {
 	_, _, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
@@ -2765,7 +2846,7 @@ func runThemesList(ctx context.Context, cmd *cli.Command) error {
 		if theme.Name != "" && theme.Name != theme.ID {
 			writeLine(os.Stdout, "    %s\n", theme.Name)
 		}
-		writeLine(os.Stdout, "    Source: %s\n", theme.SourcePath)
+		writeLine(os.Stdout, "    Source: %s\n", themeSource(theme))
 		writeLine(os.Stdout, "\n")
 	}
 
@@ -2804,7 +2885,7 @@ func runThemesShow(ctx context.Context, cmd *cli.Command) error {
 	writeLine(os.Stdout, "Theme: %s\n", theme.ID)
 	writeLine(os.Stdout, "Name: %s\n", theme.Name)
 	writeLine(os.Stdout, "Tier: %s\n", theme.Tier)
-	writeLine(os.Stdout, "Source: %s\n", theme.SourcePath)
+	writeLine(os.Stdout, "Source: %s\n", themeSource(theme))
 
 	// Print extra fields if any
 	if len(theme.ExtraFields) > 0 {
@@ -3169,7 +3250,7 @@ func runConversationWithSignal(ctx context.Context, sigChan <-chan os.Signal, pr
 		fmt.Fprintf(os.Stderr, "create runtime: %v\n", err)
 		return ExitSubsystemError
 	}
-	defer func() { _ = rt.Close(ctx) }()
+	defer func() { reportShutdownError(rt.Close(ctx)) }()
 
 	// Set up signal handling for graceful shutdown
 	interruptChan := make(chan struct{}, 1)
@@ -3223,7 +3304,7 @@ func runConversationWithSignal(ctx context.Context, sigChan <-chan os.Signal, pr
 		fmt.Fprintf(os.Stderr, "create session: %v\n", err)
 		return classifyConversationError(err)
 	}
-	defer func() { _ = sess.Close(ctx) }()
+	defer func() { reportShutdownError(sess.Close(ctx)) }()
 
 	var printMu sync.Mutex
 	printer := &eventPrinter{NoStream: false}
@@ -3258,6 +3339,10 @@ func runConversationWithSignal(ctx context.Context, sigChan <-chan os.Signal, pr
 			}
 		}
 	nextPrompt:
+		if printer.Err != nil {
+			fmt.Fprintln(os.Stderr, printer.Err)
+			return ExitProviderError
+		}
 	}
 
 	if sessionFlags.ExportPath != "" {
@@ -3279,6 +3364,10 @@ func runConversationWithSignal(ctx context.Context, sigChan <-chan os.Signal, pr
 		}
 	}
 
+	if err := printer.result(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return ExitProviderError
+	}
 	return ExitSuccess
 }
 
@@ -3311,7 +3400,7 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 		fmt.Fprintf(os.Stderr, "create runtime: %v\n", err)
 		return ExitSubsystemError
 	}
-	defer func() { _ = rt.Close(ctx) }()
+	defer func() { reportShutdownError(rt.Close(ctx)) }()
 
 	if resumeSelectionRequested(cmd) {
 		sessions, err := rt.ListSessions(ctx)
@@ -3362,7 +3451,7 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 		fmt.Fprintf(os.Stderr, "create session: %v\n", err)
 		return classifyConversationError(err)
 	}
-	defer func() { _ = sess.Close(ctx) }()
+	defer func() { reportShutdownError(sess.Close(ctx)) }()
 
 	initialPrompt := ""
 	if len(prompts) > 0 {
@@ -3377,7 +3466,9 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 		InitialPrompt:   initialPrompt,
 		CredentialStore: rtOpts.CredentialStore,
 		SettingsPath:    filepath.Join(configDir(), "settings.json"),
-		ThemeColors:     themeColorLookup(loader),
+		ModelScope:      modelScopePatterns(sessionFlags.Models, rtOpts.Settings),
+		ThemeLookup:     themeLookup(loader),
+		RefreshTheme:    themeRefresher(loader),
 		StartupMessages: diagnosticsFromContext(ctx),
 		SessionFactory: func(ctx context.Context, opts sdk.SessionOptions) (sdk.Session, error) {
 			if opts.CWD == "" {
@@ -3519,6 +3610,15 @@ func rootCmdFromContext(ctx context.Context) *cli.Command {
 	return nil
 }
 
+// modelScopePatterns returns the --models patterns, falling back to the
+// enabledModels setting.
+func modelScopePatterns(flags []string, settings *ai.Settings) []string {
+	if len(flags) > 0 || settings == nil {
+		return flags
+	}
+	return settings.EnabledModels
+}
+
 // SessionFlags holds parsed conversation flags for session creation.
 type SessionFlags struct {
 	NoTools             bool
@@ -3551,6 +3651,10 @@ type SessionFlags struct {
 //   - --fork can be combined with --session, --continue, or --resume (creates fork of target)
 func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) SessionFlags {
 	sessionFlags := SessionFlags{}
+	if cmd.String("provider") != "" && len(cmd.StringSlice("models")) == 0 {
+		sessionFlags.SelectionError = fmt.Errorf("--provider requires --model (or --models)")
+		return sessionFlags
+	}
 
 	// Collect session flag values first to enforce precedence rules
 	noSession := cmd.Bool("no-session")
@@ -3585,8 +3689,12 @@ func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) Sessio
 	if noSession {
 		rtOpts.NoSession = true
 		sessionFlags.NoSession = true
-		// Ignore all other session flags when --no-session is set
-		return sessionFlags
+		sessionID = ""
+		continueFlag = false
+		resumeID = ""
+		resumeSet = false
+		forkID = ""
+		sessionFlagCount = 0
 	}
 
 	// Enforce mutual exclusivity for --continue, --resume, --session
@@ -3627,11 +3735,15 @@ func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) Sessio
 	if len(models) > 0 {
 		rtOpts.Models = models
 		sessionFlags.Models = models
-		spec, err := ai.ResolveModelPatterns(models, rtOpts.Settings)
+		scoped, err := ai.ResolveModelPatterns(models, rtOpts.Settings)
 		if err != nil {
 			sessionFlags.SelectionError = fmt.Errorf("resolve --models: %w", err)
 		} else {
-			rtOpts.ExplicitModel = spec.Model.String()
+			rtOpts.ExplicitModel = scoped.Model.String()
+			if rtOpts.ThinkingLevel == "" && scoped.ThinkingLevel != "" {
+				rtOpts.ThinkingLevel = scoped.ThinkingLevel
+				sessionFlags.ThinkingLevel = scoped.ThinkingLevel
+			}
 		}
 	}
 
@@ -3659,6 +3771,9 @@ func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) Sessio
 	// comma-separated input to a flat list so callers can pass either form.
 	if v := normalizeToolList(cmd.StringSlice("tools")); len(v) > 0 {
 		sessionFlags.ToolAllowlist = v
+		if err := sdk.ValidateToolSelection(v); err != nil {
+			sessionFlags.SelectionError = fmt.Errorf("invalid --tools: %w", err)
+		}
 	}
 	if v := normalizeToolList(cmd.StringSlice("exclude-tools")); len(v) > 0 {
 		sessionFlags.ToolDenylist = v
@@ -3707,7 +3822,7 @@ func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) Sessio
 	}
 
 	// Handle session flags (with precedence already enforced)
-	// --no-session was already handled above and causes early return if set
+	// --no-session clears session targets without discarding runtime flags.
 	// --session, --continue, --resume precedence is enforced above
 
 	// Handle --session-dir (override session storage location)
@@ -3768,8 +3883,31 @@ func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) Sessio
 // text_delta events accumulate into Buf and print at message_end so the user
 // sees a complete response in one block instead of streamed chunks.
 type eventPrinter struct {
-	NoStream bool
-	Buf      strings.Builder
+	Err       error
+	NoStream  bool
+	Buf       strings.Builder
+	lastStop  string
+	lastError string
+}
+
+var errResponseTruncated = errors.New("Response was truncated: the model reached its output token limit.") //nolint:staticcheck // upstream print-mode wording
+
+// result reports a run failure, or failure of the final assistant reply, as
+// upstream print mode does after its last prompt.
+func (p *eventPrinter) result() error {
+	if p.Err != nil {
+		return p.Err
+	}
+	switch p.lastStop {
+	case string(ai.StopReasonError), string(ai.StopReasonAborted):
+		if p.lastError != "" {
+			return errors.New(p.lastError)
+		}
+		return errors.New("Request " + p.lastStop)
+	case string(ai.StopReasonLength):
+		return errResponseTruncated
+	}
+	return nil
 }
 
 // processEventWith handles an SDK event and prints it appropriately.
@@ -3791,6 +3929,12 @@ func processEventWith(event *sdk.Event, mu *sync.Mutex, p *eventPrinter) {
 			}
 		}
 	case "message_end":
+		if p != nil {
+			if payload, ok := event.Payload.(map[string]any); ok && payload["role"] == "assistant" {
+				p.lastStop, _ = payload["finish_reason"].(string)
+				p.lastError, _ = payload["error_message"].(string)
+			}
+		}
 		if p != nil && p.NoStream && p.Buf.Len() > 0 {
 			fmt.Print(p.Buf.String())
 			p.Buf.Reset()
@@ -3828,9 +3972,13 @@ func processEventWith(event *sdk.Event, mu *sync.Mutex, p *eventPrinter) {
 			}
 		}
 	case "error":
-		if p, ok := event.Payload.(map[string]any); ok {
-			msg, _ := p["message"].(string)
-			fmt.Fprintf(os.Stderr, "error: %s\n", msg)
+		if payload, ok := event.Payload.(map[string]any); ok {
+			msg, _ := payload["message"].(string)
+			if p != nil {
+				p.Err = errors.New("error: " + msg)
+			} else {
+				fmt.Fprintf(os.Stderr, "error: %s\n", msg)
+			}
 		}
 	case "usage":
 		if p, ok := event.Payload.(map[string]any); ok {
@@ -3904,7 +4052,7 @@ func runConversationJSONWithSignal(ctx context.Context, sigChan <-chan os.Signal
 	if err != nil {
 		return ExitSubsystemError
 	}
-	defer func() { _ = rt.Close(ctx) }()
+	defer func() { reportShutdownError(rt.Close(ctx)) }()
 
 	// Set up signal handling for graceful shutdown
 	interruptChan := make(chan struct{}, 1)
@@ -3957,7 +4105,7 @@ func runConversationJSONWithSignal(ctx context.Context, sigChan <-chan os.Signal
 		fmt.Fprintf(os.Stderr, "create session: %v\n", err)
 		return classifyConversationError(err)
 	}
-	defer func() { _ = sess.Close(ctx) }()
+	defer func() { reportShutdownError(sess.Close(ctx)) }()
 	defer func() { _ = jsonUI.Close() }()
 
 	// Emit meta event for JSON mode
@@ -4169,7 +4317,7 @@ func discoverPluginCLIFlags(args []string) map[string]string {
 	if err := mgr.Discover(context.Background()); err != nil {
 		return nil
 	}
-	defer func() { _ = mgr.Shutdown(context.Background()) }()
+	defer func() { reportShutdownError(mgr.Shutdown(context.Background())) }()
 
 	owners := make(map[string]string)
 	for pluginName, flags := range mgr.RegisteredCLIFlags() {
@@ -4402,7 +4550,8 @@ Prompt composition:
 
 Runtime options:
   --config-dir <dir> Tau config directory (default ~/.tau/agent; env TAU_CONFIG_DIR)
-  --provider         Provider to use for this run (overrides default)
+  --provider         Provider override (requires --model or --models)
+  --model, --models  Specify models to use
   --api-key          API key for the provider (overrides credential store)
   --system-prompt    Override the default system prompt
   --append-system-prompt  Append to the system prompt (may be repeated)
@@ -4445,34 +4594,43 @@ Commands:
   reload                    Reload artifacts and plugins
   skills/prompts/themes     List available artifacts`
 
-// themeColorLookup adapts the resource loader's theme registry to the shape the
-// TUI consumes. Discovery, precedence, and package filtering stay in
-// agent/artifacts; the TUI only ever asks "what colours does this name have?".
-//
-// This is the link that was missing: themes were discovered and parsed, but
-// only their names reached the UI, so installing a theme package changed
-// nothing on screen.
-func themeColorLookup(loader *artifacts.Loader) tui.ThemeColorLookup {
+// themeLookup reads the active registry on each application so reloads replace
+// both colors and appearance metadata.
+// themeRefresher is nil without artifacts, which disables theme file watching.
+func themeRefresher(loader *artifacts.Loader) func(string) (bool, error) {
 	if loader == nil {
 		return nil
 	}
-	return func(name string) (map[string]string, bool) {
+	return func(name string) (bool, error) {
 		registry := loader.ThemeRegistry()
 		if registry == nil {
-			return nil, false
+			return false, nil
+		}
+		return registry.Refresh(name)
+	}
+}
+
+func themeLookup(loader *artifacts.Loader) tui.ThemeLookup {
+	if loader == nil {
+		return nil
+	}
+	return func(name string) (tui.ThemeDefinition, bool) {
+		registry := loader.ThemeRegistry()
+		if registry == nil {
+			return tui.ThemeDefinition{}, false
 		}
 		theme, ok := registry.Get(name)
-		if !ok || theme == nil {
-			return nil, false
+		if !ok || theme == nil || len(theme.Raw) == 0 {
+			return tui.ThemeDefinition{}, false
 		}
-		colors, err := tui.DecodeThemeColors(theme.Raw)
+		definition, err := tui.DecodeTheme(theme.Raw)
 		if err != nil {
 			// A malformed theme file is worth reporting, but not worth
 			// refusing to start over: fall back to the built-in tokens.
 			fmt.Fprintf(os.Stderr, "theme %q: %v\n", name, err)
-			return nil, false
+			return tui.ThemeDefinition{}, false
 		}
-		return colors, true
+		return definition, true
 	}
 }
 

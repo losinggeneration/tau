@@ -9,6 +9,7 @@ import (
 
 	sdkpkg "github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestWorkspaceOverlayListsFiltersAndSortsPinnedFirst(t *testing.T) {
@@ -375,4 +376,10 @@ func TestWorkspaceOverlayScrollClampsWhenListShrinks(t *testing.T) {
 	if !strings.Contains(rows, "→") {
 		t.Fatalf("no focused row rendered after filter clamp:\n%s", rows)
 	}
+}
+
+func TestWorkspaceOverlayRenameInsertsShiftedSymbol(t *testing.T) {
+	o := &workspaceOverlay{rename: true}
+	o.HandleKey(tauui.KeyEvent{Key: tauui.KeyRune, Rune: '=', ShiftedRune: '+', Mod: tauui.ModShift})
+	assert.Equal(t, "+", o.name)
 }

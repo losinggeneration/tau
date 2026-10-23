@@ -2,15 +2,22 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/losinggeneration/rovel/backend/headless"
+	"github.com/losinggeneration/rovel/geom"
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/sdk"
 	sdkpkg "github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // sdkSlashInfo is a local alias so the merge test reads naturally.
@@ -997,4 +1004,142 @@ func TestCmdNewUsesSessionFactory(t *testing.T) {
 	if app.currentModel != "provider/new" {
 		t.Fatalf("currentModel = %q, want provider/new", app.currentModel)
 	}
+}
+
+func TestRestoredToolExecutionDuration(t *testing.T) {
+	for _, msg := range []sdkpkg.Message{
+		{Role: "tool", ToolCallID: "call", ToolName: "bash", Text: "ok", DurationMs: new(12.5)},
+		{Role: "toolResult", ToolCallID: "call", ToolName: "powershell", Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "ok"}}, DurationMs: new(12.5)},
+		{Role: "tool", Content: []ai.ContentBlock{{Type: ai.ContentBlockToolResult, ToolCallID: "call", ToolName: "bash", Text: "ok"}}, DurationMs: new(12.5)},
+	} {
+		conv := NewConversationModel()
+		appendSDKMessageToConversation(conv, msg)
+		snapshot := conv.Snapshot()
+		if len(snapshot.Components) != 1 || snapshot.Components[0].ToolExecution.DurationMs == nil || *snapshot.Components[0].ToolExecution.DurationMs != 12.5 {
+			t.Fatalf("duration lost: %+v", snapshot)
+		}
+	}
+}
+
+func TestRestoredEmptyToolResultKeepsTiming(t *testing.T) {
+	for _, content := range [][]ai.ContentBlock{nil, {{Type: ai.ContentBlockText, Text: ""}}} {
+		conv := NewConversationModel()
+		conv.AddToolCallWithID("call", "bash", `{"command":"true"}`)
+		appendSDKMessageToConversation(conv, sdkpkg.Message{Role: "tool", ToolCallID: "call", ToolName: "bash", Content: content, DurationMs: new(0.0)})
+		tool := conv.Snapshot().Components[0].ToolExecution
+		if tool.State != toolExecutionComplete || tool.DurationMs == nil || *tool.DurationMs != 0 {
+			t.Fatalf("empty result remained running: %+v", tool)
+		}
+	}
+}
+
+func TestRestoredExcludedShellKeepsHeaderFlag(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call", "bash", `{"command":"pwd"}`)
+	appendSDKMessageToConversation(conv, sdkpkg.Message{Role: "tool", ToolCallID: "call", ToolName: "bash", Text: "ok", ExcludeFromContext: true})
+	if !conv.Snapshot().Components[0].ToolExecution.ExcludeFromContext {
+		t.Fatal("restored context-exclusion flag lost")
+	}
+}
+
+func TestRestoredRichToolResultKeepsOneExecution(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolCallWithID("call", "lookup", `{}`)
+	blocks := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "first"}, {Type: ai.ContentBlockImage, MimeType: "image/png", Data: "aW1hZ2U="}, {Type: ai.ContentBlockText, Text: "second"}}
+	appendSDKMessageToConversation(conv, sdkpkg.Message{Role: "tool", ToolCallID: "call", ToolName: "lookup", Content: blocks, StructuredContent: json.RawMessage(`{"answer":42}`), NestedCalls: []ai.NestedToolCall{{ID: "child"}}, ToolUsage: &ai.Usage{Input: 4}})
+	components := conv.Snapshot().Components
+	if len(components) != 1 {
+		t.Fatalf("split rich result into %d components: %+v", len(components), components)
+	}
+	tool := components[0].ToolExecution
+	if len(tool.Content) != 3 || string(tool.StructuredContent) != `{"answer":42}` || len(tool.NestedCalls) != 1 || tool.ToolUsage == nil || tool.ToolUsage.Input != 4 {
+		t.Fatalf("lost rich result: %+v", tool)
+	}
+	if !strings.Contains(tool.Output, "first") || !strings.Contains(tool.Output, "second") {
+		t.Fatalf("lost text: %q", tool.Output)
+	}
+}
+
+func TestRestoredUserBashExecutionRendersAsShellRow(t *testing.T) {
+	conv := NewConversationModel()
+	details := map[string]any{"command": "make", "output": "boom", "exitCode": float64(2), "excludeFromContext": true, "durationMs": 12.5}
+	appendSDKMessageToConversation(conv, sdk.Message{Role: "custom", CustomType: sdk.BashExecutionCustomType, Text: "Ran `make`", Display: true, Details: details})
+	components := conv.Snapshot().Components
+	if len(components) != 1 {
+		t.Fatalf("components = %+v", components)
+	}
+	tool := components[0].ToolExecution
+	if tool.Name != "bash" || tool.Output != "boom" || !tool.IsError || !tool.ExcludeFromContext || !strings.Contains(tool.Args, `"command":"make"`) || tool.DurationMs == nil || *tool.DurationMs != 12.5 {
+		t.Fatalf("restored row = %+v", tool)
+	}
+}
+
+func TestTranscriptReplacementResetsMultiClickState(t *testing.T) {
+	for _, clearRows := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clear=%t", clearRows), func(t *testing.T) {
+			a := newTestApp(t)
+			a.conv.AddAssistantMessage("Inline `code` here")
+			a.chat.Layout(tauui.Rect{W: 40, H: 10})
+			a.chat.setRenderNotifier(func() error { a.chat.applyPreparedRender(); return nil })
+			waitForChatLog(t, a.chat)
+			row := findStyledRow(t, a.chat)
+			be := headless.New(geom.Size{W: 40, H: 10})
+			defer be.Close()
+			var err error
+			root := &transcriptReplacementView{ChatLog: a.chat}
+			a.app, err = tauui.New(tauui.Opts{Root: root, Backend: be})
+			require.NoError(t, err)
+			checked := false
+			root.onKey = func(key tauui.KeyEvent) {
+				switch key.Rune {
+				case 'r':
+					replacement := NewConversationModel()
+					replacement.AddAssistantMessage("Replacement `text` here")
+					a.replaceConversationWithMode(replacement, clearRows)
+					waitForChatLog(t, a.chat)
+				case 'q':
+					a.chat.mu.Lock()
+					selection := a.chat.selection
+					a.chat.mu.Unlock()
+					assert.True(t, selection.active)
+					assert.Equal(t, chatLogSelectionModeRange, selection.mode, "new transcript inherited double-click")
+					checked = true
+					a.app.Quit()
+				}
+			}
+			be.SendEvent(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MousePress, X: 10, Y: row})
+			be.SendEvent(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease, X: 10, Y: row})
+			be.SendEvent(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'r'})
+			be.SendEvent(tauui.MouseEvent{Button: tauui.MouseButtonLeft, Action: tauui.MousePress, X: 10, Y: row})
+			be.SendEvent(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'q'})
+			require.NoError(t, a.app.Run())
+			assert.True(t, checked)
+		})
+	}
+}
+
+type transcriptReplacementView struct {
+	*ChatLog
+	onKey func(tauui.KeyEvent)
+}
+
+func (v *transcriptReplacementView) Handle(e tauui.Event, ctx *tauui.Ctx) bool {
+	if key, ok := e.(tauui.KeyEvent); ok {
+		v.onKey(key)
+		return true
+	}
+	return v.ChatLog.Handle(e, ctx)
+}
+
+func TestCmdLoginOpensNativeOAuthWithoutBlocking(t *testing.T) {
+	a, _ := nativeDialogApp(t)
+	a.authStore = appCredentialStore(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	a.ctx = ctx
+	cmdLogin(a, "openrouter")
+	require.NotNil(t, a.loginDialog)
+	assert.Equal(t, "auth", a.programStatus.current().Kind)
+	a.stopLoginWorkers()
+	assert.False(t, a.dialogPicker.Shown())
 }

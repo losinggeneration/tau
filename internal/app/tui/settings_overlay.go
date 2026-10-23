@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -181,10 +182,10 @@ func (a *App) availableThemes() []string {
 	if a == nil {
 		return nil
 	}
-	names := []string{"default", "tau", "dark", "light"}
+	names := []string{systemThemeName, "default", "tau", "dark", "light"}
 	if a.extensions != nil {
 		th := a.extensions.Theme()
-		if th.Name != "" {
+		if th.Name != "" && !slices.Contains(names, th.Name) {
 			// Replace the default with the configured theme name
 			// so the user sees the current theme reflected.
 			names = append(names, th.Name)
@@ -356,7 +357,11 @@ func (a *App) applySavedThinkingLevel(key string) bool {
 		a.conv.AddError("thinking level: load settings: " + err.Error())
 		return false
 	}
-	level := settings.ThinkingLevelFor(key)
+	return a.applyThinkingLevel(settings.ThinkingLevelFor(key))
+}
+
+// applyThinkingLevel sets the session thinking level when it changes.
+func (a *App) applyThinkingLevel(level string) bool {
 	if level == "" || level == a.currentThinkingLevel() {
 		return false
 	}

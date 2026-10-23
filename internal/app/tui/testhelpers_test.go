@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -47,6 +48,7 @@ type fakeSession struct {
 	contextWindow    int
 	usedPct          float64
 	autoCompact      bool
+	usage            ai.Usage
 	setModelErr      error
 	setThinkingErr   error
 	thinkingLevels   []string
@@ -195,8 +197,36 @@ func (f *fakeSession) Steer(msg sdkpkg.Message) error {
 	return nil
 }
 
+// testDataRoot holds attachments for fakes without a data directory, so tests
+// never write into the package source tree.
+var testDataRoot string
+
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "tau-tui-test-*")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	testDataRoot = root
+	code := m.Run()
+	if err := os.RemoveAll(root); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		code = 1
+	}
+	os.Exit(code)
+}
+
+func (f *fakeSession) attachmentDataDir() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stateDataDir == "" {
+		f.stateDataDir = filepath.Join(testDataRoot, fmt.Sprintf("session-%p", f))
+	}
+	return f.stateDataDir
+}
+
 func (f *fakeSession) ImportAttachmentFile(path string) (sdkpkg.Attachment, error) {
-	store := sdkpkg.NewAttachmentStore(filepath.Join(f.State().DataDir(), "attachments"))
+	store := sdkpkg.NewAttachmentStore(filepath.Join(f.attachmentDataDir(), "attachments"))
 	record, err := store.ImportFile(path)
 	if err != nil {
 		return sdkpkg.Attachment{}, err
@@ -211,7 +241,7 @@ func (f *fakeSession) ImportAttachmentFile(path string) (sdkpkg.Attachment, erro
 }
 
 func (f *fakeSession) ImportAttachmentData(filename, mimeType, data string) (sdkpkg.Attachment, error) {
-	store := sdkpkg.NewAttachmentStore(filepath.Join(f.State().DataDir(), "attachments"))
+	store := sdkpkg.NewAttachmentStore(filepath.Join(f.attachmentDataDir(), "attachments"))
 	record, err := store.ImportData(filename, mimeType, data)
 	if err != nil {
 		return sdkpkg.Attachment{}, err
@@ -270,6 +300,7 @@ func (f *fakeSession) Stats() sdkpkg.SessionStats {
 		ContextWindow:  f.contextWindow,
 		ContextUsedPct: f.usedPct,
 		AutoCompaction: f.autoCompact,
+		Usage:          f.usage,
 	}
 }
 

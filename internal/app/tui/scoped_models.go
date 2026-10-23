@@ -469,7 +469,7 @@ func (a *App) cycleScopedModel() bool {
 		}
 	}
 	next := a.scopedModelKeys[(idx+1)%len(a.scopedModelKeys)]
-	a.applyModelFromKey(next)
+	a.selectModel(next, a.scopedThinking[next])
 	return true
 }
 

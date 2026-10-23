@@ -8,6 +8,8 @@ import (
 
 	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/keybindings"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func ctrl(r rune) tauui.Keystroke {
@@ -384,4 +386,12 @@ func TestEditingKeysAreNotCapturedByAppActions(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestAppKeymapRoutesShiftedProducedSymbol(t *testing.T) {
+	manager := keybindings.New(appKeybindingDefinitions(), keybindings.Config{actionIDModelCycleForward: {"ctrl++"}})
+	km := appKeymap{app: newAppWithSelector(t), manager: manager}
+	got, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyRune, Rune: '=', ShiftedRune: '+', Mod: tauui.ModCtrl | tauui.ModShift})
+	require.True(t, ok)
+	assert.Equal(t, AppActionModelCycleForward, got)
 }

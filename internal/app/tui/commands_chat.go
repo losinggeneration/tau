@@ -46,9 +46,20 @@ func cmdCopy(app *App, args string) {
 		app.refreshChat()
 		return
 	}
-	ctx.ClipboardWrite(text)
-	app.conv.AddSystem("copy: copied " + mode)
-	app.refreshChat()
+	if app.app == nil {
+		ctx.ClipboardWrite(text)
+		app.conv.AddSystem("copy: copied " + mode)
+		app.refreshChat()
+		return
+	}
+	app.app.ClipboardWrite(text, func(err error) {
+		if err != nil {
+			app.conv.AddError("copy: " + err.Error())
+		} else {
+			app.conv.AddSystem("copy: copied " + mode)
+		}
+		app.refreshChat()
+	})
 }
 
 func cmdExportOrStub(app *App, args string) {

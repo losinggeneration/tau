@@ -92,14 +92,14 @@ var ConversationFlags = []cli.Flag{
 	// Model flags
 	&cli.StringSliceFlag{
 		Name:    "models",
-		Aliases: []string{"M"},
+		Aliases: []string{"model", "M"},
 		Usage:   "Specify models to use",
 	},
 	&cli.StringFlag{
 		Name:  "thinking",
-		Usage: "Set thinking level (off, minimal, low, medium, high, xhigh)",
+		Usage: "Set thinking level (off, minimal, low, medium, high, xhigh, max)",
 		Validator: func(level string) error {
-			valid := []string{"off", "minimal", "low", "medium", "high", "xhigh"}
+			valid := []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 			if !slices.Contains(valid, level) {
 				return cli.Exit("invalid thinking level: "+level, ExitUserError)
 			}
@@ -110,7 +110,7 @@ var ConversationFlags = []cli.Flag{
 	// Provider / auth overrides (pi-compatible).
 	&cli.StringFlag{
 		Name:  "provider",
-		Usage: "Provider name (e.g. anthropic, openai)",
+		Usage: "Provider name (requires --model or --models)",
 	},
 	&cli.StringFlag{
 		Name:  "api-key",

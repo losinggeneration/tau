@@ -1,9 +1,13 @@
 package tui
 
 import (
+	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/losinggeneration/tau/ai"
 )
 
 // Role labels a projected chat component's origin.
@@ -23,11 +27,13 @@ const (
 // the authoritative conversation store; ConversationModel keeps committed
 // history, a single assistant draft, and transient progress state separately.
 type Message struct {
-	ID        string
-	Role      Role
-	Text      string
-	Streaming bool
-	Images    []ImageComponent
+	ExcludeFromContext bool
+	DurationMs         *float64
+	ID                 string
+	Role               Role
+	Text               string
+	Streaming          bool
+	Images             []ImageComponent
 
 	ToolName   string
 	ToolArgs   string
@@ -66,12 +72,19 @@ const (
 // ToolExecutionComponent is the structured render payload for one logical tool
 // invocation. It is updated in place as call/progress/result events arrive.
 type ToolExecutionComponent struct {
-	CallID  string
-	Name    string
-	Args    string
-	Output  string
-	State   toolExecutionState
-	IsError bool
+	Content            []ai.ContentBlock
+	StructuredContent  json.RawMessage
+	NestedCalls        []ai.NestedToolCall
+	ToolUsage          *ai.Usage
+	OutputPad          int
+	ExcludeFromContext bool
+	DurationMs         *float64
+	CallID             string
+	Name               string
+	Args               string
+	Output             string
+	State              toolExecutionState
+	IsError            bool
 }
 
 type ImageComponent struct {
@@ -167,7 +180,11 @@ func (c ChatComponent) Message() Message {
 		msg.ToolName = c.ToolExecution.Name
 		msg.ToolArgs = c.ToolExecution.Args
 		msg.ToolCallID = c.ToolExecution.CallID
+		msg.ExcludeFromContext = c.ToolExecution.ExcludeFromContext
 		msg.IsError = c.ToolExecution.IsError
+		if c.ToolExecution.DurationMs != nil {
+			msg.DurationMs = new(*c.ToolExecution.DurationMs)
+		}
 	}
 	if c.Kind == ChatComponentError {
 		msg.IsError = true
@@ -205,16 +222,19 @@ type conversationItem struct {
 	revision uint64
 	text     string
 
-	toolCallID  string
-	toolName    string
-	toolArgs    string
-	toolOutput  string
-	toolDetails any
-	toolState   toolExecutionState
-	isError     bool
-	collapsed   bool
-	image       ImageComponent
-	images      []ImageComponent
+	toolCallID              string
+	toolName                string
+	toolArgs                string
+	toolOutput              string
+	toolDurationMs          *float64
+	toolExcludedFromContext bool
+	toolDetails             any
+	toolResult              ToolExecutionComponent
+	toolState               toolExecutionState
+	isError                 bool
+	collapsed               bool
+	image                   ImageComponent
+	images                  []ImageComponent
 	// tokensBefore is the context size a compaction reclaimed. Zero when the
 	// session did not report one.
 	tokensBefore int
@@ -434,7 +454,22 @@ func (i *conversationItem) buildComponent() ChatComponent {
 			component.Role = RoleToolCall
 		}
 		component.ToolExecution = ToolExecutionComponent{CallID: i.toolCallID, Name: i.toolName, Args: i.toolArgs, Output: i.toolOutput, State: i.toolState, IsError: i.isError}
+		if i.toolDurationMs != nil {
+			component.ToolExecution.DurationMs = new(*i.toolDurationMs)
+		}
+		component.ToolExecution.ExcludeFromContext = i.toolExcludedFromContext || excludedShellArgs(i.toolName, i.toolArgs)
 		component.ToolDetails = i.toolDetails
+		component.ToolExecution.Content = slices.Clone(i.toolResult.Content)
+		component.ToolExecution.StructuredContent = slices.Clone(i.toolResult.StructuredContent)
+		component.ToolExecution.NestedCalls = slices.Clone(i.toolResult.NestedCalls)
+		for _, block := range i.toolResult.Content {
+			if block.Type == ai.ContentBlockImage {
+				component.Images = append(component.Images, imageComponentFromBlock(block))
+			}
+		}
+		if i.toolResult.ToolUsage != nil {
+			component.ToolExecution.ToolUsage = new(*i.toolResult.ToolUsage)
+		}
 		// Message() derives the effective role and then builds the same
 		// display text; calling it here built that text twice per tool
 		// component. Resolve the role directly instead.
@@ -768,6 +803,27 @@ func (m *ConversationModel) AddToolResultWithName(toolCallID, toolName, output s
 }
 
 func (m *ConversationModel) AddToolResultWithDetails(toolCallID, toolName, output string, isError bool, details any) {
+	m.addToolResult(toolCallID, toolName, output, isError, details, nil, false)
+}
+
+func (m *ConversationModel) addToolResult(toolCallID, toolName, output string, isError bool, details any, durationMs *float64, excluded bool, rich ...ToolExecutionComponent) {
+	if durationMs != nil {
+		durationMs = new(*durationMs)
+	}
+	var result ToolExecutionComponent
+	if len(rich) > 0 {
+		result = rich[0]
+		result.Content = slices.Clone(result.Content)
+		result.StructuredContent = slices.Clone(result.StructuredContent)
+		result.NestedCalls = slices.Clone(result.NestedCalls)
+		if result.ToolUsage != nil {
+			result.ToolUsage = new(*result.ToolUsage)
+		}
+		if len(result.Content) > 0 {
+			output = toolResultContentText(result.Content)
+		}
+	}
+
 	output = strings.TrimRight(output, "\n")
 	var idx int
 	if toolCallID != "" {
@@ -780,6 +836,9 @@ func (m *ConversationModel) AddToolResultWithDetails(toolCallID, toolName, outpu
 	if idx >= 0 {
 		m.committed[idx].toolOutput = output
 		m.committed[idx].toolDetails = details
+		m.committed[idx].toolResult = result
+		m.committed[idx].toolDurationMs = durationMs
+		m.committed[idx].toolExcludedFromContext = excluded
 		m.committed[idx].toolState = toolExecutionComplete
 		m.committed[idx].isError = isError
 		if toolName != "" {
@@ -796,7 +855,7 @@ func (m *ConversationModel) AddToolResultWithDetails(toolCallID, toolName, outpu
 	if isError {
 		state = toolExecutionError
 	}
-	m.committed = append(m.committed, conversationItem{id: m.nextID("tool"), kind: conversationItemToolExecution, role: RoleToolResult, revision: m.nextRevision(), toolCallID: toolCallID, toolName: toolName, toolOutput: output, toolDetails: details, toolState: state, isError: isError})
+	m.committed = append(m.committed, conversationItem{id: m.nextID("tool"), kind: conversationItemToolExecution, role: RoleToolResult, revision: m.nextRevision(), toolCallID: toolCallID, toolName: toolName, toolOutput: output, toolDetails: details, toolResult: result, toolDurationMs: durationMs, toolExcludedFromContext: excluded, toolState: state, isError: isError})
 	if m.draft != nil && m.draft.text == "" {
 		m.draftAfter = len(m.committed)
 	}
@@ -949,4 +1008,32 @@ func (m *ConversationModel) Clear() {
 	m.transient = nil
 	m.nextRevision()
 	m.notify()
+}
+
+func excludedShellArgs(name, args string) bool {
+	if name != "bash" && name != "powershell" {
+		return false
+	}
+	var input struct {
+		ExcludeFromContext bool `json:"exclude_from_context"`
+	}
+	if err := json.Unmarshal([]byte(args), &input); err != nil {
+		return false
+	}
+	return input.ExcludeFromContext
+}
+
+// toolResultContentText joins text items. Images render after the text, or
+// as fallback labels, from the component's Images, matching upstream.
+func toolResultContentText(blocks []ai.ContentBlock) string {
+	var parts []string
+	for _, block := range blocks {
+		switch block.Type {
+		case ai.ContentBlockText:
+			parts = append(parts, block.Text)
+		case ai.ContentBlockToolResult:
+			parts = append(parts, toolResultBlockText(block))
+		}
+	}
+	return strings.Join(parts, "\n")
 }

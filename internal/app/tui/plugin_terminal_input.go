@@ -95,6 +95,9 @@ func terminalInputKey(ke tauui.KeyEvent) string {
 
 func terminalInputText(ke tauui.KeyEvent) string {
 	if ke.Key == tauui.KeyRune && ke.Rune != 0 {
+		if ke.Mod&tauui.ModShift != 0 && ke.ShiftedRune != 0 {
+			return string(ke.ShiftedRune)
+		}
 		return string(ke.Rune)
 	}
 	return ""

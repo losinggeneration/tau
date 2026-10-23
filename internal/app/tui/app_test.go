@@ -1,13 +1,22 @@
 package tui
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/losinggeneration/rovel"
+	"github.com/losinggeneration/rovel/backend/headless"
+	"github.com/losinggeneration/rovel/geom"
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/extensions"
 	"github.com/losinggeneration/tau/tui/widgets"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // convText joins the transcript so a test can assert an error reached the user.
@@ -693,5 +702,427 @@ func TestExternalCommandsSkipLocalDuplicates(t *testing.T) {
 	}
 	if got[0].Name != "skill:x" {
 		t.Fatalf("externalCommands[0] = %q, want skill:x", got[0].Name)
+	}
+}
+
+type bashSession struct {
+	*fakeSession
+	calls chan bashCall
+}
+
+type bashCall struct {
+	ctx      context.Context
+	command  string
+	excluded bool
+}
+
+func (s *bashSession) ExecuteBash(ctx context.Context, command string, options sdk.BashOptions) (sdk.BashExecution, error) {
+	s.calls <- bashCall{ctx: ctx, command: command, excluded: options.ExcludeFromContext}
+	<-ctx.Done()
+	return sdk.BashExecution{Command: command, Cancelled: true}, nil
+}
+
+func TestParseUserBash(t *testing.T) {
+	for _, tc := range []struct {
+		text, command string
+		excluded, ok  bool
+	}{
+		{"!ls -la", "ls -la", false, true},
+		{"  !! git status ", "git status", true, true},
+		{"!", "", false, false},
+		{"!!  ", "", true, false},
+		{"ls !x", "", false, false},
+	} {
+		command, excluded, ok := parseUserBash(tc.text)
+		if command != tc.command || excluded != tc.excluded || ok != tc.ok {
+			t.Errorf("%q: got %q %v %v", tc.text, command, excluded, ok)
+		}
+	}
+}
+
+func TestSubmitUserBashRunsThroughSessionAndEscCancels(t *testing.T) {
+	app := newTestApp(t)
+	fake := app.sess.(*fakeSession)
+	sess := &bashSession{fakeSession: fake, calls: make(chan bashCall, 1)}
+	app.sess = sess
+	editor := newPromptEditorForTest()
+	app.editor = editor
+	app.footer = newFooterForTest()
+	ctx := testCtx()
+	ctx.FocusedID = editor.ID()
+	editor.SetText(ctx, "!!git status")
+	if !app.trySubmit(ctx) {
+		t.Fatal("shell input not consumed")
+	}
+	call := <-sess.calls
+	if call.command != "git status" || !call.excluded {
+		t.Fatalf("call = %+v", call)
+	}
+	tool := app.conv.Snapshot().Components[0].ToolExecution
+	if tool.Name != "bash" || tool.State != toolExecutionExecuting || !strings.Contains(tool.Args, `"exclude_from_context":true`) {
+		t.Fatalf("running row = %+v", tool)
+	}
+	editor.SetText(ctx, "!ls")
+	app.trySubmit(ctx)
+	if !strings.Contains(convText(app), "already running") {
+		t.Fatal("second shell was admitted")
+	}
+	fake.mu.Lock()
+	sent := len(fake.sentTexts)
+	fake.mu.Unlock()
+	if sent != 0 {
+		t.Fatal("shell input reached the model")
+	}
+	if !(&Root{app: app}).HandleAction(tauui.ActionCancel, ctx) {
+		t.Fatal("Esc not handled")
+	}
+	<-call.ctx.Done()
+}
+
+func TestNewScopesModelCyclingToConfiguredPatterns(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	var keys []string
+	for _, candidate := range newTestApp(t).allScopedModelKeys() {
+		if strings.HasPrefix(candidate, ai.ProviderOpenAI+"/") {
+			keys = append(keys, candidate)
+		}
+	}
+	require.GreaterOrEqual(t, len(keys), 2, "an OpenAI key should authenticate catalog models")
+
+	sess := &fakeSession{stateModel: keys[1]}
+	app, err := New(Options{Session: sess, ModelScope: []string{keys[0] + ":high", keys[1], "missing/*"}})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = app.chat.Close() })
+	assert.Equal(t, []string{keys[0], keys[1]}, app.scopedModelKeys)
+
+	require.True(t, app.cycleScopedModel())
+	assert.Equal(t, []string{keys[0]}, sess.setModels)
+	assert.Equal(t, []string{"high"}, sess.thinkingLevels, "a scoped level applies when cycling to its model")
+
+	unscoped, err := New(Options{Session: &fakeSession{}})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unscoped.chat.Close() })
+	assert.Nil(t, unscoped.scopedModelKeys)
+}
+
+func TestEnableSkillCommandsFalseHidesOnlySkillCompletions(t *testing.T) {
+	app := newTestApp(t)
+	fs := app.sess.(*fakeSession)
+	fs.mu.Lock()
+	fs.slashInfos = []sdkSlashInfo{
+		{Name: "review", Description: "prompt", Source: "prompt"},
+		{Name: "skill:x", Description: "skill command", Source: "skill"},
+	}
+	fs.mu.Unlock()
+	names := func() []string {
+		var out []string
+		for _, cmd := range app.externalCommands() {
+			out = append(out, cmd.Name)
+		}
+		return out
+	}
+
+	app.applyDisplaySettings(&ai.Settings{})
+	assert.Equal(t, []string{"review", "skill:x"}, names())
+
+	disabled, err := ai.ParseSettings([]byte(`{"enableSkillCommands":false}`))
+	require.NoError(t, err)
+	app.applyDisplaySettings(disabled)
+	assert.Equal(t, []string{"review"}, names())
+	assert.True(t, app.sessionSlashCommandExists("skill:x"), "typed skill commands still reach the session")
+}
+
+type settingsSession struct {
+	*fakeSession
+	settings *ai.Settings
+	steering string
+}
+
+func (s *settingsSession) Settings() *ai.Settings { return s.settings }
+
+func (s *settingsSession) SetSteeringMode(mode string) error {
+	s.steering = mode
+	return nil
+}
+
+func (s *settingsSession) SetFollowUpMode(string) error { return nil }
+
+func TestSessionSettingsDriveStartupAndSuccessfulReload(t *testing.T) {
+	startup, err := ai.ParseSettings([]byte(`{"hideThinkingBlock":true,"enableSkillCommands":false}`))
+	require.NoError(t, err)
+	sess := &settingsSession{fakeSession: &fakeSession{}, settings: startup}
+	a, err := New(Options{Session: sess})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = a.chat.Close() })
+	assert.True(t, a.hideSkillCommands, "startup ignored merged session settings")
+
+	sess.settings = &ai.Settings{}
+	a.conversationEvents = newConversationEventAdapter(a)
+	a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "output": "boom", "is_error": true}})
+	assert.True(t, a.hideSkillCommands, "failed reload reapplied settings")
+	a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "output": "reloaded"}})
+	assert.False(t, a.hideSkillCommands, "successful reload did not reapply settings")
+	a.chat.mu.Lock()
+	hidden := a.chat.hideThinkingBlock
+	a.chat.mu.Unlock()
+	assert.False(t, hidden, "reload did not reapply thinking display")
+}
+
+func TestReloadResetsRemovedDisplaySettingsAndAppliesTheme(t *testing.T) {
+	startup, err := ai.ParseSettings([]byte(`{"editorPaddingX":3,"autocompleteMaxVisible":9,"steeringMode":"one-at-a-time","theme":"light"}`))
+	require.NoError(t, err)
+	sess := &settingsSession{fakeSession: &fakeSession{}, settings: startup}
+	a, err := New(Options{Session: sess})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = a.chat.Close() })
+	assert.Equal(t, 3, a.editor.Padding())
+	assert.Equal(t, 9, a.editor.Model().AutocompleteMaxVisible())
+	assert.Equal(t, "one-at-a-time", sess.steering)
+	assert.Equal(t, "light", a.footer.data.theme)
+
+	sess.settings = &ai.Settings{}
+	a.conversationEvents = newConversationEventAdapter(a)
+	a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "output": "reloaded"}})
+	assert.Equal(t, 1, a.editor.Padding(), "removed editorPaddingX kept its old value")
+	assert.Equal(t, 5, a.editor.Model().AutocompleteMaxVisible(), "removed autocompleteMaxVisible kept its old value")
+	assert.Equal(t, "all", sess.steering, "removed steeringMode did not return to the default")
+	assert.Equal(t, "system", a.footer.data.theme, "reload did not apply the theme")
+
+	zero, err := ai.ParseSettings([]byte(`{"editorPaddingX":0}`))
+	require.NoError(t, err)
+	a.applyDisplaySettings(zero)
+	assert.Equal(t, 0, a.editor.Padding(), "explicit zero padding ignored")
+}
+
+func TestEditorPaintTracksThinkingTokensAcrossThemeChanges(t *testing.T) {
+	a := newEditorChromeApp(t)
+	a.themeLookup = func(name string) (ThemeDefinition, bool) {
+		if name != "custom" {
+			return ThemeDefinition{}, false
+		}
+		return ThemeDefinition{Values: map[string]string{"thinkingOff": "#123456", "thinkingMax": "#abcdef", "border": "#654321"}, Dim: []string{"thinkingOff"}}, true
+	}
+	a.applyTheme("custom")
+	for _, tc := range []struct {
+		level string
+		color tauui.Color
+		dim   bool
+	}{
+		{"off", tauui.ColorRGB(0x12, 0x34, 0x56), true},
+		{"max", tauui.ColorRGB(0xab, 0xcd, 0xef), false},
+	} {
+		a.footer.data.thinkingLevel = tc.level
+		a.refreshEditorChrome()
+		st := paintedRuleStyle(t, a.editor)
+		assert.Equal(t, tc.color, st.FG, tc.level)
+		assert.Equal(t, tc.dim, st.Attr&tauui.AttrDim != 0, tc.level)
+	}
+	a.applyThemeFromExtension(extensions.Theme{Name: "in-memory", Values: map[string]string{"thinkingMax": "#102030"}, Dim: []string{"thinkingMax"}})
+	st := paintedRuleStyle(t, a.editor)
+	assert.Equal(t, tauui.ColorRGB(0x10, 0x20, 0x30), st.FG)
+	assert.NotZero(t, st.Attr&tauui.AttrDim)
+	a.applyTheme("custom")
+	st = paintedRuleStyle(t, a.editor)
+	assert.Equal(t, tauui.ColorRGB(0xab, 0xcd, 0xef), st.FG)
+	assert.Zero(t, st.Attr&tauui.AttrDim)
+}
+
+func TestRootWheelFallsBackToTranscript(t *testing.T) {
+	a, viewport, _, _ := newAutoscrollFixture(t)
+	editor := tauui.NewPromptEditor()
+	layout := tauui.NewAppLayout(tauui.AppLayoutOpts{Chat: viewport, Editor: editor})
+	root := &Root{AppLayout: layout, layout: layout, app: a}
+	a.root = root
+	a.editor = editor
+	root.Layout(tauui.Rect{W: 40, H: 15})
+	ctx := &tauui.Ctx{Invalidate: func(tauui.Rect) {}}
+	viewport.ScrollBottom(ctx)
+	before := viewport.ScrollPos()
+	e := wheelEvent(tauui.MouseButtonWheelUp)
+	e.Y = editor.Rect().Y
+	e.WheelDelta = 2
+	require.True(t, root.Handle(e, ctx))
+	assert.Equal(t, before-6, viewport.ScrollPos())
+	assert.True(t, a.autoScrollOff)
+	// A wheel already delivered to the transcript must not be applied twice.
+	before = viewport.ScrollPos()
+	e.Y = viewport.Rect().Y
+	require.True(t, root.Handle(e, ctx))
+	assert.Equal(t, before-6, viewport.ScrollPos())
+}
+
+type wheelOverlayProbe struct {
+	tauui.View
+	mouseEvents int
+	keyEvents   int
+	focusedID   tauui.ID
+}
+
+func (v *wheelOverlayProbe) Focusable() bool { return true }
+func (v *wheelOverlayProbe) MouseOpaque()    {}
+func (v *wheelOverlayProbe) Handle(e tauui.Event, ctx *tauui.Ctx) bool {
+	switch e.(type) {
+	case tauui.MouseEvent:
+		v.mouseEvents++
+	case tauui.KeyEvent:
+		v.keyEvents++
+		v.focusedID = ctx.FocusedID
+	}
+	return v.View.Handle(e, ctx)
+}
+
+func TestOverlayWheelRoutingThroughToolkit(t *testing.T) {
+	for _, layoutMode := range []LayoutMode{LayoutFixed, LayoutDocument} {
+		for _, location := range []string{"chat", "editor", "outside", "scrolling-overlay"} {
+			t.Run(string(layoutMode)+"/"+location, func(t *testing.T) {
+				a, viewport, chat, _ := newAutoscrollFixture(t)
+				editor := tauui.NewPromptEditor()
+				fixed := tauui.NewAppLayout(tauui.AppLayoutOpts{Chat: viewport, Editor: editor})
+				root := &Root{AppLayout: fixed, layout: fixed, app: a}
+				a.root = root
+				a.editor = editor
+
+				if layoutMode == LayoutDocument {
+					root.document = tauui.NewDocumentLayout(tauui.AppLayoutOpts{Chat: chat, Editor: editor})
+					root.layout = root.document
+				}
+				be := headless.New(geom.Size{W: 40, H: 15})
+				defer be.Close()
+				overlay := &wheelOverlayProbe{View: tauui.NewPromptEditor()}
+				overlayScroll := widgets.NewScrollView(widgets.ScrollViewOpts{Child: tauui.NewText(strings.Repeat("overlay row\n", 40)), Scrollbar: widgets.ScrollbarHidden})
+				if location == "scrolling-overlay" {
+					overlay.View = overlayScroll
+				}
+				var before int
+				checked := false
+				var err error
+				a.app, err = tauui.New(tauui.Opts{Root: root, Backend: be, OnTerminalReply: func(tauui.TerminalReplyEvent) {
+					checked = true
+					if location == "scrolling-overlay" {
+						assert.Equal(t, 6, overlayScroll.ScrollPos())
+						if layoutMode == LayoutDocument {
+							assert.Equal(t, before, root.document.ScrollBack())
+						} else {
+							assert.Equal(t, before, viewport.ScrollPos())
+						}
+					} else if layoutMode == LayoutDocument {
+						assert.Equal(t, before+6, root.document.ScrollBack())
+					} else {
+						assert.Equal(t, before-6, viewport.ScrollPos())
+						assert.True(t, a.autoScrollOff)
+					}
+					wantMouse := 1
+					if location == "outside" {
+						wantMouse = 0
+					}
+					assert.Equal(t, wantMouse, overlay.mouseEvents)
+					assert.Equal(t, 1, overlay.keyEvents, "wheel reached focused overlay as raw key input")
+					assert.Equal(t, overlay.ID(), overlay.focusedID)
+					a.app.Quit()
+				}})
+				require.NoError(t, err)
+				require.NoError(t, a.app.Post(func(ctx *tauui.UpdateCtx) {
+					viewport.ScrollBottom(&tauui.Ctx{Invalidate: func(tauui.Rect) {}})
+					if layoutMode == LayoutDocument {
+						before = root.document.ScrollBack()
+					} else {
+						before = viewport.ScrollPos()
+					}
+					anchor := tauui.AnchorTopLeft
+					if location == "editor" {
+						anchor = tauui.AnchorBottomLeft
+					}
+					ctx.ShowOverlay(rovel.OverlayOpts{Root: overlay, Modal: true, Place: tauui.EdgeAnchored{Anchor: anchor, W: 10, H: 3}})
+					e := wheelEvent(tauui.MouseButtonWheelUp)
+					e.WheelDelta = 2
+					if location == "editor" {
+						e.Y = 14
+					}
+					if location == "outside" {
+						e.X = 30
+					}
+					if location == "scrolling-overlay" {
+						e.Button = tauui.MouseButtonWheelDown
+					}
+					be.SendEvent(e)
+					be.SendEvent(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'z'})
+					be.SendEvent(tauui.TerminalReplyEvent{Sequence: "wheel-check"})
+				}))
+				require.NoError(t, a.app.Run())
+				assert.True(t, checked)
+			})
+		}
+	}
+}
+
+func TestWheelSettingsReloadThroughToolkit(t *testing.T) {
+	for _, mode := range []LayoutMode{LayoutFixed, LayoutDocument} {
+		t.Run(string(mode), func(t *testing.T) {
+			a, viewport, chat, _ := newAutoscrollFixture(t)
+			editor := tauui.NewPromptEditor()
+			fixed := tauui.NewAppLayout(tauui.AppLayoutOpts{Chat: viewport, Editor: editor})
+			root := &Root{AppLayout: fixed, layout: fixed, app: a}
+			a.root = root
+			a.editor = editor
+			if mode == LayoutDocument {
+				root.document = tauui.NewDocumentLayout(tauui.AppLayoutOpts{Chat: chat, Editor: editor})
+				root.layout = root.document
+			}
+			settings, err := ai.ParseSettings([]byte(fmt.Sprintf(`{"fullscreenWheelScrollLines":3,"layoutMode":%q}`, mode)))
+			require.NoError(t, err)
+			sess := &settingsSession{fakeSession: &fakeSession{}, settings: settings}
+			a.sess = sess
+			a.conversationEvents = newConversationEventAdapter(a)
+			be := headless.New(geom.Size{W: 40, H: 15})
+			defer be.Close()
+			position := func() int {
+				if mode == LayoutDocument {
+					return root.document.ScrollBack()
+				}
+				return -viewport.ScrollPos()
+			}
+			var before, phase int
+			a.app, err = tauui.New(tauui.Opts{Root: root, Backend: be, WheelScrollLines: new(settings.ResolveFullscreenWheelScrollLines()), OnTerminalReply: func(tauui.TerminalReplyEvent) {
+				switch phase {
+				case 0:
+					assert.Equal(t, before+6, position())
+					sess.settings, err = ai.ParseSettings([]byte(fmt.Sprintf(`{"fullscreenWheelScrollLines":2,"layoutMode":%q}`, mode)))
+					require.NoError(t, err)
+					a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "is_error": true}})
+				case 1:
+					assert.Equal(t, before+6, position(), "failed reload changed wheel count")
+					a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload"}})
+				case 2:
+					assert.Equal(t, before+20, position(), "Alt or reload applied twice")
+					sess.settings = &ai.Settings{LayoutMode: string(mode)}
+					a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload"}})
+				case 3:
+					assert.Equal(t, before+2, position(), "removed setting did not reset to auto")
+					a.app.Quit()
+					phase++
+					return
+				}
+				phase++
+				before = position()
+				e := wheelEvent(tauui.MouseButtonWheelUp)
+				e.WheelDelta = 2
+				if phase == 2 {
+					e.Mod = tauui.ModAlt
+				}
+				be.SendEvent(e)
+				be.SendEvent(tauui.TerminalReplyEvent{Sequence: "wheel-settings"})
+			}})
+			require.NoError(t, err)
+			require.NoError(t, a.app.Post(func(*tauui.UpdateCtx) {
+				viewport.ScrollBottom(nil)
+				before = position()
+				e := wheelEvent(tauui.MouseButtonWheelUp)
+				e.WheelDelta = 2
+				be.SendEvent(e)
+				be.SendEvent(tauui.TerminalReplyEvent{Sequence: "wheel-settings"})
+			}))
+			require.NoError(t, a.app.Run())
+			assert.Equal(t, 4, phase)
+		})
 	}
 }

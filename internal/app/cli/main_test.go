@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/packages"
@@ -20,9 +23,12 @@ import (
 	"github.com/losinggeneration/tau/ai/oauth"
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/commands"
+	"github.com/losinggeneration/tau/internal/app/tui"
 	"github.com/losinggeneration/tau/rpc/server"
 	"github.com/losinggeneration/tau/sdk"
 	"github.com/losinggeneration/tau/ui"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v3"
 )
 
@@ -1007,6 +1013,7 @@ func TestApplyConversationFlags_NewPiCompatibleFlags(t *testing.T) {
 	cmd := &cli.Command{Flags: allFlags}
 	requireNoError(cmd.Set("session-dir", sessionDir))
 	requireNoError(cmd.Set("provider", "anthropic"))
+	requireNoError(cmd.Set("models", "anthropic/claude-sonnet-4-6"))
 	requireNoError(cmd.Set("api-key", "sk-test"))
 	requireNoError(cmd.Set("name", "refactor session"))
 	requireNoError(cmd.Set("system-prompt", "you are a Go expert"))
@@ -1067,7 +1074,10 @@ func TestApplyConversationFlags_NoApproveOverridesApprove(t *testing.T) {
 	}
 	defer func() { _ = os.Chdir(origWD) }()
 
-	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	cmd := &cli.Command{Flags: []cli.Flag{
+		&cli.BoolFlag{Name: "approve"},
+		&cli.BoolFlag{Name: "no-approve"},
+	}}
 	if err := cmd.Set("approve", "true"); err != nil {
 		t.Fatalf("set approve: %v", err)
 	}
@@ -1989,5 +1999,630 @@ func TestPromoteConfigDirFlag(t *testing.T) {
 	promoteConfigDirFlag([]string{"tau", "prompt", "--", "--config-dir=/tmp/c"})
 	if got := os.Getenv("TAU_CONFIG_DIR"); got != "" {
 		t.Fatalf("after -- should be ignored: got %q", got)
+	}
+}
+
+func TestPrintModeFailsOnTheFinalReplyLikeUpstream(t *testing.T) {
+	end := func(stop, message string) sdk.Event {
+		return sdk.Event{Type: "message_end", Payload: map[string]any{"role": "assistant", "finish_reason": stop, "error_message": message}}
+	}
+	for _, tc := range []struct {
+		name    string
+		events  []sdk.Event
+		wantErr string
+		wantOut string
+	}{
+		{"earlier truncation is not final", []sdk.Event{end("length", ""), end("stop", "")}, "", ""},
+		{"final truncation keeps partial text", []sdk.Event{{Type: "text_delta", Payload: map[string]any{"delta": "partial"}}, end("length", "")}, "Response was truncated: the model reached its output token limit.", "partial"},
+		{"aborted without a message", []sdk.Event{end("aborted", "")}, "Request aborted", ""},
+		{"error with a message", []sdk.Event{end("error", "boom")}, "boom", ""},
+		{"run error", []sdk.Event{end("stop", ""), {Type: "error", Payload: map[string]any{"message": "provider response failed: boom"}}}, "error: provider response failed: boom", ""},
+		{"user end is ignored", []sdk.Event{end("length", ""), {Type: "message_end", Payload: map[string]any{"role": "user"}}}, "Response was truncated: the model reached its output token limit.", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			printer := &eventPrinter{NoStream: true}
+			var stderr string
+			stdout := captureStdout(t, func() {
+				stderr = captureStderr(t, func() {
+					for _, event := range tc.events {
+						processEventWith(&event, &mu, printer)
+					}
+				})
+			})
+			if stderr != "" || stdout != tc.wantOut {
+				t.Fatalf("stdout = %q, stderr = %q; want stdout %q and no stderr before the run ends", stdout, stderr, tc.wantOut)
+			}
+			var got string
+			if err := printer.result(); err != nil {
+				got = err.Error()
+			}
+			if got != tc.wantErr {
+				t.Fatalf("result = %q, want %q", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+type reloadSettingsSession struct {
+	commands.CommandSession
+	settings *ai.Settings
+}
+
+func (s *reloadSettingsSession) ReloadSettings(_ context.Context, settings *ai.Settings) error {
+	s.settings = settings
+	return nil
+}
+
+func TestReloadSettingsWithoutArtifactLoader(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"read":{"lineCap":7}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := sdk.GlobalArtifactLoader
+	sdk.GlobalArtifactLoader = nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader = previous })
+	reg := commands.NewInMemoryRegistry()
+	registerBuiltInCommands(reg)
+	handler, _, ok := reg.Lookup("reload")
+	if !ok {
+		t.Fatal("reload command missing")
+	}
+	sess := &reloadSettingsSession{}
+	if _, err := handler(t.Context(), "", nil, sess); err != nil {
+		t.Fatal(err)
+	}
+	if sess.settings == nil || sess.settings.Read.LineCap != 7 {
+		t.Fatalf("settings not reloaded: %+v", sess.settings)
+	}
+}
+
+func TestLoadSettingsRejectsMalformedProjectSettings(t *testing.T) {
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir(filepath.Join(dir, ".tau"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".tau", "settings.json"), []byte(`{"retry":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSettings(); err == nil || !strings.Contains(err.Error(), "load project settings") {
+		t.Fatalf("expected project settings error, got %v", err)
+	}
+}
+
+func TestSessionCommandsAcceptShortPrefixes(t *testing.T) {
+	for _, operation := range []string{"rename", "move", "delete", "restore", "compact", "summarize-branch", "fork", "export"} {
+		t.Run(operation, func(t *testing.T) {
+			t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+			dir := t.TempDir()
+			t.Setenv("TAU_SESSION_DIR", dir)
+			storage, err := session.NewStorageAt(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			header := session.NewHeader("/test", nil, nil)
+			writer, err := storage.Create(header)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := session.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"shared"}`), nil)
+			abandoned := session.NewMessageEntry(&root.ID, json.RawMessage(`{"role":"assistant","content":"abandoned"}`), nil)
+			abandoned.ID = "branch-entry"
+			selected := session.NewMessageEntry(&root.ID, json.RawMessage(`{"role":"assistant","content":"selected"}`), nil)
+			for _, entry := range []session.Entry{root, abandoned, selected} {
+				if err := writer.Append(entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := writer.Path()
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := session.ReleaseOwner(path); err != nil {
+				t.Fatal(err)
+			}
+			if operation == "restore" {
+				if err := storage.Delete(header.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"tau", "sessions", operation, header.ID[:4]}
+			switch operation {
+			case "rename":
+				args = append(args, "new name")
+			case "move":
+				args = append(args, t.TempDir())
+			case "summarize-branch":
+				args = append(args, "branch")
+			case "export":
+				args = append(args, "--format", "html", "--output", filepath.Join(t.TempDir(), "history.html"))
+			}
+			cmd := newRootCommand()
+			if err := cmd.Run(t.Context(), args); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestApplyConversationFlagsProviderRequiresModel(t *testing.T) {
+	for _, ephemeral := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ephemeral=%v", ephemeral), func(t *testing.T) {
+			cmd := &cli.Command{Flags: []cli.Flag{
+				&cli.StringFlag{Name: "provider"},
+				&cli.StringSliceFlag{Name: "models"},
+				&cli.BoolFlag{Name: "no-session"},
+			}}
+			requireNoErrorSet(t, cmd.Set("provider", "anthropic"))
+			requireNoErrorSet(t, cmd.Set("no-session", strconv.FormatBool(ephemeral)))
+			opts := sdk.RuntimeOptions{Settings: &ai.Settings{DefaultProvider: "openai", DefaultModel: "gpt-4o"}}
+			flags := applyConversationFlags(&opts, cmd)
+			if flags.SelectionError == nil || !strings.Contains(flags.SelectionError.Error(), "--provider requires --model") {
+				t.Fatalf("SelectionError = %v, want missing model error", flags.SelectionError)
+			}
+		})
+	}
+}
+
+func TestApplyConversationFlagsModelThinkingSuffix(t *testing.T) {
+	newCmd := func(model, thinking string) *cli.Command {
+		cmd := &cli.Command{Flags: []cli.Flag{
+			&cli.StringSliceFlag{Name: "models", Aliases: []string{"model"}},
+			&cli.StringFlag{Name: "thinking"},
+		}}
+		requireNoErrorSet(t, cmd.Set("model", model))
+		if thinking != "" {
+			requireNoErrorSet(t, cmd.Set("thinking", thinking))
+		}
+		return cmd
+	}
+	opts := sdk.RuntimeOptions{Settings: &ai.Settings{}}
+	if flags := applyConversationFlags(&opts, newCmd("anthropic/claude-sonnet-4-6:high", "")); flags.SelectionError != nil {
+		t.Fatal(flags.SelectionError)
+	}
+	if opts.ExplicitModel != "anthropic/claude-sonnet-4-6" || opts.ThinkingLevel != "high" {
+		t.Fatalf("suffix: model=%q thinking=%q", opts.ExplicitModel, opts.ThinkingLevel)
+	}
+	opts = sdk.RuntimeOptions{Settings: &ai.Settings{}}
+	applyConversationFlags(&opts, newCmd("anthropic/claude-sonnet-4-6:high", "low"))
+	if opts.ThinkingLevel != "low" {
+		t.Fatalf("--thinking lost to the suffix: %q", opts.ThinkingLevel)
+	}
+}
+
+func TestApplyConversationFlagsModelAliasAndEphemeralOptions(t *testing.T) {
+	aliasRegistered := false
+	for _, flag := range ConversationFlags {
+		if slices.Contains(flag.Names(), "models") && slices.Contains(flag.Names(), "model") {
+			aliasRegistered = true
+		}
+	}
+	if !aliasRegistered {
+		t.Fatal("--models has no --model alias")
+	}
+	for _, ephemeral := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ephemeral=%v", ephemeral), func(t *testing.T) {
+			cmd := &cli.Command{Flags: []cli.Flag{
+				&cli.StringSliceFlag{Name: "models", Aliases: []string{"model"}},
+				&cli.StringFlag{Name: "provider"},
+				&cli.StringFlag{Name: "api-key"},
+				&cli.BoolFlag{Name: "no-session"},
+				&cli.StringFlag{Name: "session"},
+				&cli.BoolFlag{Name: "continue"},
+			}}
+			requireNoErrorSet(t, cmd.Set("provider", "anthropic"))
+			requireNoErrorSet(t, cmd.Set("model", "anthropic/claude-sonnet-4-6"))
+			requireNoErrorSet(t, cmd.Set("api-key", "explicit"))
+			requireNoErrorSet(t, cmd.Set("no-session", strconv.FormatBool(ephemeral)))
+			if ephemeral {
+				requireNoErrorSet(t, cmd.Set("session", "ignored"))
+				requireNoErrorSet(t, cmd.Set("continue", "true"))
+			}
+			opts := sdk.RuntimeOptions{Settings: &ai.Settings{DefaultProvider: "openai", DefaultModel: "gpt-4o"}}
+			flags := applyConversationFlags(&opts, cmd)
+			if flags.SelectionError != nil {
+				t.Fatal(flags.SelectionError)
+			}
+			if opts.ExplicitModel != "anthropic/claude-sonnet-4-6" || opts.Provider != "anthropic" || opts.APIKey != "explicit" || opts.NoSession != ephemeral {
+				t.Fatalf("runtime options lost: model=%q provider=%q explicit key=%v ephemeral=%v", opts.ExplicitModel, opts.Provider, opts.APIKey != "", opts.NoSession)
+			}
+			if flags.ResumeSessionID != "" || opts.ContinueSessionID != "" {
+				t.Fatal("ephemeral session retained a session target")
+			}
+		})
+	}
+}
+
+func TestSettingsArtifactPathsRetainScopeThroughStartupAndReload(t *testing.T) {
+	home := t.TempDir()
+	cfgDir := filepath.Join(home, "agent")
+	project := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Chdir(project)
+	for _, path := range []string{filepath.Join(cfgDir, "extra", "user.md"), filepath.Join(project, ".tau", "extra", "project.md")} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("prompt"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(`{"prompts":["extra"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := loadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: project, SettingsPaths: getSettingsArtifactPaths(settings), DisableSkills: true, DisableThemes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.PromptRegistry().Get("user"); !ok {
+		t.Fatal("user-relative prompt missing")
+	}
+	if err := loader.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.PromptRegistry().Get("user"); !ok {
+		t.Fatal("reload lost user-relative prompt")
+	}
+	if err := os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte(`{"prompts":["extra","!extra/*","+extra/project.md"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = loadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader, err = artifacts.NewLoader(artifacts.LoaderOptions{CWD: project, SettingsPaths: getSettingsArtifactPaths(settings), DisableSkills: true, DisableThemes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.PromptRegistry().Get("project"); !ok {
+		t.Fatal("project-relative prompt missing")
+	}
+	if _, ok := loader.PromptRegistry().Get("user"); ok {
+		t.Fatal("project list did not replace user list")
+	}
+}
+
+func TestReportShutdownErrorSurfacesFailure(t *testing.T) {
+	output := captureStderr(t, func() { reportShutdownError(errors.New("resource close failed")); reportShutdownError(nil) })
+	if output != "tau shutdown error: resource close failed\n" {
+		t.Fatalf("shutdown diagnostic = %q", output)
+	}
+}
+
+func TestModelScopePatternsPreferFlagsOverEnabledModels(t *testing.T) {
+	settings := &ai.Settings{EnabledModels: []string{"anthropic/*"}}
+	if got := modelScopePatterns([]string{"openai/gpt-5"}, settings); !slices.Equal(got, []string{"openai/gpt-5"}) {
+		t.Fatalf("flags = %q", got)
+	}
+	if got := modelScopePatterns(nil, settings); !slices.Equal(got, []string{"anthropic/*"}) {
+		t.Fatalf("settings = %q", got)
+	}
+	if got := modelScopePatterns(nil, nil); got != nil {
+		t.Fatalf("nil settings = %q", got)
+	}
+}
+
+type failingReloadSession struct {
+	commands.CommandSession
+	err error
+}
+
+func (s *failingReloadSession) ReloadSettings(context.Context, *ai.Settings) error { return s.err }
+
+func TestInvalidThemesAreReportedAtStartupAndReload(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Setenv("TAU_THEMES_DIR", "")
+	t.Chdir(t.TempDir())
+	themesDir := filepath.Join(cfgDir, "themes")
+	require.NoError(t, os.MkdirAll(themesDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(themesDir, "partial.json"), []byte(`{"name":"partial","colors":{"text":"#ffffff"}}`), 0o600))
+
+	ctx, diagnostics := withStartupDiagnostics(t.Context())
+	_, _, loader, _ := buildRuntimeOptions(ctx, nil, nil)
+	require.NotNil(t, loader)
+	lines := diagnostics.Lines()
+	require.Len(t, lines, 1)
+	assert.Contains(t, lines[0], "partial.json")
+	assert.Contains(t, lines[0], "missing required color tokens")
+	_, ok := loader.ThemeRegistry().Get("light")
+	assert.True(t, ok, "built-in light theme registers")
+
+	previousLoader, previousPlugins := sdk.GlobalArtifactLoader, GlobalPluginManager
+	sdk.GlobalArtifactLoader, GlobalPluginManager = loader, nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader, GlobalPluginManager = previousLoader, previousPlugins })
+	result, err := reloadSession(t.Context(), "", &reloadSettingsSession{})
+	require.NoError(t, err)
+	assert.Contains(t, result.Output, "warning: invalid theme ")
+	assert.Contains(t, result.Output, "partial.json")
+}
+
+func TestReloadSessionCommitsArtifactsOnlyAfterSessionSettings(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Chdir(t.TempDir())
+	for _, name := range []string{"old", "new"} {
+		if err := os.MkdirAll(filepath.Join(cfgDir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cfgDir, name, name+".md"), []byte("body"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSettings := func(dir string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(`{"prompts":["`+dir+`"]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSettings("old")
+	settings, err := loadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := commands.NewInMemoryRegistry()
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), SettingsPaths: getSettingsArtifactPaths(settings), UserDirs: artifactUserDirs(settings), DisableSkills: true, DisableThemes: true, CommandsRegistry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousLoader, previousPlugins := sdk.GlobalArtifactLoader, GlobalPluginManager
+	sdk.GlobalArtifactLoader, GlobalPluginManager = loader, nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader, GlobalPluginManager = previousLoader, previousPlugins })
+
+	writeSettings("new")
+	rejected := errors.New("invalid transport")
+	if _, err := reloadSession(t.Context(), "", &failingReloadSession{err: rejected}); !errors.Is(err, rejected) {
+		t.Fatalf("reload error = %v, want session rejection", err)
+	}
+	if _, ok := loader.PromptRegistry().Get("old"); !ok {
+		t.Fatal("rejected reload replaced artifacts")
+	}
+	if _, _, ok := reg.Lookup("new"); ok {
+		t.Fatal("rejected reload registered new prompt commands")
+	}
+
+	if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(`{"prompts":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloadSession(t.Context(), "", &reloadSettingsSession{}); err == nil {
+		t.Fatal("malformed settings reloaded")
+	}
+	if _, ok := loader.PromptRegistry().Get("old"); !ok {
+		t.Fatal("malformed settings replaced artifacts")
+	}
+
+	writeSettings("new")
+	sess := &reloadSettingsSession{}
+	result, err := reloadSession(t.Context(), "", sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.settings == nil || result.Output != "reloaded settings, artifacts, and plugins" {
+		t.Fatalf("reload result = %q, settings = %v", result.Output, sess.settings)
+	}
+	if _, ok := loader.PromptRegistry().Get("new"); !ok {
+		t.Fatal("reload ignored the new settings prompt paths")
+	}
+	if _, _, ok := reg.Lookup("old"); ok {
+		t.Fatal("reload kept the old prompt command")
+	}
+}
+
+func TestThemeLookupRetainsAppearanceAcrossResourceReload(t *testing.T) {
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisablePrompts: true})
+	require.NoError(t, err)
+	lookup := themeLookup(loader)
+	register := func(appearance string) {
+		var file map[string]any
+		entry := artifacts.BuiltinThemes()[0]
+		require.NoError(t, json.Unmarshal(entry.Raw, &file))
+		file["name"] = "metadata"
+		file["appearance"] = appearance
+		raw, err := json.Marshal(file)
+		require.NoError(t, err)
+		require.NoError(t, loader.ThemeRegistry().Reload([]artifacts.Entry{{Kind: artifacts.KindTheme, Tier: artifacts.TierProject, SourcePath: filepath.Join(t.TempDir(), "metadata.json"), Raw: raw}}))
+	}
+	register("light")
+	theme, ok := lookup("metadata")
+	require.True(t, ok)
+	assert.Equal(t, "light", theme.Appearance)
+	assert.NotEmpty(t, theme.Values["text"])
+	register("dark")
+	theme, ok = lookup("metadata")
+	require.True(t, ok)
+	assert.Equal(t, "dark", theme.Appearance)
+	_, ok = lookup("missing")
+	assert.False(t, ok)
+	assert.Nil(t, themeLookup(nil))
+}
+
+func TestThemesCommandsDescribeGeneratedSystemWithoutFile(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+	themesDir := filepath.Join(configDir, "themes")
+	require.NoError(t, os.MkdirAll(themesDir, 0o700))
+	raw := strings.Replace(string(artifacts.BuiltinThemes()[0].Raw), `"name": "dark"`, `"name": "system"`, 1)
+	require.Contains(t, raw, `"name": "system"`)
+	require.NoError(t, os.WriteFile(filepath.Join(themesDir, "system.json"), []byte(raw), 0o600))
+	t.Chdir(t.TempDir())
+	run := func(args ...string) string {
+		t.Helper()
+		var runErr error
+		output := captureStdout(t, func() {
+			cmd := newRootCommand()
+			cmd.ExitErrHandler = func(context.Context, *cli.Command, error) {}
+			runErr = cmd.Run(t.Context(), append([]string{"tau", "themes"}, args...))
+		})
+		require.NoError(t, runErr)
+		return output
+	}
+	output := run("list")
+	assert.Contains(t, output, "system [builtin]")
+	assert.Equal(t, 1, strings.Count(output, "  system ["))
+	assert.Contains(t, output, "Source: generated from terminal colors")
+	assert.Less(t, strings.Index(output, "system [builtin]"), strings.Index(output, "dark [builtin]"))
+	assert.Contains(t, run("list", "--tier", "builtin"), "system")
+	assert.NotContains(t, run("list", "--tier", "user"), "system")
+	output = run("show", "system")
+	assert.Contains(t, output, "Theme: system")
+	assert.Contains(t, output, "Tier: builtin")
+	assert.Contains(t, output, "Source: generated from terminal colors")
+	assert.NotContains(t, output, "Raw:")
+	assert.NotContains(t, output, "system.json")
+	assert.Contains(t, run("show", "light"), "Raw:")
+}
+
+func TestThemeFileRefreshReachesLookupAndRetainsValidatedSnapshot(t *testing.T) {
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisablePrompts: true, ThemeValidator: func(raw []byte) error { _, err := tui.DecodeTheme(raw); return err }})
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "custom.json")
+	var file map[string]any
+	require.NoError(t, json.Unmarshal(artifacts.BuiltinThemes()[0].Raw, &file))
+	file["name"] = "custom"
+	save := func() {
+		raw, err := json.Marshal(file)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(path, raw, 0o600))
+	}
+	save()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, loader.ThemeRegistry().Register(artifacts.Entry{Kind: artifacts.KindTheme, Tier: artifacts.TierProject, SourcePath: path, Raw: raw}))
+	lookup := themeLookup(loader)
+	initial, ok := lookup("custom")
+	require.True(t, ok)
+	file["appearance"] = "light"
+	file["colors"].(map[string]any)["text"] = "#123456"
+	save()
+	changed, err := loader.ThemeRegistry().Refresh("custom")
+	require.NoError(t, err)
+	require.True(t, changed)
+	updated, ok := lookup("custom")
+	require.True(t, ok)
+	assert.NotEqual(t, initial, updated)
+	assert.Equal(t, "light", updated.Appearance)
+	assert.Equal(t, "#123456", updated.Values["text"])
+	// Valid JSON still has to pass the shared theme schema.
+	delete(file["colors"].(map[string]any), "text")
+	save()
+	changed, err = loader.ThemeRegistry().Refresh("custom")
+	require.Error(t, err)
+	assert.False(t, changed)
+	retained, ok := lookup("custom")
+	require.True(t, ok)
+	assert.Equal(t, updated, retained)
+	require.NoError(t, os.Remove(path))
+	changed, err = loader.ThemeRegistry().Refresh("custom")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	assert.False(t, changed)
+	retained, ok = lookup("custom")
+	require.True(t, ok)
+	assert.Equal(t, updated, retained)
+}
+
+type loginCredentialProvider struct {
+	oauth.Provider
+	login func(context.Context, oauth.LoginCallbacks) (*oauth.Credentials, error)
+}
+
+func (p loginCredentialProvider) Login(ctx context.Context, callbacks oauth.LoginCallbacks) (*oauth.Credentials, error) {
+	return p.login(ctx, callbacks)
+}
+
+func TestLoginOAuthCredentialPreservesMetadata(t *testing.T) {
+	expires := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	result := &oauth.Credentials{
+		Access: "access", Refresh: "refresh", Expires: expires.UnixMilli(),
+		ProjectID: "project", Email: "user@example.com", AccountID: "account",
+		Extra: map[string]any{"enterpriseUrl": "https://example.com", "availableModels": []string{"model"}},
+	}
+	callbacks := &loginCallbacks{}
+	provider := loginCredentialProvider{login: func(ctx context.Context, got oauth.LoginCallbacks) (*oauth.Credentials, error) {
+		assert.Equal(t, t.Context(), ctx)
+		assert.Same(t, callbacks, got)
+		return result, nil
+	}}
+	cred, err := loginOAuthCredential(t.Context(), provider, callbacks)
+	require.NoError(t, err)
+	assert.Equal(t, ai.CredentialTypeOAuth, cred.Type)
+	assert.Equal(t, result.Access, cred.AccessToken)
+	assert.Equal(t, result.Refresh, cred.RefreshToken)
+	assert.True(t, expires.Equal(cred.ExpiresAt))
+	assert.Equal(t, result.ProjectID, cred.ProjectID)
+	assert.Equal(t, result.Email, cred.Email)
+	assert.Equal(t, result.AccountID, cred.AccountID)
+	assert.Equal(t, result.Extra, cred.Extra)
+	fb := store.NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), store.Options{})
+	require.NoError(t, fb.Set(t.Context(), "test", cred))
+	restored, err := fb.Get(t.Context(), "test")
+	require.NoError(t, err)
+	assert.Equal(t, cred.ProjectID, restored.ProjectID)
+	assert.Equal(t, cred.Email, restored.Email)
+	assert.Equal(t, cred.AccountID, restored.AccountID)
+	expected, err := json.Marshal(cred.Extra)
+	require.NoError(t, err)
+	actual, err := json.Marshal(restored.Extra)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(expected), string(actual))
+}
+
+func TestLoginOAuthCredentialRejectsFailure(t *testing.T) {
+	failure := errors.New("provider failed")
+	for _, tc := range []struct {
+		name   string
+		result *oauth.Credentials
+		err    error
+		cancel bool
+	}{
+		{name: "provider", err: failure},
+		{name: "nil"},
+		{name: "empty", result: &oauth.Credentials{Refresh: "refresh"}},
+		{name: "cancelled", result: &oauth.Credentials{Access: "late"}, cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			provider := loginCredentialProvider{login: func(context.Context, oauth.LoginCallbacks) (*oauth.Credentials, error) {
+				if tc.cancel {
+					cancel()
+				}
+				return tc.result, tc.err
+			}}
+			cred, err := loginOAuthCredential(ctx, provider, &loginCallbacks{})
+			require.Error(t, err)
+			assert.Equal(t, ai.Credential{}, cred)
+			if tc.err != nil {
+				assert.ErrorIs(t, err, tc.err)
+			}
+			if tc.cancel {
+				assert.ErrorIs(t, err, context.Canceled)
+			}
+		})
+	}
+}
+
+func TestLoginOAuthCredentialRejectsCancelledAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	provider := loginCredentialProvider{login: func(context.Context, oauth.LoginCallbacks) (*oauth.Credentials, error) {
+		t.Fatal("cancelled login reached provider")
+		return nil, nil
+	}}
+	cred, err := loginOAuthCredential(ctx, provider, &loginCallbacks{})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, ai.Credential{}, cred)
+}
+
+func TestThemeCallbacksDisabledWithoutArtifacts(t *testing.T) {
+	if themeRefresher(nil) != nil || themeLookup(nil) != nil {
+		t.Fatal("theme callbacks must be nil when artifact loading failed")
 	}
 }

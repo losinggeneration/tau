@@ -23,8 +23,8 @@ func TestRefreshEditorChromeTracksThinkingLevel(t *testing.T) {
 	a.footer.data.thinkingLevel = "off"
 	a.refreshEditorChrome()
 	off := paintedRuleStyle(t, a.editor)
-	if off.FG != tokens.Border {
-		t.Fatalf("thinking off: rule FG = %#v, want the neutral border token %#v", off.FG, tokens.Border)
+	if off.FG != tokens.ThinkingOff {
+		t.Fatalf("thinking off: rule FG = %#v, want the thinkingOff token %#v", off.FG, tokens.ThinkingOff)
 	}
 
 	a.footer.data.thinkingLevel = "high"
@@ -43,11 +43,11 @@ func TestRefreshEditorChromeFollowsThemeTokens(t *testing.T) {
 	a := newEditorChromeApp(t)
 	a.footer.data.thinkingLevel = "off"
 
-	a.chat.SetTheme("default", map[string]string{"border": "#0a0b0c"})
+	a.chat.SetTheme("default", map[string]string{"thinkingOff": "#0a0b0c"})
 	a.refreshEditorChrome()
 
 	if got, want := paintedRuleStyle(t, a.editor).FG, tauui.ColorRGB(0x0a, 0x0b, 0x0c); got != want {
-		t.Fatalf("rule FG = %#v, want the overridden border token %#v", got, want)
+		t.Fatalf("rule FG = %#v, want the overridden thinkingOff token %#v", got, want)
 	}
 }
 

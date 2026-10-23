@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -260,13 +261,17 @@ type App struct {
 	// completion-only follow-ups so the pending region can render the spec
 	// Steering:/Follow-up: labels.
 	steeringQueue []string
+	// userBashCancel cancels the running !/!! shell command. Loop-owned.
+	userBashCancel context.CancelFunc
+	userBashSeq    int
 
 	// status renders the keyed status lines (extension status,
 	// working messages) above the editor and below the pending
 	// view. Driven by App.setStatus / clearStatus on the app
 	// loop. The view collapses to 0x0 when the entry map is empty
 	// so the VStack treats the region as absent.
-	status *tauui.StatusEntriesView
+	status        *tauui.StatusEntriesView
+	programStatus programStatusReporter
 	// statusEntries is the keyed map of status text. Each entry
 	// is "key: text"; the same key can be re-set to update the
 	// text. Empty text and explicit clearStatus both remove the
@@ -315,7 +320,13 @@ type App struct {
 	// map has been rebuilt) so the user can type to filter and navigate
 	// with arrows. The editor remains in the layout but loses focus while
 	// the dialog is active.
-	dialogPicker *tauui.DialogPicker
+	dialogPicker      *tauui.DialogPicker
+	dialogMu          sync.Mutex
+	dialogStopped     chan struct{}
+	dialogInputActive atomic.Bool
+	extensionDialog   *extensionDialog
+	loginDialog       *loginDialog
+	loginWorkers      sync.WaitGroup
 	// currentModel is the key (provider/id) of the session's active
 	// model. Cached so model items can be sorted with the active model
 	// at the top of the list and marked with the active marker (the
@@ -367,6 +378,9 @@ type App struct {
 	// A non-nil slice is the explicit ordered set selected through
 	// /scoped-models. An empty non-nil slice means no models are enabled.
 	scopedModelKeys []string
+	// scopedThinking holds the ":level" suffixes of the startup scope
+	// patterns by model key. Cycling to such a model applies its level.
+	scopedThinking map[string]string
 
 	// extensions is the plugin extension registry. It is the public
 	// surface plugins and tests use to register custom message/tool
@@ -393,7 +407,10 @@ type App struct {
 
 	// themeColors resolves discovered theme files to their colour tokens.
 	// Nil means only the built-in token sets are available.
-	themeColors ThemeColorLookup
+	themeColors   ThemeColorLookup
+	themeLookup   ThemeLookup
+	refreshTheme  func(string) (bool, error)
+	terminalTheme terminalThemeState
 
 	// keybindings is the app-layer action registry (app.md §12). Held so
 	// /hotkeys and the settings UI can describe the live bindings rather than
@@ -404,6 +421,9 @@ type App struct {
 	// commands without standing up a full session. The field is
 	// ignored when nil; production code never reads it.
 	testExternalCommands []ExternalCommand
+	// hideSkillCommands keeps /skill: commands out of completion and help
+	// when enableSkillCommands is false; typed skill commands still run.
+	hideSkillCommands bool
 
 	// pluginRenderers is the role/tool-keyed registry the chat log
 	// consults before falling back to the built-in projection.
@@ -543,6 +563,9 @@ type Options struct {
 	// SettingsPath is where /model persists the selected default model. Empty
 	// keeps /model as a session-only switch.
 	SettingsPath string
+	// ModelScope holds --models or enabledModels patterns that limit model
+	// cycling. Empty cycles every available model.
+	ModelScope []string
 	// SessionFactory creates replacement sessions for commands like /resume.
 	// Nil disables in-process session switching.
 	SessionFactory SessionFactory
@@ -561,6 +584,10 @@ type Options struct {
 	// discovered as resources actually repaint the UI. Nil restricts the app to
 	// its built-in token sets.
 	ThemeColors ThemeColorLookup
+	// ThemeLookup preserves file appearance metadata and takes precedence over ThemeColors.
+	ThemeLookup ThemeLookup
+	// RefreshTheme rereads the selected file, retaining the last valid registry entry on error.
+	RefreshTheme func(string) (bool, error)
 	// StartupMessages are shown under the startup header before the first turn.
 	StartupMessages []string
 }
@@ -634,6 +661,8 @@ func New(opts Options) (*App, error) {
 		credentialStore: opts.CredentialStore,
 		settingsPath:    opts.SettingsPath,
 		themeColors:     opts.ThemeColors,
+		themeLookup:     opts.ThemeLookup,
+		refreshTheme:    opts.RefreshTheme,
 		header:          header,
 		extensions:      extensions.New(),
 		pluginRenderers: newPluginRenderers(),
@@ -671,7 +700,7 @@ func New(opts Options) (*App, error) {
 	// background goroutine) so they don't race the toolkit render.
 	if a.extensions != nil {
 		a.extensions.OnThemeChanged(func(theme extensions.Theme) {
-			a.applyThemeFromExtension(theme.Name, theme.Values)
+			a.applyThemeFromExtension(theme)
 		})
 		a.extensions.OnEditorTextChanged(func(text string) {
 			a.applyEditorTextFromExtension(text)
@@ -693,24 +722,35 @@ func New(opts Options) (*App, error) {
 	// Seed the plugin extension registry with the App's theme. The
 	// extensions package's SetTheme defensively copies the values
 	// map, so the caller can safely mutate their working copy.
-	initialTheme := "default"
-	var loadedSettings *ai.Settings
-	if opts.SettingsPath != "" {
+	initialTheme := systemThemeName
+	loadedSettings := sessionSettings(opts.Session)
+	if loadedSettings == nil && opts.SettingsPath != "" {
 		settings, err := ai.LoadSettings(opts.SettingsPath)
 		if err != nil {
 			_ = chatLog.Close()
 			return nil, fmt.Errorf("load tui settings: %w", err)
 		}
+		loadedSettings = settings
+	}
+	if settings := loadedSettings; settings != nil {
 		if settings.Theme != "" {
 			initialTheme = settings.Theme
 		}
-		loadedSettings = settings
 		a.applyDisplaySettings(settings)
 	}
 	a.applyDefaultSteeringMode(loadedSettings)
-	if a.footer != nil && a.footer.data != nil {
-		a.footer.data.theme = initialTheme
+	if len(opts.ModelScope) > 0 {
+		a.scopedModelKeys = []string{}
+		a.scopedThinking = map[string]string{}
+		for _, scoped := range ai.ExpandModelScope(opts.ModelScope, a.allScopedModelKeys()) {
+			key := scoped.Model.String()
+			a.scopedModelKeys = append(a.scopedModelKeys, key)
+			if scoped.ThinkingLevel != "" {
+				a.scopedThinking[key] = scoped.ThinkingLevel
+			}
+		}
 	}
+
 	// The header renders the startup banner as region 1 and reports the live
 	// keybindings, so a rebind shows up in the hints rather than the defaults
 	// we shipped.
@@ -721,12 +761,7 @@ func New(opts Options) (*App, error) {
 	// The footer reads its dim/warning/error colours from the active theme
 	// rather than from hardcoded terminal colours.
 	footer.SetThemeTokens(func() themeTokens { return chatLog.ThemeTokens() })
-	initialValues := a.themeColorsFor(initialTheme)
-	chatLog.SetTheme(initialTheme, initialValues)
-	a.refreshEditorChrome()
-	if a.extensions != nil {
-		a.extensions.SetTheme(extensions.Theme{Name: initialTheme, Values: initialValues})
-	}
+	a.applyTheme(initialTheme)
 
 	// Wire the plugin extension APIs that need live App state:
 	// editor text, paste, and tool expansion. Each of these
@@ -752,6 +787,13 @@ func New(opts Options) (*App, error) {
 	selector.SetOnSelect(a.applySelector)
 	selector.SetOnClose(a.dismissSelector)
 	dialogPicker.SetOnCancel(a.dismissDialog)
+	dialogPicker.SetOnVisibilityChanged(func(shown bool) {
+		a.programStatus.blocked = tauui.ProgramStatus{}
+		if shown {
+			a.programStatus.blocked = tauui.ProgramStatus{State: "blocked", Kind: "question", Message: dialogPicker.Header()}
+		}
+		a.refreshProgramStatus()
+	})
 
 	// Region stack (top → bottom). The middle chat region is the only flexible
 	// one; every other region sizes to its content. Pending/status/widget views
@@ -800,13 +842,17 @@ func New(opts Options) (*App, error) {
 	}
 	a.keybindings = keyManager
 
+	initialTokens := chatLog.ThemeTokens()
 	app, err := tauui.New(tauui.Opts{
-		Root:           root,
-		Title:          appTerminalTitle(a.SessionID(), false),
-		Theme:          appTheme(),
-		Keymap:         appKeymap{app: a, manager: keyManager},
-		Mouse:          true,
-		BracketedPaste: boolPtr(true),
+		WheelScrollLines:      new(loadedSettings.ResolveFullscreenWheelScrollLines()),
+		OnTerminalColorScheme: a.applyTerminalThemeScheme,
+		OnResume:              a.startTerminalTheme,
+		Root:                  root,
+		Title:                 appTerminalTitle(a.SessionID(), false),
+		Theme:                 initialTokens.nativeTheme(),
+		Keymap:                appKeymap{app: a, manager: keyManager},
+		Mouse:                 true,
+		BracketedPaste:        boolPtr(true),
 	})
 	if err != nil {
 		_ = chatLog.Close()
@@ -814,6 +860,9 @@ func New(opts Options) (*App, error) {
 	}
 	a.app = app
 	app.AddInputListener(func(e tauui.Event) (tauui.Event, bool) {
+		if a.dialogInputActive.Load() {
+			return e, false
+		}
 		pe, ok := e.(tauui.PasteEvent)
 		if !ok {
 			return e, false
@@ -880,9 +929,17 @@ func (a *App) SessionID() string {
 // Run enables the terminal, starts the event loop, and blocks until the user
 // quits. It restores the terminal on return.
 func (a *App) Run(ctx context.Context) error {
+	defer func() { a.stopExtensionDialogs(); a.stopLoginWorkers() }()
+	a.refreshProgramStatus()
 	a.ctx, a.cancelRun = context.WithCancel(ctx)
 	defer a.cancelRun()
 	defer func() { _ = a.chat.Close() }()
+
+	if err := a.app.Post(func(*tauui.UpdateCtx) { a.startTerminalTheme() }); err != nil {
+		return fmt.Errorf("initialize terminal theme: %w", err)
+	}
+	defer func() { a.terminalTheme.started = false }()
+	defer a.startThemeFileWatcher(a.ctx)()
 
 	// If an initial prompt was passed on the command line, submit it on the
 	// first loop iteration so the editor is clear and the run streams in.
@@ -1249,8 +1306,13 @@ func (r *Root) Handle(e tauui.Event, ctx *tauui.Ctx) bool {
 	// Not a scroll (or nothing moved): deliver to the same view rovel's own
 	// hit test would have chosen, so claiming the event changes nothing else.
 	if me, ok := e.(tauui.MouseEvent); ok {
-		if target := deepestViewAt(r.Children(), me.X, me.Y); target != nil {
-			return target.Handle(e, ctx)
+		target := deepestViewAt(r.Children(), me.X, me.Y)
+		if target != nil && target.Handle(e, ctx) {
+			return true
+		}
+		wheel := me.Action == tauui.MousePress && (me.Button == tauui.MouseButtonWheelUp || me.Button == tauui.MouseButtonWheelDown)
+		if wheel && r.app != nil && r.app.LayoutMode() == LayoutFixed && r.Chat != nil && target != r.Chat {
+			return r.Chat.Handle(e, ctx)
 		}
 		return false
 	}
@@ -1258,6 +1320,10 @@ func (r *Root) Handle(e tauui.Event, ctx *tauui.Ctx) bool {
 }
 
 func (a *App) requestClipboardPaste(ctx *tauui.Ctx) bool {
+	if a != nil && (a.extensionDialog != nil || a.loginDialog != nil) && ctx != nil && ctx.ClipboardRead != nil {
+		ctx.ClipboardRead()
+		return true
+	}
 	if a == nil || a.editor == nil || ctx == nil || ctx.FocusedID != a.editor.ID() {
 		return false
 	}
@@ -1274,6 +1340,15 @@ func (a *App) requestClipboardPaste(ctx *tauui.Ctx) bool {
 }
 
 func (a *App) handlePaste(e tauui.PasteEvent, ctx *tauui.Ctx) bool {
+	if a != nil && (a.extensionDialog != nil || a.loginDialog != nil) {
+		if input := a.hostedDialogInput(); input != nil {
+			input.Paste(e.Text)
+			if ctx != nil && ctx.InvalidateAll != nil {
+				ctx.InvalidateAll()
+			}
+		}
+		return true
+	}
 	if a == nil || a.editor == nil || ctx == nil || ctx.FocusedID != a.editor.ID() {
 		return false
 	}
@@ -1443,6 +1518,10 @@ func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
 		if r.app.dismissSelectorIfVisibleCtx(ctx) {
 			return true
 		}
+		if r.app.userBashCancel != nil {
+			r.app.userBashCancel()
+			return true
+		}
 		if r.app.consumeStreamingForInterrupt() {
 			return true
 		}
@@ -1551,6 +1630,20 @@ var scopedModelsActionIDs = map[string]struct{}{
 }
 
 func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Action, bool) {
+	// Hosted login and extension inputs own editing keys that the global
+	// keymap assigns to activation or quitting.
+	if k.app != nil && (k.app.extensionDialog != nil || k.app.loginDialog != nil) {
+		if k.app.hostedDialogInput() != nil || k.app.loginDialog != nil {
+			if ks.Key == tauui.KeyCtrlC || ks.Mod == tauui.ModCtrl && ks.Key == tauui.KeyRune && (ks.Rune == 'c' || ks.Rune == 'C') {
+				return AppActionExit, true
+			}
+			if ks.Mod == tauui.ModCtrl && ks.Key == tauui.KeyRune && (ks.Rune == 'v' || ks.Rune == 'V') {
+				return AppActionPaste, true
+			}
+			return tauui.ActionNone, false
+		}
+	}
+
 	if ks.Mod == tauui.ModCtrl && ks.Key == tauui.KeyRune && (ks.Rune == 'd' || ks.Rune == 'D') {
 		if k.app == nil || k.app.editor == nil || k.app.editor.Text() == "" {
 			return AppActionQuitNow, true
@@ -1609,7 +1702,7 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 		case tauui.KeyPageDown:
 			return AppActionSelectorPageDown, true
 		case tauui.KeyRune:
-			if ks.Rune == ' ' {
+			if ks.Rune == ' ' && k.app.extensionDialog == nil && k.app.loginDialog == nil {
 				return AppActionSelectorActivate, true
 			}
 		}
@@ -1671,6 +1764,10 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 
 // quit tears down the session and stops the toolkit loop.
 func (a *App) quit() {
+	a.stopExtensionDialogs()
+	if a.loginDialog != nil {
+		a.dismissDialog()
+	}
 	// Stop any pending confirm timer so its callback doesn't fire
 	// after we've already torn down state.
 	a.stopConfirmQuitTimer()
@@ -1914,6 +2011,11 @@ func (a *App) refreshFooterStats(ctx *tauui.Ctx) {
 	d.contextUsedPct = stats.ContextUsedPct
 	d.totalTokens = stats.TotalTokens
 	d.autoCompaction = stats.AutoCompaction
+	d.inputTokens = stats.Usage.Input
+	d.outputTokens = stats.Usage.Output
+	d.cacheReadTokens = stats.Usage.CacheRead
+	d.cacheWriteTokens = stats.Usage.CacheWrite
+	d.costUSD = stats.Usage.Cost.Total
 
 	if n, ok := a.sess.(sdk.Namer); ok {
 		d.sessionName = n.GetSessionName()
@@ -2055,6 +2157,71 @@ func (a *App) consumeStreamingForInterrupt() bool {
 	return true
 }
 
+// parseUserBash recognizes interactive shell input: !command records the
+// output for the model, !!command keeps it out of model context.
+func parseUserBash(text string) (command string, excluded, ok bool) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "!") {
+		return "", false, false
+	}
+	excluded = strings.HasPrefix(text, "!!")
+	command = strings.TrimSpace(strings.TrimPrefix(text[1:], "!"))
+	return command, excluded, command != ""
+}
+
+// runUserBash executes a shell command through the session so hooks,
+// operations, and recording match RPC bash. The row streams local output and
+// completes from the returned record.
+func (a *App) runUserBash(command string, excluded bool) {
+	executor, ok := a.sess.(sdk.BashExecutor)
+	if !ok {
+		a.conv.AddError("bash: session does not support shell commands")
+		a.refreshChat()
+		return
+	}
+	args, err := json.Marshal(map[string]any{"command": command, "exclude_from_context": excluded})
+	if err != nil {
+		a.conv.AddError("bash: " + err.Error())
+		a.refreshChat()
+		return
+	}
+	a.userBashSeq++
+	id := fmt.Sprintf("user-bash-%d", a.userBashSeq)
+	a.conv.AddToolCallWithID(id, "bash", string(args))
+	a.refreshChat()
+	ctx, cancel := context.WithCancel(a.ctxOrBackground())
+	a.userBashCancel = cancel
+	go func() {
+		execution, err := executor.ExecuteBash(ctx, command, sdk.BashOptions{
+			ExcludeFromContext: excluded,
+			OnOutput: func(chunk string) {
+				a.post(func(*tauui.UpdateCtx) {
+					a.conv.AddToolProgress(id, chunk)
+					a.refreshChat()
+				})
+			},
+		})
+		a.post(func(*tauui.UpdateCtx) {
+			cancel()
+			a.userBashCancel = nil
+			if err != nil {
+				a.conv.addToolResult(id, "bash", err.Error(), true, nil, nil, excluded)
+			} else {
+				addUserBashResult(a.conv, id, execution)
+			}
+			a.refreshChat()
+		})
+	}()
+}
+
+func addUserBashResult(conv *ConversationModel, id string, execution sdk.BashExecution) {
+	output := execution.Output
+	if execution.Cancelled {
+		output = strings.TrimRight(output, "\n") + "\n(command cancelled)"
+	}
+	conv.addToolResult(id, "bash", output, execution.Cancelled || execution.ExitCode != 0, execution, execution.DurationMs, execution.ExcludeFromContext)
+}
+
 // trySubmit sends the editor's text as a user prompt when the editor is
 // focused and non-empty. If the text is a slash command it is dispatched to
 // the matching command handler; otherwise it is sent as a regular prompt.
@@ -2182,6 +2349,19 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 		// state if the user interrupted it.
 		a.conv.AddError("unknown command: /" + name)
 		a.refreshChat()
+		return true
+	}
+
+	if command, excluded, ok := parseUserBash(sendText); ok {
+		if a.userBashCancel != nil {
+			a.conv.AddError("a bash command is already running; press Esc to cancel it first")
+			a.refreshChat()
+			return true
+		}
+		a.editor.Model().AddHistory(text)
+		a.editor.SetText(ctx, "")
+		a.dismissSelector()
+		a.runUserBash(command, excluded)
 		return true
 	}
 
@@ -3468,6 +3648,12 @@ func (a *App) applyModelFromArgs(modelID string) bool {
 // (currentModel, footer) is updated immediately and is directly
 // observable in unit tests without draining a post queue.
 func (a *App) applyModelFromKey(key string) {
+	a.selectModel(key, "")
+}
+
+// selectModel switches to key and then applies thinkingLevel, or the saved
+// per-model level when thinkingLevel is empty.
+func (a *App) selectModel(key, thinkingLevel string) {
 	if a.sess == nil {
 		return
 	}
@@ -3509,44 +3695,40 @@ func (a *App) applyModelFromKey(key string) {
 	// the session keeps the previous model's level. Runs after the model system
 	// row so the transcript reads model-first, and after refreshFooterStats so
 	// its footer/editor-chrome update is the last word on the displayed level.
-	a.applySavedThinkingLevel(key)
+	if thinkingLevel != "" {
+		a.applyThinkingLevel(thinkingLevel)
+	} else {
+		a.applySavedThinkingLevel(key)
+	}
 	a.refreshChat()
 }
 
-// applyTheme updates the live App state to reflect a new active theme
-// name. The settings overlay's theme submenu calls this after the user
-// picks a value; the App mirrors the name into its extensions registry
-// and footer record so the chrome and any plugin widget repaint
-// against the chosen palette.
-//
-// The applyTheme hook is intentionally a no-op-safe extension point:
-// callers may invoke it with an empty value (no-op) or an unknown name
-// (no-op beyond updating the cached state); concrete palettes are
-// resolved at render time by the views that read the name.
-func (a *App) applyTheme(name string) {
+// sessionSettings returns the merged settings a session applies, or nil when
+// the session does not report them.
+func sessionSettings(sess sdk.Session) *ai.Settings {
+	if provider, ok := sess.(sdk.SettingsProvider); ok {
+		return provider.Settings()
+	}
+	return nil
+}
+
+// reapplySessionSettings pushes the session's settings into the display after
+// a successful /reload replaced them.
+func (a *App) reapplySessionSettings() {
 	if a == nil {
 		return
 	}
-	name = strings.TrimSpace(name)
-	if a.footer != nil && a.footer.data != nil {
-		a.footer.data.theme = name
+	settings := sessionSettings(a.sess)
+	if settings == nil {
+		return
 	}
-	// A discovered theme file's colours are the whole point of installing one.
-	// Resolve them here rather than only forwarding the name, which is what
-	// made theme packages load and change nothing.
-	values := a.themeColorsFor(name)
-	if a.extensions != nil {
-		a.extensions.SetTheme(extensions.Theme{Name: name, Values: values})
+	a.applyDisplaySettings(settings)
+	a.applyDefaultSteeringMode(settings)
+	theme := settings.Theme
+	if theme == "" {
+		theme = systemThemeName
 	}
-	if a.chat != nil {
-		a.chat.SetTheme(name, values)
-	}
-	a.refreshEditorChrome()
-	// Mark the layout dirty so repaint sees the new chrome.
-	if ctx := a.loopContext(); ctx != nil && ctx.InvalidateLayout != nil {
-		ctx.InvalidateLayout()
-	}
-	a.refreshChat()
+	a.applyTheme(theme)
 }
 
 // applyDisplaySettings pushes the presentation settings into the components
@@ -3557,7 +3739,12 @@ func (a *App) applyDisplaySettings(settings *ai.Settings) {
 	if a == nil || settings == nil {
 		return
 	}
+	a.hideSkillCommands = !settings.SkillCommandsEnabled()
+	if a.app != nil {
+		a.app.SetWheelScrollLines(settings.ResolveFullscreenWheelScrollLines())
+	}
 	if a.chat != nil {
+		a.chat.SetCodeBlockIndent(settings.ResolveCodeBlockIndent())
 		a.chat.SetThinkingDisplay(settings.HideThinkingBlock, "")
 		a.chat.SetImageDisplay(settingsShowImages(settings))
 	}
@@ -3565,12 +3752,8 @@ func (a *App) applyDisplaySettings(settings *ai.Settings) {
 		a.header.SetQuietStartup(settings.QuietStartup)
 	}
 	if a.editor != nil {
-		if settings.EditorPaddingX > 0 {
-			a.editor.SetPadding(settings.EditorPaddingX)
-		}
-		if settings.AutocompleteMaxVisible > 0 {
-			a.editor.Model().SetAutocompleteMaxVisible(settings.AutocompleteMaxVisible)
-		}
+		a.editor.SetPadding(settings.ResolveEditorPaddingX())
+		a.editor.Model().SetAutocompleteMaxVisible(settings.ResolveAutocompleteMaxVisible())
 	}
 	a.applyQueueModeSettings(settings)
 
@@ -3643,7 +3826,7 @@ func (a *App) refreshEditorChrome() {
 		level = a.footer.data.thinkingLevel
 	}
 	tokens := a.chat.ThemeTokens()
-	a.editor.SetBorderStyle(tauui.Style{FG: tokens.editorBorderColor(level), BG: tokens.Surface})
+	a.editor.SetBorderStyle(tokens.editorBorderStyle(level))
 }
 
 // refreshSelector is the central decision point: given the current editor
@@ -4031,9 +4214,7 @@ func (a *App) applySelectorFromAction(ctx *tauui.Ctx) bool {
 		return true
 	}
 	if a.dialogPicker != nil && a.dialogPicker.Shown() {
-		if a.dialogPicker.Component() != nil {
-			a.dialogPicker.HandleAction(int(tauui.ActionActivate), ctx)
-		}
+		a.dialogPicker.HandleAction(int(tauui.ActionActivate), ctx)
 		return true
 	}
 	if a.selector == nil || !a.selector.Shown() {
@@ -4184,7 +4365,21 @@ func (a *App) closeDialogComponent() {
 	if a == nil || a.dialogPicker == nil {
 		return
 	}
+	a.dialogInputActive.Store(false)
+	if d := a.loginDialog; d != nil {
+		d.cancel()
+		a.loginDialog = nil
+		a.dialogPicker.SetShown(false)
+	}
+	if request := a.extensionDialog; request != nil {
+		request.finish(extensionDialogResult{index: -1})
+		a.extensionDialog = nil
+		a.dialogPicker.SetShown(false)
+	}
 	a.dialogPicker.SetComponent(nil)
+	a.dialogPicker.SetOnSelect(nil)
+	a.dialogPicker.SetOnChange(nil)
+	a.dialogPicker.SetOnCancel(a.dismissDialog)
 }
 
 // dismissDialog hides the dialog picker and returns focus to the
@@ -4215,7 +4410,9 @@ func (a *App) dismissDialogCtx(ctx *tauui.Ctx) {
 	// tree is rebuilt first.
 	if a.app != nil {
 		_ = a.app.Post(func(_ *tauui.UpdateCtx) {
-			a.app.SetFocus(a.editor.ID())
+			if !a.dialogPicker.Shown() {
+				a.app.SetFocus(a.editor.ID())
+			}
 		})
 	}
 }
@@ -4263,7 +4460,7 @@ func (a *App) externalCommands() []ExternalCommand {
 	var out []ExternalCommand
 	if a.sess != nil {
 		for _, info := range a.sess.SlashCommands() {
-			if _, dup := owned[info.Name]; dup {
+			if _, dup := owned[info.Name]; dup || (a.hideSkillCommands && info.Source == "skill") {
 				continue
 			}
 			out = append(out, ExternalCommand{
@@ -4308,6 +4505,8 @@ func (a *App) ensureAssistantMessage(messageID ...string) {
 // handleEvent maps an sdk.Event onto conversation-model mutations. It runs on
 // the app loop (inside a posted callback).
 func (a *App) handleEvent(ev sdk.Event) {
+	a.programStatus.handleEvent(ev)
+	a.refreshProgramStatus()
 	switch ev.Type {
 	case "usage_limit_wait":
 		provider, _ := plString(ev.Payload, "provider")
@@ -4320,7 +4519,6 @@ func (a *App) handleEvent(ev sdk.Event) {
 		}
 		a.setUsageLimitWait(provider, until)
 	case "usage":
-		a.applyUsagePayload(ev.Payload)
 		a.refreshFooterStats(a.loopContext())
 	case "tool_call":
 		a.setToolRunning(true)
@@ -4356,84 +4554,6 @@ func (a *App) handleEvent(ev sdk.Event) {
 		a.syncPendingFromSession(a.loopContext())
 	}
 	a.refreshChat()
-}
-
-func (a *App) applyUsagePayload(payload any) {
-	if a == nil || a.footer == nil || a.footer.data == nil {
-		return
-	}
-	m, ok := payload.(map[string]any)
-	if !ok {
-		return
-	}
-	usage, ok := m["this_call"].(map[string]any)
-	if !ok {
-		return
-	}
-	d := a.footer.data
-	d.inputTokens += usageInt(usage, "input", "input_tokens")
-	d.outputTokens += usageInt(usage, "output", "output_tokens")
-	d.cacheReadTokens += usageInt(usage, "cacheRead", "cache_read", "cache_read_tokens")
-	d.cacheWriteTokens += usageInt(usage, "cacheWrite", "cache_write", "cache_write_tokens")
-	if cost := usageCost(usage); cost > 0 || d.costKnown {
-		d.costUSD += cost
-		d.costKnown = true
-	}
-}
-
-func usageInt(m map[string]any, keys ...string) int {
-	for _, key := range keys {
-		v, ok := m[key]
-		if !ok {
-			continue
-		}
-		switch n := v.(type) {
-		case int:
-			return n
-		case int64:
-			return int(n)
-		case float64:
-			return int(n)
-		case float32:
-			return int(n)
-		}
-	}
-	return 0
-}
-
-func usageCost(m map[string]any) float64 {
-	for _, key := range []string{"cost_usd", "costUSD"} {
-		if v, ok := m[key]; ok {
-			if f, ok := usageFloat(v); ok {
-				return f
-			}
-		}
-	}
-	if raw, ok := m["cost"].(map[string]any); ok {
-		for _, key := range []string{"total", "Total"} {
-			if v, ok := raw[key]; ok {
-				if f, ok := usageFloat(v); ok {
-					return f
-				}
-			}
-		}
-	}
-	return 0
-}
-
-func usageFloat(v any) (float64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return n, true
-	case float32:
-		return float64(n), true
-	case int:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	default:
-		return 0, false
-	}
 }
 
 // refreshChat records follow-latest intent without repainting stale cached

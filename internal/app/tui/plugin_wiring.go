@@ -171,18 +171,25 @@ func (a *App) applyInsertEditorTextFromExtension(pos int, text string) {
 // would invoke this function, which would loop forever. The Registry
 // already stores the plugin's theme; the app only needs to mirror the
 // name into the footer chrome and invalidate the chat paint.
-func (a *App) applyThemeFromExtension(name string, values map[string]string) {
+func (a *App) applyThemeFromExtension(theme extensions.Theme) {
 	if a == nil {
 		return
 	}
-	name = strings.TrimSpace(name)
+	if a.terminalTheme.publishing {
+		return
+	}
+	a.terminalTheme.inMemory = true
+	a.terminalTheme.autoSync = false
+	a.setThemeNotifications()
+	name := strings.TrimSpace(theme.Name)
 	if a.footer != nil && a.footer.data != nil {
 		a.footer.data.theme = name
 	}
 	if a.chat != nil {
-		a.chat.SetTheme(name, values)
+		a.chat.setThemeDefinition(name, ThemeDefinition{Values: theme.Values, Appearance: theme.Appearance, Dim: theme.Dim})
 	}
 	a.refreshEditorChrome()
+	a.refreshNativeTheme()
 	if ctx := a.loopContext(); ctx != nil {
 		if ctx.InvalidateLayout != nil {
 			ctx.InvalidateLayout()

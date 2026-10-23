@@ -136,8 +136,8 @@ func (o *workspaceOverlay) HandleKey(ke tauui.KeyEvent) {
 		case 'd':
 			o.startDelete()
 		default:
-			if ke.Mod == 0 && ke.Rune >= 32 {
-				o.filter += string(ke.Rune)
+			if r, ok := ke.TextRune(); ok {
+				o.filter += string(r)
 				o.clamp()
 			}
 		}
@@ -156,8 +156,8 @@ func (o *workspaceOverlay) handleRenameKey(ke tauui.KeyEvent) {
 	case tauui.KeyEnter:
 		o.commitRename()
 	case tauui.KeyRune:
-		if ke.Mod == 0 && ke.Rune >= 32 {
-			o.name += string(ke.Rune)
+		if r, ok := ke.TextRune(); ok {
+			o.name += string(r)
 		}
 	}
 }
