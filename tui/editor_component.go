@@ -129,7 +129,7 @@ func cursorString(cell string, focused bool) string {
 	if !focused {
 		return cell
 	}
-	return CursorMarker + ansiInverseOn + cell + ansiInverseOff
+	return CursorMarker + fakeCursorStart + cell + fakeCursorEnd
 }
 
 func scrollRule(width int, arrow string, count int) string {

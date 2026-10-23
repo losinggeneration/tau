@@ -2,6 +2,7 @@ package clipboard
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,6 +44,9 @@ func ParseDataURL(s string) (Image, bool) {
 }
 
 func SaveImage(dir string, img Image) (string, error) {
+	if img.Filename != "" && (img.Filename == "." || img.Filename == ".." || strings.ContainsAny(img.Filename, "/\\\x00")) {
+		return "", fmt.Errorf("clipboard: invalid image filename %q", img.Filename)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("clipboard: create image dir: %w", err)
 	}
@@ -54,24 +58,26 @@ func SaveImage(dir string, img Image) (string, error) {
 	if name == "" {
 		name = "pasted-image" + ext
 	}
-	path := uniquePath(filepath.Join(dir, name))
-	if err := os.WriteFile(path, img.Data, 0o644); err != nil {
-		return "", fmt.Errorf("clipboard: save image: %w", err)
-	}
-	return path, nil
-}
-
-func uniquePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
-	}
-	ext := filepath.Ext(path)
+	path := filepath.Join(dir, name)
+	ext = filepath.Ext(path)
 	base := strings.TrimSuffix(path, ext)
-	for n := 2; ; n++ {
-		candidate := fmt.Sprintf("%s-%d%s", base, n, ext)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
+	for n := 1; ; n++ {
+		candidate := path
+		if n > 1 {
+			candidate = fmt.Sprintf("%s-%d%s", base, n, ext)
 		}
+		file, err := os.OpenFile(candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("clipboard: create image: %w", err)
+		}
+		_, writeErr := file.Write(img.Data)
+		if err := errors.Join(writeErr, file.Close()); err != nil {
+			return "", fmt.Errorf("clipboard: save image: %w", errors.Join(err, os.Remove(candidate)))
+		}
+		return candidate, nil
 	}
 }
 

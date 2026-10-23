@@ -89,6 +89,9 @@ type PasteEvent = event.PasteEvent
 // ClipboardResponseEvent is a terminal clipboard-read response.
 type ClipboardResponseEvent = event.ClipboardResponseEvent
 
+// TerminalReplyEvent carries a complete capability or color reply, not editor input.
+type TerminalReplyEvent = event.TerminalReplyEvent
+
 // Text measurement and wrapping helpers from the underlying toolkit.
 // Re-exported so application code does not import rovel/text directly.
 type (

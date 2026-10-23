@@ -3,8 +3,6 @@ package tui
 import (
 	"unicode"
 
-	"github.com/losinggeneration/rovel/geom"
-	"github.com/losinggeneration/rovel/style"
 	"github.com/losinggeneration/rovel/text"
 	inputmodel "github.com/losinggeneration/tau/tui/input"
 )
@@ -69,7 +67,7 @@ func (c *InputComponent) Render(width int) []string {
 	visibleAfter := ANSISliceStrict(afterRest, 0, remaining)
 	cursor := cursorCell
 	if c.Focused {
-		cursor = CursorMarker + ansiInverseOn + cursorCell + ansiInverseOff
+		cursor = cursorString(cursorCell, true)
 	}
 	line := prompt + visibleBefore + cursor + visibleAfter
 	visibleText := prompt + visibleBefore + cursorCell + visibleAfter
@@ -124,8 +122,8 @@ func (c *InputComponent) Handle(e Event, _ *Ctx) bool {
 	m := c.ensure()
 	switch ke.Key {
 	case KeyRune:
-		if ke.Mod == 0 && ke.Rune >= 32 {
-			m.Insert(string(ke.Rune))
+		if r, ok := ke.TextRune(); ok {
+			m.Insert(string(r))
 			return true
 		}
 	case KeyLeft:
@@ -160,8 +158,8 @@ func (c *InputComponent) Rect() Rect      { return c.rect }
 func (c *InputComponent) Layout(r Rect)   { c.rect = r }
 func (c *InputComponent) MinSize() Size   { return Size{W: 1, H: 1} }
 func (c *InputComponent) Focusable() bool { return true }
-func (c *InputComponent) Paint(d Drawer, _ *Ctx) {
+func (c *InputComponent) Paint(d Drawer, ctx *Ctx) {
 	for i, row := range c.Render(c.rect.W) {
-		d.DrawText(geom.Point{X: c.rect.X, Y: c.rect.Y + i}, row, style.Style{})
+		drawCursorRow(d, Point{X: c.rect.X, Y: c.rect.Y + i}, row, Style{}, ctx != nil && ctx.FocusedID == c.ID())
 	}
 }

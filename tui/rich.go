@@ -69,10 +69,13 @@ type Markdown struct {
 	// matching the app look's bordered chrome. Off by default; callers tie it
 	// to their theme.
 	tableChrome bool
+
+	codeBlockIndent string
+	theme           *MarkdownTheme
 }
 
 func NewMarkdown(s string) *Markdown {
-	return &Markdown{id: NewID(), text: s, visible: true}
+	return &Markdown{id: NewID(), text: s, visible: true, codeBlockIndent: "  "}
 }
 
 func NewPaddedMarkdown(s string, paddingX, paddingY int) *Markdown {
@@ -90,6 +93,14 @@ func (m *Markdown) Visible() bool          { return m.visible }
 // bottom rules. Callers tie this to their theme: tau-style looks enable it,
 // other looks keep tables as plain grids.
 func (m *Markdown) SetTableChrome(enabled bool) { m.tableChrome = enabled }
+
+// SetCodeBlockIndent sets the prefix of every code block line. It defaults
+// to two spaces.
+func (m *Markdown) SetCodeBlockIndent(indent string) { m.codeBlockIndent = indent }
+
+// SetTheme supplies semantic foreground styles. Backgrounds remain owned by the
+// surrounding message; omitting a theme preserves the standalone renderer look.
+func (m *Markdown) SetTheme(theme MarkdownTheme) { m.theme = &theme }
 
 func (m *Markdown) SetPadding(horizontal, vertical int) {
 	if horizontal < 0 {
@@ -125,7 +136,7 @@ func (m *Markdown) RenderWrapped(width int) []MarkdownRow {
 		contentW = 1
 	}
 	source := markdownPreprocess(m.text)
-	rows := renderMarkdownASTWithOpts([]byte(source), contentW, markdownRenderOptions{tableChrome: m.tableChrome})
+	rows := renderMarkdownASTWithOpts([]byte(source), contentW, m.renderOptions())
 	prefix := repeatSpace(m.paddingX)
 
 	out := []MarkdownRow{}
@@ -135,7 +146,7 @@ func (m *Markdown) RenderWrapped(width int) []MarkdownRow {
 	for _, row := range rows {
 		switch {
 		case row == markdownDivider:
-			out = append(out, MarkdownRow{Text: padRightANSI(prefix+strings.Repeat("─", contentW)+prefix, width)})
+			out = append(out, MarkdownRow{Text: padRightANSI(prefix+m.themeStyle(strings.Repeat("─", contentW), "hr")+prefix, width)})
 		case strings.HasPrefix(row, "│ "):
 			if TextWidth(row) <= contentW {
 				out = append(out, MarkdownRow{Text: padRightANSI(prefix+row+prefix, width)})
@@ -167,6 +178,10 @@ func (m *Markdown) RenderWrapped(width int) []MarkdownRow {
 	return out
 }
 
+func (m *Markdown) renderOptions() markdownRenderOptions {
+	return markdownRenderOptions{tableChrome: m.tableChrome, codeBlockIndent: m.codeBlockIndent, theme: m.theme}
+}
+
 func (m *Markdown) Render(width int) []string {
 	rows := m.RenderWrapped(width)
 	if rows == nil {
@@ -185,7 +200,7 @@ func (m *Markdown) Layout(r Rect)               { m.rect = r }
 func (m *Markdown) Focusable() bool             { return false }
 func (m *Markdown) Handle(_ Event, _ *Ctx) bool { return false }
 func (m *Markdown) MinSize() Size {
-	rows := renderMarkdownASTWithOpts([]byte(markdownPreprocess(m.text)), 0, markdownRenderOptions{tableChrome: m.tableChrome})
+	rows := renderMarkdownASTWithOpts([]byte(markdownPreprocess(m.text)), 0, m.renderOptions())
 	w := 1
 	for _, row := range rows {
 		if rw := TextWidth(row); rw > w {

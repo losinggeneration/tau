@@ -3,6 +3,8 @@ package editor
 import (
 	"testing"
 
+	"github.com/losinggeneration/rovel/render"
+
 	"github.com/losinggeneration/rovel"
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/ui"
@@ -241,5 +243,78 @@ func TestWidgetMouseIgnoresOtherButtons(t *testing.T) {
 		if w.Handle(event.MouseEvent{X: 1, Y: 0, Button: btn, Action: event.MousePress}, ctx) {
 			t.Fatalf("non-left button %d should not be handled", btn)
 		}
+	}
+}
+
+func TestWidgetInsertsShiftedProducedCharacters(t *testing.T) {
+	w := NewWidget()
+	ctx := &rovel.Ctx{FocusedID: w.ID()}
+	for _, key := range []event.KeyEvent{
+		{Key: event.KeyRune, Rune: '=', ShiftedRune: '+', Mod: event.ModShift},
+		{Key: event.KeyRune, Rune: 'c', ShiftedRune: 'C', Mod: event.ModShift},
+		{Key: event.KeyRune, Rune: 'E', Mod: event.ModShift},
+	} {
+		if !w.Handle(key, ctx) {
+			t.Fatalf("key not inserted: %+v", key)
+		}
+	}
+	if got := w.Model().Text(); got != "+CE" {
+		t.Fatalf("text=%q", got)
+	}
+	for _, mod := range []event.ModMask{event.ModCtrl, event.ModAlt, event.ModShift | event.ModCtrl} {
+		if w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: '=', ShiftedRune: '+', Mod: mod}, ctx) {
+			t.Fatalf("modified key inserted: %v", mod)
+		}
+	}
+}
+
+type editorCursorDrawer struct {
+	rovel.CellDrawer
+	pos     rovel.Point
+	visible bool
+}
+
+func (d *editorCursorDrawer) SetCursor(pos rovel.Point) { d.pos = pos; d.visible = true }
+
+func TestWidgetPaintUsesPhysicalCursorAndPreservesSelection(t *testing.T) {
+	for _, mode := range []string{"focused", "unfocused", "readonly", "selection", "scrolled"} {
+		t.Run(mode, func(t *testing.T) {
+			w := NewWidget()
+			w.Layout(rovel.Rect{X: 2, Y: 1, W: 5, H: 2})
+			w.Model().SetText("界abc\nsecond\nthird")
+			w.Model().SetCursor(len("界"))
+			if mode == "readonly" {
+				w.SetReadOnly(true)
+			}
+			if mode == "selection" {
+				w.Model().SetSelection(0, len("界"))
+			}
+			if mode == "scrolled" {
+				w.Model().SetCursor(len(w.Model().Text()))
+			}
+			buf := render.NewBuffer(10, 5)
+			d := &editorCursorDrawer{CellDrawer: rovel.NewDrawer(rovel.NewPainter(render.NewPainter(buf, rovel.Rect{W: 10, H: 5}, rovel.Style{}), rovel.Style{})).(rovel.CellDrawer)}
+			ctx := &rovel.Ctx{Theme: rovel.DefaultTheme(), FocusedID: w.ID()}
+			if mode == "unfocused" {
+				ctx.FocusedID = 0
+			}
+			w.Paint(d, ctx)
+			wantVisible := mode != "unfocused" && mode != "readonly"
+			if d.visible != wantVisible {
+				t.Fatalf("cursor visible=%t want %t", d.visible, wantVisible)
+			}
+			if wantVisible && !(rovel.Rect{X: 2, Y: 1, W: 5, H: 2}).Contains(d.pos) {
+				t.Fatalf("cursor outside editor: %+v", d.pos)
+			}
+			if mode == "focused" && d.pos != (rovel.Point{X: 4, Y: 1}) {
+				t.Fatalf("cursor=%+v", d.pos)
+			}
+			if mode == "selection" && buf.At(2, 1).Style != ctx.Theme.Palette.Selection {
+				t.Fatalf("lost selection: %+v", buf.At(2, 1))
+			}
+			if mode == "focused" && buf.At(4, 1).Style != ctx.Theme.Base {
+				t.Fatalf("fake cursor remains: %+v", buf.At(4, 1))
+			}
+		})
 	}
 }

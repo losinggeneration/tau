@@ -157,7 +157,11 @@ func (p *PromptEditor) contentWidth() int {
 	if p.rect.W <= 0 {
 		return promptEditorAssumedWidth
 	}
-	return max(p.rect.W-2*p.paddingX, 1)
+	return max(p.rect.W-2*p.contentPadding(), 1)
+}
+
+func (p *PromptEditor) contentPadding() int {
+	return min(p.paddingX, max(0, (p.rect.W-1)/2))
 }
 
 // promptEditorAssumedWidth is the width used to estimate height before the
@@ -246,10 +250,7 @@ func (p *PromptEditor) Layout(r Rect) {
 	} else {
 		inner.H = 0
 	}
-	pad := p.paddingX
-	if pad*2 >= inner.W {
-		pad = max(0, (inner.W-1)/2)
-	}
+	pad := p.contentPadding()
 	inner.X += pad
 	inner.W -= 2 * pad
 	if inner.W < 0 {
@@ -290,7 +291,8 @@ func (p *PromptEditor) Paint(d Drawer, ctx *Ctx) {
 	if p.rect.H <= promptEditorRules {
 		return
 	}
-	inner := Rect{X: p.rect.X + p.paddingX, Y: p.rect.Y + 1, W: p.rect.W - 2*p.paddingX, H: p.rect.H - promptEditorRules}
+	pad := p.contentPadding()
+	inner := Rect{X: p.rect.X + pad, Y: p.rect.Y + 1, W: p.rect.W - 2*pad, H: p.rect.H - promptEditorRules}
 	if inner.W < 0 {
 		inner.W = 0
 	}

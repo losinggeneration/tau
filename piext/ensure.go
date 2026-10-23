@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 // InstallFn installs shim runtime dependencies in dir.
@@ -27,6 +27,9 @@ func IsShimCurrent(dir string) bool {
 
 // EnsureShim materializes and dependency-installs the embedded shim when needed.
 func EnsureShim(ctx context.Context, dir string, install InstallFn, status StatusFn) (shimPath string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("ensure shim: %w", err)
+	}
 	if IsShimCurrent(dir) {
 		return dir, nil
 	}
@@ -34,15 +37,19 @@ func EnsureShim(ctx context.Context, dir string, install InstallFn, status Statu
 		return "", fmt.Errorf("tau install --pi needs network; re-run online")
 	}
 	lockPath := dir + ".lock"
-	if err := acquireLock(ctx, lockPath, status); err != nil {
+	lock, err := acquireLock(ctx, lockPath, status)
+	if err != nil {
 		return "", err
 	}
 	defer func() {
-		if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && err == nil {
-			err = fmt.Errorf("remove shim lock: %w", removeErr)
+		if unlockErr := lock.Unlock(); unlockErr != nil {
+			err = errors.Join(err, fmt.Errorf("unlock shim: %w", unlockErr))
 		}
 	}()
 
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("ensure shim: %w", err)
+	}
 	if IsShimCurrent(dir) {
 		return dir, nil
 	}
@@ -60,22 +67,65 @@ func EnsureShim(ctx context.Context, dir string, install InstallFn, status Statu
 	if err := WriteShimFilesystem(newDir); err != nil {
 		return "", err
 	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("install shim: %w", err)
+	}
 	if install == nil {
 		install = NPMInstall
 	}
 	if err := install(ctx, newDir); err != nil {
 		return "", fmt.Errorf("install shim: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("install shim: %w", err)
+	}
 	if _, err := os.Stat(filepath.Join(newDir, "node_modules", "jiti", "package.json")); err != nil {
 		return "", fmt.Errorf("verify shim deps: %w", err)
 	}
-	if err := os.RemoveAll(dir); err != nil {
-		return "", fmt.Errorf("remove old shim: %w", err)
-	}
-	if err := os.Rename(newDir, dir); err != nil {
+	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("replace shim: %w", err)
 	}
+	if err := replaceShim(newDir, dir, os.Rename); err != nil {
+		return "", err
+	}
 	return dir, nil
+}
+
+// ponytail: two renames leave a crash window; versioned directories with an atomic
+// activation pointer are needed for crash-safe replacement.
+func replaceShim(newDir, dir string, rename func(string, string) error) (err error) {
+	backup, err := os.MkdirTemp(filepath.Dir(dir), filepath.Base(dir)+".old-*")
+	if err != nil {
+		return fmt.Errorf("create shim backup: %w", err)
+	}
+	oldDir := filepath.Join(backup, "shim")
+	var keepBackup bool
+	defer func() {
+		if !keepBackup {
+			if cleanupErr := os.RemoveAll(backup); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("remove shim backup %s: %w", backup, cleanupErr))
+			}
+		}
+	}()
+	if err := rename(dir, oldDir); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("back up installed shim: %w", err)
+		}
+	} else {
+		keepBackup = true
+	}
+	if err := rename(newDir, dir); err != nil {
+		replaceErr := fmt.Errorf("replace shim: %w", err)
+		if keepBackup {
+			if restoreErr := rename(oldDir, dir); restoreErr != nil {
+				return errors.Join(replaceErr, fmt.Errorf("restore shim (preserved at %s): %w", oldDir, restoreErr))
+			}
+			keepBackup = false
+		}
+		return replaceErr
+	}
+	keepBackup = false
+	return nil
 }
 
 func shimCurrent(dir, embeddedHash string) bool {
@@ -87,75 +137,33 @@ func shimCurrent(dir, embeddedHash string) bool {
 	return err == nil
 }
 
-func acquireLock(ctx context.Context, lockPath string, status StatusFn) error {
-	deadline := time.NewTimer(5 * time.Minute)
-	defer deadline.Stop()
-	reportedWait := false
-	for {
-		if err := tryWriteLock(lockPath); err == nil {
-			return nil
-		} else if !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("create shim lock: %w", err)
-		}
-		alive, err := lockAlive(lockPath)
-		if err != nil || !alive {
-			if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove stale shim lock: %w", err)
-			}
-			continue
-		}
-		if !reportedWait && status != nil {
-			status("Another tau instance is updating the shim; waiting…")
-			reportedWait = true
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for shim lock: %w", ctx.Err())
-		case <-deadline.C:
-			return fmt.Errorf("wait for shim lock timed out")
-		case <-time.After(lockPoll):
-		}
+func acquireLock(ctx context.Context, lockPath string, status StatusFn) (*flock.Flock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("acquire shim lock: %w", err)
 	}
-}
-
-func tryWriteLock(lockPath string) (err error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
-		return fmt.Errorf("create lock dir: %w", err)
+		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
-	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Keep the lock file in place so contenders always lock the same inode.
+	lock := flock.New(lockPath, flock.SetPermissions(0o600))
+	locked, err := lock.TryLock()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("acquire shim lock: %w", err)
 	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close lock: %w", closeErr)
-		}
-	}()
-	if _, err := fmt.Fprintf(f, "%d\n%s\n", os.Getpid(), time.Now().Format(time.RFC3339)); err != nil {
-		return fmt.Errorf("write lock: %w", err)
+	if locked {
+		return lock, nil
 	}
-	return nil
-}
-
-func lockAlive(lockPath string) (bool, error) {
-	data, err := os.ReadFile(lockPath)
+	if status != nil {
+		status("Another tau instance is updating the shim; waiting…")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	locked, err = lock.TryLockContext(ctx, lockPoll)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, fmt.Errorf("read shim lock: %w", err)
+		return nil, fmt.Errorf("wait for shim lock: %w", err)
 	}
-	line, _, _ := strings.Cut(string(data), "\n")
-	pid, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil || pid <= 0 {
-		return false, nil
+	if !locked {
+		return nil, fmt.Errorf("wait for shim lock: %w", context.DeadlineExceeded)
 	}
-	err = syscall.Kill(pid, 0)
-	if err == nil {
-		return true, nil
-	}
-	if errors.Is(err, syscall.ESRCH) {
-		return false, nil
-	}
-	return true, nil
+	return lock, nil
 }

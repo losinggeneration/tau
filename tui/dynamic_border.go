@@ -32,6 +32,8 @@ const (
 // selectors/dialogs and explicit sections — it is NOT the shell for ordinary
 // user, assistant or tool messages, which render flat.
 type DynamicBorder struct {
+	// PaddingX overrides the default one-cell horizontal inset.
+	PaddingX *int
 	// Title appears inline in the top edge. It is truncated to fit and may be
 	// empty for an untitled box.
 	Title string
@@ -57,7 +59,14 @@ const (
 
 // InnerWidth is the usable text width between the edges and their padding.
 func (b DynamicBorder) InnerWidth() int {
-	return max(1, b.Width-4)
+	return max(1, b.Width-2-2*b.paddingX())
+}
+
+func (b DynamicBorder) paddingX() int {
+	if b.PaddingX == nil {
+		return 1
+	}
+	return min(max(0, *b.PaddingX), max(0, (b.Width-2)/2))
 }
 
 // Top renders the top edge, with Title inlined when there is room for it.
@@ -109,8 +118,8 @@ func (b DynamicBorder) Line(text string) string {
 		// the usual leading-pad layout would overflow by one cell.
 		return borderVertical + borderVertical
 	}
-	inner := TextTruncate(text, max(0, b.Width-4), false)
-	line := borderVertical + " " + inner
+	inner := TextTruncate(text, max(0, b.Width-2-2*b.paddingX()), false)
+	line := borderVertical + strings.Repeat(" ", b.paddingX()) + inner
 	if width := TextWidth(line); width < b.Width-1 {
 		line += strings.Repeat(" ", b.Width-1-width)
 	}

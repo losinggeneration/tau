@@ -23,16 +23,21 @@ type markdownASTRenderer struct {
 	// tableChrome encloses tables with rounded top and bottom rules, matching
 	// the app look's bordered chrome (dynamic_border.go).
 	tableChrome bool
+	codeIndent  string
+	theme       *MarkdownTheme
 }
 
 type markdownRenderOptions struct {
 	// tableChrome encloses rendered tables with rounded top and bottom rules.
 	tableChrome bool
+	// codeBlockIndent prefixes every code block line.
+	codeBlockIndent string
+	theme           *MarkdownTheme
 }
 
 func renderMarkdownASTWithOpts(source []byte, width int, opts markdownRenderOptions) []string {
 	doc := terminalMarkdown.Parser().Parse(text.NewReader(source))
-	r := markdownASTRenderer{source: source, width: width, tableChrome: opts.tableChrome}
+	r := markdownASTRenderer{source: source, width: width, tableChrome: opts.tableChrome, codeIndent: opts.codeBlockIndent, theme: opts.theme}
 	return r.renderBlocks(doc, "")
 }
 
@@ -78,7 +83,7 @@ func (r markdownASTRenderer) renderBlock(node ast.Node, prefix string) []string 
 }
 
 func (r markdownASTRenderer) renderParagraph(n *ast.Paragraph, prefix string) []string {
-	if raw, ok := rawBlockLine(n, r.source); ok && strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "    ") {
+	if raw, ok := rawBlockLine(n, r.source); r.theme == nil && ok && strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "    ") {
 		return []string{prefix + renderInline(raw)}
 	}
 	if only := r.onlyImageProtocolLine(n); only != "" {
@@ -88,7 +93,7 @@ func (r markdownASTRenderer) renderParagraph(n *ast.Paragraph, prefix string) []
 }
 
 func (r markdownASTRenderer) renderTextBlock(n *ast.TextBlock, prefix string) []string {
-	if raw, ok := rawBlockLine(n, r.source); ok && isIndentedListContinuation(raw) {
+	if raw, ok := rawBlockLine(n, r.source); r.theme == nil && ok && isIndentedListContinuation(raw) {
 		return []string{prefix + renderInline(strings.TrimSpace(raw))}
 	}
 	return splitRenderedSoftLines(prefix + r.renderInlineChildren(n))
@@ -96,6 +101,14 @@ func (r markdownASTRenderer) renderTextBlock(n *ast.TextBlock, prefix string) []
 
 func (r markdownASTRenderer) renderHeading(n *ast.Heading, prefix string) []string {
 	text := r.renderInlineChildren(n)
+	if r.theme != nil {
+		st := r.theme.Heading
+		st.Attr |= AttrBold
+		if n.Level == 1 {
+			st.Attr |= AttrUnderline
+		}
+		return []string{prefix + markdownStyle(text, st)}
+	}
 	styled := ansiBold + text + ansiReset
 	if n.Level == 1 {
 		plainWidth := TextWidth(text)
@@ -111,7 +124,25 @@ func (r markdownASTRenderer) renderHeading(n *ast.Heading, prefix string) []stri
 }
 
 func (r markdownASTRenderer) renderBlockquote(n *ast.Blockquote, prefix string) []string {
-	children := r.renderBlocks(n, "")
+	childRenderer := r
+	if r.theme != nil {
+		childRenderer.width = max(1, r.width-2)
+	}
+	children := childRenderer.renderBlocks(n, "")
+	if r.theme != nil {
+		var out []string
+		for _, child := range children {
+			if child == markdownDivider {
+				child = r.themeStyle(strings.Repeat("─", max(1, childRenderer.width)), "hr")
+			}
+			st := r.theme.Quote
+			st.Attr |= AttrItalic
+			for _, line := range ansi.Wrap(markdownStyle(child, st), max(1, childRenderer.width)) {
+				out = append(out, prefix+r.themeStyle("│ ", "quoteBorder")+line)
+			}
+		}
+		return out
+	}
 	children = expandLazyBlockquote(children)
 	out := make([]string, 0, len(children))
 	for _, child := range children {
@@ -126,6 +157,9 @@ func (r markdownASTRenderer) renderBlockquote(n *ast.Blockquote, prefix string) 
 
 func (r markdownASTRenderer) renderFencedCodeBlock(n *ast.FencedCodeBlock, prefix string) []string {
 	raw := strings.TrimRight(blockLinesText(n, r.source), "\n")
+	if r.theme != nil {
+		return r.themedCodeBlock(raw, prefix)
+	}
 	if raw == "" {
 		return []string{prefix + ansiInlineCode + "```" + ansiReset, prefix + ansiInlineCode + "```" + ansiReset}
 	}
@@ -133,7 +167,7 @@ func (r markdownASTRenderer) renderFencedCodeBlock(n *ast.FencedCodeBlock, prefi
 	out := make([]string, 0, len(lines)+2)
 	out = append(out, prefix+ansiInlineCode+"```"+ansiReset)
 	for _, line := range lines {
-		out = append(out, prefix+ansiInlineCode+"  "+line+ansiReset)
+		out = append(out, prefix+ansiInlineCode+r.codeIndent+line+ansiReset)
 	}
 	out = append(out, prefix+ansiInlineCode+"```"+ansiReset)
 	return out
@@ -141,6 +175,9 @@ func (r markdownASTRenderer) renderFencedCodeBlock(n *ast.FencedCodeBlock, prefi
 
 func (r markdownASTRenderer) renderCodeBlock(n *ast.CodeBlock, prefix string) []string {
 	raw := strings.TrimRight(blockLinesText(n, r.source), "\n")
+	if r.theme != nil {
+		return r.themedCodeBlock(raw, prefix)
+	}
 	if raw == "" {
 		return []string{prefix + ansiInlineCode + "  " + ansiReset}
 	}
@@ -151,7 +188,7 @@ func (r markdownASTRenderer) renderCodeBlock(n *ast.CodeBlock, prefix string) []
 	out := make([]string, 0, len(lines)+2)
 	out = append(out, prefix+ansiInlineCode+"```"+ansiReset)
 	for _, line := range lines {
-		out = append(out, prefix+ansiInlineCode+"  "+line+ansiReset)
+		out = append(out, prefix+ansiInlineCode+r.codeIndent+line+ansiReset)
 	}
 	out = append(out, prefix+ansiInlineCode+"```"+ansiReset)
 	return out
@@ -171,7 +208,7 @@ func (r markdownASTRenderer) renderList(n *ast.List, prefix string) []string {
 		}
 		itemRows := r.renderBlocks(item, prefix+"  ")
 		if len(itemRows) == 0 {
-			out = append(out, prefix+marker)
+			out = append(out, prefix+r.themeStyle(marker, "listBullet"))
 			continue
 		}
 		for i, row := range itemRows {
@@ -179,7 +216,7 @@ func (r markdownASTRenderer) renderList(n *ast.List, prefix string) []string {
 				row = strings.TrimPrefix(row, prefix+"  ")
 			}
 			if i == 0 {
-				out = append(out, prefix+marker+row)
+				out = append(out, prefix+r.themeStyle(marker, "listBullet")+row)
 			} else if isIndentedListContinuation(row) {
 				out = append(out, prefix+"   "+strings.TrimLeft(row, " "))
 			} else {
@@ -395,6 +432,9 @@ func (r markdownASTRenderer) renderInlineChildren(parent ast.Node) string {
 	for node := parent.FirstChild(); node != nil; node = node.NextSibling() {
 		b.WriteString(r.renderInline(node))
 	}
+	if r.theme != nil {
+		return b.String()
+	}
 	return renderBareAutolinks(b.String())
 }
 
@@ -409,6 +449,9 @@ func (r markdownASTRenderer) renderInline(node ast.Node) string {
 	case *ast.String:
 		return string(n.Value)
 	case *ast.CodeSpan:
+		if r.theme != nil {
+			return r.themeStyle(r.renderInlineChildren(n), "code")
+		}
 		return ansiInlineCode + r.renderInlineChildren(n) + ansiReset
 	case *ast.Emphasis:
 		style := ansiItalic
@@ -420,10 +463,10 @@ func (r markdownASTRenderer) renderInline(node ast.Node) string {
 		}
 		return style + r.renderInlineChildren(n) + ansiReset
 	case *ast.Link:
-		return linkText(r.renderInlineChildren(n), string(n.Destination), false)
+		return r.link(r.renderInlineChildren(n), string(n.Destination), false)
 	case *ast.AutoLink:
 		label := string(n.Label(r.source))
-		return linkText(label, string(n.URL(r.source)), true)
+		return r.link(label, string(n.URL(r.source)), true)
 	case *ast.RawHTML:
 		return htmlLikeText(rawHTMLText(n, r.source))
 	case *ast.Image:
@@ -611,4 +654,14 @@ func (r markdownASTRenderer) leadingIndent(pos int) string {
 		}
 	}
 	return string(r.source[start:pos])
+}
+
+func (r markdownASTRenderer) themedCodeBlock(raw, prefix string) []string {
+	out := []string{prefix + r.themeStyle("```", "codeBlockBorder")}
+	if raw != "" {
+		for _, line := range normalizeRows(raw) {
+			out = append(out, prefix+r.codeIndent+r.themeStyle(line, "codeBlock"))
+		}
+	}
+	return append(out, prefix+r.themeStyle("```", "codeBlockBorder"))
 }

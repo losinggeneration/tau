@@ -190,11 +190,11 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 			l.activate()
 			return
 		}
-		if l.searchEnabled && ke.Mod == 0 && ke.Rune >= 32 {
-			if ke.Rune == ' ' {
+		if r, ok := ke.TextRune(); ok && l.searchEnabled {
+			if r == ' ' {
 				return
 			}
-			l.search += string(ke.Rune)
+			l.search += string(r)
 			l.applyFilter(l.search)
 		}
 	case event.KeyEsc, event.KeyCtrlC:

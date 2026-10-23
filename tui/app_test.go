@@ -9,10 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/losinggeneration/rovel"
+	"github.com/losinggeneration/rovel/backend"
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/geom"
 	"github.com/losinggeneration/rovel/style"
 	"github.com/losinggeneration/tau/tui/internal/testbackend"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewWithBackend_UsesInjectedBackend(t *testing.T) {
@@ -1090,4 +1094,164 @@ func TestAppStartStopCycle(t *testing.T) {
 			t.Fatalf("Stop #%d: %v", i+1, err)
 		}
 	}
+}
+
+func TestSetThemeRepaintsNativeWidgets(t *testing.T) {
+	be := testbackend.New(Size{W: 20, H: 4}, nil)
+	defer be.Close()
+	view := &themeRecordingView{paintCountingView: newPaintCountingView()}
+	app, err := New(Opts{Root: view, Backend: be})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theme := DefaultThemeModern()
+	theme.Base = Style{FG: ColorDefault, BG: ColorDefault}
+	if err := app.Post(func(*UpdateCtx) { app.SetTheme(theme) }); err != nil {
+		t.Fatal(err)
+	}
+	view.onPaint = func(ctx *Ctx) {
+		if ctx.Theme.Base == theme.Base {
+			app.Quit()
+		}
+	}
+	if err := app.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if view.last.Base != theme.Base {
+		t.Fatalf("paint theme = %+v, want %+v", view.last.Base, theme.Base)
+	}
+}
+
+type themeRecordingView struct {
+	*paintCountingView
+	last    Theme
+	onPaint func(*Ctx)
+}
+
+func (v *themeRecordingView) Paint(d Drawer, ctx *Ctx) {
+	v.paintCountingView.Paint(d, ctx)
+	v.last = ctx.Theme
+	if v.onPaint != nil {
+		v.onPaint(ctx)
+	}
+}
+
+type lifecycleBackend struct {
+	*testbackend.Backend
+	signals chan backend.LifecycleSignal
+	suspend func() error
+	err     error
+}
+
+func (b *lifecycleBackend) Write(p []byte) (int, error) {
+	if b.err != nil && bytes.Contains(p, []byte("7501;")) {
+		return 0, b.err
+	}
+	return b.Backend.Write(p)
+}
+
+func (b *lifecycleBackend) Signals() <-chan backend.LifecycleSignal { return b.signals }
+func (b *lifecycleBackend) Suspend() error                          { return b.suspend() }
+
+func TestSuspendRestartsTerminalProtocols(t *testing.T) {
+	for _, path := range []string{"direct", "signal", "mirrored"} {
+		t.Run(path, func(t *testing.T) {
+			t.Setenv("TAU_PROGRAM_STATUS", "")
+			t.Setenv("PI_PROGRAM_STATUS", "")
+			be := &lifecycleBackend{Backend: testbackend.New(Size{W: 20, H: 4}, nil), signals: make(chan backend.LifecycleSignal, 1)}
+			t.Cleanup(be.Close)
+			var app *App
+			var resumed int
+			var colors TerminalColors
+			opts := Opts{Root: NewText("suspend"), Backend: be, OnResume: func() {
+				resumed++
+				require.True(t, app.terminalColors.started)
+				require.True(t, app.programStatus.pending)
+				require.NoError(t, app.QueryTerminalColors(time.Hour, func(c TerminalColors) { colors = c }))
+				if path == "signal" {
+					app.Quit()
+				}
+			}}
+			if path == "mirrored" {
+				opts.Stdout = &bytes.Buffer{}
+			}
+			var err error
+			app, err = New(opts)
+			require.NoError(t, err)
+			require.NoError(t, app.SetTerminalColorSchemeNotifications(true))
+			require.NoError(t, app.SetProgramStatus(ProgramStatus{State: "working", App: "tau"}))
+			require.NoError(t, app.Start())
+			t.Cleanup(func() { require.NoError(t, app.Stop()) })
+			app.handleTerminalReply(TerminalReplyEvent{Sequence: "\x1b]7501;?\x1b\\"})
+			app.handleTerminalReply(TerminalReplyEvent{Sequence: "\x1b[?1;2c"})
+			require.NoError(t, app.QueryTerminalColors(time.Hour, func(TerminalColors) { t.Error("cancelled query delivered") }))
+			oldQuery := app.terminalColors.queries[0]
+			be.suspend = func() error {
+				assert.Contains(t, string(be.Output()), "state=clear")
+				assert.Contains(t, string(be.Output()), "\x1b[?2031l")
+				assert.False(t, app.programStatus.started)
+				assert.False(t, app.terminalColors.started)
+				assert.False(t, oldQuery.active)
+				return nil
+			}
+			if path == "signal" {
+				be.signals <- backend.SignalSuspend
+				require.NoError(t, app.inner.Run())
+			} else {
+				require.NoError(t, app.inner.Suspend())
+			}
+			require.Equal(t, 1, resumed)
+			output := string(be.Output())
+			assert.Equal(t, 2, strings.Count(output, programStatusQuery))
+			assert.Equal(t, 2, strings.Count(output, "\x1b[?2031h"))
+			assert.Equal(t, 2, strings.Count(output, "\x1b]10;?\a"))
+			app.expireTerminalColorQuery(oldQuery)
+			before := strings.Count(output, "state=working")
+			app.handleTerminalReply(TerminalReplyEvent{Sequence: "\x1b]7501;?\x1b\\"})
+			assert.Equal(t, before+1, strings.Count(string(be.Output()), "state=working"))
+			app.handleTerminalReply(TerminalReplyEvent{Sequence: "\x1b[?1;2c"})
+			assert.Nil(t, colors.Background, "status sentinel cannot finish resumed color query")
+			app.handleTerminalReply(TerminalReplyEvent{Sequence: "\x1b]11;#ffffff\a"})
+			app.handleTerminalReply(TerminalReplyEvent{Sequence: "\x1b[?1;2c"})
+			require.NotNil(t, colors.Background)
+			assert.Equal(t, RGBColor{R: 255, G: 255, B: 255}, *colors.Background)
+		})
+	}
+}
+
+func TestSuspendProtocolFailuresPreserveCausesAndRestore(t *testing.T) {
+	t.Setenv("TAU_PROGRAM_STATUS", "")
+	t.Setenv("PI_PROGRAM_STATUS", "1")
+	for _, phase := range []string{"suspend", "resume"} {
+		t.Run(phase, func(t *testing.T) {
+			want := errors.New("suspend transport failure")
+			be := &lifecycleBackend{Backend: testbackend.New(Size{W: 20, H: 4}, nil)}
+			var resumed bool
+			app, err := New(Opts{Root: NewText("failure"), Backend: be, OnResume: func() { resumed = true }})
+			require.NoError(t, err)
+			require.NoError(t, app.SetProgramStatus(ProgramStatus{State: "working"}))
+			require.NoError(t, app.Start())
+			be.suspend = func() error { be.err = want; return nil }
+			if phase == "suspend" {
+				be.err = want
+			}
+			require.ErrorIs(t, app.inner.Suspend(), want)
+			assert.False(t, resumed)
+			// Disable injection so final terminal restoration can complete.
+			be.err = nil
+			require.NoError(t, app.Stop())
+			assert.True(t, be.Restored())
+		})
+	}
+}
+
+func TestSuspendDoesNotAdvertiseUnsupportedBackend(t *testing.T) {
+	var resumed bool
+	be := testbackend.New(Size{W: 20, H: 4}, nil)
+	app, err := New(Opts{Root: NewText("plain"), Backend: be, OnResume: func() { resumed = true }})
+	require.NoError(t, err)
+	require.NoError(t, app.Start())
+	t.Cleanup(func() { require.NoError(t, app.Stop()) })
+	require.ErrorIs(t, app.inner.Suspend(), rovel.ErrSuspendUnsupported)
+	assert.False(t, resumed)
 }

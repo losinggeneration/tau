@@ -2,10 +2,14 @@ package tui
 
 import (
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/losinggeneration/rovel"
+	"github.com/losinggeneration/rovel/backend/headless"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const promptEditorTestPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -202,4 +206,60 @@ func rawContains(ops []ansiDrawOp, s string) bool {
 		}
 	}
 	return false
+}
+
+func TestPromptEditorPaddingMatchesLayoutAndPaint(t *testing.T) {
+	for _, padding := range []int{-1, 0, 2, 100} {
+		t.Run(fmt.Sprint(padding), func(t *testing.T) {
+			ed := NewPromptEditor()
+			ed.SetPadding(padding)
+			ed.SetText(nil, "padding")
+			rect := Rect{X: 3, Y: 2, W: 10, H: 7}
+			ed.Layout(rect)
+			assert.Equal(t, max(0, padding), ed.Padding())
+			inner := ed.Widget().Rect()
+			assert.Equal(t, inner.W, ed.contentWidth())
+			d := &paddingRecordingDrawer{ansiRecordingDrawer: &ansiRecordingDrawer{}}
+			ed.Paint(d, &Ctx{Theme: DefaultThemeModern(), FocusedID: ed.ID()})
+			require.Len(t, d.clips, 1)
+			assert.Equal(t, inner, d.clips[0])
+		})
+	}
+}
+
+type paddingRecordingDrawer struct {
+	*ansiRecordingDrawer
+	clips []Rect
+}
+
+func (d *paddingRecordingDrawer) WithClip(r Rect, fn func(Drawer)) {
+	d.clips = append(d.clips, r)
+	fn(d)
+}
+
+func TestPromptEditorPhysicalCursorThroughToolkit(t *testing.T) {
+	for _, document := range []bool{false, true} {
+		t.Run(fmt.Sprint(document), func(t *testing.T) {
+			ed := NewPromptEditor()
+			ed.SetPadding(2)
+			ed.SetText(nil, "界ab")
+			ed.Model().SetCursor(len("界"))
+			var root View = NewAppLayout(AppLayoutOpts{Editor: ed})
+			if document {
+				root = NewDocumentLayout(AppLayoutOpts{Editor: ed})
+			}
+			be := headless.New(Size{W: 30, H: 12})
+			defer be.Close()
+			app, err := New(Opts{Root: root, Backend: be})
+			require.NoError(t, err)
+			require.NoError(t, app.Start())
+			defer func() { require.NoError(t, app.Stop()) }()
+			p := ed.inner.Rect()
+			want := fmt.Sprintf("\x1b[%d;%dH\x1b[?25h", p.Y+1, p.X+3)
+			output := string(be.Output())
+			assert.Contains(t, output, want)
+			assert.NotContains(t, output, CursorMarker)
+			assert.NotContains(t, output, "TAU_CURSOR")
+		})
+	}
 }

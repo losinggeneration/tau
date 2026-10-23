@@ -193,9 +193,8 @@ func (w *Widget) Paint(d rovel.Drawer, ctx *rovel.Ctx) {
 		rows = []visualRow{{text: "", start: 0, end: 0}}
 	}
 	cursorRow, cursorCol := visualCursor(rows, m.Cursor(), width)
-	focused := ctx.FocusedID == w.id
+	focused := ctx.FocusedID == w.id && !w.readOnly
 	base := ctx.Theme.Base
-	cursorStyle := ctx.Theme.Palette.Focus
 
 	selectionStyle := ctx.Theme.Palette.Selection
 	if selectionStyle == (style.Style{}) {
@@ -223,10 +222,7 @@ func (w *Widget) Paint(d rovel.Drawer, ctx *rovel.Ctx) {
 				}
 				cluster := row.text[off:next]
 				st := base
-				switch {
-				case focused && rowIdx == cursorRow && col == cursorCol:
-					st = cursorStyle
-				case rowSelStart >= 0 && col >= rowSelStart && col < rowSelEnd:
+				if rowSelStart >= 0 && col >= rowSelStart && col < rowSelEnd {
 					st = layerSelectionStyle(base, selectionStyle)
 				}
 				for _, r := range cluster {
@@ -245,16 +241,16 @@ func (w *Widget) Paint(d rovel.Drawer, ctx *rovel.Ctx) {
 				}
 				off = next
 			}
-			if focused && rowIdx == cursorRow && cursorCol >= col && remaining > 0 {
-				cd.SetCell(x, w.rect.Y+y, ' ', cursorStyle)
-				x++
-				remaining--
-			}
 		}
 		for remaining > 0 {
 			cd.SetCell(x, w.rect.Y+y, ' ', base)
 			x++
 			remaining--
+		}
+	}
+	if focused && cursorRow >= start && cursorRow < start+w.rect.H {
+		if cursor, ok := d.(rovel.CursorDrawer); ok {
+			cursor.SetCursor(geom.Point{X: w.rect.X + min(cursorCol, width-1), Y: w.rect.Y + cursorRow - start})
 		}
 	}
 }
@@ -306,11 +302,12 @@ func (w *Widget) Handle(e rovel.Event, ctx *rovel.Ctx) bool {
 	if !ok || ctx.FocusedID != w.id || w.readOnly {
 		return false
 	}
-	if ke.Key != event.KeyRune || ke.Mod != 0 || ke.Rune < 32 {
+	r, printable := ke.TextRune()
+	if !printable {
 		return false
 	}
 	old := w.Model().Cursor()
-	w.Model().Insert(string(ke.Rune))
+	w.Model().Insert(string(r))
 	w.invalidate(ctx)
 	w.notifyChange(ctx)
 	w.notifyCursorMoveIfChanged(old, CursorMoveEdit, ctx)

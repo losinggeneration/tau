@@ -88,7 +88,7 @@ func (s *StatusEntriesView) Paint(d Drawer, ctx *Ctx) {
 	if baseSt == (Style{}) {
 		baseSt = ctx.Theme.Palette.Surface
 	}
-	mutedSt := ctx.Theme.Palette.SurfaceMuted
+	mutedSt := ctx.Theme.Palette.TextMuted
 	if mutedSt == (Style{}) {
 		mutedSt = baseSt
 	}

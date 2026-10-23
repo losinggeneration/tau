@@ -26,20 +26,29 @@ func CompileKey(key string) (ui.Keystroke, error) {
 		return ui.Keystroke{}, fmt.Errorf("keybindings: empty key")
 	}
 
-	parts := strings.Split(strings.ToLower(key), "+")
-	name := parts[len(parts)-1]
+	name := strings.ToLower(key)
 	var mod event.ModMask
-	for _, part := range parts[:len(parts)-1] {
+	for name != "+" {
+		part, rest, found := strings.Cut(name, "+")
+		if !found {
+			break
+		}
+		var bit event.ModMask
 		switch part {
 		case "shift":
-			mod |= event.ModShift
+			bit = event.ModShift
 		case "alt", "option", "meta":
-			mod |= event.ModAlt
+			bit = event.ModAlt
 		case "ctrl", "control":
-			mod |= event.ModCtrl
+			bit = event.ModCtrl
 		default:
 			return ui.Keystroke{}, fmt.Errorf("keybindings: unknown modifier %q in %q", part, orig)
 		}
+		if mod&bit != 0 {
+			return ui.Keystroke{}, fmt.Errorf("keybindings: repeated modifier %q in %q", part, orig)
+		}
+		mod |= bit
+		name = rest
 	}
 
 	switch strings.ToLower(name) {
@@ -109,6 +118,10 @@ func CompileKey(key string) (ui.Keystroke, error) {
 // keystroke. Alt+Backspace is a different key from Backspace and must not fold
 // onto it.
 func canonicalKeystroke(k ui.Keystroke) ui.Keystroke {
+	k.ShiftedRune = 0
+	if k.Key == event.KeyRune && k.Mod&event.ModShift != 0 && k.Rune >= 'A' && k.Rune <= 'Z' {
+		k.Rune += 'a' - 'A'
+	}
 	switch {
 	case k.Key == event.KeyCtrlC:
 		return ui.Keystroke{Key: event.KeyCtrlC, Mod: k.Mod &^ event.ModCtrl}
@@ -128,7 +141,15 @@ func canonicalKeystroke(k ui.Keystroke) ui.Keystroke {
 // for any actual whose Key was Backspace, modifiers be damned. That silently
 // stole Backspace from the editor.
 func matchKeystroke(actual, binding ui.Keystroke) bool {
-	return canonicalKeystroke(actual) == canonicalKeystroke(binding)
+	if canonicalKeystroke(actual) == canonicalKeystroke(binding) {
+		return true
+	}
+	if actual.Key == event.KeyRune && actual.Mod&event.ModShift != 0 && actual.ShiftedRune != 0 && strings.ContainsRune("`-=[]\\;',./~!@#$%^&*()_+|{}:<>?", actual.ShiftedRune) {
+		actual.Rune = actual.ShiftedRune
+		actual.Mod &^= event.ModShift
+		return canonicalKeystroke(actual) == canonicalKeystroke(binding)
+	}
+	return false
 }
 
 // KeystrokesMatch reports whether actual is the key binding describes, folding

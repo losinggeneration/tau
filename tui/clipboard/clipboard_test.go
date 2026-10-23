@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -89,5 +90,45 @@ func TestFirstImageMIME(t *testing.T) {
 	}
 	if got := firstImageMIME("text/plain"); got != "" {
 		t.Fatalf("firstImageMIME = %q, want empty", got)
+	}
+}
+
+func TestSaveImageRejectsEscapingFilename(t *testing.T) {
+	for _, name := range []string{"../escape.png", "sub/escape.png", "..", "/tmp/escape.png", `sub\escape.png`} {
+		if _, err := SaveImage(t.TempDir(), Image{MIME: "image/png", Data: []byte{1}, Filename: name}); err == nil {
+			t.Errorf("accepted filename %q", name)
+		}
+	}
+}
+
+func TestSaveImageConcurrentWritesDoNotOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	const count = 32
+	start := make(chan struct{})
+	paths := make(chan string, count)
+	var workers sync.WaitGroup
+	for i := range count {
+		workers.Go(func() {
+			<-start
+			path, err := SaveImage(dir, Image{Filename: "image.png", Data: []byte{byte(i)}})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			paths <- path
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(paths)
+	seen := map[string]bool{}
+	for path := range paths {
+		if seen[path] {
+			t.Errorf("reused image path %q", path)
+		}
+		seen[path] = true
+	}
+	if len(seen) != count {
+		t.Fatalf("unique files=%d, want %d", len(seen), count)
 	}
 }

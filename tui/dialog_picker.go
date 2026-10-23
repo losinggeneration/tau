@@ -104,7 +104,8 @@ type DialogPicker struct {
 	// The App uses this to restore the editor region (which was
 	// cleared when the picker opened) and move focus back to the
 	// editor.
-	onCancel func()
+	onCancel            func()
+	onVisibilityChanged func(bool)
 }
 
 // DefaultDialogPickerVisible is the number of items the dialog
@@ -168,7 +169,18 @@ func (d *DialogPicker) Visible() int {
 // shown is true the picker is focusable, has its own search input,
 // and routes key events to itself. When false the picker reports
 // MinSize 0x0 and the layout treats it as absent.
-func (d *DialogPicker) SetShown(v bool) { d.shown = v }
+func (d *DialogPicker) SetShown(v bool) {
+	if d.shown == v {
+		return
+	}
+	d.shown = v
+	if d.onVisibilityChanged != nil {
+		d.onVisibilityChanged(v)
+	}
+}
+
+// SetOnVisibilityChanged observes dialog opening and closing on the app loop.
+func (d *DialogPicker) SetOnVisibilityChanged(fn func(bool)) { d.onVisibilityChanged = fn }
 
 // Shown reports whether the picker currently takes layout space.
 func (d *DialogPicker) Shown() bool { return d.shown }
@@ -286,7 +298,7 @@ func (d *DialogPicker) MinSize() geom.Size {
 		return geom.Size{W: w, H: h}
 	}
 	w := 80
-	h := d.Visible() + 4 // header + filter + separator + items + counter
+	h := d.Visible() + len(strings.Split(d.header, "\n")) + 3 // header + filter + separator + items + counter
 	if h < 4 {
 		h = 4
 	}
@@ -341,21 +353,26 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 				break
 			}
 			dw.FillRect(geom.Rect{X: r.X, Y: rowY, W: r.W, H: 1}, surfSt)
-			dw.DrawText(rovel.Point{X: r.X, Y: rowY}, text.Truncate(row, r.W, false), surfSt)
+			drawCursorRow(dw, Point{X: r.X, Y: rowY}, ANSITruncate(row, r.W, false), surfSt, ctx.FocusedID == d.ID())
 		}
 		return
 	}
 
-	// Row 0: header.
-	dw.FillRect(geom.Rect{X: r.X, Y: r.Y, W: r.W, H: 1}, surfSt)
-	if d.header != "" {
-		dw.DrawText(rovel.Point{X: r.X, Y: r.Y}, text.Truncate(d.header, r.W, false), accentSt)
+	// Multiline titles keep confirmation messages above the filter and choices.
+	headers := strings.Split(d.header, "\n")
+	headerH := len(headers)
+	for i, header := range headers {
+		if i >= r.H {
+			break
+		}
+		dw.FillRect(geom.Rect{X: r.X, Y: r.Y + i, W: r.W, H: 1}, surfSt)
+		dw.DrawText(rovel.Point{X: r.X, Y: r.Y + i}, text.Truncate(header, r.W, false), accentSt)
 	}
 	// Row 1: search input. Render it on the normal surface instead of the focus
 	// palette so the dialog matches the inline picker: selection highlight belongs
 	// to rows, not to the filter prompt.
-	if r.H > 1 {
-		inputY := r.Y + 1
+	if r.H > headerH {
+		inputY := r.Y + headerH
 		dw.FillRect(geom.Rect{X: r.X, Y: inputY, W: r.W, H: 1}, surfSt)
 		inputText := "> " + d.filter
 		// The last cell of the input row is reserved for the
@@ -371,15 +388,14 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 		if cursorX >= r.X+r.W {
 			cursorX = r.X + r.W - 1
 		}
-		if cursorX >= r.X {
-			dw.FillRect(geom.Rect{X: cursorX, Y: inputY, W: 1, H: 1}, focusSt)
-			dw.DrawText(rovel.Point{X: cursorX, Y: inputY}, " ", focusSt)
+		if cursor, ok := dw.(rovel.CursorDrawer); ok && ctx.FocusedID == d.ID() {
+			cursor.SetCursor(Point{X: cursorX, Y: inputY})
 		}
 	}
 
 	// Row 2: separator.
-	if r.H > 2 {
-		sepY := r.Y + 2
+	if r.H > headerH+1 {
+		sepY := r.Y + headerH + 1
 		dw.FillRect(geom.Rect{X: r.X, Y: sepY, W: r.W, H: 1}, surfSt)
 		glyph := string(ctx.Theme.Chrome.Border.Glyphs.H)
 		if glyph == "" {
@@ -402,7 +418,7 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 		}
 	}
 	for i := 0; i < d.Visible(); i++ {
-		rowY := r.Y + 3 + i
+		rowY := r.Y + headerH + 2 + i
 		if rowY >= r.Y+r.H {
 			break
 		}
@@ -449,7 +465,7 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 	}
 
 	// Counter row at the bottom: "(focused+1)/total".
-	totalRows := 3 + d.Visible()
+	totalRows := headerH + 2 + d.Visible()
 	if r.H > totalRows {
 		counterY := r.Y + totalRows
 		dw.FillRect(geom.Rect{X: r.X, Y: counterY, W: r.W, H: 1}, surfSt)
@@ -470,6 +486,22 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 func (d *DialogPicker) Handle(e rovel.Event, ctx *rovel.Ctx) bool {
 	if !d.shown {
 		return false
+	}
+	var paste string
+	switch value := e.(type) {
+	case rovel.PasteEvent:
+		paste = value.Text
+	case rovel.ClipboardResponseEvent:
+		paste = value.Text
+	}
+	if paste != "" && d.component != nil {
+		if input, ok := d.component.(interface{ Paste(string) }); ok {
+			input.Paste(paste)
+			if ctx != nil {
+				ctx.Invalidate(d.rect)
+			}
+			return true
+		}
 	}
 	if ke, ok := e.(rovel.KeyEvent); ok {
 		// Esc always fires onCancel — the custom component is

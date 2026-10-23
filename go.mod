@@ -14,7 +14,7 @@ require (
 	github.com/hashicorp/go-hclog v0.14.1
 	github.com/hashicorp/go-plugin v1.6.0
 	github.com/losinggeneration/claude-agent-sdk-go v0.0.0-20260913031048-005b7bd4027c
-	github.com/losinggeneration/rovel v0.0.0-20260928230552-c37995a47266
+	github.com/losinggeneration/rovel v0.0.0-20261023202732-6374a7fc485d
 	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/stretchr/testify v1.11.1
 	github.com/urfave/cli/v3 v3.8.0

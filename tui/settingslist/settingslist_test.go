@@ -366,3 +366,11 @@ func TestListValueCyclingWrapsToFirstValue(t *testing.T) {
 		t.Fatalf("cycled to %q/%q, want a", got, l.Items()[0].CurrentValue)
 	}
 }
+
+func TestSearchInsertsShiftedCharacter(t *testing.T) {
+	l := New([]Item{{ID: "plus", Label: "+"}, {ID: "equals", Label: "="}}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	l.HandleKey(event.KeyEvent{Key: event.KeyRune, Rune: '=', ShiftedRune: '+', Mod: event.ModShift})
+	if l.search != "+" {
+		t.Fatalf("search=%q", l.search)
+	}
+}

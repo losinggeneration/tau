@@ -24,6 +24,17 @@ type Opts struct {
 	// Restore/Stop clears the title as part of terminal lifecycle cleanup.
 	Title string
 
+	// OnTerminalReply handles color and capability reports on the app loop,
+	// even when a modal overlay owns input.
+	OnTerminalReply func(TerminalReplyEvent)
+
+	// OnTerminalColorScheme handles "dark" or "light" appearance reports on the app loop.
+	OnTerminalColorScheme func(string)
+
+	// OnResume runs on the app loop after terminal protocols restart and before
+	// the first resumed repaint. Use it to refresh terminal-dependent content.
+	OnResume func()
+
 	// Theme sets the visual style. Zero value uses DefaultTheme.
 	Theme Theme
 
@@ -41,6 +52,10 @@ type Opts struct {
 	// new line. When true, the region is erased and the cursor returns to
 	// where rendering began. Only meaningful in cbreak mode.
 	ClearOnExit bool
+
+	// WheelScrollLines sets logical lines per notch. Nil keeps the legacy step;
+	// zero selects automatic acceleration.
+	WheelScrollLines *int
 
 	// Mouse enables mouse tracking. Default: false.
 	Mouse bool
@@ -77,12 +92,22 @@ type App struct {
 	mu     sync.Mutex
 	closed bool
 
+	programStatus  programStatusState
+	terminalColors terminalColorState
+
 	inputListeners      []inputListenerEntry
 	nextInputListenerID int
 	focusedID           ID
 
 	overlayMu sync.Mutex
 	overlays  map[ID]*Overlay
+}
+
+// SetTheme replaces the theme for native widgets and repaints. Call on the app
+// loop after Start, or pass the initial theme through Opts before Run.
+func (a *App) SetTheme(theme Theme) {
+	a.opts.Theme = theme
+	a.inner.SetTheme(theme)
 }
 
 // OnQuit registers a callback invoked when the user quits. The app stops
@@ -134,6 +159,8 @@ func NewWithBackend(opts Opts, customBackend backend.Backend, stdout io.Writer) 
 		stdoutForApp = opts.Stdout
 	}
 
+	controller, hasController := backendForApp.(backend.SignalController)
+
 	if backendForApp == nil && (stdoutForApp != nil || opts.Stdin != nil) {
 		backendForApp = newStreamBackend(opts.Stdin, geom.Size{W: 80, H: 24})
 	}
@@ -149,14 +176,23 @@ func NewWithBackend(opts Opts, customBackend backend.Backend, stdout io.Writer) 
 	}
 
 	if backendForApp != nil {
-		backendForApp = &listenerBackend{Backend: backendForApp, app: a}
+		listener := &listenerBackend{Backend: backendForApp, app: a}
+		backendForApp = listener
+		if hasController {
+			backendForApp = &signalListenerBackend{listenerBackend: listener, SignalController: controller}
+		}
 		a.backend = backendForApp
 	}
 
 	libraryOpts := rovel.AppOpts{
-		Theme:        theme,
-		Backend:      backendForApp,
-		TerminalMode: opts.TerminalMode,
+		WheelScrollLines: opts.WheelScrollLines,
+		ClipboardWrite:   func(text string) error { a.ClipboardWrite(text, nil); return nil },
+		OnTerminalReply:  a.handleTerminalReply,
+		OnSuspend:        a.suspendTerminalProtocols,
+		OnResume:         a.resumeTerminalProtocols,
+		Theme:            theme,
+		Backend:          backendForApp,
+		TerminalMode:     opts.TerminalMode,
 		Input: rovel.InputOpts{
 			Mouse:          opts.Mouse,
 			BracketedPaste: bracketed,
@@ -214,6 +250,14 @@ func (a *App) Start() error {
 		return fmt.Errorf("tui: enable: %w", err)
 	}
 
+	if err := a.startTerminalColors(); err != nil {
+		return err
+	}
+
+	if err := a.startProgramStatus(); err != nil {
+		return err
+	}
+
 	if a.opts.Title != "" {
 		if err := writeTerminalTitle(a.backend, a.opts.Title); err != nil && !errors.Is(err, ErrUnsupported) {
 			return fmt.Errorf("tui: set terminal title: %w", err)
@@ -233,6 +277,8 @@ func (a *App) Stop() error {
 		return nil
 	}
 
+	statusErr := errors.Join(a.stopProgramStatus(), a.stopTerminalColors())
+
 	if a.opts.Title != "" {
 		if err := writeTerminalTitle(a.backend, ""); err != nil && !errors.Is(err, ErrUnsupported) {
 			fmt.Fprintf(os.Stderr, "tui: clear terminal title failed: %v\n", err)
@@ -240,10 +286,10 @@ func (a *App) Stop() error {
 	}
 
 	if err := a.inner.Restore(); err != nil {
-		return fmt.Errorf("tui: restore: %w", err)
+		return errors.Join(statusErr, fmt.Errorf("tui: restore: %w", err))
 	}
 
-	return nil
+	return statusErr
 }
 
 // Run starts the event loop and blocks until the app quits. The terminal is
@@ -519,3 +565,24 @@ func DefaultThemeModern() Theme {
 func isZeroTheme(t Theme) bool {
 	return t.Base.FG == 0 && t.Base.BG == 0 && t.Base.Attr == 0
 }
+
+func (a *App) suspendTerminalProtocols() error {
+	return errors.Join(a.stopProgramStatus(), a.stopTerminalColors())
+}
+
+func (a *App) resumeTerminalProtocols() error {
+	if err := a.startTerminalColors(); err != nil {
+		return fmt.Errorf("resume terminal colors: %w", err)
+	}
+	if err := a.startProgramStatus(); err != nil {
+		return fmt.Errorf("resume program status: %w", err)
+	}
+	if a.opts.OnResume != nil {
+		a.opts.OnResume()
+	}
+	return nil
+}
+
+// SetWheelScrollLines changes wheel scrolling on the app loop, or before Start.
+// Zero enables automatic acceleration; other values are clamped to 1-100.
+func (a *App) SetWheelScrollLines(lines int) { a.inner.SetWheelScrollLines(lines) }

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/losinggeneration/rovel"
@@ -140,15 +141,15 @@ func TestDialogPicker_PaintUsesFullRowSelectionAndPlainInput(t *testing.T) {
 
 	buf := render.NewBuffer(40, p.MinSize().H)
 	painter := render.NewPainter(buf, geom.Rect{X: 0, Y: 0, W: 40, H: p.MinSize().H}, style.Style{})
-	d := rovel.NewDrawer(rovel.NewPainter(painter, style.Style{}))
-	p.Paint(d, &rovel.Ctx{Theme: theme})
+	d := &cursorRecordingDrawer{Drawer: rovel.NewDrawer(rovel.NewPainter(painter, style.Style{}))}
+	p.Paint(d, &rovel.Ctx{Theme: theme, FocusedID: p.ID()})
+	if !d.visible || d.cursor != (Point{X: len("> alpha"), Y: 1}) {
+		t.Fatalf("cursor=%+v visible=%t", d.cursor, d.visible)
+	}
 
 	inputY := 1
 	for x := 0; x < 40; x++ {
 		want := surface
-		if x == len("> alpha") {
-			want = focus
-		}
 		if got := buf.At(x, inputY).Style; got != want {
 			t.Fatalf("input cell %d style = %#v, want %#v", x, got, want)
 		}
@@ -576,4 +577,76 @@ func TestDialogPicker_HandleMultibyteRune(t *testing.T) {
 // import goes unused elsewhere.
 func TestDialogPicker_geomImportKeptInUse(t *testing.T) {
 	_ = geom.Size{}
+}
+
+func TestDialogPickerVisibilityNotificationsIgnoreRedundantChanges(t *testing.T) {
+	picker := NewDialogPicker()
+	var changes []bool
+	picker.SetOnVisibilityChanged(func(shown bool) { changes = append(changes, shown) })
+	picker.SetShown(false)
+	picker.SetShown(true)
+	picker.SetShown(true)
+	picker.SetShown(false)
+	if len(changes) != 2 || !changes[0] || changes[1] {
+		t.Fatalf("visibility changes = %v, want [true false]", changes)
+	}
+}
+
+func TestDialogPickerHostedPrimitiveResolvesPhysicalCursor(t *testing.T) {
+	p := NewDialogPicker()
+	p.SetShown(true)
+	p.SetComponent(&InputPrimitive{Prompt: "> ", Value: "界x"})
+	p.Layout(Rect{X: 1, Y: 1, W: 10, H: 2})
+	buf := render.NewBuffer(15, 4)
+	d := &cursorRecordingDrawer{Drawer: rovel.NewDrawer(rovel.NewPainter(render.NewPainter(buf, Rect{W: 15, H: 4}, Style{}), Style{}))}
+	p.Paint(d, &Ctx{Theme: DefaultTheme(), FocusedID: p.ID()})
+	if !d.visible || d.cursor != (Point{X: 6, Y: 1}) {
+		t.Fatalf("cursor=%+v visible=%t", d.cursor, d.visible)
+	}
+	if buf.At(3, 1).R != '界' || buf.At(5, 1).R != 'x' {
+		t.Fatalf("hosted row contains marker bytes: %+v", buf)
+	}
+	if buf.At(6, 1).Style.Attr&AttrReverse != 0 {
+		t.Fatal("hosted primitive retained fake cursor")
+	}
+}
+
+func TestDialogPickerMultilineHeaderKeepsMessageAndChoicesVisible(t *testing.T) {
+	p := NewDialogPicker()
+	p.SetHeader("Allow action\nExecute this command?")
+	p.SetVisible(2)
+	p.SetItems([]DialogPickerItem{{Name: "Yes"}, {Name: "No"}})
+	p.SetShown(true)
+	if p.MinSize().H != 7 {
+		t.Fatalf("height=%d", p.MinSize().H)
+	}
+	p.Layout(geom.Rect{W: 40, H: 7})
+	buf := NewBuffer(40, 7)
+	base := Style{}
+	painter := NewRenderPainter(buf, Rect{W: 40, H: 7}, base)
+	p.Paint(NewDrawer(NewPainter(painter, base)), &Ctx{Theme: Theme{Base: base}})
+	for y, want := range map[int]string{0: "Allow action", 1: "Execute this command?", 2: "> ", 4: "→ Yes", 5: "  No"} {
+		var row strings.Builder
+		for x := range 40 {
+			row.WriteRune(buf.At(x, y).R)
+		}
+		if !strings.HasPrefix(row.String(), want) {
+			t.Fatalf("row %d=%q, want %q", y, row.String(), want)
+		}
+	}
+}
+
+func TestDialogPickerHostedInputReceivesPasteAndClipboard(t *testing.T) {
+	input := &InputPrimitive{}
+	p := NewDialogPicker()
+	p.SetComponent(input)
+	p.SetShown(true)
+	for _, e := range []Event{PasteEvent{Text: "a\nb"}, ClipboardResponseEvent{Text: " c"}} {
+		if !p.Handle(e, nil) {
+			t.Fatalf("paste not handled: %T", e)
+		}
+	}
+	if input.Value != "a b c" {
+		t.Fatalf("value=%q", input.Value)
+	}
 }

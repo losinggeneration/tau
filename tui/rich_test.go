@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestTextUtilities(t *testing.T) {
@@ -113,4 +115,19 @@ func TestImage_FallbackTextAndRender(t *testing.T) {
 			t.Fatalf("row %q width = %d, want 12", row, TextWidth(row))
 		}
 	}
+}
+
+func TestMarkdownCodeBlockIndent(t *testing.T) {
+	source := "```go\nx := 1\n```\n\n    indented"
+	render := func(m *Markdown) string { return StripANSI(strings.Join(m.Render(40), "\n")) }
+
+	assert.Contains(t, render(NewMarkdown(source)), "\n  x := 1")
+	custom := NewMarkdown(source)
+	custom.SetCodeBlockIndent("\t> ")
+	got := render(custom)
+	assert.Contains(t, got, "\n\t> x := 1")
+	assert.Contains(t, got, "\n\t> indented")
+	none := NewMarkdown(source)
+	none.SetCodeBlockIndent("")
+	assert.Contains(t, render(none), "\nx := 1")
 }

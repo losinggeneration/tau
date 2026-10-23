@@ -10,7 +10,7 @@ func TestInputPrimitiveSubmitCancelAndCursor(t *testing.T) {
 	input := &InputPrimitive{Prompt: "> ", OnSubmit: func(v string) { submitted = v }, OnCancel: func() { cancelled = true }}
 	input.HandleInput("a")
 	input.HandleInput("b")
-	if got := input.Render(8); len(got) != 1 || got[0] != "> ab"+CursorMarker+ansiInverseOn+" "+ansiInverseOff+"   " {
+	if got := input.Render(8); len(got) != 1 || got[0] != "> ab"+cursorString(" ", true)+"   " {
 		t.Fatalf("Render = %#v", got)
 	}
 	input.HandleInput("\x7f")

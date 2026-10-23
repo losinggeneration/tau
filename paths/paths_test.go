@@ -36,3 +36,23 @@ func TestDirChain(t *testing.T) {
 		t.Fatalf("default should win when unset: got %q", got)
 	}
 }
+
+func TestResourcePath(t *testing.T) {
+	home := t.TempDir()
+	base := filepath.Join(t.TempDir(), "config")
+	t.Setenv("RESOURCE_TEST_PATH", "shared")
+	for _, tc := range []struct{ entry, want string }{
+		{"~", home},
+		{"~/skills", filepath.Join(home, "skills")},
+		{"!~/skills/*", "!" + filepath.Join(home, "skills", "*")},
+		{"+./skills/a", "+" + filepath.Join(base, "skills", "a")},
+		{"-../shared/b", "-" + filepath.Join(filepath.Dir(base), "shared", "b")},
+		{"!$RESOURCE_TEST_PATH/*", "!" + filepath.Join(base, "shared", "*")},
+		{"", ""},
+		{"!", "!"},
+	} {
+		if got := ResourcePath(tc.entry, base, home); got != tc.want {
+			t.Errorf("%q = %q, want %q", tc.entry, got, tc.want)
+		}
+	}
+}

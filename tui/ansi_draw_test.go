@@ -58,3 +58,50 @@ func TestMarkdownPaintMapsANSISGRToRovelStyles(t *testing.T) {
 	assertStyledChunk("italic", style.AttrItalic)
 	assertStyledChunk("under", style.AttrUnderline)
 }
+
+func TestDrawANSITextFaintAndIntensityReset(t *testing.T) {
+	d := &ansiRecordingDrawer{}
+	DrawANSIText(d, Point{}, "\x1b[2mfaint\x1b[22mnormal", Style{Attr: AttrItalic})
+	if len(d.ops) != 2 {
+		t.Fatalf("ops=%+v", d.ops)
+	}
+	if d.ops[0].st.Attr != AttrItalic|AttrDim || d.ops[1].st.Attr != AttrItalic {
+		t.Fatalf("styles=%+v", d.ops)
+	}
+}
+
+func TestDrawANSITextThemeColors(t *testing.T) {
+	base := Style{FG: ColorWhite, BG: ColorBlack, Attr: AttrItalic | AttrDim}
+	for _, tt := range []struct {
+		seq  string
+		want Color
+	}{
+		{"31", ColorRed}, {"97", ColorBrightWhite}, {"38;5;197", ColorIndex(197)}, {"38;2;12;34;56", ColorRGB(12, 34, 56)}, {"39", ColorDefault},
+	} {
+		t.Run(tt.seq, func(t *testing.T) {
+			d := &ansiRecordingDrawer{}
+			DrawANSIText(d, Point{}, "\x1b[22;"+tt.seq+"mcolor\x1b[0mbase", base)
+			if len(d.ops) != 2 || d.ops[0].st.FG != tt.want || d.ops[0].st.BG != base.BG || d.ops[0].st.Attr != AttrItalic || d.ops[1].st != base {
+				t.Fatalf("ops=%+v", d.ops)
+			}
+		})
+	}
+}
+
+func TestDrawANSITextBackgroundColors(t *testing.T) {
+	base := Style{FG: ColorWhite, BG: ColorBlack}
+	for _, tt := range []struct {
+		seq  string
+		want Color
+	}{
+		{"41", ColorRed}, {"107", ColorBrightWhite}, {"48;5;197", ColorIndex(197)}, {"48;2;12;34;56;31", ColorRGB(12, 34, 56)}, {"41;49", ColorBlack},
+	} {
+		t.Run(tt.seq, func(t *testing.T) {
+			d := &ansiRecordingDrawer{}
+			DrawANSIText(d, Point{}, "\x1b["+tt.seq+"mcolor", base)
+			if len(d.ops) != 1 || d.ops[0].st.BG != tt.want {
+				t.Fatalf("ops=%+v", d.ops)
+			}
+		})
+	}
+}

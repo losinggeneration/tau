@@ -3,7 +3,11 @@ package extensions
 import (
 	"testing"
 
+	"github.com/losinggeneration/rovel/event"
+	"github.com/losinggeneration/rovel/ui"
 	"github.com/losinggeneration/tau/tui/keybindings"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCustomRenderers(t *testing.T) {
@@ -368,4 +372,72 @@ func toString(v any) string {
 		return s
 	}
 	return ""
+}
+
+func TestToolRendererResolversWrapInRegistrationOrder(t *testing.T) {
+	r := New()
+	if err := r.RegisterToolRenderer("known", func(any) []string { return []string{"base"} }); err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"first", "second"} {
+		r.RegisterToolRendererResolver(func(name string, next func() Renderer) Renderer {
+			base := next()
+			if name == "unknown" && base == nil {
+				base = func(any) []string { return []string{"fallback"} }
+			}
+			if base == nil {
+				return nil
+			}
+			return func(payload any) []string { return append([]string{label}, base(payload)...) }
+		})
+	}
+	for _, name := range []string{"known", "unknown"} {
+		rows, ok := r.RenderTool(name, nil)
+		if !ok || len(rows) != 3 || rows[0] != "first" || rows[1] != "second" {
+			t.Fatalf("%s chain: %v", name, rows)
+		}
+	}
+	if r.ToolRendererFor("missing") != nil {
+		t.Fatal("unknown tool without a matching resolver did not fall back")
+	}
+}
+
+func TestThemeMetadataMapsAreOwnedSnapshots(t *testing.T) {
+	r := New()
+	source := Theme{Name: "custom", Appearance: "light", Dim: []string{"muted"}, Values: map[string]string{"text": "default"}, Colors: map[string]string{"text": "#010203"}}
+	r.OnThemeChanged(func(theme Theme) {
+		if theme.Appearance != "light" {
+			t.Errorf("appearance=%q", theme.Appearance)
+		}
+		theme.Values["text"] = "callback mutation"
+		theme.Colors["text"] = "callback mutation"
+		theme.Dim[0] = "callback mutation"
+	})
+	r.SetTheme(source)
+	source.Values["text"] = "source mutation"
+	source.Colors["text"] = "source mutation"
+	source.Dim[0] = "source mutation"
+	snapshot := r.Theme()
+	if snapshot.Values["text"] != "default" || snapshot.Colors["text"] != "#010203" || snapshot.Dim[0] != "muted" {
+		t.Fatalf("theme aliased: %+v", snapshot)
+	}
+	snapshot.Colors["text"] = "snapshot mutation"
+	snapshot.Dim[0] = "snapshot mutation"
+	if r.Theme().Colors["text"] != "#010203" || r.Theme().Dim[0] != "muted" {
+		t.Fatal("colors snapshot aliased")
+	}
+	r.OnThemeChanged(nil)
+	r.SetTheme(Theme{Name: "plain"})
+	if r.Theme().Colors != nil || r.Theme().Appearance != "" {
+		t.Fatal("replacement retained old metadata")
+	}
+}
+
+func TestShortcutForShiftedProducedSymbol(t *testing.T) {
+	r := New()
+	err := r.RegisterShortcut(Shortcut{ID: "plugin.plus", Key: "ctrl++", Handler: func() {}})
+	require.NoError(t, err)
+	shortcut, ok := r.ShortcutForKeystroke(ui.Keystroke{Key: event.KeyRune, Rune: '=', ShiftedRune: '+', Mod: event.ModShift | event.ModCtrl})
+	require.True(t, ok)
+	assert.Equal(t, "plugin.plus", shortcut.ID)
 }

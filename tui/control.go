@@ -85,6 +85,11 @@ type listenerBackend struct {
 	app *App
 }
 
+type signalListenerBackend struct {
+	*listenerBackend
+	backend.SignalController
+}
+
 func (b *listenerBackend) Restore() error {
 	var err error
 	if enabler, ok := b.Backend.(backend.InputFeatureEnabler); ok {
@@ -101,10 +106,10 @@ func (b *listenerBackend) ReadEvent() Event {
 			return nil
 		}
 
-		// Resize events are terminal lifecycle events, not raw input. They must
-		// always reach the app loop so width/height changes force relayout and a
-		// full redraw even when a raw input listener consumes keyboard input.
-		if _, ok := e.(ResizeEvent); ok {
+		// Terminal lifecycle and capability replies bypass raw input listeners.
+		// Extensions cannot consume resize notifications or theme negotiation.
+		switch e.(type) {
+		case ResizeEvent, TerminalReplyEvent:
 			return e
 		}
 
@@ -241,4 +246,12 @@ func writeTerminalTitleToWriter(w io.Writer, title string) error {
 
 func sanitizeTerminalTitle(title string) string {
 	return strings.NewReplacer("\x1b", "", "\x07", "", "\x9c", "").Replace(title)
+}
+
+// ResetMouseState drops multi-click history and pointer grabs before content is
+// replaced. Call on the app loop, alongside the view's selection reset.
+func (a *App) ResetMouseState() {
+	if a != nil && a.inner != nil {
+		a.inner.ResetMouseState()
+	}
 }

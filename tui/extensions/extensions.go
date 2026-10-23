@@ -2,6 +2,8 @@ package extensions
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 
 	"github.com/losinggeneration/rovel/ui"
@@ -19,11 +21,14 @@ const (
 
 type (
 	Renderer func(payload any) []string
-	Shortcut struct {
+	// ToolRendererResolver selects or wraps a renderer, including for unregistered tools.
+	ToolRendererResolver func(name string, next func() Renderer) Renderer
+	Shortcut             struct {
 		ID, Key, Description string
 		Handler              func()
 	}
 )
+
 type Widget struct {
 	ID        string
 	Placement Placement
@@ -32,9 +37,14 @@ type Widget struct {
 type Theme struct {
 	Name   string
 	Values map[string]string
+	// Colors resolves terminal-default values for inspection without changing Values.
+	Colors     map[string]string
+	Appearance string
+	Dim        []string
 }
 
 type Registry struct {
+	toolResolvers []ToolRendererResolver
 	message       map[string]Renderer
 	tool          map[string]Renderer
 	shortcuts     map[string]Shortcut
@@ -108,8 +118,8 @@ func (r *Registry) RenderMessage(kind string, payload any) ([]string, bool) {
 }
 
 func (r *Registry) RenderTool(name string, payload any) ([]string, bool) {
-	fn, ok := r.tool[name]
-	if !ok {
+	fn := r.ToolRendererFor(name)
+	if fn == nil {
 		return nil, false
 	}
 	return fn(payload), true
@@ -160,13 +170,26 @@ func (r *Registry) MessageRendererFor(kind string) Renderer {
 	return r.message[kind]
 }
 
-// ToolRendererFor returns the registered tool renderer for name (or
-// nil). See MessageRendererFor for context.
+// RegisterToolRendererResolver appends a resolver in extension registration order.
+func (r *Registry) RegisterToolRendererResolver(resolve ToolRendererResolver) {
+	if resolve != nil {
+		r.toolResolvers = append(r.toolResolvers, resolve)
+	}
+}
+
+// ToolRendererFor resolves extension renderers before the registered tool renderer.
 func (r *Registry) ToolRendererFor(name string) Renderer {
 	if r == nil {
 		return nil
 	}
-	return r.tool[name]
+	var resolve func(int) Renderer
+	resolve = func(index int) Renderer {
+		if index == len(r.toolResolvers) {
+			return r.tool[name]
+		}
+		return r.toolResolvers[index](name, func() Renderer { return resolve(index + 1) })
+	}
+	return resolve(0)
 }
 
 func (r *Registry) RegisterShortcut(s Shortcut) error {
@@ -305,22 +328,21 @@ func (r *Registry) OnPaste(fn func(kind PasteKind, payload string) (string, bool
 }
 
 func (r *Registry) SetTheme(t Theme) {
-	vals := map[string]string{}
-	for k, v := range t.Values {
-		vals[k] = v
-	}
-	r.theme = Theme{Name: t.Name, Values: vals}
+	t.Values = maps.Clone(t.Values)
+	t.Colors = maps.Clone(t.Colors)
+	t.Dim = slices.Clone(t.Dim)
+	r.theme = t
 	if r.onTheme != nil {
-		r.onTheme(r.theme)
+		r.onTheme(r.Theme())
 	}
 }
 
 func (r *Registry) Theme() Theme {
-	vals := map[string]string{}
-	for k, v := range r.theme.Values {
-		vals[k] = v
-	}
-	return Theme{Name: r.theme.Name, Values: vals}
+	t := r.theme
+	t.Values = maps.Clone(t.Values)
+	t.Colors = maps.Clone(t.Colors)
+	t.Dim = slices.Clone(t.Dim)
+	return t
 }
 
 func (r *Registry) SetEditorText(s string) {

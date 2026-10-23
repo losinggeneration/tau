@@ -105,10 +105,7 @@ const documentWheelLines = 3
 func (d *DocumentLayout) Handle(e Event, ctx *Ctx) bool {
 	switch ev := e.(type) {
 	case MouseEvent:
-		lines := documentWheelLines
-		if ev.WheelDelta > 0 {
-			lines *= ev.WheelDelta
-		}
+		lines := ev.ScrollLines()
 		switch ev.Button {
 		case MouseButtonWheelUp:
 			return d.scroll(ctx, lines)

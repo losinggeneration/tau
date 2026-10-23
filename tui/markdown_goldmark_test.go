@@ -656,3 +656,44 @@ func TestWrapCellPrefersWordBoundaries(t *testing.T) {
 		t.Fatalf("styled wrap = %q", got)
 	}
 }
+
+func TestMarkdownThemePaintsEveryRoleAndRestoresNestedStyles(t *testing.T) {
+	theme := MarkdownTheme{
+		Heading: Style{FG: ColorRGB(1, 2, 3), Attr: AttrDim}, Link: Style{FG: ColorIndex(101)}, LinkURL: Style{FG: ColorIndex(102)},
+		Code: Style{FG: ColorIndex(103)}, CodeBlock: Style{FG: ColorIndex(104)}, CodeBlockBorder: Style{FG: ColorIndex(105)},
+		Quote: Style{FG: ColorIndex(106), Attr: AttrDim}, QuoteBorder: Style{FG: ColorIndex(107)}, HR: Style{FG: ColorIndex(108)}, ListBullet: Style{FG: ColorIndex(109)},
+	}
+	SetTerminalCapabilities(TerminalCapabilities{})
+	t.Cleanup(func() { ResetTerminalCapabilities() })
+	md := NewMarkdown("# head `code` tail\n\n[link](https://example.com)\n\n```go\nplain\n```\n\n> quote **bold** tail\n\n---\n\n- bullet")
+	md.SetTheme(theme)
+	rows := md.Render(80)
+	seen := map[Color]string{}
+	d := &ansiRecordingDrawer{}
+	for i, row := range rows {
+		DrawANSIText(d, Point{Y: i}, row, Style{FG: ColorWhite, BG: ColorBlack})
+	}
+	for _, op := range d.ops {
+		if strings.TrimSpace(op.text) == "" {
+			continue
+		}
+		seen[op.st.FG] += op.text
+		if op.st.FG == theme.Heading.FG && op.st.Attr&(AttrDim|AttrBold) != AttrDim|AttrBold {
+			t.Fatalf("heading lost attributes: %+v", op)
+		}
+		if op.st.FG == theme.Quote.FG && op.st.Attr&(AttrDim|AttrItalic) != AttrDim|AttrItalic {
+			t.Fatalf("quote lost attributes: %+v", op)
+		}
+		if op.st.BG != ColorBlack {
+			t.Fatalf("background lost: %+v", op)
+		}
+	}
+	for _, tt := range []struct {
+		color Color
+		text  string
+	}{{theme.Heading.FG, "tail"}, {theme.Link.FG, "link"}, {theme.LinkURL.FG, "https://example.com"}, {theme.Code.FG, "code"}, {theme.CodeBlock.FG, "plain"}, {theme.CodeBlockBorder.FG, "```"}, {theme.Quote.FG, "tail"}, {theme.QuoteBorder.FG, "│"}, {theme.HR.FG, "─"}, {theme.ListBullet.FG, "-"}} {
+		if !strings.Contains(seen[tt.color], tt.text) {
+			t.Errorf("role %v missing %q in %q", tt.color, tt.text, seen[tt.color])
+		}
+	}
+}

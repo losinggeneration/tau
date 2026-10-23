@@ -33,7 +33,7 @@ func NPMInstall(ctx context.Context, dir string) error {
 // npmCICmd builds the npm install command with both output streams wired to
 // w. Split out so tests can pin the descriptors without running a subprocess.
 func npmCICmd(ctx context.Context, dir string, w io.Writer) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "npm", "ci", "--omit=dev", "--prefix", dir)
+	cmd := exec.CommandContext(ctx, "npm", "ci", "--ignore-scripts", "--omit=dev", "--prefix", dir)
 	cmd.Stdout = w
 	cmd.Stderr = w
 	return cmd

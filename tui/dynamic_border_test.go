@@ -94,3 +94,16 @@ func TestDynamicBorderInnerWidth(t *testing.T) {
 		t.Fatalf("InnerWidth must stay positive, got %d", got)
 	}
 }
+
+func TestDynamicBorderConfigurablePadding(t *testing.T) {
+	for _, pad := range []int{0, 3} {
+		border := DynamicBorder{Width: 20, PaddingX: new(pad)}
+		if border.InnerWidth() != 18-2*pad {
+			t.Fatalf("inner width=%d", border.InnerWidth())
+		}
+		row := border.Line("text")
+		if !strings.HasPrefix(row, "│"+strings.Repeat(" ", pad)+"text") || TextWidth(row) != 20 {
+			t.Fatalf("pad %d: %q", pad, row)
+		}
+	}
+}

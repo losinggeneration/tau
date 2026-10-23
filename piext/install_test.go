@@ -3,6 +3,7 @@ package piext
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -50,5 +51,15 @@ func TestOutputTail(t *testing.T) {
 	multiline := bytes.NewBufferString("line one\nline two\nline three\n")
 	if got := outputTail(multiline); got != "\nline one\nline two\nline three" {
 		t.Errorf("outputTail = %q, want trimmed multiline output", got)
+	}
+}
+
+func TestNPMInstallDisablesDependencyLifecycleScripts(t *testing.T) {
+	var output bytes.Buffer
+	dir := t.TempDir()
+	cmd := npmCICmd(t.Context(), dir, &output)
+	want := []string{"npm", "ci", "--ignore-scripts", "--omit=dev", "--prefix", dir}
+	if !slices.Equal(cmd.Args, want) {
+		t.Fatalf("npm arguments = %q, want %q", cmd.Args, want)
 	}
 }

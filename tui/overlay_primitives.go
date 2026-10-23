@@ -60,7 +60,7 @@ func (p *InputPrimitive) Render(width int) []string {
 	cursor, rest := cursorCell(after)
 	afterVisible := prefixByWidth(rest, remaining)
 	visibleText := p.Prompt + beforeVisible + cursor + afterVisible
-	visible := p.Prompt + beforeVisible + CursorMarker + ansiInverseOn + cursor + ansiInverseOff + afterVisible
+	visible := p.Prompt + beforeVisible + cursorString(cursor, true) + afterVisible
 	return []string{visible + repeatSpace(width-TextWidth(visibleText))}
 }
 
@@ -143,10 +143,21 @@ func (p *InputPrimitive) HandleKey(ke event.KeyEvent) {
 			m.YankPop()
 		case ke.Mod == event.ModCtrl && ke.Rune == '-':
 			m.Undo()
-		case ke.Mod == 0 && ke.Rune >= 32:
-			m.Insert(string(ke.Rune))
+		default:
+			if r, ok := ke.TextRune(); ok {
+				m.Insert(string(r))
+			}
 		}
 	}
+	p.syncValue()
+}
+
+// Paste inserts normalized single-line clipboard text at the current cursor.
+func (p *InputPrimitive) Paste(value string) {
+	if p == nil {
+		return
+	}
+	p.ensureModel().Paste(value)
 	p.syncValue()
 }
 
@@ -387,8 +398,10 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 			m.MoveWordLeft()
 		case ke.Mod == event.ModAlt && ke.Rune == 'f':
 			m.MoveWordRight()
-		case ke.Mod == 0 && ke.Rune >= 32:
-			m.Insert(string(ke.Rune))
+		default:
+			if r, ok := ke.TextRune(); ok {
+				m.Insert(string(r))
+			}
 		}
 	}
 }

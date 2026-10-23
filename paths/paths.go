@@ -7,6 +7,7 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ConfigDir returns the tau agent config directory: TAU_CONFIG_DIR, else
@@ -34,4 +35,28 @@ func Dir(env, configured, def string) string {
 		return configured
 	}
 	return def
+}
+
+// ResourcePath expands a resource entry without consuming its optional !, +, or -
+// prefix. Relative paths are rooted at baseDir; an empty base leaves them relative.
+func ResourcePath(entry, baseDir, homeDir string) string {
+	var prefix string
+	if len(entry) > 0 && (entry[0] == '!' || entry[0] == '+' || entry[0] == '-') {
+		prefix, entry = entry[:1], entry[1:]
+	}
+	if entry == "~" || strings.HasPrefix(entry, "~/") || strings.HasPrefix(entry, `~\`) {
+		if homeDir == "" {
+			var err error
+			homeDir, err = os.UserHomeDir()
+			if err != nil {
+				return prefix + entry
+			}
+		}
+		entry = filepath.Join(homeDir, entry[1:])
+	}
+	entry = os.ExpandEnv(entry)
+	if entry != "" && baseDir != "" && !filepath.IsAbs(entry) {
+		entry = filepath.Join(baseDir, entry)
+	}
+	return prefix + entry
 }
