@@ -846,3 +846,27 @@ func TestGoogleHeaderTimeout(t *testing.T) {
 	require.ErrorContains(t, timeoutErr, "response headers timed out")
 	require.NoError(t, ctx.Err())
 }
+
+func TestGoogleCredentialsResolveAtEachRequest(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "old-key")
+	model := &Model{ID: "gemini-test", Provider: ProviderGoogle, API: APIGoogleGenerativeAI, BaseURL: "https://test.invalid"}
+	client, err := newGoogleClient(model)
+	require.NoError(t, err)
+	var requests int
+	previous := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		require.Equal(t, "new-key", req.Header.Get("x-goog-api-key"))
+		return nil, errors.New("isolated request")
+	})}
+	t.Cleanup(func() { http.DefaultClient = previous })
+	t.Setenv("GEMINI_API_KEY", "new-key")
+	streamErr := client.Stream(t.Context(), model, &Context{Messages: []Message{{Role: "user", Content: "hello"}}}, func(context.Context, StreamEvent) {}, WithMaxRetries(0), WithTimeout(time.Second))
+	if streamErr != nil {
+		require.ErrorContains(t, streamErr, "isolated request")
+	}
+	require.Equal(t, 1, requests)
+	t.Setenv("GEMINI_API_KEY", "")
+	require.ErrorContains(t, client.Stream(t.Context(), model, &Context{Messages: []Message{{Role: "user", Content: "hello"}}}, func(context.Context, StreamEvent) {}, WithMaxRetries(0), WithTimeout(time.Second)), "missing API key")
+	require.Equal(t, 1, requests)
+}

@@ -67,7 +67,7 @@ func (c *piMessagesClient) Stream(ctx context.Context, model *Model, prompt *Con
 	cfg := applyOptions(opts)
 	key := cfg.apiKey
 	if key == "" {
-		key = GetEnvAPIKey(model.Provider)
+		key = cfg.envAPIKey(model.Provider)
 	}
 	if key == "" {
 		return fmt.Errorf("no API key provided for provider %q", model.Provider)

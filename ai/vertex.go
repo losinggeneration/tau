@@ -131,12 +131,19 @@ func resolveVertexEndpoint(ctx context.Context, model *Model, o *options) (strin
 	if strings.Contains(baseURL, "{location}") {
 		baseURL = ""
 	}
-	auth := googleCloudAuth{APIKey: cmp.Or(vertexAPIKey(o.apiKey), os.Getenv("GOOGLE_CLOUD_API_KEY"), os.Getenv("VERTEXAI_API_KEY"))}
+	auth := googleCloudAuth{APIKey: vertexAPIKey(o.apiKey)}
+	if auth.APIKey == "" && !o.noEnvCredentials {
+		auth.APIKey = cmp.Or(os.Getenv("GOOGLE_CLOUD_API_KEY"), os.Getenv("VERTEXAI_API_KEY"))
+	}
 	if auth.APIKey != "" {
 		if baseURL == "" {
 			baseURL = "https://aiplatform.googleapis.com"
 		}
 		return joinVertexURL(baseURL, modelPath), auth, nil
+	}
+
+	if o.noEnvCredentials {
+		return "", auth, errors.New("vertex ai: ambient credentials disabled; supply an explicit API key")
 	}
 
 	project := cmp.Or(strings.TrimSpace(o.vertexProject), os.Getenv("GOOGLE_CLOUD_PROJECT"), os.Getenv("GCLOUD_PROJECT"))

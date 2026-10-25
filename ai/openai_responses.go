@@ -70,7 +70,7 @@ func (c *openAIResponsesClient) Stream(ctx context.Context, model *Model, prompt
 	// Get API key
 	apiKey := o.apiKey
 	if apiKey == "" {
-		apiKey = GetEnvAPIKey(model.Provider)
+		apiKey = o.envAPIKey(model.Provider)
 		if apiKey == "" {
 			return errors.New("openai responses: missing API key")
 		}
@@ -188,7 +188,7 @@ func buildOpenAIResponsesBody(model *Model, prompt *Context, o *options) (map[st
 	}
 
 	baseURL := cmp.Or(model.BaseURL, "https://api.openai.com/v1")
-	apiKey := cmp.Or(o.apiKey, GetEnvAPIKey(model.Provider))
+	apiKey := cmp.Or(o.apiKey, o.envAPIKey(model.Provider))
 	chatGPTSignIn := model.Provider == ProviderOpenAI && baseURL == "https://api.openai.com/v1" && apiKey != "" && !strings.HasPrefix(apiKey, "sk-")
 	longCache := model.Compat == nil || model.Compat.SupportsLongCacheRetention == nil || *model.Compat.SupportsLongCacheRetention
 	explicitCache := model.Compat != nil && model.Compat.SupportsExplicitPromptCacheMode

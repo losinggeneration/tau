@@ -36,3 +36,18 @@ func TestExpandModelScopeMatchesUpstreamPatterns(t *testing.T) {
 		{Model: ModelSpec{Provider: "anthropic", Model: "claude-opus-4"}, ThinkingLevel: "low"},
 	}, ExpandModelScope([]string{"GPT-5:high", "anthropic/*:low", "openai/gpt-5:minimal"}, keys), "first match keeps its level")
 }
+
+func TestModelCandidatesIncludeAnthropicBearerEnvironment(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-secret")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	var patternFound, fallbackFound bool
+	for _, candidate := range buildModelPatternCandidates(nil) {
+		patternFound = patternFound || candidate.Spec.Provider == ProviderAnthropic
+	}
+	for _, candidate := range buildAllAvailableModelSpecs() {
+		fallbackFound = fallbackFound || candidate.Provider == ProviderAnthropic
+	}
+	assert.True(t, patternFound)
+	assert.True(t, fallbackFound)
+}

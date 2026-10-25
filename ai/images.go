@@ -48,7 +48,7 @@ func GenerateImages(ctx context.Context, model *Model, input []ContentBlock, opt
 	cfg := applyOptions(opts)
 	key := cfg.apiKey
 	if key == "" {
-		key = GetEnvAPIKey(model.Provider)
+		key = cfg.envAPIKey(model.Provider)
 	}
 	if key == "" {
 		return result, fmt.Errorf("no API key for provider: %s", model.Provider)

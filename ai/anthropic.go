@@ -9,10 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"slices"
 	"strings"
 	"time"
+
+	"golang.org/x/text/encoding/unicode"
 )
 
 // Note: the path /v1/messages is appended at the call site, so the base URL
@@ -136,7 +139,6 @@ type anthropicClient struct {
 	model         *Model
 	transport     *HTTPTransport
 	isOAuth       bool
-	interleaved   bool
 	tools         []Tool
 	transportOpts *TransportOption
 	// thinkingLevel is the managed effort stamped on streamed assistant messages.
@@ -200,12 +202,15 @@ func (c *anthropicClient) stream(ctx context.Context, model *Model, prompt *Cont
 	// Determine if this is an OAuth token
 	apiKey := o.apiKey
 	if apiKey == "" {
-		apiKey = envGet(envVarNames(model.Provider)...)
+		if headers := o.envHeaders(model.Provider); len(headers) != 0 {
+			copyConfiguredHeaders(headers, o.headers)
+			o.headers = headers
+		} else {
+			apiKey = o.envAPIKey(model.Provider)
+		}
 	}
-	c.isOAuth = isOAuthToken(apiKey)
+	c.isOAuth = model.Provider != ProviderGitHubCopilot && isOAuthToken(apiKey)
 
-	// Check for interleaved thinking option
-	c.interleaved = o.interleavedThinking != nil && (*o.interleavedThinking || (isAdaptiveThinkingModel(model.ID) && *o.interleavedThinking))
 	c.tools = declared
 
 	// Build request
@@ -247,7 +252,7 @@ func (c *anthropicClient) stream(ctx context.Context, model *Model, prompt *Cont
 	if baseURL := requestBaseURL(model, apiKey); baseURL != "" {
 		transport.baseURL = baseURL
 	}
-	if refresh := cmp.Or(o.transportOpts, c.transportOpts); refresh != nil {
+	if refresh := cmp.Or(o.transportOpts, c.transportOpts); refresh != nil && apiKey != "" {
 		transport.refreshCreds, transport.provider = refresh.RefreshCreds, refresh.Provider
 	}
 
@@ -310,8 +315,8 @@ func (c *anthropicClient) stream(ctx context.Context, model *Model, prompt *Cont
 		invokeResponseCallback(&o, model, responseMetadata(resp))
 	}
 
-	// Check for streaming
-	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+	mediaType, _, mediaTypeErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mediaTypeErr == nil && mediaType == "text/event-stream" {
 		return c.handleSSE(ctx, resp.Body, handler)
 	}
 
@@ -334,8 +339,12 @@ func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options, 
 		betaFeatures = append(betaFeatures, "fine-grained-tool-streaming-2025-05-14")
 	}
 
-	// Interleaved thinking beta - only for non-adaptive models when enabled
-	needsInterleavedBeta := c.interleaved && !isAdaptiveThinkingModel(model.ID)
+	activeThinking := o.thinkingEnabled || o.thinkingBudgetTokens > 0 || o.effort != "" ||
+		(o.reasoning != "" && o.reasoning != ReasoningOff)
+	needsInterleavedBeta := model.Reasoning && activeThinking &&
+		(o.interleavedThinking == nil || *o.interleavedThinking) &&
+		!isAdaptiveThinkingModel(model.ID) && !anthropicManagedEffort(model) &&
+		(model.Compat == nil || !model.Compat.ForceAdaptiveThinking)
 	if needsInterleavedBeta {
 		betaFeatures = append(betaFeatures, "interleaved-thinking-2025-05-14")
 	}
@@ -531,8 +540,10 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 		}
 		req.MaxTokens, budget = fitThinkingBudget(model, prompt, req.MaxTokens, budget)
 		req.Thinking = &anthropicThinking{Type: "enabled", BudgetTokens: budget, Display: display}
-	case o.thinkingType == "disabled":
-		req.Thinking = &anthropicThinking{Type: "disabled"}
+	case model.Reasoning && (o.reasoning == ReasoningOff || o.thinkingType == "disabled"):
+		if off, exists := model.ThinkingLevelMap["off"]; !exists || off != nil {
+			req.Thinking = &anthropicThinking{Type: "disabled"}
+		}
 	}
 
 	// Handle tool choice
@@ -549,8 +560,8 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 	if o.temperature != nil && !hasThinking && !anthropicManagedEffort(model) && supportsTemperature {
 		req.Temperature = o.temperature
 	}
-	if len(o.metadata) > 0 {
-		req.Metadata = o.metadata
+	if userID, ok := o.metadata["user_id"].(string); ok {
+		req.Metadata = map[string]any{"user_id": userID}
 	}
 
 	data, err := json.Marshal(req)
@@ -1002,6 +1013,17 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 			return fail(err)
 		}
 
+		// The UTF-8 decoder replaces each malformed sequence with U+FFFD
+		// instead of failing, matching the provider's tolerance for bad
+		// bytes.
+		decoded, decodeErr := unicode.UTF8.NewDecoder().String(data)
+		if decodeErr != nil {
+			// Unreachable for a replacing decoder; keep the raw payload if
+			// it ever fires rather than aborting the stream.
+			decoded = data
+		}
+		data = decoded
+
 		switch name {
 		case "error":
 			return fail(errors.New(data))
@@ -1225,8 +1247,12 @@ type anthropicStopDetails struct {
 }
 
 func (c *anthropicClient) handleJSON(ctx context.Context, body io.Reader, handler EventHandler) error {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
 	var resp anthropicResponse
-	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+	if err := json.Unmarshal(data, &resp); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 

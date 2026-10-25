@@ -2285,8 +2285,8 @@ func TestSettingsArtifactPathsRetainScopeThroughStartupAndReload(t *testing.T) {
 	if _, ok := loader.PromptRegistry().Get("project"); !ok {
 		t.Fatal("project-relative prompt missing")
 	}
-	if _, ok := loader.PromptRegistry().Get("user"); ok {
-		t.Fatal("project list did not replace user list")
+	if _, ok := loader.PromptRegistry().Get("user"); !ok {
+		t.Fatal("merged list dropped user resources")
 	}
 }
 

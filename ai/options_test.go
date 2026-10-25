@@ -2,7 +2,9 @@ package ai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -695,4 +697,113 @@ func TestSessionAffinityFormatsReachTransport(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestThinkingDisableOptionsStayProviderScoped(t *testing.T) {
+	for _, api := range []string{APIAnthropicMessages, APIOpenAICompletions, APIBedrockConverseStream} {
+		for _, level := range []ReasoningLevel{"", ReasoningOff, ReasoningHigh} {
+			t.Run(api+"/"+string(level), func(t *testing.T) {
+				model := &Model{API: api, MaxTokens: 4000}
+				got := applyOptions(BuildBaseOptions(model, nil, &SimpleStreamOptions{Reasoning: level}))
+				assert.Equal(t, level, got.reasoning)
+				assert.False(t, got.thinkingEnabled)
+				if api == APIAnthropicMessages && level == "" {
+					assert.Equal(t, "disabled", got.thinkingType)
+				} else {
+					assert.Empty(t, got.thinkingType)
+				}
+			})
+		}
+	}
+	got := applyOptions([]Option{WithThinkingEnabled(false), WithThinkingEnabled(true)})
+	assert.True(t, got.thinkingEnabled)
+	assert.Empty(t, got.thinkingType)
+	got = applyOptions([]Option{WithThinkingEnabled(true), WithThinkingEnabled(false)})
+	assert.False(t, got.thinkingEnabled)
+	assert.Equal(t, "disabled", got.thinkingType)
+}
+
+func TestWithoutEnvCredentialsAtProviderBoundary(t *testing.T) {
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY", "AZURE_OPENAI_API_KEY", "GOOGLE_CLOUD_API_KEY", "VERTEXAI_API_KEY", "GOOGLE_ACCESS_TOKEN", "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "OPENROUTER_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+		t.Setenv(name, "ambient-secret")
+	}
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "project")
+	t.Setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	failure := errors.New("request reached isolated transport")
+	var requests int
+	previousTransport, previousClient := http.DefaultTransport, http.DefaultClient
+	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		assert.NotContains(t, req.Header.Get("Authorization"), "ambient-secret")
+		assert.NotContains(t, req.Header.Get("x-api-key"), "ambient-secret")
+		assert.NotContains(t, req.Header.Get("x-goog-api-key"), "ambient-secret")
+		return nil, failure
+	})
+	http.DefaultTransport, http.DefaultClient = transport, &http.Client{Transport: transport}
+	t.Cleanup(func() { http.DefaultTransport, http.DefaultClient = previousTransport, previousClient })
+	for _, tc := range []struct{ provider, api string }{
+		{ProviderAnthropic, APIAnthropicMessages},
+		{ProviderOpenAI, APIOpenAICompletions},
+		{ProviderOpenAI, APIOpenAICompatible},
+		{ProviderOpenAI, APIOpenAIResponses},
+		{ProviderOpenAICodex, APIOpenAICodexResponses},
+		{ProviderGoogle, APIGoogleGenerativeAI},
+		{ProviderMistral, APIMistralConversations},
+		{ProviderAzureOpenAI, APIAzureOpenAIResponses},
+		{ProviderGoogleVertex, APIGoogleVertex},
+		{ProviderAmazonBedrock, APIBedrockConverseStream},
+		{ProviderOpenAI, APIPiMessages},
+	} {
+		t.Run(tc.api, func(t *testing.T) {
+			model := &Model{ID: "local-test", Provider: tc.provider, API: tc.api, BaseURL: "https://test.invalid"}
+			client, err := GetClient(model)
+			require.NoError(t, err)
+			for _, explicit := range []string{"", "explicit-key"} {
+				for _, complete := range []bool{false, true} {
+					before := requests
+					key := explicit
+					if explicit != "" && tc.api == APIOpenAICodexResponses {
+						key = "h." + base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-account"}}`)) + ".s"
+					}
+					opts := []Option{WithoutEnvCredentials(), WithMaxRetries(0), WithAPIKey(key)}
+					if complete {
+						var result *AssistantMessage
+						result, err = client.Complete(t.Context(), model, &Context{}, opts...)
+						if err == nil && result != nil && result.StopReason == StopReasonError {
+							err = errors.New(result.ErrorMessage)
+						}
+					} else {
+						err = client.Stream(t.Context(), model, &Context{}, func(context.Context, StreamEvent) {}, opts...)
+					}
+					if explicit == "" {
+						require.Error(t, err)
+						if tc.api != APIOpenAICompletions {
+							assert.Equal(t, before, requests, "implicit credentials must not reach transport")
+						}
+					} else {
+						assert.Greater(t, requests, before, "explicit credentials must still reach transport")
+					}
+				}
+			}
+		})
+	}
+	for _, tc := range []struct{ operation, api string }{{"image", APIOpenRouterImages}, {"classifier", APIOpenAIDecisions}} {
+		t.Run(tc.operation, func(t *testing.T) {
+			model := &Model{ID: "local-test", Type: tc.operation, Provider: ProviderOpenRouter, API: tc.api, BaseURL: "https://test.invalid"}
+			before := requests
+			var err error
+			if tc.operation == "image" {
+				_, err = GenerateImages(t.Context(), model, nil, WithoutEnvCredentials())
+			} else {
+				_, err = Classify(t.Context(), model, ClassifierContext{Questions: map[string]ClassifierQuestion{"ok": {Type: "boolean", Instructions: "ok?"}}}, WithoutEnvCredentials())
+			}
+			require.Error(t, err)
+			assert.Equal(t, before, requests)
+		})
+	}
+	model := &Model{ID: "test", API: APIAnthropicMessages}
+	simple := ExtractSimpleStreamOptions([]Option{WithoutEnvCredentials()})
+	require.True(t, simple.NoEnvCredentials)
+	require.True(t, applyOptions(BuildBaseOptions(model, &Context{}, &simple)).noEnvCredentials)
 }

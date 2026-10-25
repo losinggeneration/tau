@@ -5,7 +5,10 @@ package store // import "github.com/losinggeneration/tau/ai/store"
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 	"sync"
 	"time"
 
@@ -58,7 +61,7 @@ func (o Options) expiryMargin() time.Duration {
 
 func (o Options) refreshFuncs() map[string]RefreshFunc {
 	if len(o.RefreshFuncs) > 0 {
-		return o.RefreshFuncs
+		return maps.Clone(o.RefreshFuncs)
 	}
 	if len(o.OAuthProviders) == 0 {
 		return nil
@@ -91,7 +94,7 @@ func OAuthProviderRefreshFuncs(providers ...oauth.Provider) map[string]RefreshFu
 			if err != nil {
 				return ai.Credential{}, err
 			}
-			return CredentialFromOAuth(refreshed), nil
+			return refreshedOAuthCredential(refreshed, cred)
 		}
 	}
 	return funcs
@@ -130,7 +133,7 @@ type MemoryBackend struct {
 	creds        map[string]ai.Credential // key = provider
 	refreshFuncs map[string]RefreshFunc
 	margin       time.Duration
-	refreshMu    sync.Map // per-key mutex for refresh serialization
+	refreshMu    sync.Map // per-key refresh admission
 }
 
 // NewMemoryBackend creates a new in-memory credential store.
@@ -153,10 +156,14 @@ func credKey(provider string) string {
 
 // Get retrieves a credential, refreshing if needed.
 func (m *MemoryBackend) Get(ctx context.Context, provider string) (ai.Credential, error) {
+	if err := context.Cause(ctx); err != nil {
+		return ai.Credential{}, err
+	}
 	key := credKey(provider)
 
 	m.mu.RLock()
 	cred, ok := m.creds[key]
+	cred = cloneMemoryCredential(cred)
 	m.mu.RUnlock()
 
 	if !ok {
@@ -169,66 +176,79 @@ func (m *MemoryBackend) Get(ctx context.Context, provider string) (ai.Credential
 	}
 
 	// Serialize refresh for the same key
-	keyMu, _ := m.refreshMu.LoadOrStore(key, &sync.Mutex{})
-	keyMu.(*sync.Mutex).Lock()
-	defer keyMu.(*sync.Mutex).Unlock()
+	release, err := acquireRefresh(ctx, &m.refreshMu, key)
+	if err != nil {
+		return ai.Credential{}, err
+	}
+	defer release()
 
 	// Re-read after acquiring lock (another goroutine may have refreshed)
 	m.mu.RLock()
 	cred, ok = m.creds[key]
+	cred = cloneMemoryCredential(cred)
 	m.mu.RUnlock()
 	if !ok {
 		return ai.Credential{}, fmt.Errorf("%w: %s", ai.ErrCredentialNotFound, key)
 	}
-	if !cred.IsExpired(m.margin) {
+	if !cred.IsExpired(m.margin) || !cred.IsRefreshable() {
 		return cred, nil
 	}
 
 	// Perform refresh
-	refreshFn, hasRefresh := m.refreshFuncs[provider]
+	refreshFn, hasRefresh := m.refreshFuncs[key]
 	if !hasRefresh {
 		return cred, nil // no refresh function, return as-is
 	}
 
+	expected := authFile{key: credentialToAuthCredential(cred)}.clone()[key]
 	refreshed, err := refreshFn(ctx, cred)
 	if err != nil {
 		if isErrCredentialNeedsReauth(err) {
 			cred.NeedsReauth = true
-			m.mu.Lock()
-			m.creds[key] = cred
-			m.mu.Unlock()
+			if writeErr := m.writeRefreshedCredential(ctx, key, expected, cred); writeErr != nil {
+				return cred, errors.Join(err, writeErr)
+			}
 			return cred, err
 		}
 		return cred, fmt.Errorf("refresh %s: %w", key, err)
 	}
 
-	m.mu.Lock()
-	m.creds[key] = refreshed
-	m.mu.Unlock()
+	if err := m.writeRefreshedCredential(ctx, key, expected, refreshed); err != nil {
+		return refreshed, err
+	}
 
 	return refreshed, nil
 }
 
 // Set stores a credential.
-func (m *MemoryBackend) Set(_ context.Context, provider string, cred ai.Credential) error {
+func (m *MemoryBackend) Set(ctx context.Context, provider string, cred ai.Credential) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.creds[credKey(provider)] = cred
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	m.creds[credKey(provider)] = cloneMemoryCredential(cred)
 	return nil
 }
 
 // Delete removes a credential.
-func (m *MemoryBackend) Delete(_ context.Context, provider string) error {
+func (m *MemoryBackend) Delete(ctx context.Context, provider string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 	delete(m.creds, credKey(provider))
 	return nil
 }
 
 // List returns all stored credential references.
-func (m *MemoryBackend) List(_ context.Context) ([]ai.CredentialRef, error) {
+func (m *MemoryBackend) List(ctx context.Context) ([]ai.CredentialRef, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 
 	refs := make([]ai.CredentialRef, 0, len(m.creds))
 	for provider, cred := range m.creds {
@@ -243,10 +263,14 @@ func (m *MemoryBackend) List(_ context.Context) ([]ai.CredentialRef, error) {
 
 // RefreshOAuth refreshes an OAuth credential using the provided oauth.Provider.
 func (m *MemoryBackend) RefreshOAuth(ctx context.Context, provider string, oauthProvider oauth.Provider) (ai.Credential, error) {
+	if err := context.Cause(ctx); err != nil {
+		return ai.Credential{}, err
+	}
 	key := credKey(provider)
 
 	m.mu.RLock()
 	cred, ok := m.creds[key]
+	cred = cloneMemoryCredential(cred)
 	m.mu.RUnlock()
 
 	if !ok {
@@ -258,19 +282,27 @@ func (m *MemoryBackend) RefreshOAuth(ctx context.Context, provider string, oauth
 	}
 
 	// Serialize refresh for the same key
-	keyMu, _ := m.refreshMu.LoadOrStore(key, &sync.Mutex{})
-	keyMu.(*sync.Mutex).Lock()
-	defer keyMu.(*sync.Mutex).Unlock()
+	release, err := acquireRefresh(ctx, &m.refreshMu, key)
+	if err != nil {
+		return ai.Credential{}, err
+	}
+	defer release()
 
 	// Re-read after acquiring lock
 	m.mu.RLock()
 	cred, ok = m.creds[key]
+	cred = cloneMemoryCredential(cred)
 	m.mu.RUnlock()
 	if !ok {
 		return ai.Credential{}, fmt.Errorf("%w: %s", ai.ErrCredentialNotFound, key)
 	}
 
+	if cred.Type != ai.CredentialTypeOAuth {
+		return cred, fmt.Errorf("credential %s is not OAuth", key)
+	}
+
 	// Convert to oauth.Credentials
+	expected := authFile{key: credentialToAuthCredential(cred)}.clone()[key]
 	oauthCreds := OAuthCredentialToCredentials(cred)
 
 	// Refresh
@@ -279,20 +311,59 @@ func (m *MemoryBackend) RefreshOAuth(ctx context.Context, provider string, oauth
 		// Check for terminal error
 		if isErrCredentialNeedsReauth(err) {
 			cred.NeedsReauth = true
-			m.mu.Lock()
-			m.creds[key] = cred
-			m.mu.Unlock()
-			return cred, ai.ErrCredentialNeedsReauth{Provider: provider}
+			if writeErr := m.writeRefreshedCredential(ctx, key, expected, cred); writeErr != nil {
+				return cred, errors.Join(err, writeErr)
+			}
+			return cred, errors.Join(err, ai.ErrCredentialNeedsReauth{Provider: provider})
 		}
 		return cred, fmt.Errorf("refresh %s: %w", key, err)
 	}
 
 	// Convert back and store
-	cred = CredentialFromOAuth(refreshed)
-	m.mu.Lock()
-	m.creds[key] = cred
-	m.mu.Unlock()
+	cred, err = refreshedOAuthCredential(refreshed, cred)
+	if err != nil {
+		return ai.Credential{}, err
+	}
+	if err := m.writeRefreshedCredential(ctx, key, expected, cred); err != nil {
+		return cred, err
+	}
 
+	return cred, nil
+}
+
+func (m *MemoryBackend) writeRefreshedCredential(ctx context.Context, key string, expected authCredential, refreshed ai.Credential) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	current, exists := m.creds[key]
+	if !exists || !reflect.DeepEqual(credentialToAuthCredential(current), expected) {
+		return errors.New("credential changed during refresh")
+	}
+	m.creds[key] = cloneMemoryCredential(refreshed)
+	return nil
+}
+
+func refreshedOAuthCredential(creds *oauth.Credentials, previous ai.Credential) (ai.Credential, error) {
+	if creds == nil {
+		return ai.Credential{}, fmt.Errorf("OAuth refresh returned missing credentials")
+	}
+	if creds.Access == "" {
+		return ai.Credential{}, fmt.Errorf("OAuth refresh returned no access token")
+	}
+	cred := CredentialFromOAuth(creds)
+	cred.Scope = previous.Scope
+	if previous.Extra != nil {
+		extra := cloneAuthJSON(previous.Extra).(map[string]any)
+		for key, value := range cred.Extra {
+			extra[key] = cloneAuthJSON(value)
+		}
+		cred.Extra = extra
+	}
+	if cred.RefreshToken == "" {
+		cred.RefreshToken = previous.RefreshToken
+	}
 	return cred, nil
 }
 
@@ -325,4 +396,12 @@ func OAuthCredentialToCredentials(cred ai.Credential) *oauth.Credentials {
 		AccountID: cred.AccountID,
 		Extra:     cred.Extra,
 	}
+}
+
+func cloneMemoryCredential(cred ai.Credential) ai.Credential {
+	cred.Env = maps.Clone(cred.Env)
+	if cred.Extra != nil {
+		cred.Extra = cloneAuthJSON(cred.Extra).(map[string]any)
+	}
+	return cred
 }

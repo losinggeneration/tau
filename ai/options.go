@@ -24,6 +24,7 @@ type options struct {
 	timeout                    time.Duration
 	timeoutSet                 bool
 	apiKey                     string
+	noEnvCredentials           bool
 	preferredTransport         Transport
 	transportOpts              *TransportOption
 	reasoning                  ReasoningLevel
@@ -76,6 +77,26 @@ func (o *options) apply(opts []Option) {
 	}
 }
 
+// WithoutEnvCredentials disables implicit environment and ambient cloud authentication.
+// Explicit keys, configured headers, and configured variable references still apply.
+func WithoutEnvCredentials() Option {
+	return func(o *options) { o.noEnvCredentials = true }
+}
+
+func (o *options) envAPIKey(provider string) string {
+	if o.noEnvCredentials {
+		return ""
+	}
+	return GetEnvAPIKey(provider)
+}
+
+func (o *options) envHeaders(provider string) map[string]string {
+	if o.noEnvCredentials {
+		return nil
+	}
+	return GetEnvHeaders(provider)
+}
+
 // WithAPIKey sets the API key for authentication.
 func WithAPIKey(key string) Option {
 	return func(o *options) {
@@ -94,6 +115,10 @@ func WithReasoning(level ReasoningLevel) Option {
 func WithThinkingEnabled(enabled bool) Option {
 	return func(o *options) {
 		o.thinkingEnabled = enabled
+		o.thinkingType = ""
+		if !enabled {
+			o.thinkingType = "disabled"
+		}
 	}
 }
 
@@ -632,6 +657,7 @@ type SimpleStreamOptions struct {
 	Reasoning        ReasoningLevel
 	ThinkingBudgets  *ThinkingBudgets
 	APIKey           string
+	NoEnvCredentials bool
 	CacheRetention   string
 	SessionID        string
 	Transport        Transport
@@ -670,6 +696,11 @@ func BuildBaseOptions(model *Model, prompt *Context, opts *SimpleStreamOptions) 
 	}
 	if opts.Reasoning != "" {
 		result = append(result, WithReasoning(opts.Reasoning))
+	} else if model.API == APIAnthropicMessages {
+		result = append(result, WithThinkingEnabled(false))
+	}
+	if opts.NoEnvCredentials {
+		result = append(result, WithoutEnvCredentials())
 	}
 	if opts.APIKey != "" {
 		result = append(result, WithAPIKey(opts.APIKey))
@@ -720,13 +751,14 @@ func ExtractSimpleStreamOptions(opts []Option) SimpleStreamOptions {
 	o.apply(opts)
 
 	result := SimpleStreamOptions{
-		Reasoning:       o.reasoning,
-		ThinkingBudgets: o.thinkingBudgets,
-		APIKey:          o.apiKey,
-		OnPayload:       o.onPayload,
-		OnPayloadModel:  o.onPayloadWithModel,
-		OnResponse:      o.onResponse,
-		OnResponseModel: o.onResponseWithModel,
+		Reasoning:        o.reasoning,
+		ThinkingBudgets:  o.thinkingBudgets,
+		APIKey:           o.apiKey,
+		NoEnvCredentials: o.noEnvCredentials,
+		OnPayload:        o.onPayload,
+		OnPayloadModel:   o.onPayloadWithModel,
+		OnResponse:       o.onResponse,
+		OnResponseModel:  o.onResponseWithModel,
 	}
 
 	if o.temperature != nil {

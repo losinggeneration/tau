@@ -49,7 +49,7 @@ func resolveOpenAIAPIKey(model *Model, o *options) string {
 		return o.apiKey
 	}
 
-	return GetEnvAPIKey(model.Provider)
+	return o.envAPIKey(model.Provider)
 }
 
 // providerRequestHeaders returns headers a specific provider requires on every

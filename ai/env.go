@@ -33,29 +33,12 @@ func TelemetryEnabled() bool {
 	}
 }
 
-var cachedVertexAdcExists *bool
-
-// HasVertexADC checks if Google Application Default Credentials are available.
-// This checks for the credentials file path in GOOGLE_APPLICATION_CREDENTIALS,
-// or the default ADC path (~/.config/gcloud/application_default_credentials.json).
-// The result is cached to handle the module-load race at startup.
+// HasVertexADC checks the configured or default ADC path on each discovery.
 func HasVertexADC() bool {
-	if cachedVertexAdcExists != nil {
-		return *cachedVertexAdcExists
+	if path := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); path != "" {
+		return fileExists(path)
 	}
-
-	// Check GOOGLE_APPLICATION_CREDENTIALS first (standard way)
-	if gacPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); gacPath != "" {
-		exists := fileExists(gacPath)
-		cachedVertexAdcExists = &exists
-		return exists
-	}
-
-	// Fall back to default ADC path
-	defaultPath := filepath.Join(userHomeDir(), ".config", "gcloud", "application_default_credentials.json")
-	exists := fileExists(defaultPath)
-	cachedVertexAdcExists = &exists
-	return exists
+	return fileExists(filepath.Join(userHomeDir(), ".config", "gcloud", "application_default_credentials.json"))
 }
 
 // HasVertexProject checks if the required Google Cloud project is set.
@@ -136,17 +119,6 @@ func userHomeDir() string {
 	return ""
 }
 
-// envGet returns an environment variable, checking multiple common names.
-func envGet(names ...string) string {
-	for _, name := range names {
-		if val := os.Getenv(name); val != "" {
-			return val
-		}
-	}
-
-	return ""
-}
-
 // envVarNames returns the environment variables consulted for the given
 // provider. For plain API-key providers this is the single entry from
 // EnvVarRegistry. Special-cased providers (Anthropic OAuth precedence,
@@ -158,7 +130,7 @@ func envVarNames(provider string) []string {
 	// more than the single registry entry.
 	switch provider {
 	case ProviderAnthropic:
-		return []string{"ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+		return []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
 	case ProviderGitHubCopilot, ProviderOpenAICodex:
 		return []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}
 	case ProviderGoogleVertex:
@@ -215,6 +187,7 @@ func buildEnvAPIKeys() map[string]string {
 		}
 	}
 	// Special-case providers' additional env vars.
+	m["ANTHROPIC_AUTH_TOKEN"] = ProviderAnthropic
 	m["ANTHROPIC_OAUTH_TOKEN"] = ProviderAnthropic
 	m["ANTHROPIC_API_KEY"] = ProviderAnthropic
 	m["COPILOT_GITHUB_TOKEN"] = ProviderGitHubCopilot
@@ -333,12 +306,25 @@ func GetEnvAPIKey(provider string) string {
 }
 
 // getEnv is exported for internal use by providers.
-func getEnv(name string) string {
-	return os.Getenv(name)
-}
-
 // ShareViewerURL returns the share viewer URL override from TAU_SHARE_VIEWER_URL.
 // Returns empty string if not set (defaults to https://pi.dev/session/).
 func ShareViewerURL() string {
 	return os.Getenv("TAU_SHARE_VIEWER_URL")
+}
+
+// GetEnvHeaders returns provider-owned authentication headers. Bearer tokens
+// are kept separate from API keys to avoid activating OAuth request shaping.
+func GetEnvHeaders(provider string) map[string]string {
+	if provider == ProviderAnthropic {
+		if token := os.Getenv("ANTHROPIC_AUTH_TOKEN"); token != "" {
+			return map[string]string{"Authorization": "Bearer " + token}
+		}
+	}
+	return nil
+}
+
+// HasEnvCredentials reports environment authentication without resolving stored
+// credentials or performing network calls.
+func HasEnvCredentials(provider string) bool {
+	return len(GetEnvHeaders(provider)) != 0 || GetEnvAPIKey(provider) != ""
 }

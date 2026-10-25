@@ -5,7 +5,9 @@ package ai
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/losinggeneration/tau/paths"
 )
 
@@ -219,16 +222,30 @@ type BranchSummarySettings struct {
 type PackageSource struct {
 	// Source is the package source specifier.
 	Source string `json:"source"`
+	// Autoload defaults to true. False applies only explicit resource overrides.
+	Autoload *bool `json:"autoload,omitzero"`
 	// Extensions, Skills, Prompts, Themes filter which package resources load.
-	Extensions []string `json:"extensions,omitempty"`
-	Skills     []string `json:"skills,omitempty"`
-	Prompts    []string `json:"prompts,omitempty"`
-	Themes     []string `json:"themes,omitempty"`
+	Extensions []string `json:"extensions,omitzero"`
+	Skills     []string `json:"skills,omitzero"`
+	Prompts    []string `json:"prompts,omitzero"`
+	Themes     []string `json:"themes,omitzero"`
+}
+
+// Clone returns an independent resource policy, preserving nil and empty lists.
+func (p PackageSource) Clone() PackageSource {
+	if p.Autoload != nil {
+		p.Autoload = new(*p.Autoload)
+	}
+	p.Extensions = slices.Clone(p.Extensions)
+	p.Skills = slices.Clone(p.Skills)
+	p.Prompts = slices.Clone(p.Prompts)
+	p.Themes = slices.Clone(p.Themes)
+	return p
 }
 
 // MarshalJSON renders PackageSource as either a string or an object.
 func (p PackageSource) MarshalJSON() ([]byte, error) {
-	if p.Extensions == nil && p.Skills == nil && p.Prompts == nil && p.Themes == nil {
+	if p.Autoload == nil && p.Extensions == nil && p.Skills == nil && p.Prompts == nil && p.Themes == nil {
 		return json.Marshal(p.Source)
 	}
 	type pkgObj PackageSource
@@ -260,8 +277,11 @@ func (p *PackageSource) UnmarshalJSON(data []byte) error {
 //
 //nolint:recvcheck // MarshalJSON takes a value so Settings values keep explicit zeros.
 type Settings struct {
-	present       map[string]json.RawMessage
-	resourceBases map[string]string
+	present        map[string]json.RawMessage
+	resourceBases  map[string]string
+	resourceScopes map[string][2]settingsResourceScope
+	packageBase    string
+	packageScopes  *[2]PackageScope
 
 	// === Top-level scalars ===
 
@@ -351,6 +371,7 @@ func LoadSettingsFromPath(path string) (*Settings, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve settings path: %w", err)
 	}
+	settings.packageBase = filepath.Dir(absolute)
 	settings.resourceBases = make(map[string]string)
 	for _, kind := range []string{"skills", "prompts", "themes", "extensions"} {
 		settings.resourceBases[kind] = filepath.Dir(absolute)
@@ -358,33 +379,86 @@ func LoadSettingsFromPath(path string) (*Settings, error) {
 	return settings, nil
 }
 
-// ResourcePaths returns resource entries resolved relative to their originating
-// settings file. The stored values remain unchanged for persistence.
-func (s *Settings) ResourcePaths(kind string) []string {
+// PackageScope retains configured sources and the directory owning their relative paths.
+type PackageScope struct {
+	BaseDir string
+	Sources []PackageSource
+}
+
+func clonePackageScope(scope PackageScope) PackageScope {
+	scope.Sources = slices.Clone(scope.Sources)
+	for i := range scope.Sources {
+		scope.Sources[i] = scope.Sources[i].Clone()
+	}
+	return scope
+}
+
+// PackageSourcesByScope returns independent snapshots without rewriting stored sources.
+// An unmerged Settings value belongs to the user scope.
+func (s *Settings) PackageSourcesByScope() (user, project PackageScope) {
+	if s == nil {
+		return user, project
+	}
+	if s.packageScopes == nil {
+		return clonePackageScope(PackageScope{s.packageBase, s.Packages}), project
+	}
+	return clonePackageScope(s.packageScopes[0]), clonePackageScope(s.packageScopes[1])
+}
+
+type settingsResourceScope struct {
+	entries []string
+	baseDir string
+}
+
+func (s *Settings) resourceEntries(kind string) []string {
 	if s == nil {
 		return nil
 	}
-	var entries []string
 	switch kind {
 	case "skills":
-		entries = s.Skills
+		return s.Skills
 	case "prompts":
-		entries = s.Prompts
+		return s.Prompts
 	case "themes":
-		entries = s.Themes
+		return s.Themes
 	case "extensions":
-		entries = s.Extensions
+		return s.Extensions
 	default:
 		return nil
 	}
-	if entries == nil {
-		return nil
+}
+
+// ResourcePathsByScope resolves each scope independently. An unmerged Settings
+// value is treated as user settings; MergeSettings assigns project ownership.
+func (s *Settings) ResourcePathsByScope(kind string) (user, project []string) {
+	if s == nil {
+		return nil, nil
 	}
-	result := make([]string, len(entries))
-	for i, entry := range entries {
-		result[i] = paths.ResourcePath(entry, s.resourceBases[kind], "")
+	scopes, ok := s.resourceScopes[kind]
+	if !ok {
+		scopes[0] = settingsResourceScope{s.resourceEntries(kind), s.resourceBases[kind]}
 	}
-	return result
+	resolve := func(scope settingsResourceScope) []string {
+		if scope.entries == nil {
+			return nil
+		}
+		result := make([]string, len(scope.entries))
+		for i, entry := range scope.entries {
+			result[i] = paths.ResourcePath(entry, scope.baseDir, "")
+		}
+		return result
+	}
+	return resolve(scopes[0]), resolve(scopes[1])
+}
+
+// ResourcePaths returns project resources followed by user resources, resolved
+// relative to their settings files. Stored values stay unchanged for persistence.
+func (s *Settings) ResourcePaths(kind string) []string {
+	user, project := s.ResourcePathsByScope(kind)
+	if project == nil {
+		return user
+	}
+	return append(project, user...)
 }
 
 // LoadSettings reads settings.json from path. A missing file returns an
@@ -401,6 +475,7 @@ func ParseSettings(data []byte) (*Settings, error) {
 }
 
 func parseSettings(data []byte) (*Settings, error) {
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 	// Reject pre-Pi schema first so users get a clear migration error
 	// instead of a zero-filled settings that silently drops everything.
 	var probe map[string]json.RawMessage
@@ -412,6 +487,35 @@ func parseSettings(data []byte) (*Settings, error) {
 	}
 	if _, ok := probe["default"]; ok {
 		return nil, fmt.Errorf("settings.json uses the deprecated {default} string; this version of tau uses defaultProvider and defaultModel fields")
+	}
+
+	if legacy, ok := probe["queueMode"]; ok && probe["steeringMode"] == nil {
+		probe["steeringMode"] = legacy
+		delete(probe, "queueMode")
+	}
+	if raw := bytes.TrimSpace(probe["skills"]); bytes.HasPrefix(raw, []byte("{")) {
+		var legacy map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &legacy); err != nil {
+			return nil, fmt.Errorf("parse legacy skills settings: %w", err)
+		}
+		if commands, ok := legacy["enableSkillCommands"]; ok && probe["enableSkillCommands"] == nil {
+			probe["enableSkillCommands"] = commands
+		}
+		delete(probe, "skills")
+		if directories := legacy["customDirectories"]; bytes.HasPrefix(bytes.TrimSpace(directories), []byte("[")) {
+			var entries []json.RawMessage
+			if err := json.Unmarshal(directories, &entries); err != nil {
+				return nil, fmt.Errorf("parse legacy skill directories: %w", err)
+			}
+			if len(entries) > 0 {
+				probe["skills"] = directories
+			}
+		}
+	}
+	var err error
+	data, err = json.Marshal(probe)
+	if err != nil {
+		return nil, fmt.Errorf("migrate settings: %w", err)
 	}
 
 	// First pass: typed decode.
@@ -495,18 +599,20 @@ func SaveSettingsToPath(path string, s *Settings) error {
 	return SaveSettings(path, s)
 }
 
-// SaveSettings writes settings to path with mode 0644, creating parent
-// directories as needed. Unknown keys held in Settings.Plugins are merged
+// SaveSettings atomically replaces the full snapshot, preserving existing file
+// permissions (0644 for a new file). Use UpdateSettings for field-local edits.
+// Parent directories are created as needed. Settings.Plugins entries are merged
 // back into the top-level JSON so user extensions round-trip.
 func SaveSettings(path string, s *Settings) error {
+	return withSettingsLock(context.Background(), path, func(ctx context.Context) error {
+		return saveSettings(ctx, path, s)
+	})
+}
+
+func saveSettings(ctx context.Context, path string, s *Settings) error {
 	if s == nil {
 		s = &Settings{}
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create settings dir: %w", err)
-	}
-
 	// Marshal typed fields first.
 	typed, err := json.Marshal(s)
 	if err != nil {
@@ -540,8 +646,132 @@ func SaveSettings(path string, s *Settings) error {
 	if err != nil {
 		return fmt.Errorf("pretty-print settings: %w", err)
 	}
-	if err := os.WriteFile(path, pretty, 0o644); err != nil {
+	return replaceSettings(ctx, path, pretty)
+}
+
+// UpdateSettings rereads settings under a file lock and merges only the supplied
+// fields. Objects merge recursively; arrays, null, and scalar values replace.
+// Invalid existing settings are never overwritten.
+func UpdateSettings(ctx context.Context, path string, fields map[string]any) error {
+	patch, err := json.Marshal(fields)
+	if err != nil {
+		return fmt.Errorf("marshal settings update: %w", err)
+	}
+	return withSettingsLock(ctx, path, func(ctx context.Context) error {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("read %s: %w", path, err)
+			}
+			data = []byte("{}")
+		}
+		if _, err := parseSettings(data); err != nil {
+			return fmt.Errorf("read %s before update: %w", path, err)
+		}
+		merged, err := mergeSettingsJSON(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")), patch)
+		if err != nil {
+			return fmt.Errorf("merge update into %s: %w", path, err)
+		}
+		if _, err := parseSettings(merged); err != nil {
+			return fmt.Errorf("validate %s after update: %w", path, err)
+		}
+		pretty, err := prettyJSON(merged)
+		if err != nil {
+			return fmt.Errorf("format settings update: %w", err)
+		}
+		return replaceSettings(ctx, path, pretty)
+	})
+}
+
+func mergeSettingsJSON(data, patch []byte) ([]byte, error) {
+	var base, updates map[string]json.RawMessage
+	if err := json.Unmarshal(data, &base); err != nil {
+		return nil, fmt.Errorf("decode settings object: %w", err)
+	}
+	if err := json.Unmarshal(patch, &updates); err != nil {
+		return nil, fmt.Errorf("decode settings update: %w", err)
+	}
+	if base == nil {
+		base = make(map[string]json.RawMessage)
+	}
+	for key, value := range updates {
+		old := bytes.TrimSpace(base[key])
+		value = bytes.TrimSpace(value)
+		if bytes.HasPrefix(old, []byte("{")) && bytes.HasPrefix(value, []byte("{")) {
+			merged, err := mergeSettingsJSON(old, value)
+			if err != nil {
+				return nil, err
+			}
+			value = merged
+		}
+		base[key] = value
+	}
+	data, err := json.Marshal(base)
+	if err != nil {
+		return nil, fmt.Errorf("encode settings update: %w", err)
+	}
+	return data, nil
+}
+
+func withSettingsLock(ctx context.Context, path string, write func(context.Context) error) (err error) {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create settings dir: %w", err)
+	}
+	lock := flock.New(path + ".lock")
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	locked, err := lock.TryLockContext(waitCtx, 10*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("lock settings: %w", errors.Join(err, context.Cause(waitCtx)))
+	}
+	if !locked {
+		return fmt.Errorf("lock settings: %w", context.Cause(waitCtx))
+	}
+	return write(ctx)
+}
+
+func replaceSettings(ctx context.Context, path string, data []byte) (err error) {
+	mode := os.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("stat settings: %w", statErr)
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".settings-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp settings: %w", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			err = errors.Join(err, file.Close())
+		}
+		if removeErr := os.Remove(file.Name()); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove temp settings: %w", removeErr))
+		}
+	}()
+	if err := file.Chmod(mode); err != nil {
+		return fmt.Errorf("set settings permissions: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
 		return fmt.Errorf("write settings: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync settings: %w", err)
+	}
+	closed = true
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close settings: %w", err)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		return fmt.Errorf("replace settings: %w", err)
 	}
 	return nil
 }
@@ -583,13 +813,10 @@ func SaveDefaultModel(settingsPath, modelSpec string) error {
 	if err != nil {
 		return fmt.Errorf("parse model spec: %w", err)
 	}
-	s, err := LoadSettings(settingsPath)
-	if err != nil {
-		return fmt.Errorf("load settings: %w", err)
-	}
-	s.DefaultProvider = provider
-	s.DefaultModel = model
-	return SaveSettings(settingsPath, s)
+	return UpdateSettings(context.Background(), settingsPath, map[string]any{
+		"defaultProvider": provider,
+		"defaultModel":    model,
+	})
 }
 
 // MergeSettingsInternal is the entry point used by model_resolver.go's shim.
@@ -609,14 +836,27 @@ func MergeSettings(user, project *Settings) *Settings {
 		project = &Settings{}
 	}
 	out := *user // shallow copy
+	userPackages, projectPackages := user.PackageSourcesByScope()
+	if project.Packages != nil {
+		projectPackages = clonePackageScope(PackageScope{project.packageBase, project.Packages})
+	}
+	out.packageScopes = &[2]PackageScope{userPackages, projectPackages}
+
 	out.resourceBases = maps.Clone(user.resourceBases)
 	if out.resourceBases == nil {
 		out.resourceBases = make(map[string]string)
 	}
-	for kind, entries := range map[string][]string{
-		"skills": project.Skills, "prompts": project.Prompts, "themes": project.Themes, "extensions": project.Extensions,
-	} {
-		if entries != nil {
+	out.resourceScopes = make(map[string][2]settingsResourceScope)
+	for _, kind := range []string{"skills", "prompts", "themes", "extensions"} {
+		if scopes, ok := user.resourceScopes[kind]; ok {
+			out.resourceScopes[kind] = scopes
+		} else {
+			out.resourceScopes[kind] = [2]settingsResourceScope{{slices.Clone(user.resourceEntries(kind)), user.resourceBases[kind]}, {}}
+		}
+		if entries := project.resourceEntries(kind); entries != nil {
+			scopes := out.resourceScopes[kind]
+			scopes[1] = settingsResourceScope{slices.Clone(entries), project.resourceBases[kind]}
+			out.resourceScopes[kind] = scopes
 			out.resourceBases[kind] = project.resourceBases[kind]
 		}
 	}
@@ -722,6 +962,16 @@ func MergeSettings(user, project *Settings) *Settings {
 		}
 	}
 
+	out.Packages = clonePackageScope(PackageScope{Sources: out.Packages}).Sources
+	out.Extensions = slices.Clone(out.Extensions)
+	out.Skills = slices.Clone(out.Skills)
+	out.Prompts = slices.Clone(out.Prompts)
+	out.Themes = slices.Clone(out.Themes)
+	out.NPMCommand = slices.Clone(out.NPMCommand)
+	out.EnabledModels = slices.Clone(out.EnabledModels)
+	out.DefaultTools = slices.Clone(out.DefaultTools)
+	out.FullscreenWheelScrollLines = slices.Clone(out.FullscreenWheelScrollLines)
+
 	// Embedded groups: per-field override.
 	out.Compaction = mergeCompaction(user.Compaction, project.Compaction)
 	out.Retry = mergeRetry(user.Retry, project.Retry)
@@ -737,13 +987,13 @@ func MergeSettings(user, project *Settings) *Settings {
 	// Plugins: project shadows user per-key. nil raw value = explicit removal.
 	out.Plugins = make(map[string]json.RawMessage, len(user.Plugins)+len(project.Plugins))
 	for k, v := range user.Plugins {
-		out.Plugins[k] = v
+		out.Plugins[k] = slices.Clone(v)
 	}
 	for k, v := range project.Plugins {
 		if v == nil {
 			delete(out.Plugins, k)
 		} else {
-			out.Plugins[k] = v
+			out.Plugins[k] = slices.Clone(v)
 		}
 	}
 	return &out
@@ -825,6 +1075,15 @@ func mergeCompaction(u, p CompactionSettings) CompactionSettings {
 		}
 		overrides[key] = existing
 	}
+	for key, value := range overrides {
+		if value.ReserveTokens != nil {
+			value.ReserveTokens = new(*value.ReserveTokens)
+		}
+		if value.KeepRecentTokens != nil {
+			value.KeepRecentTokens = new(*value.KeepRecentTokens)
+		}
+		overrides[key] = value
+	}
 	u.ModelOverrides = overrides
 	u.present = mergeSettingsPresence(u.present, p.present)
 
@@ -866,6 +1125,15 @@ func mergeRetry(u, p RetrySettings) RetrySettings {
 		u.Provider.MaxRetryDelayMs = p.Provider.MaxRetryDelayMs
 	}
 	u.present = mergeSettingsPresence(u.present, p.present)
+	if u.Provider.TimeoutMs != nil {
+		u.Provider.TimeoutMs = new(*u.Provider.TimeoutMs)
+	}
+	if u.Provider.MaxRetries != nil {
+		u.Provider.MaxRetries = new(*u.Provider.MaxRetries)
+	}
+	if u.Provider.MaxRetryDelayMs != nil {
+		u.Provider.MaxRetryDelayMs = new(*u.Provider.MaxRetryDelayMs)
+	}
 	return u
 }
 
@@ -894,6 +1162,9 @@ func mergeTerminal(u, p TerminalSettings) TerminalSettings {
 	if p.ClearOnShrink || p.present["clearOnShrink"] != nil {
 		u.ClearOnShrink = p.ClearOnShrink
 	}
+	if u.ShowImages != nil {
+		u.ShowImages = new(*u.ShowImages)
+	}
 	return u
 }
 
@@ -910,6 +1181,9 @@ func mergeImages(u, p ImageSettings) ImageSettings {
 	}
 	if p.BlockImages || p.present["blockImages"] != nil {
 		u.BlockImages = p.BlockImages
+	}
+	if u.AutoResize != nil {
+		u.AutoResize = new(*u.AutoResize)
 	}
 	return u
 }
@@ -945,6 +1219,8 @@ func mergeBash(u, p BashSettings) BashSettings {
 	if p.KillGraceMs != 0 || p.present["killGraceMs"] != nil {
 		u.KillGraceMs = p.KillGraceMs
 	}
+	u.EnvAllowlist = slices.Clone(u.EnvAllowlist)
+	u.EnvExtra = maps.Clone(u.EnvExtra)
 	return u
 }
 
@@ -1009,11 +1285,11 @@ func (s *Settings) ThinkingLevelFor(modelKey string) string {
 
 // prettyJSON reformats compact JSON with 2-space indentation.
 func prettyJSON(data []byte) ([]byte, error) {
-	var any any
-	if err := json.Unmarshal(data, &any); err != nil {
+	var out bytes.Buffer
+	if err := json.Indent(&out, data, "", "  "); err != nil {
 		return nil, err
 	}
-	return json.MarshalIndent(any, "", "  ")
+	return out.Bytes(), nil
 }
 
 func mergeSettingsPresence(base, override map[string]json.RawMessage) map[string]json.RawMessage {

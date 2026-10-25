@@ -209,13 +209,20 @@ func resolveRequestOptions(ctx context.Context, model *Model, opts []Option) ([]
 		headers.Set(name, value)
 	}
 	if cfg != nil && cfg.authHeader {
+		var authorization string
 		if key == "" {
-			key = GetEnvAPIKey(model.Provider)
+			authorization = o.envHeaders(model.Provider)["Authorization"]
+			if authorization == "" {
+				key = o.envAPIKey(model.Provider)
+			}
 		}
-		if key == "" {
+		if key != "" {
+			authorization = "Bearer " + key
+		}
+		if authorization == "" {
 			return nil, errors.New("authHeader requires a resolved API key")
 		}
-		headers.Set("Authorization", "Bearer "+key)
+		headers.Set("Authorization", authorization)
 	}
 	for name, value := range o.headers {
 		headers.Set(name, value)

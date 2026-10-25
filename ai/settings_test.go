@@ -1,15 +1,20 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -617,7 +622,7 @@ func TestSettingsResourcePathsKeepScopeAndRawValues(t *testing.T) {
 	assert.NotContains(t, string(data), userDir)
 	assert.NotContains(t, string(data), projectDir)
 	assert.Contains(t, string(data), "!~/shared/*")
-	assert.Empty(t, MergeSettings(user, load(projectDir, `{"skills":[]}`)).ResourcePaths("skills"))
+	assert.Equal(t, user.ResourcePaths("skills"), MergeSettings(user, load(projectDir, `{"skills":[]}`)).ResourcePaths("skills"))
 }
 
 func TestRetrySettingsSeparateAgentAndProviderLimits(t *testing.T) {
@@ -823,5 +828,382 @@ func TestSettingsValueMarshalKeepsExplicitZeros(t *testing.T) {
 	}
 	if string(byValue) != string(byPointer) || !strings.Contains(string(byValue), `"hideThinkingBlock":false`) {
 		t.Fatalf("value=%s pointer=%s", byValue, byPointer)
+	}
+}
+
+func TestParseSettingsMigratesLegacyShapesBeforeTypedDecode(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, mode string
+		skills            []string
+		commands          bool
+	}{
+		{name: "queue", input: `{"queueMode":"one-at-a-time"}`, mode: "one-at-a-time"},
+		{name: "canonical queue wins", input: `{"queueMode":"all","steeringMode":"one-at-a-time"}`, mode: "one-at-a-time"},
+		{name: "canonical empty queue wins", input: `{"queueMode":"all","steeringMode":""}`},
+		{name: "skills", input: `{"skills":{"enableSkillCommands":true,"customDirectories":["~/skills","!private"]}}`, skills: []string{"~/skills", "!private"}, commands: true},
+		{name: "canonical false commands wins", input: `{"enableSkillCommands":false,"skills":{"enableSkillCommands":true,"customDirectories":["./skills"]}}`, skills: []string{"./skills"}},
+		{name: "empty legacy skills", input: `{"skills":{"enableSkillCommands":false,"customDirectories":[]}}`},
+		{name: "absent legacy directories", input: `{"skills":{"enableSkillCommands":true}}`, commands: true},
+		{name: "nonarray legacy directories", input: `{"skills":{"customDirectories":"ignored"}}`},
+		{name: "modern skills", input: `{"skills":["./skills"],"enableSkillCommands":false}`, skills: []string{"./skills"}},
+	} {
+		for _, bom := range []string{"", "\xef\xbb\xbf"} {
+			t.Run(fmt.Sprintf("%s/BOM=%t", tc.name, bom != ""), func(t *testing.T) {
+				settings, err := ParseSettings([]byte(bom + tc.input))
+				require.NoError(t, err)
+				assert.Equal(t, tc.mode, settings.SteeringMode)
+				assert.Equal(t, tc.skills, settings.Skills)
+				assert.Equal(t, tc.commands, settings.EnableSkillCommands)
+				if !strings.Contains(tc.name, "canonical") {
+					assert.NotContains(t, settings.Plugins, "queueMode")
+				}
+				path := filepath.Join(t.TempDir(), "settings.json")
+				require.NoError(t, SaveSettings(path, settings))
+				reloaded, err := LoadSettings(path)
+				require.NoError(t, err)
+				assert.Equal(t, settings.SteeringMode, reloaded.SteeringMode)
+				assert.Equal(t, settings.Skills, reloaded.Skills)
+				assert.Equal(t, settings.EnableSkillCommands, reloaded.EnableSkillCommands)
+				encoded, err := os.ReadFile(path)
+				require.NoError(t, err)
+				var fields map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal(encoded, &fields))
+				if strings.Contains(tc.input, `"enableSkillCommands":false`) {
+					assert.JSONEq(t, "false", string(fields["enableSkillCommands"]))
+				}
+			})
+		}
+	}
+}
+
+func TestSaveSettingsReplacesFileWithoutTruncatingReaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	original := []byte(`{"theme":"old","extension":{"enabled":true}}`)
+	require.NoError(t, os.WriteFile(path, original, 0o600))
+	reader, err := os.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reader.Close()) })
+	require.NoError(t, SaveSettings(path, &Settings{Theme: "new"}))
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Equal(t, string(original), string(data), "readers admitted before replacement must retain the original file")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
+func TestSettingsFieldUpdatesPreserveUnrelatedJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte("\xef\xbb\xbf"+`{"theme":"old","retry":{"enabled":true,"provider":{"maxRetries":5,"future":9007199254740993}},"models":{"p/m":{"thinkingLevel":"low","future":false}},"extension":{"id":9007199254740993}}`), 0o600))
+	require.NoError(t, UpdateSettings(t.Context(), path, map[string]any{
+		"theme": "", "quietStartup": false, "skills": []string{},
+		"retry":  map[string]any{"provider": map[string]any{"maxRetries": 0}},
+		"models": map[string]any{"p/m": map[string]any{"thinkingLevel": "high"}},
+	}))
+	require.NoError(t, SaveDefaultModel(path, "anthropic/example"))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "9007199254740993")
+	assert.NotContains(t, string(data), "9007199254740992")
+	assert.JSONEq(t, `{"theme":"","quietStartup":false,"skills":[],"retry":{"enabled":true,"provider":{"maxRetries":0,"future":9007199254740993}},"models":{"p/m":{"thinkingLevel":"high","future":false}},"extension":{"id":9007199254740993},"defaultProvider":"anthropic","defaultModel":"example"}`, string(data))
+}
+
+func TestSettingsUpdatesSerializeSameFileWriters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := range 24 {
+		workers.Go(func() {
+			<-start
+			if err := UpdateSettings(t.Context(), path, map[string]any{"extension": map[string]any{fmt.Sprintf("worker%d", i): i}}); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	close(start)
+	workers.Wait()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var saved struct{ Extension map[string]int }
+	require.NoError(t, json.Unmarshal(data, &saved))
+	require.Len(t, saved.Extension, 24)
+	for i := range 24 {
+		assert.Equal(t, i, saved.Extension[fmt.Sprintf("worker%d", i)])
+	}
+}
+
+func TestSettingsUpdateFailureRetainsOriginalFile(t *testing.T) {
+	for _, original := range []string{`{"theme":`, `{"retry":{"enabled":"invalid"}}`, `{"default":"legacy"}`} {
+		t.Run(original, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.json")
+			require.NoError(t, os.WriteFile(path, []byte(original), 0o600))
+			require.Error(t, UpdateSettings(t.Context(), path, map[string]any{"theme": "new"}))
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+			assert.Equal(t, original, string(data))
+		})
+	}
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"theme":"old"}`), 0o600))
+	for _, patch := range []map[string]any{{"retry": map[string]any{"enabled": "invalid"}}, {"theme": make(chan int)}} {
+		require.Error(t, UpdateSettings(t.Context(), path, patch))
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"theme":"old"}`, string(data))
+	}
+	entries, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".settings-*.tmp"))
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestSettingsUpdateErrorNamesTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"theme":`), 0o600))
+	err := UpdateSettings(t.Context(), path, map[string]any{"theme": "new"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), path, "error does not name the file the user must repair")
+}
+
+func TestSettingsUpdateCancellationWhileWaitingForLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"theme":"old"}`), 0o600))
+	lock := flock.New(path + ".lock")
+	require.NoError(t, lock.Lock())
+	t.Cleanup(func() { require.NoError(t, lock.Close()) })
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, UpdateSettings(ctx, path, map[string]any{"theme": "new"}), context.DeadlineExceeded)
+	require.NoError(t, lock.Unlock())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"theme":"old"}`, string(data))
+}
+
+func TestReplaceSettingsCleansUpUncommittedFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"theme":"old"}`), 0o600))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, replaceSettings(ctx, path, []byte(`{"theme":"new"}`)), context.Canceled)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"theme":"old"}`, string(data))
+	entries, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".settings-*.tmp"))
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+	blocked := filepath.Join(t.TempDir(), "directory")
+	require.NoError(t, os.Mkdir(blocked, 0o755))
+	require.Error(t, replaceSettings(t.Context(), blocked, []byte("{}")))
+	entries, err = filepath.Glob(filepath.Join(filepath.Dir(blocked), ".settings-*.tmp"))
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestResourceListsRetainIndependentScopes(t *testing.T) {
+	root := t.TempDir()
+	load := func(scope, contents string) *Settings {
+		t.Helper()
+		dir := filepath.Join(root, scope)
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		path := filepath.Join(dir, "settings.json")
+		require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
+		settings, err := LoadSettings(path)
+		require.NoError(t, err)
+		return settings
+	}
+	user := load("user", `{"skills":["extra"],"prompts":["extra"],"themes":["extra"],"extensions":["extra"]}`)
+	project := load("project", `{"skills":["extra"],"prompts":["extra"],"themes":["extra"],"extensions":["extra"]}`)
+	for _, kind := range []string{"skills", "prompts", "themes", "extensions"} {
+		assert.Equal(t, []string{filepath.Join(root, "project", "extra"), filepath.Join(root, "user", "extra")}, MergeSettings(user, project).ResourcePaths(kind), kind)
+		merged := MergeSettings(user, project)
+		userPaths, projectPaths := merged.ResourcePathsByScope(kind)
+		assert.Equal(t, []string{filepath.Join(root, "user", "extra")}, userPaths)
+		assert.Equal(t, []string{filepath.Join(root, "project", "extra")}, projectPaths)
+		userPaths[0], projectPaths[0] = "mutated-user", "mutated-project"
+		assert.Equal(t, merged.ResourcePaths(kind), MergeSettings(merged, &Settings{}).ResourcePaths(kind))
+		assert.Equal(t, []string{filepath.Join(root, "user", "extra")}, MergeSettings(user, load("empty", `{"skills":[],"prompts":[],"themes":[],"extensions":[]}`)).ResourcePaths(kind), kind)
+	}
+}
+
+func TestPackageSourcePreservesExplicitFiltersAndAutoload(t *testing.T) {
+	for _, raw := range []string{
+		`"./local"`,
+		`{"source":"npm:@scope/package@1","extensions":[],"skills":[],"prompts":[],"themes":[]}`,
+		`{"source":"./local","autoload":false}`,
+		`{"source":"./local","autoload":true,"prompts":["prompts/*","!prompts/private/*","+prompts/keep.md","-prompts/drop.md"]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			settings, err := ParseSettings([]byte(`{"packages":[` + raw + `]}`))
+			require.NoError(t, err)
+			encoded, err := json.Marshal(settings)
+			require.NoError(t, err)
+			var saved map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &saved))
+			assert.JSONEq(t, `[`+raw+`]`, string(saved["packages"]))
+			path := filepath.Join(t.TempDir(), "settings.json")
+			require.NoError(t, SaveSettings(path, settings))
+			loaded, err := LoadSettings(path)
+			require.NoError(t, err)
+			assert.Equal(t, settings.Packages, loaded.Packages)
+		})
+	}
+}
+
+func TestPackageSourceNullFiltersAndReuseReset(t *testing.T) {
+	var source PackageSource
+	require.NoError(t, json.Unmarshal([]byte(`{"source":"./local","autoload":false,"prompts":[]}`), &source))
+	require.NotNil(t, source.Autoload)
+	require.NotNil(t, source.Prompts)
+	require.NoError(t, json.Unmarshal([]byte(`{"source":"./other","autoload":null,"prompts":null}`), &source))
+	assert.Nil(t, source.Autoload)
+	assert.Nil(t, source.Prompts)
+	assert.Equal(t, "./other", source.Source)
+	require.NoError(t, json.Unmarshal([]byte(`"./string"`), &source))
+	assert.Equal(t, PackageSource{Source: "./string"}, source)
+}
+
+func TestSettingsPackageScopesPreserveSourcesAndOwnership(t *testing.T) {
+	load := func(dir, contents string) *Settings {
+		t.Helper()
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		path := filepath.Join(dir, "settings.json")
+		require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
+		s, err := LoadSettings(path)
+		require.NoError(t, err)
+		return s
+	}
+	userDir, projectDir := t.TempDir(), t.TempDir()
+	user := load(userDir, `{"packages":[{"source":"./local","autoload":false,"prompts":[]},"npm:@scope/example@1"]}`)
+	project := load(projectDir, `{"packages":[{"source":"../shared","skills":["+skills/keep"]}]}`)
+	merged := MergeSettings(user, project)
+	u, p := merged.PackageSourcesByScope()
+	assert.Equal(t, userDir, u.BaseDir)
+	assert.Equal(t, projectDir, p.BaseDir)
+	assert.Equal(t, user.Packages, u.Sources)
+	assert.Equal(t, project.Packages, p.Sources)
+	assert.Equal(t, project.Packages, merged.Packages)
+	*u.Sources[0].Autoload = true
+	p.Sources[0].Skills[0] = "mutated"
+	u.Sources[0].Source = "mutated"
+	u, p = merged.PackageSourcesByScope()
+	assert.Equal(t, "./local", u.Sources[0].Source)
+	assert.False(t, *u.Sources[0].Autoload)
+	assert.NotNil(t, u.Sources[0].Prompts)
+	assert.Equal(t, []string{"+skills/keep"}, p.Sources[0].Skills)
+	data, err := json.Marshal(merged)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), userDir)
+	assert.NotContains(t, string(data), projectDir)
+	assert.Contains(t, string(data), "../shared")
+	u, p = MergeSettings(user, load(projectDir, `{"packages":[]}`)).PackageSourcesByScope()
+	assert.Len(t, u.Sources, 2)
+	assert.NotNil(t, p.Sources)
+	assert.Empty(t, p.Sources)
+	u, p = MergeSettings(merged, nil).PackageSourcesByScope()
+	assert.Equal(t, user.Packages, u.Sources)
+	assert.Equal(t, project.Packages, p.Sources)
+}
+
+func TestMergeSettingsOwnsPluginJSON(t *testing.T) {
+	user := &Settings{Plugins: map[string]json.RawMessage{"user": json.RawMessage(`{"value":1}`)}}
+	project := &Settings{Plugins: map[string]json.RawMessage{"project": json.RawMessage(`{"value":2}`)}}
+	merged := MergeSettings(user, project)
+	merged.Plugins["user"][9] = '3'
+	merged.Plugins["project"][9] = '4'
+	assert.JSONEq(t, `{"value":1}`, string(user.Plugins["user"]))
+	assert.JSONEq(t, `{"value":2}`, string(project.Plugins["project"]))
+	user.Plugins["user"][9] = '5'
+	project.Plugins["project"][9] = '6'
+	assert.JSONEq(t, `{"value":3}`, string(merged.Plugins["user"]))
+	assert.JSONEq(t, `{"value":4}`, string(merged.Plugins["project"]))
+}
+
+func TestMergeSettingsOwnsLists(t *testing.T) {
+	for _, scope := range []string{"user", "project"} {
+		t.Run(scope, func(t *testing.T) {
+			source, err := parseSettings([]byte(`{"packages":[{"source":"./extension","extensions":["index.js"],"autoload":true}],"extensions":["extension"],"skills":["skill"],"prompts":["prompt"],"themes":["theme"],"npmCommand":["npm"],"enabledModels":["provider/model"],"defaultTools":["read"],"fullscreenWheelScrollLines":3}`))
+			require.NoError(t, err)
+			before, err := json.Marshal(source)
+			require.NoError(t, err)
+			var merged *Settings
+			if scope == "user" {
+				merged = MergeSettings(source, nil)
+			} else {
+				merged = MergeSettings(nil, source)
+			}
+			for _, list := range [][]string{merged.Extensions, merged.Skills, merged.Prompts, merged.Themes, merged.NPMCommand, merged.EnabledModels, merged.DefaultTools} {
+				list[0] = "changed"
+			}
+			merged.Packages[0].Source = "changed"
+			merged.Packages[0].Extensions[0] = "changed.js"
+			*merged.Packages[0].Autoload = false
+			merged.FullscreenWheelScrollLines[0] = '7'
+			after, err := json.Marshal(source)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after))
+		})
+	}
+}
+
+func TestMergeSettingsOwnsNestedRuntimeGroups(t *testing.T) {
+	for _, scope := range []string{"user", "project"} {
+		t.Run(scope, func(t *testing.T) {
+			source, err := parseSettings([]byte(`{"bash":{"envAllowlist":["HOME"],"envExtra":{"MODE":"safe"}},"terminal":{"showImages":true},"images":{"autoResize":true},"retry":{"provider":{"timeoutMs":10,"maxRetries":2,"maxRetryDelayMs":20}},"compaction":{"modelOverrides":{"p/m":{"reserveTokens":30,"keepRecentTokens":40}}}}`))
+			require.NoError(t, err)
+			before, err := json.Marshal(source)
+			require.NoError(t, err)
+			var merged *Settings
+			if scope == "user" {
+				merged = MergeSettings(source, nil)
+			} else {
+				merged = MergeSettings(nil, source)
+			}
+			merged.Bash.EnvAllowlist[0] = "OTHER"
+			merged.Bash.EnvExtra["MODE"] = "unsafe"
+			*merged.Terminal.ShowImages = false
+			*merged.Images.AutoResize = false
+			*merged.Retry.Provider.TimeoutMs = 99
+			*merged.Retry.Provider.MaxRetries = 99
+			*merged.Retry.Provider.MaxRetryDelayMs = 99
+			override := merged.Compaction.ModelOverrides["p/m"]
+			*override.ReserveTokens = 99
+			*override.KeepRecentTokens = 99
+			after, err := json.Marshal(source)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after))
+		})
+	}
+}
+
+func TestSettingsWritesPreserveCancellationCause(t *testing.T) {
+	for _, operation := range []string{"update", "replace", "lock wait"} {
+		t.Run(operation, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.json")
+			original := []byte(`{"theme":"original"}`)
+			require.NoError(t, os.WriteFile(path, original, 0o600))
+			cause := errors.New("settings canceled by caller")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			if operation == "lock wait" {
+				lock := flock.New(path + ".lock")
+				require.NoError(t, lock.Lock())
+				defer func() { require.NoError(t, lock.Close()) }()
+				cancel(cause)
+				var stop context.CancelFunc
+				ctx, stop = context.WithTimeoutCause(t.Context(), time.Millisecond, cause)
+				defer stop()
+			} else {
+				cancel(cause)
+			}
+			var err error
+			if operation == "replace" {
+				err = replaceSettings(ctx, path, []byte(`{"theme":"new"}`))
+			} else {
+				err = UpdateSettings(ctx, path, map[string]any{"theme": "new"})
+			}
+			require.ErrorIs(t, err, cause)
+			got, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, original, got)
+		})
 	}
 }

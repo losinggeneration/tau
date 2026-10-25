@@ -235,17 +235,25 @@ func streamBedrockEvents(ctx context.Context, model *Model, events <-chan bedroc
 }
 
 func newBedrockRuntimeClient(ctx context.Context, o *options) (*bedrockruntime.Client, error) {
-	loadOptions := make([]func(*awsconfig.LoadOptions) error, 0, 2)
-	if region := resolveBedrockRegion(o); region != "" {
-		loadOptions = append(loadOptions, awsconfig.WithRegion(region))
-	}
-	if o != nil && o.bedrockProfile != "" {
-		loadOptions = append(loadOptions, awsconfig.WithSharedConfigProfile(o.bedrockProfile))
-	}
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("bedrock: load config: %w", err)
+	var cfg aws.Config
+	if o != nil && o.noEnvCredentials {
+		if resolveBedrockBearerToken(o) == "" {
+			return nil, errors.New("bedrock: ambient credentials disabled; supply an explicit bearer token")
+		}
+		cfg = aws.Config{Region: resolveBedrockRegion(o), Credentials: aws.AnonymousCredentials{}}
+	} else {
+		loadOptions := make([]func(*awsconfig.LoadOptions) error, 0, 2)
+		if region := resolveBedrockRegion(o); region != "" {
+			loadOptions = append(loadOptions, awsconfig.WithRegion(region))
+		}
+		if o != nil && o.bedrockProfile != "" {
+			loadOptions = append(loadOptions, awsconfig.WithSharedConfigProfile(o.bedrockProfile))
+		}
+		var err error
+		cfg, err = awsconfig.LoadDefaultConfig(ctx, loadOptions...)
+		if err != nil {
+			return nil, fmt.Errorf("bedrock: load config: %w", err)
+		}
 	}
 
 	client := bedrockruntime.NewFromConfig(cfg, func(options *bedrockruntime.Options) {
@@ -256,7 +264,7 @@ func newBedrockRuntimeClient(ctx context.Context, o *options) (*bedrockruntime.C
 			options.RetryMaxAttempts = *o.maxRetries + 1
 		}
 		transport := http.DefaultTransport
-		if len(o.headers) > 0 || o.bedrockBearerToken != "" {
+		if len(o.headers) > 0 || resolveBedrockBearerToken(o) != "" {
 			transport = &bedrockHeaderRoundTripper{
 				base:        transport,
 				headers:     cloneStringMap(o.headers),
@@ -290,6 +298,14 @@ func resolveBedrockRegion(o *options) string {
 func resolveBedrockBearerToken(o *options) string {
 	if o != nil && o.bedrockBearerToken != "" {
 		return o.bedrockBearerToken
+	}
+	if o != nil {
+		if o.apiKey != "" && o.apiKey != "<authenticated>" {
+			return o.apiKey
+		}
+		if o.noEnvCredentials {
+			return ""
+		}
 	}
 	return os.Getenv("AWS_BEARER_TOKEN_BEDROCK")
 }

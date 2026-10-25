@@ -826,3 +826,15 @@ func TestOperationModelLookupRetainsIndependentDefinitions(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAnthropicBearerEnvironmentIsDiscoverable(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-secret")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	if key := GetEnvAPIKey(ProviderAnthropic); key != "" {
+		t.Fatal("bearer token must not be returned as an API key")
+	}
+	if _, ok := AuthenticatedProviderSet(t.Context(), nil)[ProviderAnthropic]; !ok {
+		t.Error("bearer-only provider missing from authenticated providers")
+	}
+}

@@ -63,7 +63,7 @@ func (c *azureClient) Stream(ctx context.Context, model *Model, prompt *Context,
 
 	apiKey := o.apiKey
 	if apiKey == "" {
-		apiKey = os.Getenv("AZURE_OPENAI_API_KEY")
+		apiKey = o.envAPIKey(ProviderAzureOpenAI)
 		if apiKey == "" {
 			return errors.New("azure openai: missing API key (set AZURE_OPENAI_API_KEY)")
 		}

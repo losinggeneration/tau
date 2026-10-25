@@ -226,7 +226,8 @@ func openStore() (*store.FileBackend, error) {
 	return fb, nil
 }
 
-// reloadSession reloads settings, artifacts, plugins, and tools for /reload.
+// reloadSession reloads settings, artifacts, plugins, tools, and the system
+// prompt for /reload.
 // Settings files, artifact discovery, and session settings are validated
 // before anything is replaced, so those failures leave the previous state.
 // Plugin restarts happen after that commit and report their own failures.
@@ -271,6 +272,11 @@ func reloadSession(ctx context.Context, plugin string, sess commands.CommandSess
 	if reloader, ok := sess.(sdk.ToolRegistryReloader); ok {
 		if err := reloader.ReloadToolRegistry(ctx); err != nil {
 			return commands.Result{}, fmt.Errorf("reload tool registry: %w", err)
+		}
+	}
+	if reloader, ok := sess.(sdk.SystemPromptReloader); ok {
+		if err := reloader.ReloadSystemPrompt(ctx); err != nil {
+			return commands.Result{}, fmt.Errorf("reload system prompt: %w", err)
 		}
 	}
 	output := "reloaded settings, artifacts, and plugins"

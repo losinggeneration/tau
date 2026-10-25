@@ -22,16 +22,12 @@ const (
 
 // mistralClient is the provider-specific client for Mistral.
 type mistralClient struct {
-	model  *Model
-	apiKey string
+	model *Model
 }
 
 // newMistralClient creates a new Mistral client.
 func newMistralClient(model *Model) (*mistralClient, error) {
-	return &mistralClient{
-		model:  model,
-		apiKey: getEnv("MISTRAL_API_KEY"),
-	}, nil
+	return &mistralClient{model: model}, nil
 }
 
 // Complete implements Client.
@@ -54,7 +50,7 @@ func (c *mistralClient) Stream(ctx context.Context, model *Model, prompt *Contex
 	cfg := applyOptions(opts)
 	apiKey := cfg.apiKey
 	if apiKey == "" {
-		apiKey = c.apiKey
+		apiKey = cfg.envAPIKey(ProviderMistral)
 	}
 	if apiKey == "" {
 		return fmt.Errorf("mistral: missing API key (set MISTRAL_API_KEY)")

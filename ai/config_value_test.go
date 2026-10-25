@@ -181,3 +181,39 @@ func TestConfigValueResolverReportsEveryMissingVariable(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestConfiguredAuthHeaderUsesEnvironmentBearer(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "oauth")
+	t.Setenv("ANTHROPIC_API_KEY", "environment-key")
+	model := &Model{Provider: ProviderAnthropic, requestConfig: &modelRequestConfig{authHeader: true, resolver: &configValueResolver{}}}
+	resolved, err := resolveRequestOptions(t.Context(), model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := applyOptions(resolved)
+	if o.apiKey != "" || o.headers["Authorization"] != "Bearer bearer" {
+		t.Errorf("expected header-owned bearer authentication, got key %q and headers %v", o.apiKey, o.headers)
+	}
+}
+
+func TestRequestConfigEnvOptOutKeepsExplicitReferences(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "ambient-bearer")
+	t.Setenv("ANTHROPIC_API_KEY", "ambient-key")
+	t.Setenv("TAU_CONFIGURED_SECRET", "configured-key")
+	model := &Model{Provider: ProviderAnthropic, requestConfig: &modelRequestConfig{authHeader: true, resolver: &configValueResolver{}}}
+	_, err := resolveRequestOptions(t.Context(), model, []Option{WithoutEnvCredentials()})
+	if err == nil || strings.Contains(err.Error(), "ambient-") {
+		t.Fatalf("authHeader must not fall through to environment: %v", err)
+	}
+	model.requestConfig.apiKey = "$TAU_CONFIGURED_SECRET"
+	model.Headers = map[string]string{"X-Configured": "${TAU_CONFIGURED_SECRET}"}
+	resolved, err := resolveRequestOptions(t.Context(), model, []Option{WithoutEnvCredentials()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := applyOptions(resolved)
+	if !o.noEnvCredentials || o.apiKey != "configured-key" || o.headers["Authorization"] != "Bearer configured-key" || o.headers["X-Configured"] != "configured-key" {
+		t.Fatal("explicit configured references or opt-out were lost")
+	}
+}

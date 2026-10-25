@@ -2,6 +2,8 @@ package ai
 
 import (
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -410,5 +412,78 @@ func TestGetEnvAPIKeyConsultsAtCallTime(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "set-after-unset")
 	if got := GetEnvAPIKey(ProviderDeepSeek); got != "set-after-unset" {
 		t.Errorf("expected 'set-after-unset', got %q", got)
+	}
+}
+
+func TestAnthropicBearerEnvironmentDiscoveryAndResolutionStaySeparate(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "oauth")
+	t.Setenv("ANTHROPIC_API_KEY", "key")
+	if EnvAPIKeys["ANTHROPIC_AUTH_TOKEN"] != ProviderAnthropic {
+		t.Error("bearer variable missing from credential inventory")
+	}
+	if names := envVarNames(ProviderAnthropic); len(names) != 3 || names[0] != "ANTHROPIC_AUTH_TOKEN" {
+		t.Errorf("unexpected discovery order: %v", names)
+	}
+	if key := GetEnvAPIKey(ProviderAnthropic); key != "oauth" {
+		t.Errorf("API-key helper must skip bearer auth, got %q", key)
+	}
+	headers := GetEnvHeaders(ProviderAnthropic)
+	headers["Authorization"] = "mutated"
+	if GetEnvHeaders(ProviderAnthropic)["Authorization"] != "Bearer bearer" {
+		t.Error("environment header result retained caller mutation")
+	}
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	if HasEnvCredentials(ProviderAnthropic) || len(GetEnvHeaders(ProviderAnthropic)) != 0 {
+		t.Error("cleared credentials remained cached")
+	}
+}
+
+func TestVertexADCDiscoveryTracksCurrentPathAndFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	if HasVertexADC() {
+		t.Fatal("unexpected ADC in empty home")
+	}
+	path := filepath.Join(home, "adc.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path)
+	if !HasVertexADC() {
+		t.Fatal("newly configured ADC was hidden by stale discovery")
+	}
+	var workers sync.WaitGroup
+	for range 16 {
+		workers.Go(func() {
+			if !HasVertexADC() {
+				t.Error("concurrent ADC discovery failed")
+			}
+		})
+	}
+	workers.Wait()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if HasVertexADC() {
+		t.Fatal("removed ADC remained available")
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	defaultPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+	if err := os.MkdirAll(filepath.Dir(defaultPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaultPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !HasVertexADC() {
+		t.Fatal("new default ADC was not discovered")
+	}
+	t.Setenv("HOME", t.TempDir())
+	if HasVertexADC() {
+		t.Fatal("ADC discovery retained the previous home")
 	}
 }

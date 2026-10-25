@@ -142,7 +142,7 @@ func (c *codexClient) Stream(ctx context.Context, model *Model, prompt *Context,
 
 	apiKey := o.apiKey
 	if apiKey == "" {
-		apiKey = GetEnvAPIKey(model.Provider)
+		apiKey = o.envAPIKey(model.Provider)
 		if apiKey == "" {
 			return errors.New("openai codex: missing API key")
 		}

@@ -10961,3 +10961,64 @@ func TestTriggeredCustomMessageOutlivesCallerContext(t *testing.T) {
 	assert.Equal(t, agent.RoleAssistant, last.Role)
 	assert.NotEqual(t, ai.StopReasonAborted, last.StopReason)
 }
+
+func TestReloadSystemPromptRereadsContextFilesAcrossCompactionAndResume(t *testing.T) {
+	provider, model := registerRecordingProvider(t, "reply")
+	cwd := t.TempDir()
+	agentsPath := filepath.Join(cwd, "AGENTS.md")
+	require.NoError(t, os.WriteFile(agentsPath, []byte("MARKER_ONE"), 0o644))
+	rt, err := NewRuntime(RuntimeOptions{Settings: compactAllSettings(), SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	send := func(sess Session) string {
+		t.Helper()
+		events, err := sess.Send(t.Context(), Message{Text: "hi"})
+		require.NoError(t, err)
+		collectSessionEvents(t, events)
+		return provider.LastPrompt().SystemPrompt
+	}
+
+	// A reload before the first message rewrites the pending baseline in place.
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(agentsPath, []byte("MARKER_PENDING"), 0o644))
+	require.NoError(t, sess.(SystemPromptReloader).ReloadSystemPrompt(t.Context()))
+	prompt := send(sess)
+	assert.Contains(t, prompt, "MARKER_PENDING")
+	assert.NotContains(t, prompt, "MARKER_ONE")
+
+	require.NoError(t, os.WriteFile(agentsPath, []byte("MARKER_TWO"), 0o644))
+	assert.Contains(t, send(sess), "MARKER_PENDING", "context files are read once per session until /reload")
+	require.NoError(t, sess.(SystemPromptReloader).ReloadSystemPrompt(t.Context()))
+	concrete := sess.(*agentSession)
+	entries := len(sessionEntries(mustReadSession(t, concrete)))
+	require.NoError(t, sess.(SystemPromptReloader).ReloadSystemPrompt(t.Context()))
+	assert.Len(t, sessionEntries(mustReadSession(t, concrete)), entries, "an unchanged prompt appends nothing")
+	assert.Empty(t, slices.DeleteFunc(concrete.GetMessages(), func(m Message) bool { return m.Role != string(agent.RoleSystem) }), "reloaded baselines stay hidden")
+
+	require.NoError(t, sess.Compact(t.Context()))
+	prompt = send(sess)
+	assert.NotContains(t, prompt, "MARKER_PENDING")
+	require.Contains(t, prompt, "MARKER_TWO")
+	require.Contains(t, prompt, "Session Summary:")
+	assert.Less(t, strings.Index(prompt, "MARKER_TWO"), strings.Index(prompt, "Session Summary:"), "the prompt stays ahead of the summary")
+
+	id := sess.ID()
+	require.NoError(t, sess.Close(t.Context()))
+	require.NoError(t, os.WriteFile(agentsPath, []byte("MARKER_THREE"), 0o644))
+	resumed, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, SessionID: id})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resumed.Close(t.Context())) })
+	assert.Equal(t, prompt, ai.CurrentSystemPrompt(agent.ConvertMessagesToAI(resumed.(*agentSession).agent.Messages())), "resume replays the reloaded prompt")
+	require.NoError(t, resumed.(SystemPromptReloader).ReloadSystemPrompt(t.Context()))
+	prompt = send(resumed)
+	assert.Contains(t, prompt, "MARKER_THREE")
+	assert.NotContains(t, prompt, "MARKER_TWO")
+}
+
+func mustReadSession(t *testing.T, s *agentSession) *sessionpkg.Reader {
+	t.Helper()
+	reader, err := sessionpkg.ReadFile(s.sessionWriter.Path())
+	require.NoError(t, err)
+	return reader
+}

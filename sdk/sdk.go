@@ -1915,7 +1915,7 @@ func (s *agentSession) compact(ctx context.Context, trigger compactionTrigger, i
 		}
 	}
 	replacement = append(replacement, summaryMsg)
-	s.agent.ReplaceMessages(append(replacement, keptMessages...))
+	s.agent.ReplaceMessages(collapseSystemBaselines(append(replacement, keptMessages...)))
 
 	// Fire `compaction_end` (informational) so plugins can observe the
 	// successful compaction outcome.
@@ -2791,6 +2791,89 @@ func (s *agentSession) ReloadToolRegistry(ctx context.Context) error {
 	s.agent.SetTools(tools...)
 	s.runtime.syncPluginVirtualModels()
 	return nil
+}
+
+// SystemPromptReloader rebuilds an idle session's system prompt from disk.
+type SystemPromptReloader interface {
+	ReloadSystemPrompt(context.Context) error
+}
+
+// ReloadSystemPrompt re-reads SYSTEM.md, the context files, and the skills
+// catalog. A changed prompt is recorded as a later baseline that
+// collapseSystemBaselines folds into the first one on every restore.
+func (s *agentSession) ReloadSystemPrompt(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("session closed")
+	}
+	if s.runDone != nil || s.agent.State().IsStreaming {
+		return errors.New("cannot reload system prompt while session is processing")
+	}
+	prompt := s.runtime.buildSystemPrompt(s.cwd, s.artifactLoader, s.systemPromptOverride, s.appendSystemPrompts, s.logger)
+	messages := s.agent.Messages()
+	if first := slices.IndexFunc(messages, isInitialSystemBaseline); first >= 0 && agentMessageText(messages[first]) == prompt {
+		return nil
+	}
+	content := []ai.ContentBlock{{Type: ai.ContentBlockText, Text: prompt}}
+	if pending := s.pendingInitialTranscript; pending != nil {
+		baseline := *pending
+		baseline.Content = content
+		s.pendingInitialTranscript = &baseline
+		if i := slices.Index(messages, pending); i >= 0 {
+			messages[i] = &baseline
+			s.agent.ReplaceMessages(messages)
+			return nil
+		}
+	}
+	replacement := &agent.Message{Role: agent.RoleSystem, Timestamp: time.UnixMilli(0), Content: content}
+	if s.sessionWriter != nil && s.pendingInitialTranscript == nil {
+		data, err := marshalSessionMessageEnvelope(replacement)
+		if err != nil {
+			return fmt.Errorf("marshal system prompt: %w", err)
+		}
+		entry := sessionpkg.NewMessageEntry(s.parentMsgID, data, nil)
+		if err := s.sessionWriter.Append(entry); err != nil {
+			return fmt.Errorf("append system prompt: %w", err)
+		}
+		s.parentMsgID = &entry.ID
+	}
+	s.agent.ReplaceMessages(collapseSystemBaselines(append(messages, replacement)))
+	return nil
+}
+
+// collapseSystemBaselines applies system prompt reloads: the last baseline
+// with text supplies the first baseline's text, keeping the prompt ahead of
+// compaction summaries, and the later baselines keep only their declarations.
+func collapseSystemBaselines(messages []*agent.Message) []*agent.Message {
+	var indexes []int
+	for i, message := range messages {
+		if isInitialSystemBaseline(message) && !message.ExcludeFromContext {
+			indexes = append(indexes, i)
+		}
+	}
+	if len(indexes) < 2 {
+		return messages
+	}
+	var content []ai.ContentBlock
+	for _, i := range indexes {
+		if len(messages[i].Content) > 0 {
+			content = messages[i].Content
+		}
+	}
+	out := slices.Clone(messages)
+	for n, i := range indexes {
+		collapsed := *messages[i]
+		collapsed.Content = nil
+		if n == 0 {
+			collapsed.Content = content
+		}
+		out[i] = &collapsed
+	}
+	return out
 }
 
 // SettingsReloader updates an idle session after settings files are reloaded.
@@ -5487,71 +5570,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		loader = GlobalArtifactLoader
 	}
 
-	var addendumParts []string
-	addendumParts = append(addendumParts, fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd))
-	if !r.noContextFiles {
-		contextAddendum, err := buildContextFileAddendum(paths.ConfigDir(), cwd)
-		if err != nil {
-			sessionLogger.Warn("context files", "error", err)
-		}
-		if contextAddendum != "" {
-			addendumParts = append(addendumParts, contextAddendum)
-		}
-	}
-	if loader != nil {
-		if reg := loader.SkillRegistry(); reg != nil {
-			if catalog := artifacts.FormatSkillsCatalog(reg.List()); catalog != "" {
-				addendumParts = append(addendumParts, catalog)
-			}
-		}
-	}
-
-	// Inject preloaded skills (ID-based, not path-based).
-	// PreloadSkills are resolved from the registry after discovery is complete.
-	if loader != nil && len(r.preloadSkills) > 0 {
-		if reg := loader.SkillRegistry(); reg != nil {
-			for _, skillID := range r.preloadSkills {
-				if skill, found := reg.Get(skillID); found {
-					// Format as <skill> block per spec, with references note and body.
-					skillBlock := fmt.Sprintf("<skill name=%q location=%q>\nReferences are relative to %s.\n\n%s</skill>",
-						skill.ID, skill.SourcePath, skill.BaseDir, skill.Body)
-					addendumParts = append(addendumParts, skillBlock)
-				}
-			}
-		}
-	}
-
-	if len(addendumParts) > 0 {
-		agentCfg.SystemAddendum = strings.Join(addendumParts, "\n\n")
-	}
-
-	// SYSTEM.md overrides the system prompt; APPEND_SYSTEM.md is appended.
-	// Both lookups respect <cwd>/.tau first then the user config dir.
-	if sys, sErr := loadSystemPrompt(paths.ConfigDir(), cwd); sErr == nil && sys != "" {
-		agentCfg.SystemPrompt = sys
-	}
-	if appendSys, aErr := loadAppendSystemPrompt(paths.ConfigDir(), cwd); aErr == nil && appendSys != "" {
-		if agentCfg.SystemAddendum != "" {
-			agentCfg.SystemAddendum += "\n\n"
-		}
-		agentCfg.SystemAddendum += appendSys
-	}
-
-	// SessionOptions.SystemPrompt is the explicit CLI override and wins over
-	// every file-loaded default. AppendSystemPrompts stack after the resolved
-	// prompt in order; empty entries are skipped.
-	if opts.SystemPrompt != "" {
-		agentCfg.SystemPrompt = opts.SystemPrompt
-	}
-	for _, p := range opts.AppendSystemPrompts {
-		if p == "" {
-			continue
-		}
-		if agentCfg.SystemAddendum != "" {
-			agentCfg.SystemAddendum += "\n\n"
-		}
-		agentCfg.SystemAddendum += p
-	}
+	agentCfg.SystemPrompt = r.buildSystemPrompt(cwd, loader, opts.SystemPrompt, opts.AppendSystemPrompts, sessionLogger)
 
 	sessionID := opts.SessionID
 	requestedSessionID := opts.SessionID
@@ -5827,15 +5846,6 @@ agentCreation:
 	// the model is resolved.
 	agentCfg.Capabilities = capabilities
 
-	if len(agentCfg.InitialMessages) == 0 || agentCfg.InitialMessages[0] == nil || agentCfg.InitialMessages[0].Role != agent.RoleSystem || agentCfg.InitialMessages[0].ExcludeFromContext {
-		if agentCfg.SystemAddendum != "" {
-			if agentCfg.SystemPrompt != "" {
-				agentCfg.SystemPrompt += "\n\n"
-			}
-			agentCfg.SystemPrompt += agentCfg.SystemAddendum
-		}
-	}
-	agentCfg.SystemAddendum = ""
 	if !r.noTools && !r.noBuiltinTools {
 		agentCfg.Tools = restoreDeclaredBuiltinTools(agentCfg.Tools, agentCfg.InitialMessages, settings, opts.ToolAllowlist, opts.ToolDenylist)
 	}
@@ -6376,6 +6386,55 @@ func canonicalPath(path string) string {
 	return path
 }
 
+// buildSystemPrompt resolves the session system prompt from SYSTEM.md, the
+// context files, the skills catalog, preloaded skills, APPEND_SYSTEM.md, and
+// the explicit overrides, reading every source from disk on each call.
+func (r *runtime) buildSystemPrompt(cwd string, loader ArtifactLoader, override string, appends []string, logger *slog.Logger) string {
+	addendumParts := []string{fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd)}
+	if !r.noContextFiles {
+		contextAddendum, err := buildContextFileAddendum(paths.ConfigDir(), cwd)
+		if err != nil {
+			logger.Warn("context files", "error", err)
+		}
+		if contextAddendum != "" {
+			addendumParts = append(addendumParts, contextAddendum)
+		}
+	}
+	if loader != nil {
+		if reg := loader.SkillRegistry(); reg != nil {
+			if catalog := artifacts.FormatSkillsCatalog(reg.List()); catalog != "" {
+				addendumParts = append(addendumParts, catalog)
+			}
+			for _, skillID := range r.preloadSkills {
+				if skill, found := reg.Get(skillID); found {
+					addendumParts = append(addendumParts, fmt.Sprintf("<skill name=%q location=%q>\nReferences are relative to %s.\n\n%s</skill>",
+						skill.ID, skill.SourcePath, skill.BaseDir, skill.Body))
+				}
+			}
+		}
+	}
+	if appendSys, err := loadAppendSystemPrompt(paths.ConfigDir(), cwd); err == nil && appendSys != "" {
+		addendumParts = append(addendumParts, appendSys)
+	}
+	for _, p := range appends {
+		if p != "" {
+			addendumParts = append(addendumParts, p)
+		}
+	}
+
+	var prompt string
+	if sys, err := loadSystemPrompt(paths.ConfigDir(), cwd); err == nil && sys != "" {
+		prompt = sys
+	}
+	if override != "" {
+		prompt = override
+	}
+	if prompt != "" {
+		prompt += "\n\n"
+	}
+	return prompt + strings.Join(addendumParts, "\n\n")
+}
+
 // loadSystemPrompt reads SYSTEM.md from <cwd>/.tau first, then
 // ~/.tau/agent. First-wins. The path used is reported alongside the body
 // so callers can show provenance.
@@ -6494,7 +6553,7 @@ func sessionMessagesToAgentMessages(sessionMsgs []*sessionpkg.Message) []*agent.
 			Timestamp:             sm.Timestamp,
 		})
 	}
-	return messages
+	return collapseSystemBaselines(messages)
 }
 
 func sessionEntries(reader *sessionpkg.Reader) []sessionpkg.Entry {

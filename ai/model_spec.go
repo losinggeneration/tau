@@ -432,7 +432,7 @@ func buildModelPatternCandidates(settings *Settings) []modelPatternCandidate {
 	}
 
 	for _, provider := range ListProviders() {
-		if GetEnvAPIKey(provider) == "" {
+		if !HasEnvCredentials(provider) {
 			continue
 		}
 		for _, model := range ListAvailableModels(provider) {
@@ -755,7 +755,7 @@ func buildAllAvailableModelSpecs() []ModelSpec {
 	// Add from configured settings (would need Settings passed in, so skip for now)
 	// Add from environment-backed models
 	for _, provider := range ListProviders() {
-		if GetEnvAPIKey(provider) == "" {
+		if !HasEnvCredentials(provider) {
 			continue
 		}
 		for _, model := range ListAvailableModels(provider) {

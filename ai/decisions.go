@@ -73,7 +73,7 @@ func Classify(ctx context.Context, model *Model, input ClassifierContext, opts .
 	cfg := applyOptions(opts)
 	key := cfg.apiKey
 	if key == "" {
-		key = GetEnvAPIKey(model.Provider)
+		key = cfg.envAPIKey(model.Provider)
 	}
 	if key == "" && model.Provider == ProviderLlamaCpp {
 		// llama-server accepts any key unless started with --api-key.

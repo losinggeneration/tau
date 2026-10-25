@@ -15,16 +15,12 @@ import (
 
 // googleClient is the provider-specific client for Google Generative AI.
 type googleClient struct {
-	model  *Model
-	apiKey string
+	model *Model
 }
 
 // newGoogleClient creates a new Google Generative AI client.
 func newGoogleClient(model *Model) (*googleClient, error) {
-	return &googleClient{
-		model:  model,
-		apiKey: getEnv("GEMINI_API_KEY"),
-	}, nil
+	return &googleClient{model: model}, nil
 }
 
 // Complete implements Client.
@@ -47,7 +43,7 @@ func (c *googleClient) Stream(ctx context.Context, model *Model, prompt *Context
 	cfg := applyOptions(opts)
 	apiKey := cfg.apiKey
 	if apiKey == "" {
-		apiKey = c.apiKey
+		apiKey = cfg.envAPIKey(ProviderGoogle)
 	}
 	if apiKey == "" {
 		return fmt.Errorf("google: missing API key (set GEMINI_API_KEY)")

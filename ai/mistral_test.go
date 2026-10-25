@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestMistralToolMessageConversion(t *testing.T) {
@@ -315,10 +317,8 @@ func TestMistralStreamWithServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &mistralClient{
-		model:  &Model{ID: "test-model", Provider: ProviderMistral},
-		apiKey: "test-key",
-	}
+	t.Setenv("MISTRAL_API_KEY", "test-key")
+	client := &mistralClient{model: &Model{ID: "test-model", Provider: ProviderMistral}}
 
 	_, err := client.Complete(context.Background(), &Model{ID: "test", BaseURL: server.URL}, &Context{
 		Messages: []Message{{Role: "user", Content: "test"}},
@@ -368,7 +368,8 @@ func TestMistralHeaderTimeoutDoesNotLimitBody(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client := &mistralClient{apiKey: "key"}
+	t.Setenv("MISTRAL_API_KEY", "key")
+	client := &mistralClient{}
 	var final StreamEvent
 	err := client.Stream(context.Background(), &Model{ID: "test", BaseURL: server.URL}, &Context{}, func(_ context.Context, event StreamEvent) { final = event }, WithTimeout(20*time.Millisecond))
 	if err != nil {
@@ -410,7 +411,8 @@ func TestMistralTimeoutFinishAndCancellationOutcomes(t *testing.T) {
 	}))
 	defer server.Close()
 	defer close(stall)
-	client := &mistralClient{apiKey: "key"}
+	t.Setenv("MISTRAL_API_KEY", "key")
+	client := &mistralClient{}
 	prompt := &Context{Messages: []Message{{Role: "user", Content: "hi"}}}
 
 	err := client.Stream(t.Context(), &Model{ID: "m", BaseURL: server.URL + "/slow"}, prompt, func(context.Context, StreamEvent) {}, WithTimeout(20*time.Millisecond))
@@ -478,11 +480,33 @@ func TestMistralExplicitZeroDisablesHeaderTimeout(t *testing.T) {
 	})}
 	t.Cleanup(func() { http.DefaultClient = previous })
 	var final StreamEvent
-	err := (&mistralClient{apiKey: "key"}).Stream(t.Context(), &Model{ID: "test", BaseURL: "https://test.invalid"}, &Context{}, func(_ context.Context, event StreamEvent) { final = event }, WithTimeout(0))
+	t.Setenv("MISTRAL_API_KEY", "key")
+	err := (&mistralClient{}).Stream(t.Context(), &Model{ID: "test", BaseURL: "https://test.invalid"}, &Context{}, func(_ context.Context, event StreamEvent) { final = event }, WithTimeout(0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := final.(Done); !ok {
 		t.Fatalf("terminal=%#v", final)
 	}
+}
+
+func TestMistralCredentialsResolveAtEachRequest(t *testing.T) {
+	t.Setenv("MISTRAL_API_KEY", "old-key")
+	model := &Model{ID: "mistral-test", Provider: ProviderMistral, API: APIMistralConversations, BaseURL: "https://test.invalid"}
+	client, err := newMistralClient(model)
+	require.NoError(t, err)
+	var requests int
+	previous := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		require.Equal(t, "Bearer new-key", req.Header.Get("Authorization"))
+		return nil, errors.New("isolated request")
+	})}
+	t.Cleanup(func() { http.DefaultClient = previous })
+	t.Setenv("MISTRAL_API_KEY", "new-key")
+	require.ErrorContains(t, client.Stream(t.Context(), model, &Context{}, func(context.Context, StreamEvent) {}, WithMaxRetries(0)), "isolated request")
+	require.Equal(t, 1, requests)
+	t.Setenv("MISTRAL_API_KEY", "")
+	require.ErrorContains(t, client.Stream(t.Context(), model, &Context{}, func(context.Context, StreamEvent) {}, WithMaxRetries(0)), "missing API key")
+	require.Equal(t, 1, requests)
 }

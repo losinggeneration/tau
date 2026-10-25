@@ -35,7 +35,8 @@ func TestDebugMistralStream(t *testing.T) {
 		t.Logf("Choice %d: Delta.Content = %+v (type: %T)", i, choice.Delta.Content, choice.Delta.Content)
 	}
 
-	client := &mistralClient{apiKey: "test-key"}
+	t.Setenv("MISTRAL_API_KEY", "test-key")
+	client := &mistralClient{}
 
 	var events []StreamEvent
 	err := client.Stream(context.Background(), &Model{ID: "test", BaseURL: server.URL, Provider: ProviderMistral}, &Context{

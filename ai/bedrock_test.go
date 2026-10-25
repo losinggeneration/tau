@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"reflect"
 	"strings"
@@ -11,7 +12,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/stretchr/testify/require"
 )
 
 // TestBedrockModelMetadata verifies Bedrock models have correct metadata.
@@ -678,4 +681,27 @@ func TestBedrockSharedThinkingBudgetRequestAndOverrides(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBedrockEnvOptOutUsesExplicitBearerWithoutAmbientConfig(t *testing.T) {
+	t.Setenv("AWS_PROFILE", "nonexistent-profile")
+	t.Setenv("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+	var requests int
+	previous := http.DefaultTransport
+	http.DefaultTransport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		require.Equal(t, "Bearer explicit-token", req.Header.Get("Authorization"))
+		require.Empty(t, req.Header.Get("X-Amz-Security-Token"))
+		require.Empty(t, req.Header.Get("X-Amz-Date"))
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"message":"synthetic rejection"}`))}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	for _, auth := range []Option{WithAPIKey("explicit-token"), WithBedrockBearerToken("explicit-token")} {
+		o := applyOptions([]Option{WithoutEnvCredentials(), auth, WithMaxRetries(0)})
+		client, err := newBedrockRuntimeClient(t.Context(), o)
+		require.NoError(t, err)
+		_, err = client.ConverseStream(t.Context(), &bedrockruntime.ConverseStreamInput{ModelId: new("test")})
+		require.ErrorContains(t, err, "synthetic rejection")
+	}
+	require.Equal(t, 2, requests)
 }

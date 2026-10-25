@@ -248,14 +248,14 @@ func ModelsList() []*Model {
 
 // AuthenticatedProviderSet returns providers with credentials available from
 // environment variables or from the credential reference store. It deliberately
-// uses only CredentialRefLister.List and GetEnvAPIKey, so callers can use it in
+// uses only CredentialRefLister.List and HasEnvCredentials, so callers can use it in
 // model pickers and list commands without causing network calls or OAuth token
 // refreshes. If the store cannot be listed, environment-authenticated providers
 // are still returned.
 func AuthenticatedProviderSet(ctx context.Context, credentialStore CredentialRefLister) map[string]struct{} {
 	allowed := make(map[string]struct{})
 	for _, provider := range ListProviders() {
-		if ProviderAllowsNoCredential(provider) || GetEnvAPIKey(provider) != "" {
+		if ProviderAllowsNoCredential(provider) || HasEnvCredentials(provider) {
 			allowed[provider] = struct{}{}
 		}
 	}

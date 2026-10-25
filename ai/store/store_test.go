@@ -10,9 +10,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/ai/oauth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -708,4 +710,504 @@ func TestAPIKeyFromCredentialResolvesStoredReferences(t *testing.T) {
 	cancel()
 	_, err = APIKeyFromCredential(canceled, "env", ai.NewAPIKeyCredential("!command"))
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestOAuthRefreshRejectsMissingCredentials(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		for _, backend := range []string{"memory", "file"} {
+			for _, method := range []string{"Get", "RefreshOAuth"} {
+				t.Run(fmt.Sprintf("%s/%s/empty=%v", backend, method, empty), func(t *testing.T) {
+					provider := missingCredentialsProvider{empty: empty}
+					opts := Options{OAuthProviders: map[string]oauth.Provider{"provider": provider}}
+					var store CredentialStore
+					if backend == "memory" {
+						store = NewMemoryBackend(opts)
+					} else {
+						store = NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), opts)
+					}
+					original := ai.NewOAuthCredential("original", "refresh", time.Now().Add(-time.Hour), "scope")
+					require.NoError(t, store.Set(t.Context(), "provider", original))
+					var err error
+					if method == "Get" {
+						_, err = store.Get(t.Context(), "provider")
+					} else {
+						_, err = store.RefreshOAuth(t.Context(), "provider", provider)
+					}
+					if empty {
+						require.ErrorContains(t, err, "no access token")
+					} else {
+						require.ErrorContains(t, err, "missing credentials")
+					}
+					if memory, ok := store.(*MemoryBackend); ok {
+						require.Equal(t, original, memory.creds["provider"])
+					} else {
+						got, readErr := store.(*FileBackend).readCredential("provider")
+						require.NoError(t, readErr)
+						require.Equal(t, original.AccessToken, got.AccessToken)
+					}
+				})
+			}
+		}
+	}
+}
+
+type missingCredentialsProvider struct {
+	oauth.Provider
+	empty bool
+}
+
+func (missingCredentialsProvider) ID() oauth.ProviderID { return "provider" }
+func (p missingCredentialsProvider) RefreshToken(context.Context, *oauth.Credentials) (*oauth.Credentials, error) {
+	if p.empty {
+		return &oauth.Credentials{Refresh: "rotated", Expires: time.Now().Add(time.Hour).UnixMilli()}, nil
+	}
+	return nil, nil
+}
+
+func TestOAuthRefreshRetainsStoredScope(t *testing.T) {
+	for _, rotate := range []bool{false, true} {
+		for _, backend := range []string{"memory", "file"} {
+			for _, method := range []string{"Get", "RefreshOAuth"} {
+				t.Run(fmt.Sprintf("%s/%s/rotate=%v", backend, method, rotate), func(t *testing.T) {
+					provider := scopedRefreshProvider{rotate: rotate}
+					opts := Options{OAuthProviders: map[string]oauth.Provider{"provider": provider}}
+					var store CredentialStore
+					if backend == "memory" {
+						store = NewMemoryBackend(opts)
+					} else {
+						store = NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), opts)
+					}
+					original := ai.NewOAuthCredential("original", "refresh", time.Now().Add(-time.Hour), "read write")
+					original.Extra = map[string]any{"retained": map[string]any{"value": "keep"}, "updated": "old"}
+					require.NoError(t, store.Set(t.Context(), "provider", original))
+					var got ai.Credential
+					var err error
+					if method == "Get" {
+						got, err = store.Get(t.Context(), "provider")
+					} else {
+						got, err = store.RefreshOAuth(t.Context(), "provider", provider)
+					}
+					require.NoError(t, err)
+					require.Equal(t, "read write", got.Scope)
+					got, err = store.Get(t.Context(), "provider")
+					require.NoError(t, err)
+					require.Equal(t, "read write", got.Scope)
+					require.Equal(t, "new", got.AccessToken)
+					require.Equal(t, map[string]any{"value": "keep"}, got.Extra["retained"])
+					require.Equal(t, "new", got.Extra["updated"])
+					if rotate {
+						require.Equal(t, "rotated", got.RefreshToken)
+					} else {
+						require.Equal(t, "refresh", got.RefreshToken)
+					}
+				})
+			}
+		}
+	}
+}
+
+type scopedRefreshProvider struct {
+	oauth.Provider
+	rotate bool
+}
+
+func (scopedRefreshProvider) ID() oauth.ProviderID { return "provider" }
+func (p scopedRefreshProvider) RefreshToken(context.Context, *oauth.Credentials) (*oauth.Credentials, error) {
+	var refresh string
+	if p.rotate {
+		refresh = "rotated"
+	}
+	return &oauth.Credentials{Access: "new", Extra: map[string]any{"updated": "new"}, Refresh: refresh, Expires: time.Now().Add(time.Hour).UnixMilli()}, nil
+}
+
+func TestMemoryRefreshDoesNotOverwriteConcurrentCredentialChange(t *testing.T) {
+	for _, method := range []string{"Get", "RefreshOAuth"} {
+		for _, change := range []string{"login", "logout"} {
+			for _, terminal := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/terminal=%v", method, change, terminal), func(t *testing.T) {
+					var store *MemoryBackend
+					refresh := func() (*oauth.Credentials, error) {
+						var err error
+						if change == "login" {
+							err = store.Set(t.Context(), "provider", ai.NewAPIKeyCredential("new-login"))
+						} else {
+							err = store.Delete(t.Context(), "provider")
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						if terminal {
+							return nil, ai.ErrCredentialNeedsReauth{Provider: "provider"}
+						}
+						return &oauth.Credentials{Access: "stale-refresh", Refresh: "rotated", Expires: time.Now().Add(time.Hour).UnixMilli()}, nil
+					}
+					store = NewMemoryBackend(Options{RefreshFuncs: map[string]RefreshFunc{"provider": func(context.Context, ai.Credential) (ai.Credential, error) {
+						cred, err := refresh()
+						return CredentialFromOAuth(cred), err
+					}}})
+					if err := store.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")); err != nil {
+						t.Fatal(err)
+					}
+					var err error
+					if method == "Get" {
+						_, err = store.Get(t.Context(), "provider")
+					} else {
+						_, err = store.RefreshOAuth(t.Context(), "provider", callbackRefreshProvider{refresh: refresh})
+					}
+					if err == nil {
+						t.Error("stale refresh reported success")
+					}
+					got, err := store.Get(t.Context(), "provider")
+					if change == "logout" {
+						if !errors.Is(err, ai.ErrCredentialNotFound) {
+							t.Errorf("refresh resurrected logout: %+v, %v", got, err)
+						}
+					} else if err != nil || got.APIKey != "new-login" {
+						t.Errorf("refresh overwrote login: %+v, %v", got, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMemoryRefreshWaitHonorsCancellation(t *testing.T) {
+	for _, method := range []string{"Get", "RefreshOAuth"} {
+		t.Run(method, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			firstDone := make(chan error, 1)
+			store := NewMemoryBackend(Options{RefreshFuncs: map[string]RefreshFunc{"provider": func(context.Context, ai.Credential) (ai.Credential, error) {
+				close(entered)
+				<-release
+				return ai.NewOAuthCredential("new", "refresh", time.Now().Add(time.Hour), "scope"), nil
+			}}})
+			if err := store.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")); err != nil {
+				t.Fatal(err)
+			}
+			go func() { _, err := store.Get(t.Context(), "provider"); firstDone <- err }()
+			<-entered
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				if method == "Get" {
+					_, err = store.Get(ctx, "provider")
+				} else {
+					_, err = store.RefreshOAuth(ctx, "provider", terminalRefreshProvider{refresh: func(context.Context) error { return errors.New("unexpected provider call") }})
+				}
+				done <- err
+			}()
+			received := false
+			defer func() {
+				close(release)
+				if err := <-firstDone; err != nil {
+					t.Error(err)
+				}
+				if !received {
+					<-done
+				}
+			}()
+			select {
+			case err := <-done:
+				received = true
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("lost wait cancellation: %v", err)
+				}
+			case <-time.After(200 * time.Millisecond):
+				t.Error("refresh wait ignored deadline")
+			}
+		})
+	}
+}
+
+func TestRefreshCancellationBeforePersistence(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		for _, method := range []string{"Get", "RefreshOAuth"} {
+			for _, terminal := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/terminal=%v", backend, method, terminal), func(t *testing.T) {
+					ctx, cancel := context.WithCancelCause(t.Context())
+					cause := errors.New("caller canceled refresh")
+					defer cancel(cause)
+					refresh := func() (*oauth.Credentials, error) {
+						cancel(cause)
+						if terminal {
+							return nil, ai.ErrCredentialNeedsReauth{Provider: "provider"}
+						}
+						return &oauth.Credentials{Access: "new", Refresh: "rotated", Expires: time.Now().Add(time.Hour).UnixMilli()}, nil
+					}
+					opts := Options{RefreshFuncs: map[string]RefreshFunc{"provider": func(context.Context, ai.Credential) (ai.Credential, error) {
+						c, err := refresh()
+						return CredentialFromOAuth(c), err
+					}}}
+					var store CredentialStore
+					if backend == "memory" {
+						store = NewMemoryBackend(opts)
+					} else {
+						store = NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), opts)
+					}
+					original := ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")
+					require.NoError(t, store.Set(t.Context(), "provider", original))
+					var err error
+					if method == "Get" {
+						_, err = store.Get(ctx, "provider")
+					} else {
+						_, err = store.RefreshOAuth(ctx, "provider", callbackRefreshProvider{refresh: refresh})
+					}
+					require.ErrorIs(t, err, cause)
+					// Read without automatic refresh to inspect the persisted value.
+					switch s := store.(type) {
+					case *MemoryBackend:
+						s.mu.RLock()
+						got := s.creds["provider"]
+						s.mu.RUnlock()
+						require.Equal(t, original, got)
+					case *FileBackend:
+						got, err := s.readCredential("provider")
+						require.NoError(t, err)
+						require.Equal(t, original.AccessToken, got.AccessToken)
+						require.False(t, got.NeedsReauth)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMemoryCredentialMetadataOwnership(t *testing.T) {
+	store := NewMemoryBackend(Options{})
+	ctx := t.Context()
+	api := ai.NewAPIKeyCredential("$TOKEN")
+	api.Env = map[string]string{"TOKEN": "original"}
+	require.NoError(t, store.Set(ctx, "key", api))
+	api.Env["TOKEN"] = "changed input"
+	got, err := store.Get(ctx, "key")
+	require.NoError(t, err)
+	assert.Equal(t, "original", got.Env["TOKEN"])
+	got.Env["TOKEN"] = "changed output"
+	got, err = store.Get(ctx, "key")
+	require.NoError(t, err)
+	assert.Equal(t, "original", got.Env["TOKEN"])
+	cred := ai.NewOAuthCredential("old", "refresh", time.Now().Add(time.Hour), "scope")
+	cred.Extra = map[string]any{"nested": map[string]any{"list": []any{"original"}}}
+	require.NoError(t, store.Set(ctx, "oauth", cred))
+	cred.Extra["nested"].(map[string]any)["list"].([]any)[0] = "changed input"
+	got, err = store.Get(ctx, "oauth")
+	require.NoError(t, err)
+	assert.Equal(t, "original", got.Extra["nested"].(map[string]any)["list"].([]any)[0])
+	got.Extra["nested"].(map[string]any)["list"].([]any)[0] = "changed output"
+	got, err = store.Get(ctx, "oauth")
+	require.NoError(t, err)
+	assert.Equal(t, "original", got.Extra["nested"].(map[string]any)["list"].([]any)[0])
+}
+
+func TestMemoryFailedRefreshDoesNotMutateStoredMetadata(t *testing.T) {
+	for _, method := range []string{"Get", "RefreshOAuth"} {
+		t.Run(method, func(t *testing.T) {
+			failure := errors.New("refresh failed")
+			store := NewMemoryBackend(Options{RefreshFuncs: map[string]RefreshFunc{"provider": func(_ context.Context, cred ai.Credential) (ai.Credential, error) {
+				cred.Extra["nested"].(map[string]any)["value"] = "changed"
+				return ai.Credential{}, failure
+			}}})
+			original := ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")
+			original.Extra = map[string]any{"nested": map[string]any{"value": "original"}}
+			require.NoError(t, store.Set(t.Context(), "provider", original))
+			var err error
+			if method == "Get" {
+				_, err = store.Get(t.Context(), "provider")
+			} else {
+				_, err = store.RefreshOAuth(t.Context(), "provider", metadataFailureProvider{failure: failure})
+			}
+			require.ErrorIs(t, err, failure)
+			store.mu.RLock()
+			value := store.creds["provider"].Extra["nested"].(map[string]any)["value"]
+			store.mu.RUnlock()
+			assert.Equal(t, "original", value)
+		})
+	}
+}
+
+type metadataFailureProvider struct {
+	oauth.Provider
+	failure error
+}
+
+func (p metadataFailureProvider) RefreshToken(_ context.Context, cred *oauth.Credentials) (*oauth.Credentials, error) {
+	cred.Extra["nested"].(map[string]any)["value"] = "changed"
+	return nil, p.failure
+}
+
+func TestMemoryMutationsAndListHonorCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("credential operation canceled")
+	cancel(cause)
+	store := NewMemoryBackend(Options{})
+	original := ai.NewAPIKeyCredential("original")
+	require.NoError(t, store.Set(t.Context(), "provider", original))
+	require.ErrorIs(t, store.Set(ctx, "provider", ai.NewAPIKeyCredential("replacement")), cause)
+	require.ErrorIs(t, store.Delete(ctx, "provider"), cause)
+	refs, err := store.List(ctx)
+	require.ErrorIs(t, err, cause)
+	require.Nil(t, refs)
+	got, err := store.Get(t.Context(), "provider")
+	require.NoError(t, err)
+	require.Equal(t, original, got)
+}
+
+func TestRefreshUsesCanonicalCredentialProvider(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			calls := 0
+			opts := Options{RefreshFuncs: map[string]RefreshFunc{ai.ProviderAzureOpenAI: func(context.Context, ai.Credential) (ai.Credential, error) {
+				calls++
+				return ai.NewOAuthCredential("new", "rotated", time.Now().Add(time.Hour), "scope"), nil
+			}}}
+			var store CredentialStore
+			if backend == "memory" {
+				store = NewMemoryBackend(opts)
+			} else {
+				store = NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), opts)
+			}
+			require.NoError(t, store.Set(t.Context(), ai.ProviderAzureOpenAI, ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")))
+			got, err := store.Get(t.Context(), "azure-openai-responses")
+			require.NoError(t, err)
+			assert.Equal(t, "new", got.AccessToken)
+			assert.Equal(t, 1, calls)
+			got, err = store.Get(t.Context(), ai.ProviderAzureOpenAI)
+			require.NoError(t, err)
+			assert.Equal(t, "new", got.AccessToken)
+			assert.Equal(t, 1, calls)
+		})
+	}
+}
+
+func TestExplicitRefreshRevalidatesCredentialAfterWaiting(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var store CredentialStore
+				gate := make(chan struct{}, 1)
+				gate <- struct{}{}
+				if backend == "memory" {
+					memory := NewMemoryBackend(Options{})
+					memory.refreshMu.Store("provider", gate)
+					store = memory
+				} else {
+					file := NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), Options{})
+					file.refreshMu.Store("provider", gate)
+					store = file
+				}
+				require.NoError(t, store.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")))
+				calls := 0
+				done := make(chan error, 1)
+				go func() {
+					_, err := store.RefreshOAuth(t.Context(), "provider", callbackRefreshProvider{refresh: func() (*oauth.Credentials, error) {
+						calls++
+						return &oauth.Credentials{Access: "unexpected", Expires: time.Now().Add(time.Hour).UnixMilli()}, nil
+					}})
+					done <- err
+				}()
+				synctest.Wait()
+				replacement := ai.NewAPIKeyCredential("replacement")
+				require.NoError(t, store.Set(t.Context(), "provider", replacement))
+				<-gate
+				err := <-done
+				require.ErrorContains(t, err, "not OAuth")
+				require.Zero(t, calls)
+				got, err := store.Get(t.Context(), "provider")
+				require.NoError(t, err)
+				require.Equal(t, replacement, got)
+			})
+		})
+	}
+}
+
+func TestStoreOwnsConfiguredRefreshCallbacks(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			callbacks := map[string]RefreshFunc{"provider": func(context.Context, ai.Credential) (ai.Credential, error) {
+				return ai.NewOAuthCredential("expected", "refresh", time.Now().Add(time.Hour), "scope"), nil
+			}}
+			options := Options{RefreshFuncs: callbacks}
+			var store CredentialStore
+			if backend == "memory" {
+				store = NewMemoryBackend(options)
+			} else {
+				store = NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), options)
+			}
+			callbacks["provider"] = func(context.Context, ai.Credential) (ai.Credential, error) {
+				return ai.Credential{}, errors.New("mutated caller callback")
+			}
+			require.NoError(t, store.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")))
+			got, err := store.Get(t.Context(), "provider")
+			require.NoError(t, err)
+			require.Equal(t, "expected", got.AccessToken)
+		})
+	}
+}
+
+func TestAutomaticRefreshRevalidatesRefreshabilityAfterWaiting(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				calls := 0
+				opts := Options{RefreshFuncs: map[string]RefreshFunc{"provider": func(context.Context, ai.Credential) (ai.Credential, error) {
+					calls++
+					return ai.NewOAuthCredential("unexpected", "rotated", time.Now().Add(time.Hour), "scope"), nil
+				}}}
+				var store CredentialStore
+				gate := make(chan struct{}, 1)
+				gate <- struct{}{}
+				if backend == "memory" {
+					memory := NewMemoryBackend(opts)
+					memory.refreshMu.Store("provider", gate)
+					store = memory
+				} else {
+					file := NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), opts)
+					file.refreshMu.Store("provider", gate)
+					store = file
+				}
+				require.NoError(t, store.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")))
+				type result struct {
+					cred ai.Credential
+					err  error
+				}
+				done := make(chan result, 1)
+				go func() { cred, err := store.Get(t.Context(), "provider"); done <- result{cred, err} }()
+				synctest.Wait()
+				replacement := ai.NewOAuthCredential("replacement", "", time.Now().Add(-time.Hour), "scope")
+				require.NoError(t, store.Set(t.Context(), "provider", replacement))
+				<-gate
+				got := <-done
+				require.NoError(t, got.err)
+				require.Equal(t, "replacement", got.cred.AccessToken)
+				require.Empty(t, got.cred.RefreshToken)
+				require.Zero(t, calls)
+				stored, err := store.Get(t.Context(), "provider")
+				require.NoError(t, err)
+				require.Equal(t, "replacement", stored.AccessToken)
+			})
+		})
+	}
+}
+
+func TestExplicitRefreshRetainsTerminalProviderCause(t *testing.T) {
+	for _, backend := range []string{"memory", "file"} {
+		t.Run(backend, func(t *testing.T) {
+			var store CredentialStore
+			if backend == "memory" {
+				store = NewMemoryBackend(Options{})
+			} else {
+				store = NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), Options{})
+			}
+			require.NoError(t, store.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(time.Hour), "scope")))
+			cause := errors.New("provider rejected refresh")
+			terminal := errors.Join(ai.ErrCredentialNeedsReauth{Provider: "provider"}, cause)
+			got, err := store.RefreshOAuth(t.Context(), "provider", terminalRefreshProvider{refresh: func(context.Context) error { return terminal }})
+			require.ErrorIs(t, err, cause)
+			require.ErrorIs(t, err, ai.ErrCredentialNeedsReauth{})
+			require.True(t, got.NeedsReauth)
+		})
+	}
 }

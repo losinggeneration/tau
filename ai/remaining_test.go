@@ -148,5 +148,4 @@ func clearEnvForAPIKeyParity(t *testing.T) {
 	} {
 		t.Setenv(name, "")
 	}
-	cachedVertexAdcExists = nil
 }

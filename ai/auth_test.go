@@ -147,11 +147,6 @@ func TestGetEnvAPIKeyGitHubCopilotPrecedence(t *testing.T) {
 
 // TestGetEnvAPIKeyVertex verifies Vertex ADC and env var handling.
 func TestGetEnvAPIKeyVertex(t *testing.T) {
-	cachedVertexAdcExists = nil
-	t.Cleanup(func() {
-		cachedVertexAdcExists = nil
-	})
-
 	// Clear all
 	t.Setenv("GOOGLE_CLOUD_API_KEY", "")
 	t.Setenv("VERTEXAI_API_KEY", "")
@@ -189,7 +184,6 @@ func TestGetEnvAPIKeyVertex(t *testing.T) {
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", adcPath)
 	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
 	t.Setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-	cachedVertexAdcExists = nil
 	if key := GetEnvAPIKey(ProviderGoogleVertex); key != "<authenticated>" {
 		t.Errorf("expected <authenticated>, got %q", key)
 	}
