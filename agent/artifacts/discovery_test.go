@@ -4,7 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/losinggeneration/tau/agent/packages"
+	"github.com/losinggeneration/tau/ai"
 )
 
 func TestWalkSettingsPathsUseConfiguredScopeAndModifiers(t *testing.T) {
@@ -87,5 +94,153 @@ func TestSettingsTierUsesDirectoryBoundaries(t *testing.T) {
 		if len(entries) != 1 || tier != tc.want {
 			t.Errorf("%s tier=%v, want %v", tc.path, tier, tc.want)
 		}
+	}
+}
+
+func TestWalkKeepsResourceScopeFiltersIndependent(t *testing.T) {
+	home, cwd := t.TempDir(), t.TempDir()
+	userDir, projectDir := filepath.Join(home, "shared"), filepath.Join(cwd, "shared")
+	for _, dir := range []string{userDir, projectDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"keep.md", "drop.md"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("prompt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	entries, err := Walk(DiscoveryConfig{
+		HomeDir: home, CWD: cwd, DisableSkills: true, DisableThemes: true, DisableExtensions: true,
+		SettingsScopes: map[SourceTier]map[ArtifactKind][]string{
+			TierUser:    {KindPrompt: {userDir, filepath.Join(userDir, "drop*")}},
+			TierProject: {KindPrompt: {projectDir, "!" + projectDir + "/*", "+" + filepath.Join(projectDir, "keep.md")}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].SourcePath != filepath.Join(projectDir, "keep.md") || entries[0].Tier != TierProject || entries[1].SourcePath != filepath.Join(userDir, "drop.md") || entries[1].Tier != TierUser {
+		t.Fatalf("independent scopes = %+v", entries)
+	}
+}
+
+func TestWalkFindsScopedPackagesAndKeepsSearchPriority(t *testing.T) {
+	root := t.TempDir()
+	project, user := filepath.Join(root, "z-project"), filepath.Join(root, "a-user")
+	for _, base := range []string{project, user} {
+		for _, name := range []string{"plain", "@scope/scoped"} {
+			pkg := filepath.Join(base, name)
+			files := map[string]string{
+				"prompts/" + filepath.Base(name) + ".md":      base,
+				"skills/" + filepath.Base(name) + "/SKILL.md": "---\nname: " + filepath.Base(name) + "\ndescription: test\n---\n" + base,
+				"themes/" + filepath.Base(name) + ".json":     `{}`,
+			}
+			if name == "@scope/scoped" {
+				files["tau-package.toml"] = `[package]
+name = "scoped"
+version = "1.0.0"
+[[prompt]]
+path = "prompts/"
+[[skill]]
+path = "skills/"
+[[theme]]
+path = "themes/"
+`
+			}
+			for path, contents := range files {
+				path = filepath.Join(pkg, path)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	entries, err := Walk(DiscoveryConfig{CWD: t.TempDir(), HomeDir: t.TempDir(), PackagePaths: []string{project, user}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := make(map[ArtifactKind]int)
+	for _, entry := range entries {
+		if entry.Tier == TierPackages {
+			counts[entry.Kind]++
+		}
+	}
+	for _, kind := range []ArtifactKind{KindSkill, KindPrompt, KindTheme} {
+		if counts[kind] != 4 {
+			t.Errorf("%s entries = %d, want scoped and plain packages from both directories", kind, counts[kind])
+		}
+	}
+	registry := NewPromptRegistry(nil)
+	if err := registry.Load(entries); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"plain", "scoped"} {
+		prompt, ok := registry.Get(name)
+		if !ok || string(prompt.Body) != project {
+			t.Errorf("%s prompt = %+v, want project package", name, prompt)
+		}
+	}
+}
+
+func TestWalkConfiguredPackageFiltersDoNotLeakInstalledResources(t *testing.T) {
+	root := t.TempDir()
+	pkgRoot := filepath.Join(root, "packages", "example")
+	for _, name := range []string{"keep", "drop"} {
+		for _, path := range []string{filepath.Join(pkgRoot, "prompts", name+".md"), filepath.Join(pkgRoot, "skills", name, "SKILL.md"), filepath.Join(pkgRoot, "themes", name+".json")} {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("body"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cfg := DiscoveryConfig{CWD: t.TempDir(), HomeDir: t.TempDir(), PackagePaths: []string{filepath.Dir(pkgRoot)}, Packages: []packages.ResolvedPackage{{Root: pkgRoot, Source: ai.PackageSource{Prompts: []string{"+prompts/keep.md", "!prompts/*"}, Themes: []string{}, Skills: []string{"skills/keep"}}}}}
+	entries, err := Walk(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = slices.DeleteFunc(entries, func(entry Entry) bool { return entry.Tier != TierPackages })
+	if len(entries) != 2 {
+		t.Fatalf("entries = %v", entries)
+	}
+	for _, entry := range entries {
+		if !strings.Contains(entry.SourcePath, "keep") {
+			t.Fatalf("unfiltered entry %v", entry)
+		}
+	}
+}
+
+func TestPiManifestResourcesDoNotLeakConventions(t *testing.T) {
+	root := t.TempDir()
+	for path, body := range map[string]string{
+		"package.json":                      `{"pi":{"skills":["custom-skills/*"],"prompts":["custom-prompts/**/*.md","!custom-prompts/**/drop.md"],"themes":[]}}`,
+		"custom-skills/keep/SKILL.md":       "---\nname: keep\ndescription: kept\n---\nbody",
+		"custom-prompts/keep.md":            "kept",
+		"custom-prompts/nested/keep-too.md": "also kept",
+		"custom-prompts/nested/drop.md":     "excluded",
+		"prompts/convention.md":             "must not load",
+		"themes/convention.json":            `{}`,
+		"custom-prompts/.hidden.md":         "must not load",
+	} {
+		full := filepath.Join(root, path)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o700))
+		require.NoError(t, os.WriteFile(full, []byte(body), 0o600))
+	}
+	found := discoverPackageRoot(root, DiscoveryConfig{})
+	var paths []string
+	for _, entry := range found {
+		rel, err := filepath.Rel(root, entry.SourcePath)
+		require.NoError(t, err)
+		paths = append(paths, filepath.ToSlash(rel))
+	}
+	assert.ElementsMatch(t, []string{"custom-skills/keep/SKILL.md", "custom-prompts/keep.md", "custom-prompts/nested/keep-too.md"}, paths)
+	for _, body := range []string{`{"pi":{}}`, `{"pi":{"skills":[],"prompts":[],"themes":[]}}`} {
+		require.NoError(t, os.WriteFile(filepath.Join(root, "package.json"), []byte(body), 0o600))
+		assert.Empty(t, discoverPackageRoot(root, DiscoveryConfig{}), "Pi manifest absence/empty declarations must not load undeclared conventions")
 	}
 }

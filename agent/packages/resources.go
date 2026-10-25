@@ -1,6 +1,7 @@
 package packages
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,29 +34,41 @@ type Resource struct {
 func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resource, error) {
 	var resources []Resource
 
-	// Check for package.json with pi.extensions field
-	packageJSONPath := filepath.Join(dir, "package.json")
-	if info, err := os.Stat(packageJSONPath); err == nil && !info.IsDir() {
-		if extensions := readPiExtensions(packageJSONPath); len(extensions) > 0 {
-			// Use explicit extension entries from package.json
-			for _, extPath := range extensions {
-				fullPath := filepath.Join(dir, extPath)
-				if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
-					resources = append(resources, Resource{
-						Path:  fullPath,
-						Kind:  ResourceKindExtension,
-						Valid: true,
-					})
-				}
+	pi, err := ReadPiManifest(dir)
+	if err != nil {
+		return nil, err
+	}
+	if pi != nil && len(pi.Extensions) > 0 {
+		for _, extPath := range pi.Extensions {
+			fullPath := extPath
+			if !filepath.IsAbs(fullPath) {
+				fullPath = filepath.Join(dir, fullPath)
 			}
-			return resources, nil
+			info, err := os.Stat(fullPath)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("stat extension: %w", err)
+			}
+			if !info.IsDir() {
+				resources = append(resources, Resource{Path: fullPath, Kind: ResourceKindExtension, Valid: true})
+			}
 		}
+		return resources, nil
 	}
 
 	// Fall back to index.ts/index.js
 	for _, name := range []string{"index.ts", "index.js"} {
 		indexPath := filepath.Join(dir, name)
-		if _, err := os.Stat(indexPath); err == nil {
+		info, err := os.Stat(indexPath)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat extension index: %w", err)
+		}
+		if !info.IsDir() {
 			resources = append(resources, Resource{
 				Path:  indexPath,
 				Kind:  ResourceKindExtension,
@@ -74,7 +87,10 @@ func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resou
 	}
 
 	// Smart discovery: collect .ts and .js files in directory
-	ignore := newIgnoreMatcher(dir, dir)
+	ignore, err := newIgnoreMatcher(dir, dir)
+	if err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -83,16 +99,38 @@ func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resou
 	for _, entry := range entries {
 		name := entry.Name()
 		path := filepath.Join(dir, name)
+		if strings.HasPrefix(name, ".") || name == "node_modules" {
+			continue
+		}
+		isDir := entry.IsDir()
+		isFile := entry.Type().IsRegular()
+		if entry.Type()&os.ModeSymlink != 0 {
+			info, err := os.Stat(path)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("stat extension entry: %w", err)
+			}
+			isDir = info.IsDir()
+			isFile = info.Mode().IsRegular()
+		}
+		if isIgnored(ignore, path, isDir) {
+			continue
+		}
 
-		if entry.IsDir() {
+		if isDir {
 			// Recurse into subdirectories with ignore context
-			subResources, _ := collectExtensionResources(path, ignore)
+			subResources, err := collectExtensionResources(path, ignore)
+			if err != nil {
+				return nil, fmt.Errorf("collect extensions in %s: %w", path, err)
+			}
 			resources = append(resources, subResources...)
 			continue
 		}
 
 		ext := filepath.Ext(name)
-		if ext != ".ts" && ext != ".js" {
+		if !isFile || (ext != ".ts" && ext != ".js") {
 			continue
 		}
 
@@ -115,69 +153,6 @@ func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resou
 	return resources, nil
 }
 
-// readPiExtensions reads the pi.extensions field from a package.json.
-func readPiExtensions(packageJSONPath string) []string {
-	data, err := os.ReadFile(packageJSONPath)
-	if err != nil {
-		return nil
-	}
-
-	// Simple JSON parsing to extract pi.extensions
-	// This avoids importing encoding/json for this simple use case
-	content := string(data)
-
-	// Look for "pi": { ... "extensions": [...] }
-	piIdx := strings.Index(content, `"pi"`)
-	if piIdx == -1 {
-		return nil
-	}
-
-	extensionsIdx := strings.Index(content[piIdx:], `"extensions"`)
-	if extensionsIdx == -1 {
-		return nil
-	}
-
-	// Find the array start [
-	arrayStart := strings.Index(content[piIdx+extensionsIdx:], "[")
-	if arrayStart == -1 {
-		return nil
-	}
-
-	// Extract array content (simplified parsing)
-	start := piIdx + extensionsIdx + arrayStart + 1
-	depth := 1
-	end := start
-	for i := start; i < len(content) && depth > 0; i++ {
-		switch content[i] {
-		case '[':
-			depth++
-		case ']':
-			depth--
-			if depth == 0 {
-				end = i
-			}
-		}
-	}
-
-	arrayContent := strings.TrimSpace(content[start:end])
-	if arrayContent == "" {
-		return nil
-	}
-
-	// Parse array elements
-	var extensions []string
-	elements := strings.Split(arrayContent, ",")
-	for _, elem := range elements {
-		elem = strings.TrimSpace(elem)
-		if strings.HasPrefix(elem, `"`) && strings.HasSuffix(elem, `"`) {
-			ext := elem[1 : len(elem)-1]
-			extensions = append(extensions, ext)
-		}
-	}
-
-	return extensions
-}
-
 // collectSkillResources recursively collects SKILL.md files.
 // This matches the TypeScript collectSkillEntries() behavior.
 func collectSkillResources(dir string, rootDir string, skillMode string) ([]Resource, error) {
@@ -194,11 +169,18 @@ func collectSkillResources(dir string, rootDir string, skillMode string) ([]Reso
 		return nil, nil
 	}
 
-	ignore := newIgnoreMatcher(dir, rootDir)
+	ignore, err := newIgnoreMatcher(dir, rootDir)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check for SKILL.md in this directory first (directory mode)
 	skillMDPath := filepath.Join(dir, "SKILL.md")
-	if _, err := os.Stat(skillMDPath); err == nil {
+	skillInfo, err := os.Stat(skillMDPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat skill entry: %w", err)
+	}
+	if err == nil && !skillInfo.IsDir() {
 		if !isIgnored(ignore, skillMDPath, false) {
 			resources = append(resources, Resource{
 				Path:  skillMDPath,
@@ -229,7 +211,10 @@ func collectSkillResources(dir string, rootDir string, skillMode string) ([]Reso
 			}
 
 			// Recurse into subdirectories
-			subResources, _ := collectSkillResources(path, rootDir, skillMode)
+			subResources, err := collectSkillResources(path, rootDir, skillMode)
+			if err != nil {
+				return nil, fmt.Errorf("collect skills in %s: %w", path, err)
+			}
 			resources = append(resources, subResources...)
 		} else {
 			// Check for loose .md files (not SKILL.md)
@@ -265,7 +250,10 @@ func collectPromptResources(dir string) ([]Resource, error) {
 		return nil, nil
 	}
 
-	ignore := newIgnoreMatcher(dir, dir)
+	ignore, err := newIgnoreMatcher(dir, dir)
+	if err != nil {
+		return nil, err
+	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -319,7 +307,10 @@ func collectThemeResources(dir string) ([]Resource, error) {
 		return nil, nil
 	}
 
-	ignore := newIgnoreMatcher(dir, dir)
+	ignore, err := newIgnoreMatcher(dir, dir)
+	if err != nil {
+		return nil, err
+	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -362,27 +353,33 @@ func collectThemeResources(dir string) ([]Resource, error) {
 func CollectPackageResources(pkgRoot string, manifest *Manifest) ([]Resource, error) {
 	var resources []Resource
 
-	// Collect extensions with smart discovery (package.json pi.extensions or index.ts/index.js fallback)
-	extensionsDir := filepath.Join(pkgRoot, "extensions")
-	if extResources, err := collectExtensionResources(extensionsDir, nil); err == nil {
-		resources = append(resources, extResources...)
-	} else {
-		// If extensions directory doesn't exist, check for package.json in root for extension entries
-		if extResources, err := collectExtensionResources(pkgRoot, nil); err == nil && len(extResources) > 0 {
-			resources = append(resources, extResources...)
-		}
+	extResources, err := collectExtensionResources(filepath.Join(pkgRoot, "extensions"), nil)
+	if os.IsNotExist(err) {
+		extResources, err = collectExtensionResources(pkgRoot, nil)
 	}
+	if err != nil {
+		return nil, fmt.Errorf("collect package extensions: %w", err)
+	}
+	resources = append(resources, extResources...)
 
 	// Collect skills
 	if manifest != nil && len(manifest.AllSkills()) > 0 {
 		for _, skill := range manifest.AllSkills() {
 			skillPath := filepath.Join(pkgRoot, skill.Path)
 			info, err := os.Stat(skillPath)
-			if err == nil && info.IsDir() {
-				if skillResources, err := collectSkillResources(skillPath, pkgRoot, "pi"); err == nil {
-					resources = append(resources, skillResources...)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("stat package skill: %w", err)
+			}
+			if info.IsDir() {
+				skillResources, err := collectSkillResources(skillPath, pkgRoot, "pi")
+				if err != nil {
+					return nil, fmt.Errorf("collect package skills: %w", err)
 				}
-			} else if err == nil {
+				resources = append(resources, skillResources...)
+			} else {
 				// Single file
 				resources = append(resources, Resource{
 					Path:  skillPath,
@@ -394,9 +391,11 @@ func CollectPackageResources(pkgRoot string, manifest *Manifest) ([]Resource, er
 	} else {
 		// Convention: skills/ directory
 		skillsDir := filepath.Join(pkgRoot, "skills")
-		if skillResources, err := collectSkillResources(skillsDir, pkgRoot, "pi"); err == nil {
-			resources = append(resources, skillResources...)
+		skillResources, err := collectSkillResources(skillsDir, pkgRoot, "pi")
+		if err != nil {
+			return nil, fmt.Errorf("collect package skills: %w", err)
 		}
+		resources = append(resources, skillResources...)
 	}
 
 	// Collect prompts
@@ -404,11 +403,19 @@ func CollectPackageResources(pkgRoot string, manifest *Manifest) ([]Resource, er
 		for _, prompt := range manifest.AllPrompts() {
 			promptPath := filepath.Join(pkgRoot, prompt.Path)
 			info, err := os.Stat(promptPath)
-			if err == nil && info.IsDir() {
-				if promptResources, err := collectPromptResources(promptPath); err == nil {
-					resources = append(resources, promptResources...)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("stat package prompt: %w", err)
+			}
+			if info.IsDir() {
+				promptResources, err := collectPromptResources(promptPath)
+				if err != nil {
+					return nil, fmt.Errorf("collect package prompts: %w", err)
 				}
-			} else if err == nil {
+				resources = append(resources, promptResources...)
+			} else {
 				// Single file
 				resources = append(resources, Resource{
 					Path:  promptPath,
@@ -420,9 +427,11 @@ func CollectPackageResources(pkgRoot string, manifest *Manifest) ([]Resource, er
 	} else {
 		// Convention: prompts/ directory
 		promptsDir := filepath.Join(pkgRoot, "prompts")
-		if promptResources, err := collectPromptResources(promptsDir); err == nil {
-			resources = append(resources, promptResources...)
+		promptResources, err := collectPromptResources(promptsDir)
+		if err != nil {
+			return nil, fmt.Errorf("collect package prompts: %w", err)
 		}
+		resources = append(resources, promptResources...)
 	}
 
 	// Collect themes
@@ -430,11 +439,19 @@ func CollectPackageResources(pkgRoot string, manifest *Manifest) ([]Resource, er
 		for _, theme := range manifest.AllThemes() {
 			themePath := filepath.Join(pkgRoot, theme.Path)
 			info, err := os.Stat(themePath)
-			if err == nil && info.IsDir() {
-				if themeResources, err := collectThemeResources(themePath); err == nil {
-					resources = append(resources, themeResources...)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("stat package theme: %w", err)
+			}
+			if info.IsDir() {
+				themeResources, err := collectThemeResources(themePath)
+				if err != nil {
+					return nil, fmt.Errorf("collect package themes: %w", err)
 				}
-			} else if err == nil {
+				resources = append(resources, themeResources...)
+			} else {
 				// Single file
 				resources = append(resources, Resource{
 					Path:  themePath,
@@ -446,9 +463,11 @@ func CollectPackageResources(pkgRoot string, manifest *Manifest) ([]Resource, er
 	} else {
 		// Convention: themes/ directory
 		themesDir := filepath.Join(pkgRoot, "themes")
-		if themeResources, err := collectThemeResources(themesDir); err == nil {
-			resources = append(resources, themeResources...)
+		themeResources, err := collectThemeResources(themesDir)
+		if err != nil {
+			return nil, fmt.Errorf("collect package themes: %w", err)
 		}
+		resources = append(resources, themeResources...)
 	}
 
 	return resources, nil

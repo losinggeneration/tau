@@ -1220,3 +1220,15 @@ func TestShutdownRetainsEveryRPCFailure(t *testing.T) {
 	require.ErrorIs(t, err, first)
 	require.ErrorIs(t, err, second)
 }
+
+func TestDiscoverRejectsCancelledContextBeforeReplacingCandidates(t *testing.T) {
+	m := NewManager(t.TempDir(), nil, nil)
+	m.binaries["retained"] = "hash"
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("discovery interrupted")
+	cancel(cause)
+	require.ErrorIs(t, m.Discover(ctx), cause)
+	require.Equal(t, "hash", m.binaries["retained"])
+	require.ErrorIs(t, m.ReloadNamed(ctx, ""), cause)
+	require.Equal(t, "hash", m.binaries["retained"])
+}

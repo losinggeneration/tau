@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // computeHash computes the MD5 hash of a file.
@@ -30,10 +31,18 @@ func (m *Manager) computeHash(path string) (string, error) {
 }
 
 func computeManagedShimHash(manifestPath string, manifest *Manifest) (string, error) {
-	if manifestPath == "" || manifest == nil {
+	if manifestPath == "" || manifest == nil || !manifest.HasRunCommand() {
 		return "", fmt.Errorf("missing manifest")
 	}
-	return hashFiles(filepath.Dir(manifestPath), []string{manifestPath})
+	hash, err := hashFiles(filepath.Dir(manifestPath), []string{manifestPath})
+	if err != nil {
+		return "", err
+	}
+	args := manifest.Run.args
+	if args == nil {
+		args = splitCommand(manifest.Run.Command)
+	}
+	return fmt.Sprintf("%x", md5.Sum([]byte(hash+"\x00"+strings.Join(args, "\x00")))), nil
 }
 
 func hashFiles(root string, paths []string) (string, error) {

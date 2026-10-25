@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/denormal/go-gitignore"
+	"github.com/losinggeneration/tau/agent/packages"
+	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/paths"
 )
 
@@ -633,5 +635,61 @@ func ApplyFilter(allPaths []string, patterns []string, baseDir string) []string 
 		result = filtered
 	}
 
+	return result
+}
+
+// ApplyPackageFilter applies a package policy, then any ordered project delta.
+// Nil lists inherit defaults; explicit empty lists disable that resource family.
+func ApplyPackageFilter(all []string, pkg packages.ResolvedPackage, kind string) []string {
+	patternsFor := func(source ai.PackageSource) []string {
+		switch kind {
+		case "extensions":
+			return source.Extensions
+		case "skills":
+			return source.Skills
+		case "prompts":
+			return source.Prompts
+		case "themes":
+			return source.Themes
+		default:
+			return nil
+		}
+	}
+	applyDelta := func(enabled map[string]bool, patterns []string) {
+		for _, pattern := range patterns {
+			target := pattern
+			if strings.HasPrefix(pattern, "+") || strings.HasPrefix(pattern, "-") || strings.HasPrefix(pattern, "!") {
+				target = pattern[1:]
+			}
+			exact := strings.HasPrefix(pattern, "+") || strings.HasPrefix(pattern, "-")
+			for _, path := range all {
+				matches := matchesAnyPattern(path, []string{target}, pkg.Root)
+				if exact {
+					matches = matchesAnyExactPattern(path, []string{target}, pkg.Root)
+				}
+				if matches {
+					enabled[path] = !strings.HasPrefix(pattern, "-") && !strings.HasPrefix(pattern, "!")
+				}
+			}
+		}
+	}
+	patterns := patternsFor(pkg.Source)
+	enabled := make(map[string]bool, len(all))
+	if pkg.Source.Autoload != nil && !*pkg.Source.Autoload {
+		applyDelta(enabled, patterns)
+	} else if patterns == nil || len(patterns) > 0 {
+		for _, path := range ApplyFilter(all, patterns, pkg.Root) {
+			enabled[path] = true
+		}
+	}
+	if pkg.Delta != nil {
+		applyDelta(enabled, patternsFor(*pkg.Delta))
+	}
+	var result []string
+	for _, path := range all {
+		if enabled[path] {
+			result = append(result, path)
+		}
+	}
 	return result
 }

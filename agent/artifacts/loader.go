@@ -7,8 +7,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 
+	"github.com/losinggeneration/tau/agent/packages"
 	"github.com/losinggeneration/tau/commands"
 )
 
@@ -49,6 +51,8 @@ type LoaderOptions struct {
 	CWD string
 	// SettingsPaths are explicit paths from settings.json.
 	SettingsPaths map[ArtifactKind][]string
+	// SettingsScopes retains independent project and user resource lists.
+	SettingsScopes map[SourceTier]map[ArtifactKind][]string
 	// UserDirs overrides the user-global artifact directories per kind.
 	// Empty entries default to ~/.tau/agent/<subdir>.
 	UserDirs map[ArtifactKind]string
@@ -56,6 +60,9 @@ type LoaderOptions struct {
 	CLIPaths map[ArtifactKind][]string
 	// PackagePaths are directories to scan for installed packages.
 	PackagePaths []string
+	// Packages replaces implicit scanning with resolved roots and policies.
+	// On reload, nil preserves the current policy and empty disables packages.
+	Packages []packages.ResolvedPackage
 	// DisableSkills skips skill discovery.
 	DisableSkills bool
 	// DisablePrompts skips prompt template discovery.
@@ -74,9 +81,11 @@ func NewLoader(opts LoaderOptions) (*Loader, error) {
 	cfg := &DiscoveryConfig{
 		CWD:            opts.CWD,
 		SettingsPaths:  opts.SettingsPaths,
+		SettingsScopes: opts.SettingsScopes,
 		UserDirs:       opts.UserDirs,
 		CLIPaths:       opts.CLIPaths,
 		PackagePaths:   opts.PackagePaths,
+		Packages:       packages.CloneResolvedPackages(opts.Packages),
 		DisableSkills:  opts.DisableSkills,
 		DisablePrompts: opts.DisablePrompts,
 		DisableThemes:  opts.DisableThemes,
@@ -144,7 +153,7 @@ func (l *Loader) ThemeRegistry() *ThemeRegistry {
 // is registered.
 func (l *Loader) Reload(ctx context.Context) error {
 	l.mu.RLock()
-	opts := ReloadOptions{SettingsPaths: l.cfg.SettingsPaths, UserDirs: l.cfg.UserDirs}
+	opts := ReloadOptions{SettingsPaths: l.cfg.SettingsPaths, SettingsScopes: l.cfg.SettingsScopes, UserDirs: l.cfg.UserDirs, PackagePaths: l.cfg.PackagePaths, Packages: l.cfg.Packages}
 	l.mu.RUnlock()
 	prepared, err := l.Prepare(opts)
 	if err != nil {
@@ -159,8 +168,16 @@ func (l *Loader) Reload(ctx context.Context) error {
 
 // ReloadOptions carries the settings-derived discovery inputs for a reload.
 type ReloadOptions struct {
+	// PackagePaths replaces installed-package search directories when nonnil.
+	// An explicit empty slice disables installed-package discovery.
+	PackagePaths []string
+	// Packages replaces implicit scanning with resolved roots and policies.
+	// On reload, nil preserves the current policy and empty disables packages.
+	Packages []packages.ResolvedPackage
 	// SettingsPaths are explicit paths from settings.json.
 	SettingsPaths map[ArtifactKind][]string
+	// SettingsScopes retains independent project and user resource lists.
+	SettingsScopes map[SourceTier]map[ArtifactKind][]string
 	// UserDirs overrides the user-global artifact directories per kind.
 	UserDirs map[ArtifactKind]string
 }
@@ -182,7 +199,14 @@ func (l *Loader) Prepare(opts ReloadOptions) (*PreparedReload, error) {
 	cfg := *l.cfg
 	l.mu.RUnlock()
 	cfg.SettingsPaths = opts.SettingsPaths
+	cfg.SettingsScopes = opts.SettingsScopes
 	cfg.UserDirs = opts.UserDirs
+	if opts.Packages != nil {
+		cfg.Packages = packages.CloneResolvedPackages(opts.Packages)
+	}
+	if opts.PackagePaths != nil {
+		cfg.PackagePaths = slices.Clone(opts.PackagePaths)
+	}
 
 	entries, err := Walk(cfg)
 	if err != nil {

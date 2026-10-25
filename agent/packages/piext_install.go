@@ -131,13 +131,16 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 		}
 	}
 
-	shimDir := filepath.Join(filepath.Dir(m.userDir), "pi-ext-shim")
-	if err := m.ensurePiShim(ctx, shimDir); err != nil {
-		return fmt.Errorf("ensure pi-ext-shim: %w", err)
-	}
-	nodeBin, err := m.findNode()
-	if err != nil {
-		return fmt.Errorf("find node: %w", err)
+	var shimDir, nodeBin string
+	if len(pkg.Extensions) > 0 {
+		shimDir = filepath.Join(filepath.Dir(m.userDir), "pi-ext-shim")
+		if err := m.ensurePiShim(ctx, shimDir); err != nil {
+			return fmt.Errorf("ensure pi-ext-shim: %w", err)
+		}
+		nodeBin, err = m.findNode()
+		if err != nil {
+			return fmt.Errorf("find node: %w", err)
+		}
 	}
 	manifestBytes, err := GenerateManifest(pkg, shimDir, nodeBin)
 	if err != nil {
@@ -174,7 +177,15 @@ func piManifestForPrompt(pkg *PiPackage) *Manifest {
 			Version:     pkg.Version,
 			Description: pkg.Description,
 		},
-		Plugin: PluginSection{APIVersion: "1"},
+	}
+	if len(pkg.Extensions) > 0 {
+		m.Plugin = PluginSection{APIVersion: "1"}
+	}
+	for _, prompt := range cleanPiEntries(pkg.Prompts) {
+		m.PromptsPlural = append(m.PromptsPlural, ArtifactPath{Path: prompt})
+	}
+	for _, theme := range cleanPiEntries(pkg.Themes) {
+		m.ThemesPlural = append(m.ThemesPlural, ArtifactPath{Path: theme})
 	}
 	for _, skill := range cleanPiEntries(pkg.Skills) {
 		m.SkillsPlural = append(m.SkillsPlural, ArtifactPath{Path: skill})

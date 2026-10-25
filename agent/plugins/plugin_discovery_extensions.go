@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/losinggeneration/tau/agent/artifacts"
+	"github.com/losinggeneration/tau/agent/packages"
 	"github.com/losinggeneration/tau/paths"
 )
 
@@ -46,42 +47,71 @@ func isExtensionPattern(entry string) bool {
 func (m *Manager) filterConfiguredExtensions() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var patterns []string
-	for _, entry := range m.settings.ResourcePaths("extensions") {
-		if isExtensionPattern(entry) {
-			patterns = append(patterns, entry)
-		}
-	}
-	if len(patterns) == 0 {
-		return
-	}
-	all := make([]string, 0, len(m.binaries))
+	user, project := m.settings.ResourcePathsByScope("extensions")
+	var all []string
 	for path := range m.binaries {
 		all = append(all, path)
 	}
-	enabled := artifacts.ApplyFilter(all, patterns, "")
-	allowed := make(map[string]bool, len(enabled))
-	for _, path := range enabled {
-		allowed[path] = true
-	}
-	for _, path := range all {
-		if allowed[path] {
-			continue
-		}
-		explicit := false
-		for _, cliPath := range m.extensionPaths {
-			cliPath = paths.ResourcePath(cliPath, "", "")
-			rel, err := filepath.Rel(cliPath, path)
-			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				explicit = true
-				break
+	allowed := make(map[string]bool, len(all))
+	claimed := make(map[string]bool, len(all))
+	for _, scope := range []struct {
+		entries []string
+		root    string
+	}{{project, m.projectPluginDir()}, {user, m.userExtensionDir()}} {
+		roots := []string{scope.root}
+		var patterns []string
+		for _, entry := range scope.entries {
+			if isExtensionPattern(entry) {
+				patterns = append(patterns, entry)
+			} else {
+				roots = append(roots, entry)
 			}
 		}
-		if !explicit {
+		var candidates []string
+		for _, path := range all {
+			if claimed[path] {
+				continue
+			}
+			for _, root := range roots {
+				if extensionPathWithin(root, path) {
+					candidates = append(candidates, path)
+					claimed[path] = true
+					break
+				}
+			}
+		}
+		for _, path := range artifacts.ApplyFilter(candidates, patterns, "") {
+			allowed[path] = true
+		}
+	}
+
+	for _, path := range all {
+		if allowed[path] || !claimed[path] {
+			continue
+		}
+		if !m.isCLIExtension(path) {
 			delete(m.binaries, path)
 			delete(m.manifestPaths, path)
 		}
 	}
+}
+
+// isCLIExtension requires m.mu to be held.
+func (m *Manager) isCLIExtension(path string) bool {
+	for _, cliPath := range m.extensionPaths {
+		if extensionPathWithin(paths.ResourcePath(cliPath, "", ""), path) {
+			return true
+		}
+	}
+	return false
+}
+
+func extensionPathWithin(root, path string) bool {
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // userExtensionDir resolves the user-global extensions directory:
@@ -115,6 +145,9 @@ func (m *Manager) projectPluginDir() string {
 // scanDir scans a directory for plugin binaries.
 func (m *Manager) scanDir(dir string) error {
 	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		if isPiExtensionFile(dir) {
+			return m.scanPiExtensionFile(dir)
+		}
 		if info.Mode()&0o111 == 0 {
 			return nil
 		}
@@ -136,6 +169,16 @@ func (m *Manager) scanDir(dir string) error {
 		return fmt.Errorf("read dir: %w", err)
 	}
 
+	extensionEntries, err := packages.PiResourcePaths(dir, []string{"."}, packages.ResourceKindExtension)
+	if err != nil {
+		return fmt.Errorf("collect Pi extensions: %w", err)
+	}
+	for _, path := range extensionEntries {
+		if err := m.scanPiExtensionFile(path); err != nil {
+			return err
+		}
+	}
+
 	// Collect and sort loose executable entries alphabetically for consistent
 	// load order. Directory-style plugins are handled below by looking for
 	// tau-package.toml files.
@@ -151,6 +194,10 @@ func (m *Manager) scanDir(dir string) error {
 		path := filepath.Join(dir, name)
 		info, err := os.Stat(path)
 		if err != nil {
+			continue
+		}
+
+		if isPiExtensionFile(path) {
 			continue
 		}
 
@@ -236,4 +283,52 @@ func isIgnoredPluginSupportDir(name string) bool {
 	default:
 		return false
 	}
+}
+
+func isPiExtensionFile(path string) bool {
+	switch filepath.Ext(path) {
+	case ".js", ".ts":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) scanPiExtensionFile(path string) error {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve extension path: %w", err)
+	}
+	args := []string{"node", filepath.Join(m.shimDir(), "index.js"), path}
+	manifest := &Manifest{Run: &RunSection{Command: strings.Join(args, " "), args: args}}
+	manifest.Package.Name = filepath.Base(path)
+	hash, err := computeManagedShimHash(path, manifest)
+	if err != nil {
+		return fmt.Errorf("hash Pi extension: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.packageManifests[path] = manifest
+	m.manifestPaths[path] = path
+	m.binaries[path] = hash
+	return nil
+}
+
+func (m *Manager) scanExtensionCandidates() error {
+	m.mu.Lock()
+	for path := range m.binaries {
+		if m.packageBinaries[path] {
+			continue
+		}
+		delete(m.packageManifests, m.manifestPaths[path])
+		delete(m.manifestPaths, path)
+		delete(m.binaries, path)
+	}
+	m.mu.Unlock()
+	for _, dir := range m.pluginDirs() {
+		if err := m.scanDir(dir); err != nil {
+			return fmt.Errorf("scan extensions in %s: %w", dir, err)
+		}
+	}
+	return nil
 }

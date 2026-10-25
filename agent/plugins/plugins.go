@@ -147,7 +147,9 @@ type Manager struct {
 	binaries map[string]string // path -> hash
 
 	// manifestPaths maps binary paths to their manifest paths (if any).
-	manifestPaths map[string]string // path -> manifestPath
+	manifestPaths    map[string]string // path -> manifestPath
+	packageBinaries  map[string]bool
+	packageManifests map[string]*Manifest
 
 	// Configuration.
 	configDir string
@@ -624,25 +626,33 @@ func (m *Manager) Handshake(ctx context.Context, path string) (*HandshakeResult,
 // handshakeMetadata extracts the metadata needed for a plugin handshake
 // without actually loading the plugin into the manager.
 func (m *Manager) handshakeMetadata(path string) (hash string, manifest *Manifest, manifestPath string, err error) {
-	manifestPath = filepath.Join(filepath.Dir(path), "tau-package.toml")
-	// Directory-style plugins keep the manifest inside the plugin dir itself.
-	if info, statErr := os.Stat(filepath.Join(path, "tau-package.toml")); statErr == nil && !info.IsDir() {
-		manifestPath = filepath.Join(path, "tau-package.toml")
-	}
-	_, err = os.ReadFile(manifestPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// No manifest is fine for loose plugins.
-			manifestPath = ""
-		} else {
-			return "", nil, "", fmt.Errorf("read manifest: %w", err)
+	m.mu.RLock()
+	manifestPath = m.manifestPaths[path]
+	manifest = m.packageManifests[manifestPath]
+	m.mu.RUnlock()
+	if manifest == nil {
+		manifestPath = filepath.Join(filepath.Dir(path), "tau-package.toml")
+		// Directory-style plugins keep the manifest inside the plugin dir itself.
+		if info, statErr := os.Stat(filepath.Join(path, "tau-package.toml")); statErr == nil && !info.IsDir() {
+			manifestPath = filepath.Join(path, "tau-package.toml")
 		}
-	} else {
-		var parseErr error
-		manifest, parseErr = parseManifest(manifestPath)
-		if parseErr != nil {
-			// Log but continue without manifest.
-			m.logger.Warn("plugin manifest parse failed", "path", manifestPath, "error", parseErr)
+		_, err = os.ReadFile(manifestPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// No manifest is fine for loose plugins.
+				manifestPath = ""
+			} else {
+				return "", nil, "", fmt.Errorf("read manifest: %w", err)
+			}
+		} else {
+			var parseErr error
+			m.mu.RLock()
+			manifest, parseErr = m.packageManifest(manifestPath)
+			m.mu.RUnlock()
+			if parseErr != nil {
+				// Log but continue without manifest.
+				m.logger.Warn("plugin manifest parse failed", "path", manifestPath, "error", parseErr)
+			}
 		}
 	}
 
@@ -764,6 +774,7 @@ func NewManager(configDir string, ui ui.UI, commandRegistry *commands.InMemoryRe
 		plugins:             make(map[string]*PluginInfo),
 		binaries:            make(map[string]string),
 		manifestPaths:       make(map[string]string),
+		packageManifests:    make(map[string]*Manifest),
 		configDir:           configDir,
 		ui:                  adaptedUI,
 		eventHandlers:       make(map[string][]EventHandler),
@@ -889,24 +900,22 @@ func (m *Manager) uiSetWidget(key string, lines []string) {
 
 // Discover scans for plugins in the configured directories and loads them.
 func (m *Manager) Discover(ctx context.Context) error {
-	dirs := m.pluginDirs()
-
-	for _, dir := range dirs {
-		if err := m.scanDir(dir); err != nil {
-			// Log but continue
-			m.logger.Warn("plugin scan failed", "dir", dir, "error", err)
-		}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := m.scanExtensionCandidates(); err != nil {
+		return err
 	}
 
 	// Scan for plugins in installed packages.
-	pkgDirs := m.packageDirs()
-	for _, dir := range pkgDirs {
-		if err := m.scanPackagesDir(dir); err != nil {
-			m.logger.Warn("plugin package scan failed", "dir", dir, "error", err)
-		}
+	if err := m.scanConfiguredPackages(); err != nil {
+		return fmt.Errorf("discover configured packages: %w", err)
 	}
 
 	m.filterConfiguredExtensions()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 
 	m.mu.Lock()
 	m.prepareShimIfNeeded(ctx)
@@ -989,7 +998,7 @@ func (m *Manager) loadLocked(ctx context.Context, path string, manifestPath stri
 	var manifest *Manifest
 	var err error
 	if manifestPath != "" {
-		manifest, err = parseManifest(manifestPath)
+		manifest, err = m.packageManifest(manifestPath)
 		if err != nil {
 			m.logger.Warn("plugin manifest parse failed", "path", manifestPath, "error", err)
 		}
@@ -1572,21 +1581,21 @@ func (m *Manager) Reload(ctx context.Context) error {
 // ReloadNamed rehashes plugins and restarts those matching name (or all if name is empty).
 // If name is non-empty, the matching plugin is force-reloaded even if its hash unchanged.
 func (m *Manager) ReloadNamed(ctx context.Context, name string) error {
-	// Scan directories to discover current binaries and hashes.
-	dirs := m.pluginDirs()
-	for _, dir := range dirs {
-		if err := m.scanDir(dir); err != nil {
-			m.logger.Warn("plugin scan failed", "dir", dir, "error", err)
-		}
+	if err := context.Cause(ctx); err != nil {
+		return err
 	}
-	pkgDirs := m.packageDirs()
-	for _, dir := range pkgDirs {
-		if err := m.scanPackagesDir(dir); err != nil {
-			m.logger.Warn("plugin package scan failed", "dir", dir, "error", err)
-		}
+	// Scan directories to discover current binaries and hashes.
+	if err := m.scanExtensionCandidates(); err != nil {
+		return err
+	}
+	if err := m.scanConfiguredPackages(); err != nil {
+		return fmt.Errorf("discover configured packages: %w", err)
 	}
 
 	m.filterConfiguredExtensions()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

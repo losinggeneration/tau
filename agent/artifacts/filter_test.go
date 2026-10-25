@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/losinggeneration/tau/agent/packages"
+	"github.com/losinggeneration/tau/ai"
 )
 
 func TestGlobMatch(t *testing.T) {
@@ -267,5 +270,33 @@ func TestApplyFilterExpandsHomeAfterModifiers(t *testing.T) {
 		if got := ApplyFilter([]string{a, b, other}, tc.patterns, t.TempDir()); !slices.Equal(got, tc.want) {
 			t.Errorf("ApplyFilter(%v) = %v, want %v", tc.patterns, got, tc.want)
 		}
+	}
+}
+
+func TestApplyPackageFilterPreservesPresenceAndOrderedDelta(t *testing.T) {
+	root := t.TempDir()
+	all := []string{filepath.Join(root, "prompts", "keep.md"), filepath.Join(root, "prompts", "drop.md"), filepath.Join(root, "prompts", "last.md")}
+	for _, tc := range []struct {
+		name     string
+		patterns []string
+		autoload *bool
+		delta    *ai.PackageSource
+		want     []string
+	}{
+		{name: "absent", want: all},
+		{name: "empty", patterns: []string{}, want: nil},
+		{name: "include exclude force", patterns: []string{"prompts/*", "!prompts/*", "+prompts/keep.md", "+prompts/last.md", "-prompts/last.md"}, want: all[:1]},
+		{name: "disabled starts empty", autoload: new(false), want: nil},
+		{name: "disabled ordered", autoload: new(false), patterns: []string{"+prompts/keep.md", "-prompts/keep.md", "prompts/drop.md"}, want: all[1:2]},
+		{name: "project delta", delta: &ai.PackageSource{Autoload: new(false), Prompts: []string{"-prompts/drop.md"}}, want: []string{all[0], all[2]}},
+		{name: "empty project delta inherits", delta: &ai.PackageSource{Autoload: new(false), Prompts: []string{}}, want: all},
+		{name: "delta enables excluded", patterns: []string{}, delta: &ai.PackageSource{Autoload: new(false), Prompts: []string{"+prompts/keep.md"}}, want: all[:1]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ApplyPackageFilter(all, packages.ResolvedPackage{Root: root, Source: ai.PackageSource{Autoload: tc.autoload, Prompts: tc.patterns}, Delta: tc.delta}, "prompts")
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

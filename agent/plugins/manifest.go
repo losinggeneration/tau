@@ -34,6 +34,8 @@ type Manifest struct {
 // RunSection defines how to launch the plugin.
 type RunSection struct {
 	Command string `toml:"command"`
+	// args is the policy-selected argv for a managed shim. Nil uses Command.
+	args []string
 }
 
 // HasRunCommand returns true if the manifest specifies a run command.

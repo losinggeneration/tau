@@ -1,6 +1,7 @@
 package packages
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,25 +28,6 @@ func TestIsHidden(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := isHidden(tt.path)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-func TestUnescapeIgnorePattern(t *testing.T) {
-	tests := []struct {
-		name     string
-		pattern  string
-		expected string
-	}{
-		{"normal", "*.log", "*.log"},
-		{"escaped bang", "\\!important.txt", "!important.txt"},
-		{"escaped hash", "\\#note.txt", "#note.txt"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := unescapeIgnorePattern(tt.pattern)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -333,4 +315,76 @@ version = "1.0.0"
 
 	// Files in node_modules should NOT be included
 	assert.False(t, resourcePaths["extensions/node_modules/lodash/index.ts"], "node_modules should be ignored")
+}
+
+func TestIgnoreRulesUseGitignoreSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name, rules, path  string
+		directory, ignored bool
+	}{
+		{name: "last rule wins", rules: "*.md\n!keep.md\n", path: "keep.md"},
+		{name: "escaped bang is literal", rules: "\\!note.md\n", path: "!note.md", ignored: true},
+		{name: "escaped hash is literal", rules: "\\#note.md\n", path: "#note.md", ignored: true},
+		{name: "root directory anchor", rules: "/build/\n", path: "build", directory: true, ignored: true},
+		{name: "root anchor excludes descendants", rules: "/build/\n", path: "nested/build", directory: true},
+		{name: "star cannot cross slash", rules: "/a*b.md\n", path: "a/keep/b.md"},
+		{name: "question cannot cross slash", rules: "/a?b.md\n", path: "a/b.md"},
+		{name: "double star matches zero directories", rules: "**/keep.md\n", path: "keep.md", ignored: true},
+		{name: "character class", rules: "[ab].md\n", path: "a.md", ignored: true},
+		{name: "directory pattern does not match file", rules: "cache/\n", path: "cache"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(root, ".gitignore"), []byte(tc.rules), 0o600))
+			matcher, err := newIgnoreMatcher(root, root)
+			require.NoError(t, err)
+			assert.Equal(t, tc.ignored, isIgnored(matcher, filepath.Join(root, filepath.FromSlash(tc.path)), tc.directory))
+		})
+	}
+}
+
+func TestIgnoreRulesKeepNestedBasesAndPrecedence(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	require.NoError(t, os.Mkdir(nested, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*.md\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, ".gitignore"), []byte("!keep.md\n/local.js\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, ".ignore"), []byte("!local.js\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, ".fdignore"), []byte("/local.js\n"), 0o600))
+	matcher, err := newIgnoreMatcher(nested, root)
+	require.NoError(t, err)
+	assert.False(t, isIgnored(matcher, filepath.Join(nested, "keep.md"), false))
+	assert.True(t, isIgnored(matcher, filepath.Join(nested, "drop.md"), false))
+	assert.True(t, isIgnored(matcher, filepath.Join(nested, "local.js"), false))
+	assert.False(t, isIgnored(matcher, filepath.Join(root, "local.js"), false))
+	assert.False(t, isIgnored(matcher, filepath.Join(nested, "deeper", "local.js"), false))
+	assert.False(t, isIgnored(matcher, filepath.Join(root+"-outside", "drop.md"), false))
+}
+
+func TestIgnoreFileReadErrorsReachCollectors(t *testing.T) {
+	for _, kind := range []ResourceKind{ResourceKindExtension, ResourceKindSkill, ResourceKindPrompt, ResourceKindTheme} {
+		t.Run(fmt.Sprint(kind), func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "resources")
+			require.NoError(t, os.Mkdir(dir, 0o700))
+			require.NoError(t, os.Symlink(".gitignore", filepath.Join(dir, ".gitignore")))
+			got, err := PiResourcePaths(root, []string{"resources"}, kind)
+			require.ErrorContains(t, err, "read ignore file")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+func TestSkillCollectionUsesNestedIgnoreExceptions(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	require.NoError(t, os.Mkdir(nested, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*.md\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, ".gitignore"), []byte("!keep.md\n"), 0o600))
+	for _, name := range []string{"keep.md", "drop.md"} {
+		require.NoError(t, os.WriteFile(filepath.Join(nested, name), []byte("skill"), 0o600))
+	}
+	got, err := collectSkillResources(root, root, "pi")
+	require.NoError(t, err)
+	assert.Equal(t, []Resource{{Path: filepath.Join(nested, "keep.md"), Kind: ResourceKindSkill, Valid: true}}, got)
 }

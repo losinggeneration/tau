@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -20,6 +21,8 @@ type PiPackage struct {
 	Description string
 	Extensions  []string
 	Skills      []string
+	Prompts     []string
+	Themes      []string
 	PeerDeps    []string
 	HasDeps     bool
 }
@@ -37,19 +40,13 @@ func ParsePiPackage(dir string) (*PiPackage, error) {
 		Description      string            `json:"description"`
 		Dependencies     map[string]string `json:"dependencies"`
 		PeerDependencies map[string]string `json:"peerDependencies"`
-		Pi               *struct {
-			Extensions []string `json:"extensions"`
-			Skills     []string `json:"skills"`
-		} `json:"pi"`
+		Pi               *PiManifest       `json:"pi"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")), &raw); err != nil {
 		return nil, fmt.Errorf("parse package.json: %w", err)
 	}
 	if raw.Pi == nil {
 		return nil, errors.New(notPiPackageError)
-	}
-	if len(raw.Pi.Extensions) == 0 {
-		return nil, fmt.Errorf("pi.extensions is required")
 	}
 	if raw.Name == "" {
 		return nil, fmt.Errorf("package.json name is required")
@@ -58,14 +55,33 @@ func ParsePiPackage(dir string) (*PiPackage, error) {
 		return nil, fmt.Errorf("package.json version is required")
 	}
 
+	extensions := raw.Pi.Extensions
+	if slices.ContainsFunc(extensions, func(entry string) bool {
+		return strings.ContainsAny(entry, "*?") || strings.HasPrefix(entry, "!") || strings.HasPrefix(entry, "+") || strings.HasPrefix(entry, "-")
+	}) {
+		resolved, err := PiResourcePaths(dir, extensions, ResourceKindExtension)
+		if err != nil {
+			return nil, err
+		}
+		extensions = make([]string, 0, len(resolved))
+		for _, path := range resolved {
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				return nil, fmt.Errorf("relative Pi extension: %w", err)
+			}
+			extensions = append(extensions, filepath.ToSlash(rel))
+		}
+	}
 	peerDeps := packageSpecs(raw.PeerDependencies)
 
 	return &PiPackage{
 		Name:        raw.Name,
 		Version:     raw.Version,
 		Description: raw.Description,
-		Extensions:  resolvePiExtensionEntries(dir, raw.Pi.Extensions),
-		Skills:      append([]string(nil), raw.Pi.Skills...),
+		Extensions:  resolvePiExtensionEntries(dir, extensions),
+		Skills:      slices.Clone(raw.Pi.Skills),
+		Prompts:     slices.Clone(raw.Pi.Prompts),
+		Themes:      slices.Clone(raw.Pi.Themes),
 		PeerDeps:    peerDeps,
 		HasDeps:     len(raw.Dependencies) > 0 || len(peerDeps) > 0,
 	}, nil
@@ -76,10 +92,7 @@ func GenerateManifest(pkg *PiPackage, shimDir, nodeBin string) ([]byte, error) {
 	if pkg == nil {
 		return nil, fmt.Errorf("missing pi package")
 	}
-	if len(pkg.Extensions) == 0 {
-		return nil, fmt.Errorf("pi.extensions is required")
-	}
-	if !filepath.IsAbs(nodeBin) {
+	if len(pkg.Extensions) > 0 && !filepath.IsAbs(nodeBin) {
 		return nil, fmt.Errorf("node path must be absolute")
 	}
 
@@ -91,19 +104,36 @@ func GenerateManifest(pkg *PiPackage, shimDir, nodeBin string) ([]byte, error) {
 	if desc != "" {
 		desc += " "
 	}
-	desc += "(pi extension via pi-ext-shim)"
+	if len(pkg.Extensions) > 0 {
+		desc += "(pi extension via pi-ext-shim)"
+	}
 	writeTomlString(&b, "description", desc)
-	fmt.Fprintf(&b, "\n[plugin]\napi_version = \"1\"\n\n[run]\n")
-
-	args := []string{nodeBin, filepath.Join(shimDir, "index.js")}
-	args = append(args, cleanPiEntries(pkg.Extensions)...)
-	writeTomlString(&b, "command", strings.Join(args, " "))
-
-	for _, skill := range cleanPiEntries(pkg.Skills) {
-		fmt.Fprintf(&b, "\n[[skills]]\n")
-		writeTomlString(&b, "path", skill)
+	if len(pkg.Extensions) > 0 {
+		fmt.Fprintf(&b, "\n[plugin]\napi_version = \"1\"\n\n[run]\n")
+		args := []string{nodeBin, filepath.Join(shimDir, "index.js")}
+		args = append(args, cleanPiEntries(pkg.Extensions)...)
+		for i, arg := range args {
+			args[i] = quotePiCommandArg(arg)
+		}
+		writeTomlString(&b, "command", strings.Join(args, " "))
+	}
+	for _, family := range []struct {
+		name    string
+		entries []string
+	}{{"skills", pkg.Skills}, {"prompts", pkg.Prompts}, {"themes", pkg.Themes}} {
+		for _, entry := range cleanPiEntries(family.entries) {
+			fmt.Fprintf(&b, "\n[[%s]]\n", family.name)
+			writeTomlString(&b, "path", entry)
+		}
 	}
 	return b.Bytes(), nil
+}
+
+func quotePiCommandArg(arg string) string {
+	if arg != "" && strings.Trim(arg, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-") == "" {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
 }
 
 func writeTomlString(b *bytes.Buffer, key, value string) {
@@ -134,6 +164,9 @@ func cleanPiEntry(entry string) string {
 }
 
 func resolvePiExtensionEntries(dir string, entries []string) []string {
+	if entries == nil {
+		return nil
+	}
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		clean := cleanPiEntry(entry)

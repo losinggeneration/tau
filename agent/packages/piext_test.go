@@ -30,9 +30,9 @@ func TestParsePiPackage(t *testing.T) {
 			wantErr: notPiPackageError,
 		},
 		{
-			name:    "missing extensions",
-			json:    `{"name":"plain","version":"1.0.0","pi":{"skills":["skills"]}}`,
-			wantErr: "pi.extensions is required",
+			name: "skills only",
+			json: `{"name":"plain","version":"1.0.0","pi":{"skills":["skills"]}}`,
+			want: &PiPackage{Name: "plain", Version: "1.0.0", Skills: []string{"skills"}},
 		},
 		{
 			name: "missing skills tolerated",
@@ -373,5 +373,80 @@ func TestInstallPiGitInstallsPackage(t *testing.T) {
 	}
 	if !sidecar.Pi || sidecar.CommitSHA == "" {
 		t.Fatalf("sidecar = %#v, want pi with commit", sidecar)
+	}
+}
+
+func TestPiResourceOnlyInstallDoesNotRequireShim(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"resources","version":"1.0.0","pi":{"prompts":["custom"],"themes":["looks"],"skills":[]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := ParsePiPackage(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := GenerateManifest(pkg, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.HasPlugin() || manifest.Run.Command != "" {
+		t.Fatal("resource-only manifest launches a plugin")
+	}
+	if !reflect.DeepEqual(manifest.AllPrompts(), []ArtifactPath{{Path: "custom"}}) || !reflect.DeepEqual(manifest.AllThemes(), []ArtifactPath{{Path: "looks"}}) {
+		t.Fatalf("lost resources: %s", data)
+	}
+	m := NewInstallManager(t.TempDir(), t.TempDir())
+	m.ensureShim = func(context.Context, string) error { t.Fatal("resource-only install prepared shim"); return nil }
+	m.lookPath = func(string) (string, error) { t.Fatal("resource-only install looked up node"); return "", nil }
+	if err := m.Install(t.Context(), Config{Source: root, Pi: true, Yes: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParsePiPackageResolvesExtensionGlobs(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"keep.js", "drop.js"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("source"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("\xef\xbb\xbf"+`{"name":"example","version":"1.0.0","pi":{"extensions":["*.js","!drop.js"],"prompts":[],"themes":["themes"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := ParsePiPackage(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(pkg.Extensions, []string{"keep.js"}) || pkg.Prompts == nil || !reflect.DeepEqual(pkg.Themes, []string{"themes"}) {
+		t.Fatalf("lost manifest policy: %#v", pkg)
+	}
+	data, err := GenerateManifest(pkg, "/managed/pi-ext-shim", "/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "drop.js") || strings.Contains(string(data), "*.js") {
+		t.Fatalf("generated command contains unresolved sources: %s", data)
+	}
+}
+
+func TestGenerateManifestQuotesLaunchArguments(t *testing.T) {
+	pkg := &PiPackage{Name: "quoted", Version: "1", Extensions: []string{
+		"plain.js", "space name.js", "apostrophe's.js", `double"quote.js`, "$HOME.js", "$(touch injected).js", "semi;colon.js", "line\nbreak.js", "日本語.js", "back\\slash.js",
+	}}
+	data, err := GenerateManifest(pkg, "/shim's $dir/pi-ext-shim", "/node bin/node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `'/node bin/node' '/shim'"'"'s $dir/pi-ext-shim/index.js' plain.js 'space name.js' 'apostrophe'"'"'s.js' 'double"quote.js' '$HOME.js' '$(touch injected).js' 'semi;colon.js' 'line` + "\n" + `break.js' '日本語.js' 'back\slash.js'`
+	if manifest.Run.Command != want {
+		t.Fatalf("command = %q, want %q", manifest.Run.Command, want)
 	}
 }

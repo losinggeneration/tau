@@ -9,7 +9,7 @@ import (
 )
 
 func resolveRunCommandPath(pkgDir, runCommand string) string {
-	fields := strings.Fields(strings.TrimSpace(runCommand))
+	fields := splitCommand(runCommand)
 	if len(fields) == 0 {
 		return ""
 	}
@@ -131,6 +131,14 @@ func buildPluginCmd(path string, manifest *Manifest, manifestPath, hostSocket st
 	}
 
 	if manifest != nil && manifest.HasRunCommand() {
+		if args := manifest.Run.args; args != nil {
+			bin, err := resolveLaunchBinary(args[0])
+			if err != nil {
+				return nil, err
+			}
+			wrapperArgs := append([]string{"-c", pluginDirectScript, bin}, args[1:]...)
+			return withEnv(exec.Command("sh", wrapperArgs...)), nil
+		}
 		runCmd := manifest.Run.Command
 		if !strings.ContainsAny(runCmd, shellMetachars) {
 			if fields := splitCommand(runCmd); len(fields) > 0 {

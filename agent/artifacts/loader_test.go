@@ -8,6 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/losinggeneration/tau/agent/packages"
+	"github.com/losinggeneration/tau/ai"
+
 	"github.com/losinggeneration/tau/commands"
 )
 
@@ -178,4 +183,130 @@ func TestLoaderPrepareCommitsSettingsPathsOnlyOnCommit(t *testing.T) {
 	if _, ok := loader.PromptRegistry().Get("new"); !ok {
 		t.Fatal("reload did not keep the committed settings paths")
 	}
+}
+
+func TestLoaderPrepareReplacesPackageDirectoriesOnlyOnCommit(t *testing.T) {
+	root := t.TempDir()
+	oldDir, newDir := filepath.Join(root, "old"), filepath.Join(root, "new")
+	for _, dir := range []string{oldDir, newDir} {
+		path := filepath.Join(dir, "example", "prompts", filepath.Base(dir)+".md")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("body"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg := commands.NewInMemoryRegistry()
+	loader, err := NewLoader(LoaderOptions{CWD: t.TempDir(), PackagePaths: []string{oldDir}, DisableSkills: true, DisableThemes: true, CommandsRegistry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrompt := func(name string, want bool) {
+		t.Helper()
+		if _, ok := loader.PromptRegistry().Get(name); ok != want {
+			t.Fatalf("prompt %s present = %t, want %t", name, ok, want)
+		}
+		if _, _, ok := reg.Lookup(name); ok != want {
+			t.Fatalf("command %s present = %t, want %t", name, ok, want)
+		}
+	}
+	opts := ReloadOptions{PackagePaths: []string{newDir}}
+	prepared, err := loader.Prepare(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.PackagePaths[0] = "mutated"
+	assertPrompt("old", true)
+	assertPrompt("new", false)
+	prepared.Commit()
+	assertPrompt("old", false)
+	assertPrompt("new", true)
+	// Omitting package paths keeps the committed directories.
+	prepared, err = loader.Prepare(ReloadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.Commit()
+	if err := loader.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertPrompt("new", true)
+	prepared, err = loader.Prepare(ReloadOptions{PackagePaths: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrompt("new", true)
+	prepared.Commit()
+	assertPrompt("new", false)
+	if err := loader.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertPrompt("new", false)
+}
+
+func TestLoaderPreparedPackagePoliciesOwnTheirInputs(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "prompts", "keep.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loader, err := NewLoader(LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisableThemes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := []packages.ResolvedPackage{{Root: root, Source: ai.PackageSource{Autoload: new(false)}, Delta: &ai.PackageSource{Prompts: []string{"+prompts/keep.md"}}}}
+	prepared, err := loader.Prepare(ReloadOptions{Packages: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input[0].Delta.Prompts[0] = "-prompts/keep.md"
+	*input[0].Source.Autoload = true
+	prepared.Commit()
+	if err := loader.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.PromptRegistry().Get("keep"); !ok {
+		t.Fatal("prepared package policy retained caller aliases")
+	}
+	prepared, err = loader.Prepare(ReloadOptions{Packages: []packages.ResolvedPackage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.Commit()
+	if err := loader.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.PromptRegistry().Get("keep"); ok {
+		t.Fatal("explicit empty policy restored implicit scanning")
+	}
+}
+
+func TestLoaderPiManifestPoliciesSurvivePreparedReload(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"keep", "drop"} {
+		path := filepath.Join(root, "custom", name+".md")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		require.NoError(t, os.WriteFile(path, []byte(name), 0o600))
+	}
+	manifest := filepath.Join(root, "package.json")
+	require.NoError(t, os.WriteFile(manifest, []byte(`{"pi":{"prompts":["custom/*.md","!custom/drop.md"]}}`), 0o600))
+	loader, err := NewLoader(LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisableThemes: true, Packages: []packages.ResolvedPackage{{Root: root}}})
+	require.NoError(t, err)
+	_, ok := loader.PromptRegistry().Get("keep")
+	require.True(t, ok)
+	_, ok = loader.PromptRegistry().Get("drop")
+	require.False(t, ok)
+	require.NoError(t, os.WriteFile(manifest, []byte(`{"pi":{"prompts":[]}}`), 0o600))
+	prepared, err := loader.Prepare(ReloadOptions{})
+	require.NoError(t, err)
+	_, ok = loader.PromptRegistry().Get("keep")
+	require.True(t, ok, "prepare changed live manifest resources")
+	prepared.Commit()
+	require.NoError(t, loader.Reload(t.Context()))
+	_, ok = loader.PromptRegistry().Get("keep")
+	require.False(t, ok, "reload restored a resource disabled by the Pi manifest")
 }

@@ -50,7 +50,7 @@ func (m *Manager) prepareShimIfNeeded(ctx context.Context) {
 
 func (m *Manager) hasShimManifestLocked() bool {
 	for _, manifestPath := range m.manifestPaths {
-		manifest, err := parseManifest(manifestPath)
+		manifest, err := m.packageManifest(manifestPath)
 		if err != nil || !manifestNeedsManagedShim(manifest) {
 			continue
 		}
@@ -149,7 +149,10 @@ func manifestNeedsManagedShim(manifest *Manifest) bool {
 	if manifest == nil || !manifest.HasRunCommand() {
 		return false
 	}
-	fields := splitCommand(manifest.Run.Command)
+	fields := manifest.Run.args
+	if fields == nil {
+		fields = splitCommand(manifest.Run.Command)
+	}
 	if len(fields) < 2 {
 		return false
 	}

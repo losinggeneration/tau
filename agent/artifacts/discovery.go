@@ -125,9 +125,10 @@ const (
 
 // Entry represents a discovered artifact source.
 type Entry struct {
-	Tier       SourceTier
-	Kind       ArtifactKind
-	SourcePath string
+	packageOrder int
+	Tier         SourceTier
+	Kind         ArtifactKind
+	SourcePath   string
 	// RealPath is the resolved real path for duplicate detection via symlinks.
 	// If empty, SourcePath is used as the real path.
 	RealPath string
@@ -140,8 +141,10 @@ type DiscoveryConfig struct {
 	HomeDir string
 	// CWD is the current working directory (for project-local discovery).
 	CWD string
-	// SettingsPaths are explicit paths from settings.json.
+	// SettingsPaths are unscoped paths retained for direct discovery callers.
 	SettingsPaths map[ArtifactKind][]string
+	// SettingsScopes keeps project and user paths and filters independent.
+	SettingsScopes map[SourceTier]map[ArtifactKind][]string
 	// UserDirs overrides the user-global artifact directories per kind.
 	// Kinds without an entry (or with an empty value) default to
 	// <HomeDir>/.tau/agent/<subdir>. Callers resolve env/config-dir policy
@@ -149,8 +152,10 @@ type DiscoveryConfig struct {
 	UserDirs map[ArtifactKind]string
 	// CLIPaths are explicit paths from CLI flags.
 	CLIPaths map[ArtifactKind][]string
-	// PackagePaths are directories to scan for installed packages.
+	// PackagePaths are directories to scan for installed packages, highest priority first.
 	PackagePaths []string
+	// Packages, when nonnil, replaces implicit package-directory scanning.
+	Packages []packages.ResolvedPackage
 	// DisableSkills skips skill discovery.
 	DisableSkills bool
 	// DisablePrompts skips prompt template discovery.
@@ -282,48 +287,15 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 		entries = append(entries, e...)
 	}
 
-	// Settings entries discover plain paths; patterns select within the discovered set.
-	for _, kind := range []ArtifactKind{KindSkill, KindPrompt, KindTheme, KindExtension} {
-		if (kind == KindSkill && cfg.DisableSkills) || (kind == KindPrompt && cfg.DisablePrompts) ||
-			(kind == KindTheme && cfg.DisableThemes) || (kind == KindExtension && cfg.DisableExtensions) {
-			continue
-		}
-		plain, _ := splitPatterns(cfg.SettingsPaths[kind])
-		for _, path := range plain {
-			es, tier := discoverArtifactPathWithSettingsTier(paths.ResourcePath(path, cfg.CWD, cfg.HomeDir), cfg.CWD, cfg.HomeDir, kind)
-			if len(es) > 0 {
-				entries = append(entries, es...)
-			} else if tier != TierBuiltin {
-				warn(cfg.Log, string(kind), path, errors.New("not found"))
-			}
+	// Packages retain their own filtering policy, separate from scoped local paths.
+	entries = append(entries, discoverPackageArtifacts(cfg)...)
+	for _, tier := range []SourceTier{TierProject, TierUser} {
+		for kind, configured := range cfg.SettingsScopes[tier] {
+			entries = discoverSettingsEntries(entries, configured, kind, tier, cfg)
 		}
 	}
-
-	// 6. Packages (TierPackages)
-	entries = append(entries, discoverPackageArtifacts(cfg)...)
-
 	for kind, configured := range cfg.SettingsPaths {
-		_, patterns := splitPatterns(configured)
-		if len(patterns) == 0 {
-			continue
-		}
-		for i, pattern := range patterns {
-			patterns[i] = paths.ResourcePath(pattern, cfg.CWD, cfg.HomeDir)
-		}
-		var candidates []string
-		for _, entry := range entries {
-			if entry.Kind == kind && entry.Tier != TierCLI {
-				candidates = append(candidates, entry.SourcePath)
-			}
-		}
-		enabled := ApplyFilter(candidates, patterns, cfg.CWD)
-		allowed := make(map[string]bool, len(enabled))
-		for _, path := range enabled {
-			allowed[path] = true
-		}
-		entries = slices.DeleteFunc(entries, func(entry Entry) bool {
-			return entry.Kind == kind && entry.Tier != TierCLI && !allowed[entry.SourcePath]
-		})
+		entries = discoverSettingsEntries(entries, configured, kind, TierSettings, cfg)
 	}
 
 	// 7. Built-in themes (TierBuiltin)
@@ -331,7 +303,7 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 		entries = append(entries, BuiltinThemes()...)
 	}
 
-	// Sort entries within each tier by source path for deterministic first-load-wins ordering
+	// Preserve configured package priority before deterministic source-path ordering.
 	entries = sortEntriesByTier(entries)
 
 	// Suppress duplicates: if multiple entries resolve to the same real path,
@@ -342,99 +314,210 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 	return entries, nil
 }
 
+func discoverSettingsEntries(entries []Entry, configured []string, kind ArtifactKind, scope SourceTier, cfg DiscoveryConfig) []Entry {
+	if (kind == KindSkill && cfg.DisableSkills) || (kind == KindPrompt && cfg.DisablePrompts) ||
+		(kind == KindTheme && cfg.DisableThemes) || (kind == KindExtension && cfg.DisableExtensions) {
+		return entries
+	}
+	plain, patterns := splitPatterns(configured)
+	for _, path := range plain {
+		es, tier := discoverArtifactPathWithSettingsTier(paths.ResourcePath(path, cfg.CWD, cfg.HomeDir), cfg.CWD, cfg.HomeDir, kind)
+		if len(es) == 0 && tier != TierBuiltin {
+			warn(cfg.Log, string(kind), path, errors.New("not found"))
+		}
+		if scope != TierSettings {
+			for i := range es {
+				es[i].Tier = scope
+			}
+		}
+		entries = append(entries, es...)
+	}
+	if len(patterns) == 0 {
+		return entries
+	}
+	for i, pattern := range patterns {
+		patterns[i] = paths.ResourcePath(pattern, cfg.CWD, cfg.HomeDir)
+	}
+	matchesScope := func(entry Entry) bool {
+		return entry.Kind == kind && entry.Tier != TierCLI && (scope == TierSettings || entry.Tier == scope)
+	}
+	var candidates []string
+	for _, entry := range entries {
+		if matchesScope(entry) {
+			candidates = append(candidates, entry.SourcePath)
+		}
+	}
+	allowed := make(map[string]bool)
+	for _, path := range ApplyFilter(candidates, patterns, cfg.CWD) {
+		allowed[path] = true
+	}
+	return slices.DeleteFunc(entries, func(entry Entry) bool {
+		return matchesScope(entry) && !allowed[entry.SourcePath]
+	})
+}
+
 // discoverPackageArtifacts discovers artifacts from installed packages.
 func discoverPackageArtifacts(cfg DiscoveryConfig) []Entry {
 	var entries []Entry
-
-	for _, basePath := range cfg.PackagePaths {
-		basePath = paths.ResourcePath(basePath, cfg.CWD, cfg.HomeDir)
-		pkgDirs, err := os.ReadDir(basePath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			warn(cfg.Log, "packages", basePath, err)
-			continue
-		}
-
-		for _, pkgEntry := range pkgDirs {
-			// Skip non-directory entries unless it's a symlink (which may point to a directory).
-			if !pkgEntry.IsDir() && pkgEntry.Type()&os.ModeSymlink == 0 {
-				continue
-			}
-
-			pkgName := pkgEntry.Name()
-			pkgRoot := filepath.Join(basePath, pkgName)
-
-			// Resolve symlinks so we can read the actual package directory.
-			pkgRoot, _ = filepath.EvalSymlinks(pkgRoot)
-			manifestPath := filepath.Join(pkgRoot, "tau-package.toml")
-
-			// Try to load manifest; if missing, fall back to convention-based discovery.
-			manifest, err := packages.Load(manifestPath)
-			if err != nil {
-				// Convention fallback: missing manifest with skills/prompts/themes at root
-				// auto-discovers as if declared. Plugins require a manifest (security).
-				if !discoverConventionFallback(pkgRoot, cfg, &entries) {
-					continue
-				}
-				// Artifacts were discovered via convention fallback; continue to next package.
-				continue
-			}
-
-			skills := manifest.AllSkills()
-			if !cfg.DisableSkills && len(skills) > 0 {
-				for _, skill := range skills {
-					skillPath := filepath.Join(pkgRoot, skill.Path)
-					e, err := discoverArtifactPath(skillPath, KindSkill, TierPackages)
-					if err != nil {
-						warn(cfg.Log, "skill", skillPath, err)
-						continue
+	if cfg.Packages != nil {
+		for order, pkg := range cfg.Packages {
+			found := discoverPackageRoot(pkg.Root, cfg)
+			allowed := make(map[string]bool)
+			for _, family := range []struct {
+				kind ArtifactKind
+				name string
+			}{{KindSkill, "skills"}, {KindPrompt, "prompts"}, {KindTheme, "themes"}} {
+				var all []string
+				for _, entry := range found {
+					if entry.Kind == family.kind {
+						all = append(all, entry.SourcePath)
 					}
-					entries = append(entries, e...)
 				}
-			} else if !cfg.DisableSkills {
-				skillPath := filepath.Join(pkgRoot, "skills")
-				e, _ := discoverDir(skillPath, KindSkill, TierPackages, false, pkgRoot)
-				entries = append(entries, e...)
+				for _, path := range ApplyPackageFilter(all, pkg, family.name) {
+					allowed[path] = true
+				}
 			}
-
-			prompts := manifest.AllPrompts()
-			if !cfg.DisablePrompts && len(prompts) > 0 {
-				for _, prompt := range prompts {
-					promptPath := filepath.Join(pkgRoot, prompt.Path)
-					e, err := discoverArtifactPath(promptPath, KindPrompt, TierPackages)
-					if err != nil {
-						warn(cfg.Log, "prompt", promptPath, err)
-						continue
-					}
-					entries = append(entries, e...)
+			for _, entry := range found {
+				if allowed[entry.SourcePath] {
+					entry.packageOrder = order
+					entries = append(entries, entry)
 				}
-			} else if !cfg.DisablePrompts {
-				promptPath := filepath.Join(pkgRoot, "prompts")
-				e, _ := discoverDir(promptPath, KindPrompt, TierPackages, false, pkgRoot)
-				entries = append(entries, e...)
-			}
-
-			themes := manifest.AllThemes()
-			if !cfg.DisableThemes && len(themes) > 0 {
-				for _, theme := range themes {
-					themePath := filepath.Join(pkgRoot, theme.Path)
-					e, err := discoverArtifactPath(themePath, KindTheme, TierPackages)
-					if err != nil {
-						warn(cfg.Log, "theme", themePath, err)
-						continue
-					}
-					entries = append(entries, e...)
-				}
-			} else if !cfg.DisableThemes {
-				themePath := filepath.Join(pkgRoot, "themes")
-				e, _ := discoverDir(themePath, KindTheme, TierPackages, false, pkgRoot)
-				entries = append(entries, e...)
 			}
 		}
+		return entries
 	}
 
+	for order, basePath := range cfg.PackagePaths {
+		basePath = paths.ResourcePath(basePath, cfg.CWD, cfg.HomeDir)
+		for _, pkgRoot := range packageRoots(basePath, cfg.Log) {
+			found := discoverPackageRoot(pkgRoot, cfg)
+			for i := range found {
+				found[i].packageOrder = order
+			}
+			entries = append(entries, found...)
+		}
+	}
+	return entries
+}
+
+func packageRoots(basePath string, log *slog.Logger) []string {
+	roots, err := packages.InstalledRoots(basePath)
+	if err != nil {
+		warn(log, "packages", basePath, err)
+	}
+	return roots
+}
+
+func discoverPackageRoot(pkgRoot string, cfg DiscoveryConfig) []Entry {
+	var entries []Entry
+	resolved, err := filepath.EvalSymlinks(pkgRoot)
+	if err != nil {
+		warn(cfg.Log, "packages", pkgRoot, err)
+		return nil
+	}
+	pkgRoot = resolved
+	manifestPath := filepath.Join(pkgRoot, "tau-package.toml")
+
+	pi, piErr := packages.ReadPiManifest(pkgRoot)
+	if piErr != nil {
+		warn(cfg.Log, "Pi manifest", pkgRoot, piErr)
+		return nil
+	}
+	if pi != nil {
+		for _, family := range []struct {
+			kind     ArtifactKind
+			resource packages.ResourceKind
+			paths    []string
+			disabled bool
+		}{
+			{KindSkill, packages.ResourceKindSkill, pi.Skills, cfg.DisableSkills},
+			{KindPrompt, packages.ResourceKindPrompt, pi.Prompts, cfg.DisablePrompts},
+			{KindTheme, packages.ResourceKindTheme, pi.Themes, cfg.DisableThemes},
+		} {
+			if family.disabled {
+				continue
+			}
+			paths, err := packages.PiResourcePaths(pkgRoot, family.paths, family.resource)
+			if err != nil {
+				warn(cfg.Log, "Pi resources", pkgRoot, err)
+				continue
+			}
+			for _, path := range paths {
+				found, err := discoverFile(path, family.kind, TierPackages)
+				if err != nil {
+					warn(cfg.Log, "Pi resource", path, err)
+					continue
+				}
+				entries = append(entries, found...)
+			}
+		}
+		return entries
+	}
+	manifest, err := packages.Load(manifestPath)
+	if err != nil {
+		discoverConventionFallback(pkgRoot, cfg, &entries)
+		return entries
+	}
+
+	skills := manifest.AllSkills()
+	if !cfg.DisableSkills && len(skills) > 0 {
+		for _, skill := range skills {
+			skillPath := filepath.Join(pkgRoot, skill.Path)
+			e, err := discoverArtifactPath(skillPath, KindSkill, TierPackages)
+			if err != nil {
+				warn(cfg.Log, "skill", skillPath, err)
+				continue
+			}
+			entries = append(entries, e...)
+		}
+	} else if !cfg.DisableSkills {
+		skillPath := filepath.Join(pkgRoot, "skills")
+		e, err := discoverDir(skillPath, KindSkill, TierPackages, false, pkgRoot)
+		if err != nil {
+			warn(cfg.Log, "skill", skillPath, err)
+		}
+		entries = append(entries, e...)
+	}
+
+	prompts := manifest.AllPrompts()
+	if !cfg.DisablePrompts && len(prompts) > 0 {
+		for _, prompt := range prompts {
+			promptPath := filepath.Join(pkgRoot, prompt.Path)
+			e, err := discoverArtifactPath(promptPath, KindPrompt, TierPackages)
+			if err != nil {
+				warn(cfg.Log, "prompt", promptPath, err)
+				continue
+			}
+			entries = append(entries, e...)
+		}
+	} else if !cfg.DisablePrompts {
+		promptPath := filepath.Join(pkgRoot, "prompts")
+		e, err := discoverDir(promptPath, KindPrompt, TierPackages, false, pkgRoot)
+		if err != nil {
+			warn(cfg.Log, "prompt", promptPath, err)
+		}
+		entries = append(entries, e...)
+	}
+
+	themes := manifest.AllThemes()
+	if !cfg.DisableThemes && len(themes) > 0 {
+		for _, theme := range themes {
+			themePath := filepath.Join(pkgRoot, theme.Path)
+			e, err := discoverArtifactPath(themePath, KindTheme, TierPackages)
+			if err != nil {
+				warn(cfg.Log, "theme", themePath, err)
+				continue
+			}
+			entries = append(entries, e...)
+		}
+	} else if !cfg.DisableThemes {
+		themePath := filepath.Join(pkgRoot, "themes")
+		e, err := discoverDir(themePath, KindTheme, TierPackages, false, pkgRoot)
+		if err != nil {
+			warn(cfg.Log, "theme", themePath, err)
+		}
+		entries = append(entries, e...)
+	}
 	return entries
 }
 
@@ -876,8 +959,7 @@ func warn(logger *slog.Logger, kind, path string, err error) {
 }
 
 // sortEntriesByTier orders entries by tier precedence (higher precedence
-// first), with source-path alphabetical order as the tiebreaker. Within a
-// tier, deterministic ordering is preserved by sorting entries by source path.
+// first), then configured package-directory priority, then source path.
 //
 // TierCLI wins on collision; TierBuiltin loses. Registries that consume the
 // result of this function (and register with first-wins semantics) therefore
@@ -893,6 +975,11 @@ func sortEntriesByTier(entries []Entry) []Entry {
 	slices.SortStableFunc(sorted, func(a, b Entry) int {
 		if c := cmp.Compare(b.Tier.Precedence(), a.Tier.Precedence()); c != 0 {
 			return c
+		}
+		if a.Tier == TierPackages {
+			if c := cmp.Compare(a.packageOrder, b.packageOrder); c != 0 {
+				return c
+			}
 		}
 		return cmp.Compare(a.SourcePath, b.SourcePath)
 	})
