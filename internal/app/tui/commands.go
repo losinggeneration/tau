@@ -492,6 +492,7 @@ func (a *App) replaceConversationWithMode(conv *ConversationModel, clearChat boo
 		a.app.ResetMouseState()
 	}
 	a.conv = conv
+	a.resetHistoryPaging()
 	if a.chat != nil {
 		if clearChat {
 			a.chat.SetConversation(conv)
@@ -810,15 +811,9 @@ func (a *App) populateChatFromSession(sess sdk.Session) {
 	a.populateChatFromMessages(lister.GetMessages(), "")
 }
 
-// seedChatFromSession installs a resumed transcript into the chat log.
-//
-// The whole transcript is rendered up front. An earlier version rendered only a
-// tail and paged older history in as the user scrolled, sized by an estimate of
-// how tall each message would render. That estimate had to model the renderer,
-// so it drifted whenever rendering changed and was wrong by a wide margin on
-// tool-heavy histories. It existed to defer wrapping cost that measured at
-// 2-47ms across real sessions once grapheme-cluster iteration stopped being
-// quadratic — far less than reading the session file, which happens either way.
+// seedChatFromSession installs a resumed transcript into the chat log. The
+// chat log wraps only a tail window of it and grows the window from real
+// renders as the user scrolls up; no height is estimated.
 func (a *App) seedChatFromSession(sess sdk.Session, notice string) {
 	if a == nil || sess == nil || a.conv == nil {
 		return
@@ -831,7 +826,13 @@ func (a *App) seedChatFromSession(sess sdk.Session, notice string) {
 		return
 	}
 	messages := lister.GetMessages()
-	a.populateChatFromMessages(messages, notice)
+	if a.seedChatFromHistory(sess) {
+		if notice != "" {
+			a.conv.AddSystem(notice)
+		}
+	} else {
+		a.populateChatFromMessages(messages, notice)
+	}
 	a.populateEditorHistoryFromMessages(messages)
 }
 

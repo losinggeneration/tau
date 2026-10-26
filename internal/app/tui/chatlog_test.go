@@ -1441,35 +1441,98 @@ func chatLogText(log *ChatLog) string {
 	return b.String()
 }
 
-// TestChatLogLargeHistoryRendersFully pins that a long transcript is rendered
-// in full. It previously also asserted the placeholder-virtualization path was
-// not taken; that path has since been removed, since it was never enabled and
-// the cost it existed to avoid was a quadratic text wrapper, now fixed.
-func TestChatLogLargeHistoryRendersFully(t *testing.T) {
+// TestChatLogLargeHistoryRendersTailWindow pins that a long transcript keeps
+// only its tail wrapped: the window grows when the viewport reaches its top,
+// keeps the viewed content in place, and shrinks back once the viewport
+// returns to the bottom.
+func TestChatLogLargeHistoryRendersTailWindow(t *testing.T) {
 	conv := NewConversationModel()
-	for i := range 1500 {
-		conv.AddSystem("history row " + strings.Repeat("x", i%11))
+	total := 3 * chatLogWindowComponents
+	for i := range total {
+		conv.AddSystem(fmt.Sprintf("history row %04d", i))
 	}
 	log := NewChatLog(conv)
 	t.Cleanup(func() { _ = log.Close() })
-	log.setRenderNotifier(func() error {
-		log.applyPreparedRender()
-		return nil
-	})
-	log.setVisibleRows(0, 20)
-	log.Layout(tauui.Rect{W: 60, H: 20})
-	waitForChatLog(t, log)
-
-	log.mu.Lock()
-	lineCount := log.lineCount
-	text := strings.Join(renderLineTexts(log.lines), "\n")
-	log.mu.Unlock()
-
-	if lineCount < 1500 {
-		t.Fatalf("line count = %d, want full rendered history", lineCount)
+	log.setRenderNotifier(func() error { return nil })
+	settle := func() chatLogRenderUpdate {
+		t.Helper()
+		var last chatLogRenderUpdate
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			log.mu.Lock()
+			has := log.latestPrepared != nil
+			idle := log.pending == nil && !has && log.renderedRevision == log.revision
+			log.mu.Unlock()
+			if has {
+				if u := log.applyPreparedRender(); u.installed {
+					last = u
+				}
+				continue
+			}
+			if idle {
+				return last
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+		t.Fatal("chat log never settled")
+		return last
 	}
-	if !strings.Contains(text, "history row xxxxxxxxxx") {
-		t.Fatalf("full history render missing expected content")
+	rendered := func() (int, int, string) {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		return log.renderedState.snapshot.Offset, len(log.renderedState.components), strings.Join(renderLineTexts(log.lines), "\n")
+	}
+
+	log.Layout(tauui.Rect{W: 60, H: 20})
+	settle()
+	offset, window, text := rendered()
+	if offset != total-chatLogWindowComponents || window != chatLogWindowComponents {
+		t.Fatalf("initial window = [%d, +%d), want the last %d of %d", offset, window, chatLogWindowComponents, total)
+	}
+	if strings.Contains(text, "history row 0000") || !strings.Contains(text, fmt.Sprintf("history row %04d", total-1)) {
+		t.Fatal("initial render should hold only the tail")
+	}
+
+	// Painting the top of the window loads the previous chunk and reports the
+	// rows added above the old first row, so a top-anchored view can stay put.
+	ctx := &tauui.Ctx{Theme: appTheme()}
+	for chunk := 2; chunk <= 3; chunk++ {
+		log.setVisibleRows(0, 20)
+		log.Paint(&recordingDrawer{}, ctx)
+		update := settle()
+		offset, window, _ = rendered()
+		if offset != total-chunk*chatLogWindowComponents || window != chunk*chatLogWindowComponents {
+			t.Fatalf("grown window = [%d, +%d), want %d chunks", offset, window, chunk)
+		}
+		if want := log.renderedState.spans[chatLogWindowComponents].start; update.topDelta != want {
+			t.Fatalf("topDelta = %d, want %d", update.topDelta, want)
+		}
+	}
+	if _, _, text = rendered(); !strings.Contains(text, "history row 0000") {
+		t.Fatal("full window should reach the start of the history")
+	}
+
+	// At the top of everything the model holds, Paint asks the owner for
+	// older history instead.
+	reached := 0
+	log.setReachTopHandler(func() { reached++ })
+	log.setVisibleRows(0, 20)
+	log.Paint(&recordingDrawer{}, ctx)
+	if reached != 1 {
+		t.Fatalf("reach-top handler called %d times, want 1", reached)
+	}
+
+	// Back at the bottom, the window trims to the default tail.
+	lines := log.LineCount()
+	log.setVisibleRows(lines-20, lines)
+	log.Paint(&recordingDrawer{}, ctx)
+	update := settle()
+	offset, window, _ = rendered()
+	if offset != total-chatLogWindowComponents || window != chatLogWindowComponents {
+		t.Fatalf("trimmed window = [%d, +%d), want the last %d", offset, window, chatLogWindowComponents)
+	}
+	if update.topDelta >= 0 || update.newLineCount != lines+update.topDelta {
+		t.Fatalf("trim update = %+v, want the dropped rows reported (had %d lines)", update, lines)
 	}
 }
 
@@ -2919,5 +2982,45 @@ func TestChatMarkdownThemeReachesAssistantUserAndStreamingFences(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+type clippedRecordingDrawer struct {
+	recordingDrawer
+	clip tauui.Rect
+}
+
+func (c *clippedRecordingDrawer) ClipRect() tauui.Rect { return c.clip }
+
+// TestChatLogPaintBoundedByClipInDocumentLayout pins repaint cost to the
+// visible window when the chat log is laid out at full height inside the
+// document layout. There is no scroll viewport to supply a visible-row hint
+// there, so Paint must derive it from the drawer's clip; drawing every cached
+// row made each frame of a long session cost seconds.
+func TestChatLogPaintBoundedByClipInDocumentLayout(t *testing.T) {
+	conv := NewConversationModel()
+	for i := range 200 {
+		conv.AddUserMessage(fmt.Sprintf("line-%03d", i))
+	}
+	log := newTestChatLog(t, conv)
+	doc := tauui.NewDocumentLayout(tauui.AppLayoutOpts{Chat: log})
+	doc.Layout(tauui.Rect{W: 20, H: 5})
+	waitForChatLog(t, log)
+	doc.Layout(tauui.Rect{W: 20, H: 5})
+	if log.LineCount() <= 5 {
+		t.Fatalf("line count = %d, want a transcript taller than the viewport", log.LineCount())
+	}
+
+	d := &clippedRecordingDrawer{clip: tauui.Rect{W: 20, H: 5}}
+	log.Paint(d, &tauui.Ctx{Theme: appTheme()})
+
+	rowFills := len(d.fills) - 1
+	if rowFills != 5 {
+		t.Fatalf("row fills = %d, want viewport height 5", rowFills)
+	}
+	for _, f := range d.fills {
+		if f.rect.Y < 0 || f.rect.Y+f.rect.H > 5 {
+			t.Fatalf("fill %+v outside the clip", f.rect)
+		}
 	}
 }

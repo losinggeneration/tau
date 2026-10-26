@@ -125,6 +125,12 @@ type SessionState struct {
 	// the active branch, respecting position_change entries per the session
 	// tree model spec.
 	position string
+
+	// sessionPath, when set, resolves position lazily on Position(). The
+	// cursor needs the whole session log parsed, which on a long session costs
+	// hundreds of milliseconds and the file's size in garbage, and most State
+	// callers only want the model or working directory.
+	sessionPath string
 }
 
 // SessionID returns the session identifier.
@@ -147,7 +153,16 @@ func (s SessionState) TotalTokens() int { return s.totalTokens }
 
 // Position returns the current session cursor: the entry ID of the
 // current head on the active branch. Returns empty string if no messages.
-func (s SessionState) Position() string { return s.position }
+func (s SessionState) Position() string {
+	if s.position != "" || s.sessionPath == "" {
+		return s.position
+	}
+	reader, err := sessionpkg.ReadFile(s.sessionPath)
+	if err != nil {
+		return ""
+	}
+	return reader.CurrentPosition()
+}
 
 // NewSessionState constructs a SessionState with the given core fields.
 // Provided for tests and callers that need to surface session state outside
@@ -368,6 +383,23 @@ type ModelLister interface {
 
 // MessageLister exposes the session's in-memory messages.
 type MessageLister interface{ GetMessages() []Message }
+
+// HistoryEntry is one displayable entry of a session's persisted history.
+type HistoryEntry struct {
+	EntryID string
+	Message Message
+}
+
+// HistoryPager reads a session's persisted display history a page at a time,
+// newest pages first, so a frontend can drop old history from memory and load
+// it back when the user scrolls to it.
+type HistoryPager interface {
+	// History returns up to limit entries of the active branch, oldest first,
+	// ending just before the entry before, or at the current head when before
+	// is empty. next is the before value for the preceding page, empty once
+	// the start of the history is reached.
+	History(before string, limit int) (entries []HistoryEntry, next string, err error)
+}
 
 // ContextEditor changes model-visible content without changing displayed history.
 // A null replacement omits the target from context.
@@ -731,6 +763,9 @@ type agentSession struct {
 	sessionWriter        *sessionpkg.Writer
 	parentMsgID          *string // parent ID for the next message entry
 	prePersistedMessage  *agent.Message
+	prePersistedEntryID  string
+	historyMu            sync.Mutex
+	historyIndex         sessionpkg.Index
 	pendingNextTurn      []*agent.Message
 	pendingStartupCustom []*agent.Message
 	emittingSettled      bool
@@ -1329,15 +1364,18 @@ func (s *agentSession) sendPreparedMessageLocked(ctx context.Context, msg Messag
 func (s *agentSession) runPreparedMessage(ctx context.Context, msg Message) error {
 	agentMsg := agentMessageFromSDK(msg)
 
-	if err := s.appendUserMessageToSession(msg); err != nil {
+	entryID, err := s.appendUserMessageToSession(msg)
+	if err != nil {
 		return fmt.Errorf("persist prompt: %w", err)
 	}
 	s.mu.Lock()
 	s.prePersistedMessage = agentMsg
+	s.prePersistedEntryID = entryID
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		s.prePersistedMessage = nil
+		s.prePersistedEntryID = ""
 		s.mu.Unlock()
 	}()
 
@@ -2272,7 +2310,7 @@ func trimTranscriptForSummaryWithReserve(transcript string, contextWindow, reser
 // providers see an unauthenticated summary request, fail immediately, and the
 // caller falls back to the naive instant summary.
 func (s *agentSession) compactionCompletionOptions(ctx context.Context, model *ai.Model, level agent.ThinkingLevel) ([]ai.Option, error) {
-	opts := append(s.settingsSnapshot().ResolveRetry().Provider.RequestOptions(), ai.WithSessionID(s.id))
+	opts := append(s.runtime.requestOptions(s.settingsSnapshot()), ai.WithSessionID(s.id))
 	// Mirror buildAIOptions: with no level set, the OpenAI-compat layer sends
 	// enable_thinking:false, which always-thinking models (zai glm-5.3) reject
 	// (error 1210) — so forward the session's level like a normal prompt does.
@@ -2497,13 +2535,6 @@ func (s *agentSession) State() SessionState {
 	dataDir := s.sessionDataDir
 	s.mu.Unlock()
 
-	var position string
-	if writerPath != "" {
-		if reader, err := sessionpkg.ReadFile(writerPath); err == nil {
-			position = reader.CurrentPosition()
-		}
-	}
-
 	return SessionState{
 		id:          s.id,
 		model:       modelID,
@@ -2511,7 +2542,7 @@ func (s *agentSession) State() SessionState {
 		dataDir:     dataDir,
 		isStreaming: processing,
 		totalTokens: s.totalTokens,
-		position:    position,
+		sessionPath: writerPath,
 	}
 }
 
@@ -2881,6 +2912,14 @@ type SettingsReloader interface {
 	ReloadSettings(context.Context, *ai.Settings) error
 }
 
+func (r *runtime) requestOptions(settings *ai.Settings) []ai.Option {
+	opts := settings.ResolveRetry().Provider.RequestOptions()
+	if r != nil && r.noEnvCredentials {
+		opts = append(opts, ai.WithoutEnvCredentials())
+	}
+	return opts
+}
+
 // SettingsProvider reports the settings a session currently applies.
 type SettingsProvider interface {
 	Settings() *ai.Settings
@@ -2934,7 +2973,7 @@ func (s *agentSession) ReloadSettings(ctx context.Context, settings *ai.Settings
 		s.pluginManager.SetSettings(settings)
 	}
 	s.agent.SetThinkingBudgets(settings.ResolveThinkingBudgets())
-	s.agent.SetRequestOptions(settings.ResolveRetry().Provider.RequestOptions()...)
+	s.agent.SetRequestOptions(s.runtime.requestOptions(settings)...)
 	s.agent.SetTransport(transport)
 	if !s.runtime.noTools && !s.runtime.noBuiltinTools {
 		tools := s.agent.State().Tools
@@ -3508,6 +3547,40 @@ func (s *agentSession) GetAllMessages() []Message {
 	return out
 }
 
+// History pages the persisted display history through an offset index of the
+// session file, so each page reads only its own entries.
+func (s *agentSession) History(before string, limit int) ([]HistoryEntry, string, error) {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	head := ""
+	if s.parentMsgID != nil {
+		head = *s.parentMsgID
+	}
+	s.mu.Unlock()
+	if writer == nil || limit <= 0 {
+		return nil, "", nil
+	}
+	s.historyMu.Lock()
+	entries, next, err := s.historyIndex.History(writer.Path(), head, before, limit)
+	s.historyMu.Unlock()
+	if err != nil {
+		return nil, "", fmt.Errorf("read session history: %w", err)
+	}
+	out := make([]HistoryEntry, 0, len(entries))
+	for i := range entries {
+		msg := entries[i].ToAgentMessage()
+		if msg == nil {
+			continue
+		}
+		agentMsg := sessionMessagesToAgentMessages([]*sessionpkg.Message{msg})[0]
+		if isInitialSystemBaseline(agentMsg) {
+			continue
+		}
+		out = append(out, HistoryEntry{EntryID: entries[i].ID, Message: sdkMessageFromAgent(agentMsg)})
+	}
+	return out, next, nil
+}
+
 func (s *agentSession) GetUserMessagesForForking() []Message {
 	all := s.GetMessages()
 	users := make([]Message, 0, len(all))
@@ -4005,27 +4078,35 @@ func errorRequestSummary(messages []*agent.Message, systemPrompt string) map[str
 	return out
 }
 
-// appendMessageToSession writes a message to the session file.
-func (s *agentSession) appendMessageToSession(msg *agent.Message) {
-	if err := s.persistMessage(msg); err != nil {
+// appendMessageToSession writes a message to the session file and returns its
+// entry ID, empty when nothing was written.
+func (s *agentSession) appendMessageToSession(msg *agent.Message) string {
+	id, err := s.persistMessageEntry(msg)
+	if err != nil {
 		s.logger.Error("session write failed", "error", err)
 	}
+	return id
 }
 
 func (s *agentSession) persistMessage(msg *agent.Message) error {
+	_, err := s.persistMessageEntry(msg)
+	return err
+}
+
+func (s *agentSession) persistMessageEntry(msg *agent.Message) (string, error) {
 	s.mu.Lock()
 	writer := s.sessionWriter
 	parentID := s.parentMsgID
 	s.mu.Unlock()
 	if writer == nil {
-		return nil
+		return "", nil
 	}
 
 	// Always marshal the envelope to ensure valid {role, content} structure.
 	// Even if content is nil, we need the role field present.
 	content, err := marshalSessionMessageEnvelope(msg)
 	if err != nil {
-		return fmt.Errorf("marshal message: %w", err)
+		return "", fmt.Errorf("marshal message: %w", err)
 	}
 
 	var tokens *sessionpkg.TokenCounts
@@ -4039,14 +4120,14 @@ func (s *agentSession) persistMessage(msg *agent.Message) error {
 
 	entry := sessionpkg.NewMessageEntry(parentID, content, tokens)
 	if err := writer.Append(entry); err != nil {
-		return fmt.Errorf("append message: %w", err)
+		return "", fmt.Errorf("append message: %w", err)
 	}
 	s.mu.Lock()
 	if s.sessionWriter != nil {
 		s.parentMsgID = &entry.ID
 	}
 	s.mu.Unlock()
-	return nil
+	return entry.ID, nil
 }
 
 func marshalSessionMessageEnvelope(msg *agent.Message) ([]byte, error) {
@@ -4112,28 +4193,30 @@ func marshalSessionMessageEnvelope(msg *agent.Message) ([]byte, error) {
 }
 
 // appendUserMessageToSession writes a user message to the session file.
-func (s *agentSession) appendUserMessageToSession(msg Message) error {
+// appendUserMessageToSession writes a prompt to the session file and returns its
+// entry ID, empty when nothing was written.
+func (s *agentSession) appendUserMessageToSession(msg Message) (string, error) {
 	writer, err := s.ensureSessionWriter()
 	s.mu.Lock()
 	parentID := s.parentMsgID
 	isFirstMessage := s.sessionFileBeforeRename != ""
 	s.mu.Unlock()
 	if err != nil {
-		return fmt.Errorf("ensure session writer: %w", err)
+		return "", fmt.Errorf("ensure session writer: %w", err)
 	}
 	if writer == nil {
-		return nil
+		return "", nil
 	}
 
 	rawContent, err := marshalSessionMessageEnvelope(agentMessageFromSDK(msg))
 	if err != nil {
-		return fmt.Errorf("marshal user message content: %w", err)
+		return "", fmt.Errorf("marshal user message content: %w", err)
 	}
 
 	entry := sessionpkg.NewMessageEntry(parentID, rawContent, nil)
 	entry.ID = sessionpkg.NewID()
 	if err := writer.Append(entry); err != nil {
-		return fmt.Errorf("append user message: %w", err)
+		return "", fmt.Errorf("append user message: %w", err)
 	}
 
 	// Update parentMsgID under the lock so subsequent sends chain to this one.
@@ -4152,7 +4235,7 @@ func (s *agentSession) appendUserMessageToSession(msg Message) error {
 		}
 	}
 
-	return nil
+	return entry.ID, nil
 }
 
 // maybeDeriveSlugFromFirstMessage updates the session filename by deriving
@@ -4451,11 +4534,26 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 				// Log usage to the usage log
 				s.logUsage(usageValue, e.Message.Model)
 			}
+			// Only the triggering prompt is persisted before admission. Consumed
+			// steering and follow-up messages must be written at their boundary.
+			// Messages are written before message_end so the event can name
+			// their entry: frontends page history back in from that point.
+			s.mu.Lock()
+			persisted := e.Message == s.prePersistedMessage
+			entryID := ""
+			if persisted {
+				entryID = s.prePersistedEntryID
+			}
+			s.mu.Unlock()
+			if !persisted {
+				entryID = s.appendMessageToSession(e.Message)
+			}
 			s.emit(ch, Event{
 				Type:      "message_end",
 				SessionID: s.id,
 				Payload: map[string]any{
 					"message_id":    msgID,
+					"entry_id":      entryID,
 					"role":          string(e.Message.Role),
 					"content":       agentMessageText(e.Message),
 					"tokens":        tokens,
@@ -4478,14 +4576,6 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 				})
 			}
 
-			// Only the triggering prompt is persisted before admission. Consumed
-			// steering and follow-up messages must be written at their boundary.
-			s.mu.Lock()
-			prePersisted := e.Message == s.prePersistedMessage
-			s.mu.Unlock()
-			if !prePersisted {
-				s.appendMessageToSession(e.Message)
-			}
 		}
 	case agent.ToolStart:
 		inputJSON, _ := json.Marshal(e.Args)
@@ -5034,7 +5124,7 @@ var ErrNoModelConfigured = errors.New("no model configured: use /model to pick a
 // ResolveModel resolves the active model through the chain:
 // 1. Explicit override (CLI or SDK option)
 // 2. Settings default (user + project merged)
-// 3. Env-var fallback (ANTHROPIC_API_KEY or OPENAI_API_KEY)
+// 3. Env-var fallback (Anthropic credentials or OPENAI_API_KEY)
 // 4. ErrNoModelConfigured if no model can be resolved
 func (r *runtime) ResolveModel() (*ResolvedModel, error) {
 	return r.resolveModel(context.Background())
@@ -5072,8 +5162,8 @@ func (r *runtime) resolveModel(ctx context.Context) (*ResolvedModel, error) {
 
 	// 3. Env-var fallback (skip if IgnoreEnv is set)
 	if modelID == "" && !r.noEnvCredentials {
-		// Check ANTHROPIC_API_KEY
-		if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		// Check Anthropic authentication.
+		if ai.HasEnvCredentials(ai.ProviderAnthropic) {
 			providerKey = "anthropic"
 			modelID = "claude-sonnet-4-6"
 		}
@@ -5195,7 +5285,7 @@ func (r *runtime) resolveModelWithOverride(modelSpec string) (*ResolvedModel, er
 		}
 		// Env fallback (skip if IgnoreEnv is set)
 		if modelID == "" && !r.noEnvCredentials {
-			if os.Getenv("ANTHROPIC_API_KEY") != "" {
+			if ai.HasEnvCredentials(ai.ProviderAnthropic) {
 				providerKey = ai.ProviderAnthropic
 				modelID = "claude-sonnet-4-6"
 			} else if os.Getenv("OPENAI_API_KEY") != "" {
@@ -5280,7 +5370,7 @@ func (r *runtime) restoredModelCredentialAvailable(ctx context.Context, provider
 	if provider, ok := r.modelRegistry.Provider(providerKey); ok && provider.APIKey != "" {
 		return true
 	}
-	return !r.noEnvCredentials && ai.GetEnvAPIKey(providerKey) != ""
+	return !r.noEnvCredentials && ai.HasEnvCredentials(providerKey)
 }
 
 func stringPtrValue(ptr *string) string {
@@ -5439,6 +5529,9 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		}
 
 		if !r.noEnvCredentials {
+			if len(ai.GetEnvHeaders(providerKey)) != 0 {
+				return "", nil
+			}
 			if envAPIKey := ai.GetEnvAPIKey(providerKey); envAPIKey != "" {
 				envOverrideLoggedOncePtr.Do(func() {
 					sessionLogger.Info("NOTICE: using API key from environment", "provider", providerKey)
@@ -5496,7 +5589,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		agent.WithFollowUpMode(followUpMode),
 		agent.WithModel(sessionModel),
 		agent.WithThinkingBudgets(settings.ResolveThinkingBudgets()),
-		agent.WithRequestOptions(settings.ResolveRetry().Provider.RequestOptions()...),
+		agent.WithRequestOptions(r.requestOptions(settings)...),
 		agent.WithTransport(transport),
 		agent.WithClientFactory(clientFactory),
 		agent.WithAPIKeyProvider(credentialProvider),

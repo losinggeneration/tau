@@ -373,19 +373,7 @@ func (a *App) saveScopedModels() error {
 	if a == nil || a.settingsPath == "" {
 		return nil
 	}
-	settings, err := ai.LoadSettings(a.settingsPath)
-	if err != nil {
-		return fmt.Errorf("load settings: %w", err)
-	}
-	if a.scopedModelKeys == nil {
-		settings.EnabledModels = nil
-	} else {
-		settings.EnabledModels = append([]string(nil), a.scopedModelKeys...)
-	}
-	if err := ai.SaveSettings(a.settingsPath, settings); err != nil {
-		return fmt.Errorf("write settings: %w", err)
-	}
-	return nil
+	return ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{"enabledModels": a.scopedModelKeys})
 }
 
 func (a *App) allScopedModelKeys() []string {

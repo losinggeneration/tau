@@ -211,6 +211,14 @@ type App struct {
 	// followChat records app-loop-owned follow-the-tail intent, consumed by a
 	// current render result.
 	followChat bool
+
+	// historyNext is the session entry to page older chat history in before,
+	// empty when nothing older is held in the file. historyLoading marks a
+	// page read in flight; historyGeneration invalidates reads that a
+	// transcript replacement or a drop overtook. All loop-owned.
+	historyNext       string
+	historyLoading    bool
+	historyGeneration uint64
 	// autoScrollOff suspends follow-the-tail while the user reads away from the
 	// end of the chat buffer. It is runtime UI state, never configuration: it
 	// is set by user scroll events through chatScrollViewport.onUserScroll and
@@ -878,6 +886,8 @@ func New(opts Options) (*App, error) {
 		return nil, true
 	})
 
+	chatLog.setReachTopHandler(a.loadOlderHistory)
+
 	// Render preparation happens on ChatLog's private worker, but completed
 	// state belongs to the toolkit loop. Keep one coalesced post outstanding;
 	// the callback installs the newest prepared result before invalidating the
@@ -1016,6 +1026,7 @@ func (a *App) handleChatRenderUpdate(update chatLogRenderUpdate, invalidate func
 	if !update.installed {
 		return
 	}
+	a.dropOffscreenHistory()
 	// The banner is region 1, not part of the transcript, so its visibility has
 	// to be reconciled whenever the transcript changes.
 	a.refreshHeaderVisibility()
@@ -1026,6 +1037,13 @@ func (a *App) handleChatRenderUpdate(update chatLogRenderUpdate, invalidate func
 	viewport := update.rect
 	if a.scroll != nil {
 		viewport = a.scroll.Rect()
+		// The fixed shell scrolls from the top, so rows the chat window
+		// gained or dropped above the view would otherwise slide the content
+		// under the reader. The document layout is bottom-anchored and needs
+		// no correction.
+		if update.topDelta != 0 && a.LayoutMode() == LayoutFixed && invalidate != nil {
+			a.scroll.ScrollBy(&tauui.Ctx{Invalidate: invalidate}, update.topDelta)
+		}
 		// Consume follow-latest intent only when this result has caught
 		// up to the newest scheduled revision. A same-width intermediate
 		// result may paint during continuous streaming, but must not clear
@@ -1736,7 +1754,7 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 			return AppActionSelectorPageDown, true
 		}
 	}
-	if ctx == tauui.KeyCtxTextInput && ks.Key == tauui.KeyRune && (ks.Rune == 'v' || ks.Rune == 'V') && ks.Mod&(tauui.ModCtrl) != 0 && ks.Mod&^(tauui.ModCtrl|tauui.ModShift) == 0 {
+	if ctx == tauui.KeyCtxTextInput && ks.Key == tauui.KeyRune && (ks.Rune == 'v' || ks.Rune == 'V') && ks.Mod&tauui.ModCtrl != 0 && ks.Mod&^(tauui.ModCtrl|tauui.ModShift) == 0 {
 		return AppActionPaste, true
 	}
 
@@ -3684,7 +3702,7 @@ func (a *App) selectModel(key, thinkingLevel string) {
 	}
 	a.refreshFooterStats(a.loopContext())
 	if a.settingsPath != "" {
-		if err := ai.SaveDefaultModel(a.settingsPath, key); err != nil {
+		if err := ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{"defaultProvider": provider, "defaultModel": strings.TrimPrefix(key, provider+"/")}); err != nil {
 			a.conv.AddError("model: selected " + key + " but failed to save default: " + err.Error())
 			a.refreshChat()
 			return

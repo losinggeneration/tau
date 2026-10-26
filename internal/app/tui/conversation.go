@@ -48,6 +48,15 @@ type Message struct {
 type ChatSnapshot struct {
 	Revision   uint64
 	Components []ChatComponent
+
+	// Offset is the position of Components[0], and Base the position of the
+	// oldest component the model holds. Positions are stable across
+	// DropBefore and PrependHistory, so a renderer can keep addressing the
+	// same component while history leaves and re-enters memory. A windowed
+	// snapshot (SnapshotFrom, SnapshotTail) leaves the components before
+	// Offset out.
+	Offset int
+	Base   int
 }
 
 // ChatComponentKind identifies the structured payload carried by a chat
@@ -217,6 +226,7 @@ const (
 
 type conversationItem struct {
 	id       string
+	entryID  string // session entry of a persisted user message
 	kind     conversationItemKind
 	role     Role
 	revision uint64
@@ -279,6 +289,17 @@ type ConversationModel struct {
 	revision       uint64
 	notifyDepth    int
 	dirty          bool
+
+	// toolCallIDs holds every tool call ID in committed, so findTool can
+	// answer the common miss (a new call) without scanning the transcript.
+	toolCallIDs map[string]struct{}
+
+	// memoFloor is the start of the last snapshot window; items below it
+	// have had their projection memo released.
+	memoFloor int
+
+	// base is the position of committed[0]; see ChatSnapshot.Offset.
+	base int
 }
 
 func NewConversationModel() *ConversationModel { return &ConversationModel{} }
@@ -394,29 +415,162 @@ func (m *ConversationModel) IsEmpty() bool {
 	return len(m.committed) == 0 && len(m.transient) == 0 && m.draft == nil
 }
 
+// Snapshot projects every component the model holds.
 func (m *ConversationModel) Snapshot() ChatSnapshot {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	components := m.projectComponentsLocked()
-	return ChatSnapshot{Revision: m.revision, Components: components}
+	return m.snapshot(func(int) int { return 0 })
 }
 
-func (m *ConversationModel) projectComponentsLocked() []ChatComponent {
+// SnapshotFrom projects only the components from position start onward, so a
+// renderer showing the tail of a long transcript pays for the tail rather than
+// the whole history on every mutation. The start is clamped to the components
+// the model holds; Offset reports where the returned components begin.
+func (m *ConversationModel) SnapshotFrom(start int) ChatSnapshot {
+	return m.snapshot(func(int) int { return start - m.base })
+}
+
+// SnapshotTail projects the last n components.
+func (m *ConversationModel) SnapshotTail(n int) ChatSnapshot {
+	return m.snapshot(func(total int) int { return total - n })
+}
+
+// snapshot projects from the local index startAt returns for the component
+// count.
+func (m *ConversationModel) snapshot(startAt func(total int) int) ChatSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	split := min(m.draftAfter, len(m.committed))
+	draft := 0
+	if m.draft != nil {
+		draft = 1
+	}
+	total := len(m.committed) + draft + len(m.transient)
+	start := min(max(startAt(total), 0), total)
+	// Items that fell out of the rendered window drop their projection memo,
+	// so a long session does not keep a second copy of its whole history.
+	for i := m.memoFloor; i < min(start, split); i++ {
+		m.committed[i].projection = nil
+	}
+	m.memoFloor = start
+	return ChatSnapshot{Revision: m.revision, Components: m.projectComponentsLocked(start, split, total), Offset: m.base + start, Base: m.base}
+}
+
+// DropBefore releases the committed items before position pos, keeping the
+// streaming draft and everything after it. Their history stays in the session
+// file; PrependHistory brings it back.
+func (m *ConversationModel) DropBefore(pos int) {
+	m.mu.Lock()
+	k := min(max(pos-m.base, 0), len(m.committed))
+	if m.draft != nil {
+		k = min(k, m.draftAfter)
+	}
+	if k == 0 {
+		m.mu.Unlock()
+		return
+	}
+	m.committed = slices.Delete(m.committed, 0, k)
+	m.base += k
+	m.draftAfter = max(m.draftAfter-k, 0)
+	m.memoFloor = max(m.memoFloor-k, 0)
+	m.revision++
+	m.mu.Unlock()
+	m.notify()
+}
+
+// PrependHistory moves src's committed items in front of the model's, as the
+// history that preceded them. They take fresh IDs and revisions so they can
+// never collide with components the renderer has already cached.
+func (m *ConversationModel) PrependHistory(src *ConversationModel) {
+	if src == nil || len(src.committed) == 0 {
+		return
+	}
+	items := src.committed
+	src.committed = nil
+	for i := range items {
+		items[i].id = m.nextID("history")
+		items[i].revision = m.nextRevision()
+		items[i].projection = nil
+		if items[i].kind == conversationItemToolExecution {
+			m.recordToolCallID(items[i].toolCallID)
+		}
+	}
+	m.mu.Lock()
+	m.committed = append(items, m.committed...)
+	m.base -= len(items)
+	m.draftAfter += len(items)
+	m.memoFloor += len(items)
+	m.mu.Unlock()
+	m.notify()
+}
+
+// HistoryBoundary returns the first item of the newest session entry that
+// starts at or before position pos: the point the model can drop everything
+// before and later page back in from. ok is false when there is none past the
+// oldest held component.
+func (m *ConversationModel) HistoryBoundary(pos int) (boundary int, entryID string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	split := len(m.committed)
+	if m.draft != nil {
+		split = min(m.draftAfter, split)
+	}
+	for i := min(pos-m.base, split-1); i > 0; i-- {
+		if entryID = m.committed[i].entryID; entryID == "" {
+			continue
+		}
+		for i > 0 && m.committed[i-1].entryID == entryID {
+			i--
+		}
+		if i == 0 {
+			return 0, "", false
+		}
+		return m.base + i, entryID, true
+	}
+	return 0, "", false
+}
+
+// Revision returns the model's current revision.
+func (m *ConversationModel) Revision() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.revision
+}
+
+// tagEntrySince records entryID on the committed items created or changed
+// after revision mark that have none yet: the items a just-persisted message
+// produced.
+func (m *ConversationModel) tagEntrySince(mark uint64, entryID string) {
+	for i := range m.committed {
+		if item := &m.committed[i]; item.revision > mark && item.entryID == "" {
+			item.entryID = entryID
+		}
+	}
+}
+
+func (m *ConversationModel) projectComponentsLocked(start, split, total int) []ChatComponent {
 	// Index rather than range by value: component() memoizes onto the item, so
 	// a copy would rebuild the projection every time and throw the memo away.
-	split := min(m.draftAfter, len(m.committed))
-	out := make([]ChatComponent, 0, len(m.committed)+len(m.transient)+1)
-	for i := range split {
+	out := make([]ChatComponent, 0, total-start)
+	for i := start; i < split; i++ {
 		out = append(out, m.committed[i].component())
 	}
+	pos := split
 	if m.draft != nil {
-		out = append(out, ChatComponent{ID: m.draft.id, Kind: ChatComponentAssistant, Role: RoleAssistant, Text: m.draft.text, Streaming: true, Revision: m.draft.revision})
+		if pos >= start {
+			out = append(out, ChatComponent{ID: m.draft.id, Kind: ChatComponentAssistant, Role: RoleAssistant, Text: m.draft.text, Streaming: true, Revision: m.draft.revision})
+		}
+		pos++
 	}
 	for i := split; i < len(m.committed); i++ {
-		out = append(out, m.committed[i].component())
+		if pos >= start {
+			out = append(out, m.committed[i].component())
+		}
+		pos++
 	}
 	for _, item := range m.transient {
-		out = append(out, ChatComponent{ID: item.id, Kind: kindForRole(item.role), Role: item.role, Text: item.text, Streaming: true, Revision: item.revision})
+		if pos >= start {
+			out = append(out, ChatComponent{ID: item.id, Kind: kindForRole(item.role), Role: item.role, Text: item.text, Streaming: true, Revision: item.revision})
+		}
+		pos++
 	}
 	return out
 }
@@ -558,7 +712,13 @@ func (m *ConversationModel) AddUserMessage(text string) int {
 }
 
 func (m *ConversationModel) AddUserMessageWithImages(text string, images []ImageComponent) int {
-	m.committed = append(m.committed, conversationItem{id: m.nextID("user"), kind: conversationItemUser, revision: m.nextRevision(), text: strings.TrimRight(text, "\n"), images: append([]ImageComponent(nil), images...)})
+	return m.AddPersistedUserMessage("", text, images)
+}
+
+// AddPersistedUserMessage adds a user message recorded as session entry
+// entryID, which lets the history before it be dropped and paged back in.
+func (m *ConversationModel) AddPersistedUserMessage(entryID, text string, images []ImageComponent) int {
+	m.committed = append(m.committed, conversationItem{id: m.nextID("user"), entryID: entryID, kind: conversationItemUser, revision: m.nextRevision(), text: strings.TrimRight(text, "\n"), images: append([]ImageComponent(nil), images...)})
 	idx := len(m.committed) - 1
 	m.notify()
 	return idx
@@ -759,6 +919,7 @@ func (m *ConversationModel) AddToolCallWithID(toolCallID, name, args string) {
 		}
 	}
 	m.committed = append(m.committed, conversationItem{id: m.nextID("tool"), kind: conversationItemToolExecution, role: RoleToolCall, revision: m.nextRevision(), toolCallID: toolCallID, toolName: name, toolArgs: args, toolState: toolExecutionExecuting})
+	m.recordToolCallID(toolCallID)
 	if m.draft != nil && m.draft.text == "" {
 		m.draftAfter = len(m.committed)
 	}
@@ -856,6 +1017,7 @@ func (m *ConversationModel) addToolResult(toolCallID, toolName, output string, i
 		state = toolExecutionError
 	}
 	m.committed = append(m.committed, conversationItem{id: m.nextID("tool"), kind: conversationItemToolExecution, role: RoleToolResult, revision: m.nextRevision(), toolCallID: toolCallID, toolName: toolName, toolOutput: output, toolDetails: details, toolResult: result, toolDurationMs: durationMs, toolExcludedFromContext: excluded, toolState: state, isError: isError})
+	m.recordToolCallID(toolCallID)
 	if m.draft != nil && m.draft.text == "" {
 		m.draftAfter = len(m.committed)
 	}
@@ -884,8 +1046,13 @@ func (m *ConversationModel) CancelTool(toolCallID, reason string) {
 	m.notify()
 }
 
+// findTool scans newest-first: a result almost always lands right after its
+// call, so a forward scan made loading a long transcript quadratic.
 func (m *ConversationModel) findTool(toolCallID string) int {
-	for i := range m.committed {
+	if _, ok := m.toolCallIDs[toolCallID]; !ok {
+		return -1
+	}
+	for i := len(m.committed) - 1; i >= 0; i-- {
 		if m.committed[i].kind == conversationItemToolExecution && m.committed[i].toolCallID == toolCallID {
 			return i
 		}
@@ -997,6 +1164,13 @@ func (m *ConversationModel) commitCompactionSummary(text string, tokensBefore in
 	m.notify()
 }
 
+func (m *ConversationModel) recordToolCallID(id string) {
+	if m.toolCallIDs == nil {
+		m.toolCallIDs = make(map[string]struct{})
+	}
+	m.toolCallIDs[id] = struct{}{}
+}
+
 func (m *ConversationModel) IsStreaming() bool { return m.draft != nil }
 
 func (m *ConversationModel) Clear() {
@@ -1004,6 +1178,9 @@ func (m *ConversationModel) Clear() {
 		return
 	}
 	m.committed = nil
+	m.toolCallIDs = nil
+	m.memoFloor = 0
+	m.base = 0
 	m.draft = nil
 	m.transient = nil
 	m.nextRevision()

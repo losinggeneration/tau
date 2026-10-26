@@ -647,7 +647,7 @@ func (s *Storage) globFiles(pattern string, recursive bool) ([]string, error) {
 	var matches []string
 	err := filepath.WalkDir(s.baseDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return fmt.Errorf("walk session path %s: %w", path, err)
 		}
 		if d.IsDir() {
 			if filepath.Base(path) == trashDirName {
@@ -866,9 +866,14 @@ func (s *Storage) CleanupStaleOwners() error {
 		return err
 	}
 
+	var cleanupErr error
 	for _, m := range matches {
 		data, err := os.ReadFile(m)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("read session owner %s: %w", m, err))
 			continue
 		}
 
@@ -878,10 +883,12 @@ func (s *Storage) CleanupStaleOwners() error {
 		}
 
 		if !isProcessRunning(pid) {
-			_ = os.Remove(m)
+			if err := os.Remove(m); err != nil && !errors.Is(err, os.ErrNotExist) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove stale session owner %s: %w", m, err))
+			}
 		}
 	}
-	return nil
+	return cleanupErr
 }
 
 // ExportJSON exports a session as structured JSON.

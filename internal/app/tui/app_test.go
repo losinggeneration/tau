@@ -1126,3 +1126,20 @@ func TestWheelSettingsReloadThroughToolkit(t *testing.T) {
 		})
 	}
 }
+
+// Rows the chat window loads (or drops) above the viewed content must not
+// slide that content under a reader in the top-anchored fixed shell.
+func TestChatRenderUpdateKeepsFixedViewOnWindowGrowth(t *testing.T) {
+	a, viewport, _, _ := newAutoscrollFixture(t)
+	ctx := &tauui.Ctx{Invalidate: func(tauui.Rect) {}}
+	viewport.ScrollTo(ctx, 5)
+
+	a.handleChatRenderUpdate(chatLogRenderUpdate{installed: true, rect: viewport.Rect(), topDelta: 3}, func(tauui.Rect) {}, nil)
+	if got := viewport.ScrollPos(); got != 8 {
+		t.Fatalf("scroll pos after 3 rows added above = %d, want 8", got)
+	}
+	a.handleChatRenderUpdate(chatLogRenderUpdate{installed: true, rect: viewport.Rect(), topDelta: -2}, func(tauui.Rect) {}, nil)
+	if got := viewport.ScrollPos(); got != 6 {
+		t.Fatalf("scroll pos after 2 rows dropped above = %d, want 6", got)
+	}
+}

@@ -374,6 +374,44 @@ func TestSessionMessageEndCarriesRoleAndFinalContent(t *testing.T) {
 	assert.Equal(t, "final response", payload["content"])
 }
 
+// A user message_end names the session entry that recorded it, so a frontend
+// can page persisted history back in from that message.
+func TestSessionUserMessageEndCarriesEntryID(t *testing.T) {
+	_, explicitModel := registerRecordingProvider(t, "final response")
+	rt, err := NewRuntime(RuntimeOptions{
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		ExplicitModel:   explicitModel,
+	})
+	require.NoError(t, err)
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+
+	var entryIDs []string
+	for _, text := range []string{"hello", "again"} {
+		events, err := sess.Send(testContext(t), Message{Text: text})
+		require.NoError(t, err)
+		for _, event := range collectSessionEvents(t, events) {
+			payload, _ := event.Payload.(map[string]any)
+			if event.Type == "message_end" && payload["role"] == "user" {
+				id, _ := payload["entry_id"].(string)
+				entryIDs = append(entryIDs, id)
+			}
+		}
+	}
+	require.Len(t, entryIDs, 2)
+
+	pager, ok := sess.(HistoryPager)
+	require.True(t, ok)
+	page, _, err := pager.History("", 10)
+	require.NoError(t, err)
+	byID := map[string]string{}
+	for _, e := range page {
+		byID[e.EntryID] = e.Message.Text
+	}
+	assert.Equal(t, "hello", byID[entryIDs[0]])
+	assert.Equal(t, "again", byID[entryIDs[1]])
+}
+
 func promptText(t *testing.T, prompt *ai.Context) string {
 	t.Helper()
 	require.NotNil(t, prompt)
@@ -989,6 +1027,15 @@ func TestSessionState_Position_Semantics(t *testing.T) {
 	// Cursor set to a message entry ID
 	s = SessionState{id: "test", position: "018f8c55-message-1"}
 	assert.Equal(t, "018f8c55-message-1", s.Position())
+
+	// Cursor resolved from the session log on demand.
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	log := `{"type":"session","version":3,"id":"s","timestamp":"2026-01-01T00:00:00Z","cwd":"/"}
+{"type":"message","id":"m1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+`
+	require.NoError(t, os.WriteFile(path, []byte(log), 0o600))
+	s = SessionState{id: "test", sessionPath: path}
+	assert.Equal(t, "m1", s.Position())
 }
 
 func TestNewSession_UsesCredentialStore(t *testing.T) {
@@ -3184,6 +3231,43 @@ func TestGetAllMessagesReturnsFullTranscript(t *testing.T) {
 	if joined != want {
 		t.Errorf("GetAllMessages texts = %q, want %q", joined, want)
 	}
+}
+
+// History pages the same full-history view GetAllMessages returns, newest
+// page first, naming each entry so a frontend can page back from it.
+func TestHistoryPagesPersistedTranscript(t *testing.T) {
+	storage, err := sessionpkg.NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	writer, err := storage.Create(sessionpkg.NewHeader(".", nil, nil, "history"))
+	require.NoError(t, err)
+	msg1 := sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"before the compaction"}`), nil)
+	require.NoError(t, writer.Append(msg1))
+	msg2 := sessionpkg.NewMessageEntry(&msg1.ID, json.RawMessage(`{"role":"assistant","content":"acknowledged"}`), nil)
+	require.NoError(t, writer.Append(msg2))
+	require.NoError(t, writer.Append(sessionpkg.NewCompactionEntry("early history summarized", msg2.ID, 100, 20, false)))
+	msg3 := sessionpkg.NewMessageEntry(&msg2.ID, json.RawMessage(`{"role":"user","content":"after the compaction"}`), nil)
+	require.NoError(t, writer.Append(msg3))
+	require.NoError(t, writer.Close())
+
+	session := &agentSession{sessionWriter: writer, parentMsgID: &msg3.ID}
+	texts := func(entries []HistoryEntry) string {
+		var out []string
+		for _, e := range entries {
+			out = append(out, e.Message.Text)
+		}
+		return strings.Join(out, "|")
+	}
+
+	page, next, err := session.History("", 1)
+	require.NoError(t, err)
+	assert.Equal(t, "after the compaction", texts(page))
+	assert.Equal(t, msg3.ID, page[0].EntryID)
+	assert.Equal(t, msg3.ID, next)
+
+	page, next, err = session.History(next, 10)
+	require.NoError(t, err)
+	assert.Equal(t, "before the compaction|Session Summary: early history summarized|acknowledged", texts(page))
+	assert.Empty(t, next)
 }
 
 func TestCompactRetriesAfterFallbackCompaction(t *testing.T) {
@@ -10960,6 +11044,166 @@ func TestTriggeredCustomMessageOutlivesCallerContext(t *testing.T) {
 	last := messages[len(messages)-1]
 	assert.Equal(t, agent.RoleAssistant, last.Role)
 	assert.NotEqual(t, ai.StopReasonAborted, last.StopReason)
+}
+
+func TestSessionAnthropicBearerPrecedenceReachesTransport(t *testing.T) {
+	ai.Init()
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat-environment-bearer")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "environment-oauth")
+	t.Setenv("ANTHROPIC_API_KEY", "environment-key")
+	for _, tc := range []struct {
+		name, explicit, stored, configured, wantKey, wantBearer string
+		ignoreEnv                                               bool
+	}{
+		{name: "explicit", explicit: "explicit", stored: "stored", configured: "configured", wantKey: "explicit"},
+		{name: "stored", stored: "stored", configured: "configured", wantKey: "stored"},
+		{name: "configured", configured: "configured", wantKey: "configured"},
+		{name: "environment bearer", wantBearer: "Bearer sk-ant-oat-environment-bearer"},
+		{name: "ignore environment", ignoreEnv: true},
+		{name: "ignore environment explicit", ignoreEnv: true, explicit: "explicit", wantKey: "explicit"},
+		{name: "ignore environment stored", ignoreEnv: true, stored: "stored", wantKey: "stored"},
+		{name: "ignore environment configured", ignoreEnv: true, configured: "configured", wantKey: "configured"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				requests.Add(1)
+				assert.Equal(t, tc.wantKey, req.Header.Get("x-api-key"))
+				assert.Equal(t, tc.wantBearer, req.Header.Get("Authorization"))
+				assert.NotContains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
+				w.Header().Set("Content-Type", "application/json")
+				_, err := io.WriteString(w, `{"id":"msg_auth","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}`)
+				assert.NoError(t, err)
+			}))
+			defer server.Close()
+			path := filepath.Join(t.TempDir(), "models.json")
+			data, err := json.Marshal(ai.ModelRegistryFile{Providers: map[string]ai.ModelRegistryProvider{ai.ProviderAnthropic: {APIKey: tc.configured, API: ai.APIAnthropicMessages, BaseURL: server.URL, Models: []ai.ModelRegistryModel{{ID: "bearer-test-local"}}}}})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(path, data, 0o600))
+			registry, err := ai.LoadModelRegistry(path)
+			require.NoError(t, err)
+			credentials := &mockCredStore{getErr: ai.ErrCredentialNotFound}
+			if tc.stored != "" {
+				credentials = &mockCredStore{getCred: ai.NewAPIKeyCredential(tc.stored)}
+			}
+			rt, err := NewRuntime(RuntimeOptions{IgnoreEnv: tc.ignoreEnv, ExplicitModel: "anthropic/bearer-test-local", APIKey: tc.explicit, ModelRegistry: registry, CredentialStore: credentials})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+			assert.Equal(t, !tc.ignoreEnv || tc.explicit != "" || tc.stored != "" || tc.configured != "", rt.(*runtime).restoredModelCredentialAvailable(t.Context(), ai.ProviderAnthropic, credentials))
+			sess, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+			require.NoError(t, err)
+			for range 2 {
+				before := requests.Load()
+				events, err := sess.Send(t.Context(), Message{Text: "hello"})
+				require.NoError(t, err)
+				var failed bool
+				for event := range events {
+					failed = failed || event.Type == "error"
+				}
+				missing := tc.ignoreEnv && tc.explicit == "" && tc.stored == "" && tc.configured == ""
+				assert.Equal(t, missing, failed)
+				if missing {
+					assert.Equal(t, before, requests.Load())
+				} else {
+					assert.Equal(t, before+1, requests.Load())
+				}
+				s := sess.(*agentSession)
+				opts, err := s.compactionCompletionOptions(t.Context(), s.model, agent.ThinkingOff)
+				require.NoError(t, err)
+				assert.Equal(t, tc.ignoreEnv, ai.ExtractSimpleStreamOptions(opts).NoEnvCredentials)
+				client, err := s.getClient(s.model)
+				require.NoError(t, err)
+				_, err = client.Complete(t.Context(), s.model, &ai.Context{}, opts...)
+				if missing {
+					require.ErrorContains(t, err, "missing API key")
+					assert.Equal(t, before, requests.Load())
+				} else {
+					require.NoError(t, err)
+					assert.Equal(t, before+2, requests.Load())
+				}
+				require.NoError(t, s.ReloadSettings(t.Context(), &ai.Settings{}))
+			}
+			model, err := json.Marshal(sess.(*agentSession).model)
+			require.NoError(t, err)
+			assert.NotContains(t, string(model), "sk-ant-oat-environment-bearer")
+		})
+	}
+}
+
+func TestLegacySettingsDriveStartupAndReload(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte("\xef\xbb\xbf"+`{"queueMode":"all","skills":{"enableSkillCommands":false,"customDirectories":["./skills"]}}`), 0o600))
+	settings, err := ai.LoadSettings(path)
+	require.NoError(t, err)
+	rt, err := NewRuntime(RuntimeOptions{Settings: settings, ExplicitModel: model, CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	s := sess.(*agentSession)
+	checkQueue := func(wantRequests int) {
+		t.Helper()
+		s.agent.Steer(&agent.Message{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "first"}}})
+		s.agent.Steer(&agent.Message{Role: agent.RoleUser, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "second"}}})
+		before := len(s.agent.Messages())
+		events, err := sess.Send(t.Context(), Message{Text: "initial"})
+		require.NoError(t, err)
+		collectSessionEvents(t, events)
+		var assistants int
+		for _, message := range s.agent.Messages()[before:] {
+			if message.Role == agent.RoleAssistant {
+				assistants++
+			}
+		}
+		assert.Equal(t, wantRequests, assistants)
+	}
+	checkQueue(1)
+	assert.Equal(t, []string{filepath.Join(filepath.Dir(path), "skills")}, s.Settings().ResourcePaths("skills"))
+	assert.False(t, s.Settings().EnableSkillCommands)
+
+	require.NoError(t, os.WriteFile(path, []byte(`{"queueMode":"one-at-a-time","skills":{"enableSkillCommands":true,"customDirectories":["./new-skills"]}}`), 0o600))
+	reloaded, err := ai.LoadSettings(path)
+	require.NoError(t, err)
+	require.NoError(t, s.ReloadSettings(t.Context(), reloaded))
+	checkQueue(2)
+	assert.Equal(t, []string{filepath.Join(filepath.Dir(path), "new-skills")}, s.Settings().ResourcePaths("skills"))
+	assert.True(t, s.Settings().EnableSkillCommands)
+	later, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	assert.Equal(t, "one-at-a-time", later.(*agentSession).Settings().SteeringMode)
+}
+
+func TestAnthropicEnvironmentCredentialsSelectDefaultModel(t *testing.T) {
+	ai.Init()
+	path := filepath.Join(t.TempDir(), "models.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"providers":{"anthropic":{"api":"anthropic-messages","models":[{"id":"claude-sonnet-4-6"}]}}}`), 0o600))
+	registry, err := ai.LoadModelRegistry(path)
+	require.NoError(t, err)
+	for _, variable := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"} {
+		t.Run(variable, func(t *testing.T) {
+			for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"} {
+				t.Setenv(name, "")
+			}
+			t.Setenv(variable, "synthetic")
+			rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ModelRegistry: registry, CredentialStore: &mockCredStore{getErr: ai.ErrCredentialNotFound}, SessionsDir: t.TempDir()})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+			resolved, err := rt.ResolveModel()
+			require.NoError(t, err)
+			assert.Equal(t, ai.ProviderAnthropic, resolved.Model.Provider)
+			assert.Equal(t, "claude-sonnet-4-6", resolved.Model.ID)
+			impl := rt.(*runtime)
+			override, err := impl.resolveModelWithOverride("anthropic/")
+			require.NoError(t, err)
+			assert.Equal(t, resolved.Model.ID, override.Model.ID)
+			impl.noEnvCredentials = true
+			_, err = rt.ResolveModel()
+			require.ErrorIs(t, err, ErrNoModelConfigured)
+			_, err = impl.resolveModelWithOverride("anthropic/")
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestReloadSystemPromptRereadsContextFilesAcrossCompactionAndResume(t *testing.T) {

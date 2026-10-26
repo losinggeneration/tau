@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,11 +15,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/packages"
+	"github.com/losinggeneration/tau/agent/plugins"
 	"github.com/losinggeneration/tau/agent/session"
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/ai/oauth"
@@ -572,7 +576,8 @@ func isolateBuildEnv(t *testing.T) string {
 func TestBuildRuntimeOptionsWithoutPluginsSkipsManager(t *testing.T) {
 	isolateBuildEnv(t)
 
-	_, pluginMgr, loader, _ := buildRuntimeOptions(context.Background(), ui.NewNoOpUI(), nil, withoutPlugins())
+	_, pluginMgr, loader, _, buildErr := buildRuntimeOptions(context.Background(), ui.NewNoOpUI(), nil, withoutPlugins())
+	require.NoError(t, buildErr)
 	if pluginMgr != nil {
 		t.Fatal("withoutPlugins returned a plugin manager; want nil")
 	}
@@ -584,7 +589,8 @@ func TestBuildRuntimeOptionsWithoutPluginsSkipsManager(t *testing.T) {
 func TestBuildRuntimeOptionsDefaultCreatesManager(t *testing.T) {
 	isolateBuildEnv(t)
 
-	_, pluginMgr, _, _ := buildRuntimeOptions(context.Background(), ui.NewNoOpUI(), nil)
+	_, pluginMgr, _, _, buildErr := buildRuntimeOptions(context.Background(), ui.NewNoOpUI(), nil)
+	require.NoError(t, buildErr)
 	if pluginMgr == nil {
 		t.Fatal("default buildRuntimeOptions returned nil plugin manager")
 	}
@@ -618,7 +624,8 @@ func TestBuildConversationRuntimeOptionsHonorsRootFlags(t *testing.T) {
 	requireNoError(cmd.Set("no-skills", "true"))
 
 	ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
-	rtOpts, _, loader, _, _ := buildConversationRuntimeOptions(ctx, nil)
+	rtOpts, _, loader, _, _, buildErr := buildConversationRuntimeOptions(ctx, nil)
+	require.NoError(t, buildErr)
 
 	if rtOpts.SessionsDir != sessionDir {
 		t.Fatalf("SessionsDir = %q, want %q", rtOpts.SessionsDir, sessionDir)
@@ -662,7 +669,8 @@ func TestBuildConversationRuntimeOptionsIncludesCLIArtifactPaths(t *testing.T) {
 	}
 
 	ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
-	_, _, loader, _, _ := buildConversationRuntimeOptions(ctx, nil)
+	_, _, loader, _, _, buildErr := buildConversationRuntimeOptions(ctx, nil)
+	require.NoError(t, buildErr)
 	if loader == nil {
 		t.Fatal("expected artifact loader")
 	}
@@ -701,7 +709,8 @@ func TestBuildConversationRuntimeOptionsResolvesModelsFlag(t *testing.T) {
 	}
 
 	ctx := context.WithValue(context.Background(), rootCmdKey{}, cmd)
-	rtOpts, _, _, _, sessionFlags := buildConversationRuntimeOptions(ctx, nil)
+	rtOpts, _, _, _, sessionFlags, buildErr := buildConversationRuntimeOptions(ctx, nil)
+	require.NoError(t, buildErr)
 	if sessionFlags.SelectionError != nil {
 		t.Fatalf("SelectionError = %v", sessionFlags.SelectionError)
 	}
@@ -1908,22 +1917,22 @@ func TestSessionsDirResolution(t *testing.T) {
 	t.Setenv("TAU_CONFIG_DIR", cfgDir)
 	t.Setenv("TAU_SESSION_DIR", "")
 
-	if want := filepath.Join(cfgDir, "sessions"); sessionDir() != want {
-		t.Fatalf("default = %q, want %q", sessionDir(), want)
-	}
+	dir, err := sessionDir()
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(cfgDir, "sessions"), dir)
 
 	settings := `{"sessionDir": "/from/settings"}`
 	if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	if got := sessionDir(); got != "/from/settings" {
-		t.Fatalf("settings = %q, want /from/settings", got)
-	}
+	dir, err = sessionDir()
+	require.NoError(t, err)
+	require.Equal(t, "/from/settings", dir)
 
 	t.Setenv("TAU_SESSION_DIR", "/from/env")
-	if got := sessionDir(); got != "/from/env" {
-		t.Fatalf("env = %q, want /from/env", got)
-	}
+	dir, err = sessionDir()
+	require.NoError(t, err)
+	require.Equal(t, "/from/env", dir)
 }
 
 func TestPackagesDirsResolution(t *testing.T) {
@@ -2258,7 +2267,7 @@ func TestSettingsArtifactPathsRetainScopeThroughStartupAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: project, SettingsPaths: getSettingsArtifactPaths(settings), DisableSkills: true, DisableThemes: true})
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: project, SettingsScopes: getSettingsArtifactScopes(settings), DisableSkills: true, DisableThemes: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2278,15 +2287,45 @@ func TestSettingsArtifactPathsRetainScopeThroughStartupAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loader, err = artifacts.NewLoader(artifacts.LoaderOptions{CWD: project, SettingsPaths: getSettingsArtifactPaths(settings), DisableSkills: true, DisableThemes: true})
+	prepared, err := loader.Prepare(artifacts.ReloadOptions{SettingsScopes: getSettingsArtifactScopes(settings)})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, ok := loader.PromptRegistry().Get("project"); ok {
+		t.Fatal("preparation changed live resources")
+	}
+	prepared.Commit()
 	if _, ok := loader.PromptRegistry().Get("project"); !ok {
 		t.Fatal("project-relative prompt missing")
 	}
 	if _, ok := loader.PromptRegistry().Get("user"); !ok {
-		t.Fatal("merged list dropped user resources")
+		t.Fatal("project list discarded user resources")
+	}
+	if err := loader.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"user", "project"} {
+		if _, ok := loader.PromptRegistry().Get(name); !ok {
+			t.Fatalf("reload discarded %s resources", name)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte(`{"prompts":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = loadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err = loader.Prepare(artifacts.ReloadOptions{SettingsScopes: getSettingsArtifactScopes(settings)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.Commit()
+	if _, ok := loader.PromptRegistry().Get("user"); !ok {
+		t.Fatal("empty project list discarded user resources")
+	}
+	if _, ok := loader.PromptRegistry().Get("project"); ok {
+		t.Fatal("empty project list retained project resources")
 	}
 }
 
@@ -2327,7 +2366,8 @@ func TestInvalidThemesAreReportedAtStartupAndReload(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(themesDir, "partial.json"), []byte(`{"name":"partial","colors":{"text":"#ffffff"}}`), 0o600))
 
 	ctx, diagnostics := withStartupDiagnostics(t.Context())
-	_, _, loader, _ := buildRuntimeOptions(ctx, nil, nil)
+	_, _, loader, _, buildErr := buildRuntimeOptions(ctx, nil, nil)
+	require.NoError(t, buildErr)
 	require.NotNil(t, loader)
 	lines := diagnostics.Lines()
 	require.Len(t, lines, 1)
@@ -2369,7 +2409,7 @@ func TestReloadSessionCommitsArtifactsOnlyAfterSessionSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := commands.NewInMemoryRegistry()
-	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), SettingsPaths: getSettingsArtifactPaths(settings), UserDirs: artifactUserDirs(settings), DisableSkills: true, DisableThemes: true, CommandsRegistry: reg})
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), SettingsScopes: getSettingsArtifactScopes(settings), UserDirs: artifactUserDirs(settings), DisableSkills: true, DisableThemes: true, CommandsRegistry: reg})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2625,4 +2665,369 @@ func TestThemeCallbacksDisabledWithoutArtifacts(t *testing.T) {
 	if themeRefresher(nil) != nil || themeLookup(nil) != nil {
 		t.Fatal("theme callbacks must be nil when artifact loading failed")
 	}
+}
+
+func TestBearerEnvironmentProviderCredential(t *testing.T) {
+	ai.Init()
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-secret")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
+	refs := mergeProviderRefsWithEnv(nil)
+	assert.True(t, slices.ContainsFunc(refs, func(ref ai.CredentialRef) bool { return ref.Provider == ai.ProviderAnthropic }))
+	fb := store.NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), store.Options{})
+	cred, err := providerCredential(t.Context(), fb, ai.CredentialRef{Provider: ai.ProviderAnthropic})
+	require.NoError(t, err)
+	assert.Empty(t, cred.APIKey, "bearer auth must stay provider-owned rather than become an API key")
+}
+
+func TestModelsDiscoverUsesEnvironmentBearer(t *testing.T) {
+	ai.Init()
+	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-secret")
+	t.Setenv("ANTHROPIC_API_KEY", "environment-key")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests.Add(1)
+		assert.Equal(t, "Bearer bearer-secret", req.Header.Get("Authorization"))
+		_, err := io.WriteString(w, `{"data":[{"id":"claude-local"}]}`)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+	data, err := json.Marshal(ai.ModelRegistryFile{Providers: map[string]ai.ModelRegistryProvider{ai.ProviderAnthropic: {BaseURL: server.URL}}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(configDir(), "models.json"), data, 0o600))
+	cmd := &cli.Command{Name: "discover", Action: runModelsDiscover, Flags: ModelsDiscoverFlags}
+	output := captureStdout(t, func() { require.NoError(t, cmd.Run(t.Context(), []string{"discover", ai.ProviderAnthropic})) })
+	assert.Equal(t, "anthropic/claude-local\n", output)
+	assert.Equal(t, int32(1), requests.Load())
+}
+
+func TestProviderCredentialRejectsMalformedStoreDespiteEnvironment(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-secret")
+	path := filepath.Join(t.TempDir(), "auth.json")
+	require.NoError(t, os.WriteFile(path, []byte("invalid json"), 0o600))
+	fb := store.NewFileBackend(path, store.Options{})
+	_, err := providerCredential(t.Context(), fb, ai.CredentialRef{Provider: ai.ProviderAnthropic})
+	require.ErrorContains(t, err, "parse auth.json")
+}
+
+func TestSetModelPreservesUnrelatedSettingsJSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", dir)
+	path := filepath.Join(dir, "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"terminal":{"future":true},"extension":9007199254740993,"quietStartup":false}`), 0o600))
+	cmd := newRootCommand()
+	require.NoError(t, cmd.Run(t.Context(), []string{"tau", "set-model", "anthropic/example"}))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"terminal":{"future":true},"extension":9007199254740993,"quietStartup":false,"defaultProvider":"anthropic","defaultModel":"example"}`, string(data))
+	assert.Contains(t, string(data), "9007199254740993")
+}
+
+func TestLoginWithoutDefaultDoesNotRewriteSettings(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", dir)
+	path := filepath.Join(dir, "settings.json")
+	original := []byte(`{"future":9007199254740993, "terminal":{"future":true}}`)
+	require.NoError(t, os.WriteFile(path, original, 0o600))
+	cmd := newRootCommand()
+	require.NoError(t, cmd.Run(t.Context(), []string{"tau", "login", ai.ProviderOpenAI, "--api-key", "synthetic"}))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, string(original), string(data))
+}
+
+func TestReloadSessionReplacesPackageDirectory(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Setenv("TAU_PACKAGE_DIR", "")
+	t.Chdir(t.TempDir())
+	for _, name := range []string{"old", "new"} {
+		path := filepath.Join(cfgDir, name, "example", "prompts", name+".md")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		require.NoError(t, os.WriteFile(path, []byte(name), 0o600))
+	}
+	writeSettings := func(name string) {
+		t.Helper()
+		data, err := json.Marshal(map[string]string{"packageDir": filepath.Join(cfgDir, name)})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(cfgDir, "settings.json"), data, 0o600))
+	}
+	writeSettings("old")
+	user, project := packagesDirs()
+	reg := commands.NewInMemoryRegistry()
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), PackagePaths: []string{project, user}, DisableSkills: true, DisableThemes: true, CommandsRegistry: reg})
+	require.NoError(t, err)
+	previousLoader, previousPlugins := sdk.GlobalArtifactLoader, GlobalPluginManager
+	sdk.GlobalArtifactLoader, GlobalPluginManager = loader, nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader, GlobalPluginManager = previousLoader, previousPlugins })
+	_, ok := loader.PromptRegistry().Get("old")
+	require.True(t, ok)
+	writeSettings("new")
+	rejected := errors.New("session rejected settings")
+	_, err = reloadSession(t.Context(), "", &failingReloadSession{err: rejected})
+	require.ErrorIs(t, err, rejected)
+	_, ok = loader.PromptRegistry().Get("old")
+	require.True(t, ok)
+	require.NoError(t, loader.Reload(t.Context()))
+	_, ok = loader.PromptRegistry().Get("old")
+	require.True(t, ok, "rejected reload changed discovery inputs")
+	_, err = reloadSession(t.Context(), "", &reloadSettingsSession{})
+	require.NoError(t, err)
+	_, ok = loader.PromptRegistry().Get("new")
+	require.True(t, ok, "reload did not scan new packageDir")
+	_, _, ok = reg.Lookup("old")
+	require.False(t, ok, "reload retained old package command")
+	require.NoError(t, loader.Reload(t.Context()))
+	_, ok = loader.PromptRegistry().Get("new")
+	require.True(t, ok, "normal reload forgot committed packageDir")
+	t.Setenv("TAU_PACKAGE_DIR", filepath.Join(cfgDir, "old"))
+	_, err = reloadSession(t.Context(), "", &reloadSettingsSession{})
+	require.NoError(t, err)
+	_, ok = loader.PromptRegistry().Get("old")
+	require.True(t, ok, "reload ignored package directory environment override")
+}
+
+func TestReloadSessionAppliesConfiguredPackagePolicy(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfgDir)
+	t.Setenv("TAU_PACKAGE_DIR", "")
+	t.Chdir(t.TempDir())
+	root := filepath.Join(cfgDir, "local")
+	for _, name := range []string{"keep", "drop"} {
+		path := filepath.Join(root, "prompts", name+".md")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		require.NoError(t, os.WriteFile(path, []byte(name), 0o600))
+	}
+	settingsPath := filepath.Join(cfgDir, "settings.json")
+	require.NoError(t, os.WriteFile(settingsPath, []byte(`{"packages":[{"source":"./local","prompts":["prompts/keep.md"]}]}`), 0o600))
+	_, _, startup, startupCommands, buildErr := buildRuntimeOptions(t.Context(), nil, nil, withoutPlugins())
+	require.NoError(t, buildErr)
+	require.NotNil(t, startup)
+	_, _, startupKeep := startupCommands.Lookup("keep")
+	require.True(t, startupKeep, "startup did not resolve configured local packages")
+	_, _, startupDrop := startupCommands.Lookup("drop")
+	require.False(t, startupDrop, "startup bypassed package policy")
+	reg := commands.NewInMemoryRegistry()
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisableThemes: true, CommandsRegistry: reg})
+	require.NoError(t, err)
+	oldLoader, oldPlugins := sdk.GlobalArtifactLoader, GlobalPluginManager
+	sdk.GlobalArtifactLoader, GlobalPluginManager = loader, nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader, GlobalPluginManager = oldLoader, oldPlugins })
+	_, err = reloadSession(t.Context(), "", &reloadSettingsSession{})
+	require.NoError(t, err)
+	_, ok := loader.PromptRegistry().Get("keep")
+	require.True(t, ok, "configured local package was not discovered")
+	_, _, ok = reg.Lookup("drop")
+	require.False(t, ok, "package filter leaked an excluded command")
+	require.NoError(t, os.WriteFile(settingsPath, []byte(`{"packages":[{"source":"./local","prompts":[]}]}`), 0o600))
+	rejected := errors.New("rejected")
+	_, err = reloadSession(t.Context(), "", &failingReloadSession{err: rejected})
+	require.ErrorIs(t, err, rejected)
+	_, _, ok = reg.Lookup("keep")
+	require.True(t, ok)
+	_, err = reloadSession(t.Context(), "", &reloadSettingsSession{})
+	require.NoError(t, err)
+	_, _, ok = reg.Lookup("keep")
+	require.False(t, ok)
+	require.NoError(t, loader.Reload(t.Context()))
+	_, _, ok = reg.Lookup("keep")
+	require.False(t, ok, "normal reload forgot the package policy")
+	// Invalid package metadata fails before session admission or artifact commit.
+	require.NoError(t, os.WriteFile(settingsPath, []byte(`{"packages":["npm:../../escape"]}`), 0o600))
+	_, err = reloadSession(t.Context(), "", &reloadSettingsSession{})
+	require.ErrorContains(t, err, "package")
+	_, _, ok = reg.Lookup("keep")
+	require.False(t, ok)
+}
+
+func TestRuntimeCommandsRejectInvalidSettingsBeforeDiscovery(t *testing.T) {
+	for _, scope := range []string{"user", "project"} {
+		for _, tc := range []struct {
+			name string
+			run  func(context.Context, *cli.Command) error
+		}{
+			{"skills", runSkillsList}, {"prompts", runPromptsList}, {"themes", runThemesList},
+		} {
+			t.Run(scope+"/"+tc.name, func(t *testing.T) {
+				cfg := isolateBuildEnv(t)
+				root := t.TempDir()
+				t.Chdir(root)
+				path := filepath.Join(cfg, "settings.json")
+				if scope == "project" {
+					require.NoError(t, os.Mkdir(filepath.Join(root, ".tau"), 0o700))
+					path = filepath.Join(root, ".tau", "settings.json")
+				}
+				require.NoError(t, os.WriteFile(path, []byte(`{"retry":`), 0o600))
+				err := tc.run(t.Context(), &cli.Command{})
+				require.ErrorContains(t, err, "load "+scope+" settings")
+				_, statErr := os.Stat(filepath.Join(cfg, "sessions"))
+				require.ErrorIs(t, statErr, os.ErrNotExist)
+			})
+		}
+	}
+}
+
+func TestBuildRuntimeOptionsRejectsSettingsWithoutPartialState(t *testing.T) {
+	for _, scope := range []string{"user", "project"} {
+		for _, withPlugins := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/plugins=%t", scope, withPlugins), func(t *testing.T) {
+				cfg := isolateBuildEnv(t)
+				root := t.TempDir()
+				t.Chdir(root)
+				path := filepath.Join(cfg, "settings.json")
+				if scope == "project" {
+					require.NoError(t, os.Mkdir(filepath.Join(root, ".tau"), 0o700))
+					path = filepath.Join(root, ".tau", "settings.json")
+				}
+				require.NoError(t, os.WriteFile(path, []byte(`{"retry":`), 0o600))
+				var options []runtimeBuildOption
+				if !withPlugins {
+					options = append(options, withoutPlugins())
+				}
+				opts, mgr, loader, reg, err := buildRuntimeOptions(t.Context(), ui.NewNoOpUI(), nil, options...)
+				require.ErrorContains(t, err, "load "+scope+" settings")
+				assert.Equal(t, sdk.RuntimeOptions{}, opts)
+				assert.Nil(t, mgr)
+				assert.Nil(t, loader)
+				assert.Nil(t, reg)
+				_, statErr := os.Stat(filepath.Join(cfg, "sessions"))
+				require.ErrorIs(t, statErr, os.ErrNotExist)
+				oldLoader := sdk.GlobalArtifactLoader
+				t.Cleanup(func() { sdk.GlobalArtifactLoader = oldLoader })
+				opts, mgr, loader, reg, flags, err := buildConversationRuntimeOptions(t.Context(), ui.NewNoOpUI())
+				require.ErrorContains(t, err, "load "+scope+" settings")
+				assert.Equal(t, sdk.RuntimeOptions{}, opts)
+				assert.Nil(t, mgr)
+				assert.Nil(t, loader)
+				assert.Nil(t, reg)
+				assert.Equal(t, SessionFlags{}, flags)
+				if oldLoader == nil {
+					assert.Nil(t, sdk.GlobalArtifactLoader)
+				} else {
+					assert.Same(t, oldLoader, sdk.GlobalArtifactLoader)
+				}
+			})
+		}
+	}
+}
+
+func TestBuildRuntimeOptionsRejectsInvalidSessionStorage(t *testing.T) {
+	for _, withPlugins := range []bool{false, true} {
+		t.Run(fmt.Sprint(withPlugins), func(t *testing.T) {
+			cfg := isolateBuildEnv(t)
+			t.Chdir(t.TempDir())
+			blocked := filepath.Join(cfg, "blocked")
+			require.NoError(t, os.WriteFile(blocked, []byte("file"), 0o600))
+			t.Setenv("TAU_SESSION_DIR", blocked)
+			var options []runtimeBuildOption
+			if !withPlugins {
+				options = append(options, withoutPlugins())
+			}
+			opts, mgr, loader, reg, err := buildRuntimeOptions(t.Context(), nil, nil, options...)
+			require.ErrorContains(t, err, "create sessions dir")
+			assert.Equal(t, sdk.RuntimeOptions{}, opts)
+			assert.Nil(t, mgr)
+			assert.Nil(t, loader)
+			assert.Nil(t, reg)
+		})
+	}
+}
+
+func TestBuildRuntimeOptionsRejectsOwnerCleanupFailure(t *testing.T) {
+	t.Setenv("TAU_SESSION_DIR", "")
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	dir := filepath.Join(cfg, "sessions")
+	require.NoError(t, os.Mkdir(dir, 0o700))
+	require.NoError(t, os.Symlink("bad.owner", filepath.Join(dir, "bad.owner")))
+	opts, mgr, loader, reg, err := buildRuntimeOptions(t.Context(), nil, nil)
+	require.ErrorContains(t, err, "clean stale session owners")
+	assert.Equal(t, sdk.RuntimeOptions{}, opts)
+	assert.Nil(t, mgr)
+	assert.Nil(t, loader)
+	assert.Nil(t, reg)
+}
+
+func TestSessionCommandsRejectMalformedSettings(t *testing.T) {
+	for _, scope := range []string{"user", "project"} {
+		t.Run(scope, func(t *testing.T) {
+			cfg := isolateBuildEnv(t)
+			t.Setenv("TAU_SESSION_DIR", "")
+			root := t.TempDir()
+			t.Chdir(root)
+			path := filepath.Join(cfg, "settings.json")
+			if scope == "project" {
+				require.NoError(t, os.Mkdir(filepath.Join(root, ".tau"), 0o700))
+				path = filepath.Join(root, ".tau", "settings.json")
+			}
+			require.NoError(t, os.WriteFile(path, []byte(`{"retry":`), 0o600))
+			err := runSessionsList(t.Context(), &cli.Command{})
+			require.ErrorContains(t, err, "load "+scope+" settings")
+			_, err = os.Stat(filepath.Join(cfg, "sessions"))
+			require.ErrorIs(t, err, os.ErrNotExist)
+		})
+	}
+}
+
+func TestPluginCLIFlagDiscoveryRejectsInvalidSettings(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{"retry":`), 0o600))
+	_, err := discoverPluginCLIFlags(t.Context(), []string{"tau", "--extension", t.TempDir()})
+	require.ErrorContains(t, err, "load user settings")
+}
+
+func TestPluginCLIFlagDiscoveryHonorsCancellation(t *testing.T) {
+	isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("pre-parser interrupted")
+	cancel(cause)
+	_, err := discoverPluginCLIFlags(ctx, []string{"tau", "--extension", t.TempDir()})
+	require.ErrorIs(t, err, cause)
+	_, _, err = preprocessPluginCLIArgs(ctx, []string{"tau", "--extension", t.TempDir()})
+	require.ErrorIs(t, err, cause)
+}
+
+func TestReloadSessionReplacesPluginSettingsAfterAdmission(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	oldLoader := sdk.GlobalArtifactLoader
+	sdk.GlobalArtifactLoader = nil
+	oldManager := GlobalPluginManager
+	t.Cleanup(func() { sdk.GlobalArtifactLoader = oldLoader; GlobalPluginManager = oldManager })
+	loop := filepath.Join(t.TempDir(), "loop")
+	require.NoError(t, os.Symlink(loop, loop))
+	mgr := plugins.NewManager(cfg, nil, nil)
+	mgr.SetSettings(&ai.Settings{Extensions: []string{loop}})
+	GlobalPluginManager = mgr
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{}`), 0o600))
+	rejected := errors.New("settings rejected")
+	_, err := reloadSession(t.Context(), "", &failingReloadSession{err: rejected})
+	require.ErrorIs(t, err, rejected)
+	require.ErrorContains(t, mgr.Reload(t.Context()), "scan extensions")
+	_, err = reloadSession(t.Context(), "", &reloadSettingsSession{})
+	require.NoError(t, err)
+	require.NoError(t, mgr.Reload(t.Context()))
+}
+
+func TestReloadSessionRejectsCancellationBeforeAdmission(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{"read":{"lineCap":7}}`), 0o600))
+	oldLoader := sdk.GlobalArtifactLoader
+	sdk.GlobalArtifactLoader = nil
+	oldManager := GlobalPluginManager
+	GlobalPluginManager = nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader = oldLoader; GlobalPluginManager = oldManager })
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("reload interrupted")
+	cancel(cause)
+	sess := &reloadSettingsSession{}
+	result, err := reloadSession(ctx, "", sess)
+	require.ErrorIs(t, err, cause)
+	require.Nil(t, sess.settings)
+	require.Equal(t, commands.Result{}, result)
 }

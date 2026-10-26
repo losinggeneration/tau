@@ -186,6 +186,11 @@ type chatLogRenderUpdate struct {
 	layoutChanged bool
 	oldLineCount  int
 	newLineCount  int
+
+	// topDelta is how many rows the window gained (or, negative, lost) above
+	// the previously first rendered component. A top-anchored scroll position
+	// must move by it to keep showing the same content.
+	topDelta int
 }
 
 // chatLogRenderNotifier must marshal ChatLog.applyPreparedRender onto the app
@@ -277,6 +282,20 @@ type ChatLog struct {
 	visibleStart int
 	visibleEnd   int
 
+	// windowStart is the position (ChatSnapshot.Offset) of the first
+	// component the log renders, or windowAtTail before one is chosen. Only
+	// the tail of a long transcript is wrapped and held in memory: Paint grows
+	// the window when the viewport nears its top and trims it back once the
+	// viewport returns to the bottom. atBottom records whether the last paint
+	// showed the final row.
+	windowStart int
+	atBottom    bool
+
+	// onReachTop, when set, is called from Paint while the viewport sits at
+	// the top of everything the conversation model holds, so the owner can
+	// page older history in.
+	onReachTop func()
+
 	// Cross-goroutine request/result handoff state.
 	revision            uint64
 	pending             *chatLogRenderRequest
@@ -304,13 +323,14 @@ type ChatLog struct {
 func NewChatLog(conv *ConversationModel) *ChatLog {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &ChatLog{
-		outputPad: 1,
-		id:        tauui.NewID(),
-		conv:      conv,
-		tokens:    defaultThemeTokens(),
-		wake:      make(chan struct{}, 1),
-		cancel:    cancel,
-		done:      make(chan struct{}),
+		outputPad:   1,
+		id:          tauui.NewID(),
+		conv:        conv,
+		windowStart: windowAtTail,
+		tokens:      defaultThemeTokens(),
+		wake:        make(chan struct{}, 1),
+		cancel:      cancel,
+		done:        make(chan struct{}),
 	}
 	c.setPalette(c.tokens.chatPalette())
 	c.wrapMessagesFunc = c.wrapComponents
@@ -509,7 +529,7 @@ func (c *ChatLog) setConversation(conv *ConversationModel, clearRendered bool) {
 	c.selection = chatLogSelection{}
 	if clearRendered {
 		c.renderedRevision = c.revision
-		c.renderedState = chatLogRenderState{width: c.desiredWidth, snapshot: conv.Snapshot()}
+		c.renderedState = chatLogRenderState{width: c.desiredWidth, snapshot: conv.SnapshotTail(chatLogWindowComponents)}
 		c.lines = nil
 		c.lineCount = 0
 		c.wrapWidth = 0
@@ -519,6 +539,7 @@ func (c *ChatLog) setConversation(conv *ConversationModel, clearRendered bool) {
 	c.renderCache = nil
 	c.renderCacheOrder = nil
 	c.expanded = nil
+	c.windowStart = windowAtTail
 	c.mu.Unlock()
 
 	unsubscribe()
@@ -726,6 +747,13 @@ func (c *ChatLog) Paint(d tauui.Drawer, ctx *tauui.Ctx) {
 	if rect.W <= 0 || rect.H <= 0 {
 		return
 	}
+	// Without a viewport hint (the document layout lays the log out at full
+	// height and only clips it), bound the rows by the drawer's clip so a
+	// frame costs the visible window rather than the whole transcript.
+	if clip := d.ClipRect(); end <= start && clip.W > 0 && clip.H > 0 {
+		start = max(0, clip.Y-rect.Y)
+		end = max(start, clip.Y+clip.H-rect.Y)
+	}
 	if start < 0 {
 		start = 0
 	}
@@ -777,6 +805,54 @@ func (c *ChatLog) Paint(d tauui.Drawer, ctx *tauui.Ctx) {
 		}
 		c.paintSelectionForLine(d, rect, i, ln, selection, st, ctx)
 	}
+	c.adjustWindow(start, end, totalLines)
+}
+
+// adjustWindow grows the rendered window when the painted rows come within a
+// screen of its top, and shrinks it once they reach the bottom again, so only
+// the part of a long transcript the user is near stays wrapped in memory.
+func (c *ChatLog) adjustWindow(start, end, totalLines int) {
+	c.mu.Lock()
+	c.atBottom = end >= totalLines
+	offset, base := c.renderedState.snapshot.Offset, c.renderedState.snapshot.Base
+	window := len(c.renderedState.components)
+	settled := c.windowStart == offset
+	nearTop := start <= end-start
+	reschedule, reachTop := false, false
+	switch {
+	case !settled:
+	case nearTop && offset > base:
+		c.windowStart = max(base, offset-chatLogWindowComponents)
+		reschedule = true
+	case nearTop:
+		reachTop = c.onReachTop != nil
+	case c.atBottom && window > 2*chatLogWindowComponents:
+		reschedule = true
+	}
+	onReachTop := c.onReachTop
+	c.mu.Unlock()
+	if reschedule {
+		c.scheduleCurrentSnapshot()
+	}
+	if reachTop {
+		onReachTop()
+	}
+}
+
+// setReachTopHandler installs the callback Paint makes while the viewport is
+// at the top of the held history. Called on the app loop.
+func (c *ChatLog) setReachTopHandler(fn func()) {
+	c.mu.Lock()
+	c.onReachTop = fn
+	c.mu.Unlock()
+}
+
+// windowBounds reports the rendered window's first position and the oldest
+// position the conversation model held when it was rendered.
+func (c *ChatLog) windowBounds() (offset, base int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.renderedState.snapshot.Offset, c.renderedState.snapshot.Base
 }
 
 // setVisibleRows records the content rows the owning scroll viewport is about
@@ -795,18 +871,44 @@ func (c *ChatLog) onChanged() {
 	c.scheduleCurrentSnapshot()
 }
 
+// chatLogWindowComponents is how many trailing components the log renders by
+// default, and how many more each scroll past the window's top loads.
+// ponytail: sized in components, not rows; a run of very tall components
+// makes the window taller than it needs to be.
+const chatLogWindowComponents = 400
+
+// windowAtTail marks a window that starts chatLogWindowComponents from the end.
+const windowAtTail = math.MinInt
+
 func (c *ChatLog) scheduleCurrentSnapshot() {
+	c.mu.Lock()
+	start := c.windowStart
+	c.mu.Unlock()
 	// Snapshot already returns a freshly built slice that no one else retains,
 	// so the request can reference it directly. Copying it here doubled the
 	// per-mutation allocation for the whole transcript.
-	snapshot := c.conv.Snapshot()
-	components := snapshot.Components
+	var snapshot ChatSnapshot
+	if start == windowAtTail {
+		snapshot = c.conv.SnapshotTail(chatLogWindowComponents)
+	} else {
+		snapshot = c.conv.SnapshotFrom(start)
+	}
 
 	c.mu.Lock()
 	if c.closed || c.rect.W <= 0 {
 		c.mu.Unlock()
 		return
 	}
+	// Live appends grow the window; once the viewport is back at the bottom,
+	// drop the excess so a long session holds a bounded tail.
+	if excess := len(snapshot.Components) - chatLogWindowComponents; c.atBottom && excess > chatLogWindowComponents {
+		snapshot.Components = snapshot.Components[excess:]
+		snapshot.Offset += excess
+	}
+	if c.windowStart == start {
+		c.windowStart = snapshot.Offset
+	}
+	components := snapshot.Components
 	width := c.rect.W
 	if width < 1 {
 		width = 1
@@ -867,6 +969,7 @@ func (c *ChatLog) renderWorker(ctx context.Context) {
 			if !incremental {
 				c.setActiveRenderCancel(cancelReq)
 				state = req.wrap(reqCtx, req.components, req.width)
+				state.snapshot = req.snapshot
 				c.clearActiveRenderCancel(cancelReq)
 				c.recordFullRender(reqCtx.Err() != nil)
 			} else {
@@ -994,6 +1097,7 @@ func (c *ChatLog) applyPreparedRender() chatLogRenderUpdate {
 
 	oldLineCount := c.lineCount
 	oldWrapWidth := c.wrapWidth
+	topDelta := windowTopDelta(c.renderedState, result.state)
 	c.renderedState = result.state
 	c.lines = result.state.lines
 	c.lineCount = len(result.state.lines)
@@ -1013,6 +1117,21 @@ func (c *ChatLog) applyPreparedRender() chatLogRenderUpdate {
 		layoutChanged: oldLineCount != newLineCount || oldWrapWidth != c.wrapWidth,
 		oldLineCount:  oldLineCount,
 		newLineCount:  newLineCount,
+		topDelta:      topDelta,
+	}
+}
+
+// windowTopDelta reports how many rows next added (positive) or removed
+// (negative) above the first component old rendered.
+func windowTopDelta(old, next chatLogRenderState) int {
+	shift := old.snapshot.Offset - next.snapshot.Offset
+	switch {
+	case shift > 0 && shift < len(next.spans):
+		return next.spans[shift].start
+	case shift < 0 && -shift < len(old.spans):
+		return -old.spans[-shift].start
+	default:
+		return 0
 	}
 }
 
@@ -1624,6 +1743,10 @@ func (c *ChatLog) applyPluginComponent(component ChatComponent, width int) ([]re
 
 func (c *ChatLog) tryIncrementalComponentRender(previous *chatLogRenderState, snapshot ChatSnapshot, components []ChatComponent, width int) (chatLogRenderState, bool) {
 	if previous == nil || previous.width != width || len(previous.spans) != len(previous.components) || len(previous.messages) != len(previous.components) {
+		return chatLogRenderState{}, false
+	}
+	// A moved window shifts every index; re-wrap it (cheap, from the cache).
+	if previous.snapshot.Offset != snapshot.Offset {
 		return chatLogRenderState{}, false
 	}
 	if len(components) == 0 && len(previous.components) == 0 {

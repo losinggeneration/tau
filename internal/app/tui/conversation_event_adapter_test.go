@@ -2,6 +2,7 @@ package tui
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -135,5 +136,37 @@ func TestLiveRichToolResultMatchesRestoration(t *testing.T) {
 	images := app.conv.Snapshot().Components[0].Images
 	if tool.Output != "first\nsecond" || len(images) != 1 || images[0].Data != "aW1hZ2U=" || images[0].MIMEType != "image/png" {
 		t.Fatalf("lost item boundaries: %q %+v", tool.Output, images)
+	}
+}
+
+// Live items carry the session entry that recorded them: the user row its own
+// entry, an assistant message's text and the tool executions it requested the
+// assistant entry. That is what lets the model drop history at a message.
+func TestMessageEndTagsItemsWithSessionEntry(t *testing.T) {
+	a := newTestApp(t)
+	a.footer = NewFooter(&footerData{})
+
+	a.handleEvent(sdk.Event{Type: "message_end", Payload: map[string]any{"role": "user", "content": "go", "entry_id": "eU"}})
+	a.handleEvent(sdk.Event{Type: "message_start", Payload: map[string]any{"role": "assistant", "message_id": "m1"}})
+	a.handleEvent(sdk.Event{Type: "text_delta", Payload: map[string]any{"delta": "running it", "message_id": "m1"}})
+	a.handleEvent(sdk.Event{Type: "message_end", Payload: map[string]any{"role": "assistant", "content": "running it", "message_id": "m1", "entry_id": "eA"}})
+	a.handleEvent(sdk.Event{Type: "tool_call", Payload: map[string]any{"tool_call_id": "c1", "name": "bash", "input": `{"command":"ls"}`}})
+	a.handleEvent(sdk.Event{Type: "tool_result", Payload: map[string]any{"tool_call_id": "c1", "output": "ok"}})
+	// A tool call that starts before its message finishes cannot be attributed.
+	a.handleEvent(sdk.Event{Type: "message_start", Payload: map[string]any{"role": "assistant", "message_id": "m2"}})
+	a.handleEvent(sdk.Event{Type: "tool_call", Payload: map[string]any{"tool_call_id": "c2", "name": "bash", "input": `{"command":"pwd"}`}})
+
+	var got []string
+	for _, item := range a.conv.committed {
+		got = append(got, fmt.Sprintf("%d=%s", item.kind, item.entryID))
+	}
+	want := []string{
+		fmt.Sprintf("%d=eU", conversationItemUser),
+		fmt.Sprintf("%d=eA", conversationItemAssistant),
+		fmt.Sprintf("%d=eA", conversationItemToolExecution),
+		fmt.Sprintf("%d=", conversationItemToolExecution),
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("tags = %v, want %v", got, want)
 	}
 }

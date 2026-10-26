@@ -98,7 +98,11 @@ func CLI() {
 
 	root := newRootCommand()
 
-	cleanArgs, pluginCLIFlags := preprocessPluginCLIArgs(os.Args)
+	cleanArgs, pluginCLIFlags, err := preprocessPluginCLIArgs(ctx, os.Args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(ExitUserError)
+	}
 	cleanArgs = normalizeOptionalResumeArgs(cleanArgs)
 
 	// Store the root command in context for conversation mode flag access.
@@ -179,37 +183,39 @@ func configDir() string {
 // sessionDir returns the sessions directory. Precedence: TAU_SESSION_DIR,
 // then sessionDir in settings.json, then <configDir>/sessions. The
 // --session-dir flag is applied by sessionDirForCmd on top of this.
-func sessionDir() string {
-	var configured string
-	if settings, err := loadSettings(); err == nil && settings != nil {
-		configured = settings.SessionDir
+func sessionDir() (string, error) {
+	settings, err := loadSettings()
+	if err != nil {
+		return "", err
 	}
-	return paths.Dir("TAU_SESSION_DIR", configured, filepath.Join(configDir(), "sessions"))
+	return paths.Dir("TAU_SESSION_DIR", settings.SessionDir, filepath.Join(configDir(), "sessions")), nil
 }
 
-// sessionDirForCmd returns the sessions directory, respecting --session-dir flag override.
-// If the command has the session-dir flag set and non-empty, that value is used.
-// Otherwise falls back to TAU_SESSION_DIR env var, then the default location.
-func sessionDirForCmd(cmd *cli.Command) string {
-	if cmd != nil {
-		if dir := cmd.String("session-dir"); dir != "" {
-			return dir
-		}
+// sessionDirForCmd applies the CLI override after validating settings.
+func sessionDirForCmd(cmd *cli.Command) (string, error) {
+	dir, err := sessionDir()
+	if err != nil {
+		return "", err
 	}
-	return sessionDir()
+	if cmd != nil && cmd.String("session-dir") != "" {
+		return cmd.String("session-dir"), nil
+	}
+	return dir, nil
 }
 
 // loadSettings loads and merges user + project settings.
 func loadSettings() (*ai.Settings, error) {
 	cfgDir := configDir()
-	userSettings, err := ai.LoadSettings(filepath.Join(cfgDir, "settings.json"))
+	userPath := filepath.Join(cfgDir, "settings.json")
+	userSettings, err := ai.LoadSettings(userPath)
 	if err != nil {
-		return nil, fmt.Errorf("load user settings: %w", err)
+		return nil, fmt.Errorf("load user settings %s: %w", userPath, err)
 	}
 
-	projectSettings, err := ai.LoadSettings(".tau/settings.json")
+	projectPath := ".tau/settings.json"
+	projectSettings, err := ai.LoadSettings(projectPath)
 	if err != nil {
-		return nil, fmt.Errorf("load project settings: %w", err)
+		return nil, fmt.Errorf("load project settings %s: %w", projectPath, err)
 	}
 
 	return ai.MergeSettings(userSettings, projectSettings), nil
@@ -232,19 +238,32 @@ func openStore() (*store.FileBackend, error) {
 // before anything is replaced, so those failures leave the previous state.
 // Plugin restarts happen after that commit and report their own failures.
 func reloadSession(ctx context.Context, plugin string, sess commands.CommandSession) (commands.Result, error) {
+	if err := context.Cause(ctx); err != nil {
+		return commands.Result{}, err
+	}
 	settings, err := loadSettings()
 	if err != nil {
 		return commands.Result{}, fmt.Errorf("reload settings: %w", err)
 	}
 	var prepared *artifacts.PreparedReload
 	if loader, ok := sdk.GlobalArtifactLoader.(*artifacts.Loader); ok {
+		userDir, projectDir := packageDirsFromSettings(settings)
+		resolved, resolveErr := packages.ResolvePackageSources(settings, userDir, projectDir)
+		if resolveErr != nil {
+			return commands.Result{}, fmt.Errorf("reload package sources: %w", resolveErr)
+		}
 		prepared, err = loader.Prepare(artifacts.ReloadOptions{
-			SettingsPaths: getSettingsArtifactPaths(settings),
-			UserDirs:      artifactUserDirs(settings),
+			PackagePaths:   []string{projectDir, userDir},
+			Packages:       resolved,
+			SettingsScopes: getSettingsArtifactScopes(settings),
+			UserDirs:       artifactUserDirs(settings),
 		})
 		if err != nil {
 			return commands.Result{}, fmt.Errorf("reload artifacts: %w", err)
 		}
+	}
+	if err := context.Cause(ctx); err != nil {
+		return commands.Result{}, err
 	}
 	if reloader, ok := sess.(sdk.SettingsReloader); ok {
 		if err := reloader.ReloadSettings(ctx, settings); err != nil {
@@ -260,6 +279,7 @@ func reloadSession(ctx context.Context, plugin string, sess commands.CommandSess
 		}
 	}
 	if GlobalPluginManager != nil {
+		GlobalPluginManager.SetSettings(settings)
 		if plugin != "" {
 			err = GlobalPluginManager.ReloadNamed(ctx, plugin)
 		} else {
@@ -436,10 +456,15 @@ func withoutPlugins() runtimeBuildOption {
 
 // buildRuntimeOptions creates RuntimeOptions with all shared state initialized.
 // cmd may be nil for commands that don't have conversation flags.
-func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, buildOpts ...runtimeBuildOption) (sdk.RuntimeOptions, *plugins.Manager, *artifacts.Loader, *commands.InMemoryRegistry) {
+func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, buildOpts ...runtimeBuildOption) (sdk.RuntimeOptions, *plugins.Manager, *artifacts.Loader, *commands.InMemoryRegistry, error) {
 	var cfg runtimeBuildConfig
 	for _, opt := range buildOpts {
 		opt(&cfg)
+	}
+
+	settings, err := loadSettings()
+	if err != nil {
+		return sdk.RuntimeOptions{}, nil, nil, nil, err
 	}
 
 	reg := commands.NewInMemoryRegistry()
@@ -449,16 +474,30 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 
 	cfgDir := configDir()
 	fb, err := openStore()
-	if err == nil {
-		opts.CredentialStore = fb
+	if err != nil {
+		return sdk.RuntimeOptions{}, nil, nil, nil, err
 	}
+	opts.CredentialStore = fb
 
-	settings, _ := loadSettings()
 	opts.Settings = settings
+
+	sessDir := paths.Dir("TAU_SESSION_DIR", settings.SessionDir, filepath.Join(cfgDir, "sessions"))
+	if cmd != nil && cmd.String("session-dir") != "" {
+		sessDir = cmd.String("session-dir")
+	}
+	opts.SessionsDir = sessDir
+	sessionStorage, err := session.NewStorageAt(sessDir)
+	if err != nil {
+		return sdk.RuntimeOptions{}, nil, nil, nil, err
+	}
+	if err := sessionStorage.CleanupStaleOwners(); err != nil {
+		return sdk.RuntimeOptions{}, nil, nil, nil, fmt.Errorf("clean stale session owners: %w", err)
+	}
 
 	var pluginMgr *plugins.Manager
 	if !cfg.skipPlugins {
 		pluginMgr = plugins.NewManager(cfgDir, uiImpl, reg)
+		pluginMgr.SetSessionAccessor(session.NewSessionStoreAccessor(sessionStorage))
 		if settings != nil {
 			pluginMgr.SetSettings(settings)
 		}
@@ -481,20 +520,8 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		applyPluginCLIFlags(ctx, pluginMgr)
 	}
 
-	sessDir := sessionDirForCmd(cmd)
-	opts.SessionsDir = sessDir
-
-	sessionStorage, err := session.NewStorageAt(sessDir)
-	if err == nil {
-		sessionAccessor := session.NewSessionStoreAccessor(sessionStorage)
-		if pluginMgr != nil {
-			pluginMgr.SetSessionAccessor(sessionAccessor)
-		}
-		_ = sessionStorage.CleanupStaleOwners()
-	}
-
 	cwd, _ := os.Getwd()
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir := packageDirsFromSettings(settings)
 	var cliPaths map[artifacts.ArtifactKind][]string
 	if cmd != nil {
 		cliPaths = map[artifacts.ArtifactKind][]string{
@@ -503,13 +530,19 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 			artifacts.KindTheme:  cmd.StringSlice("theme"),
 		}
 	}
+	resolved, resolveErr := packages.ResolvePackageSources(settings, userDir, projectDir)
+	if resolveErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to resolve package sources: %v\n", resolveErr)
+		resolved = []packages.ResolvedPackage{}
+	}
 	loaderOpts := artifacts.LoaderOptions{
 		ThemeValidator:   func(raw []byte) error { _, err := tui.DecodeThemeColors(raw); return err },
 		Log:              nil,
 		CWD:              cwd,
-		SettingsPaths:    getSettingsArtifactPaths(settings),
+		SettingsScopes:   getSettingsArtifactScopes(settings),
 		CLIPaths:         cliPaths,
-		PackagePaths:     []string{userDir, projectDir},
+		PackagePaths:     []string{projectDir, userDir},
+		Packages:         resolved,
 		UserDirs:         artifactUserDirs(settings),
 		CommandsRegistry: reg,
 		// Honor artifact discovery control flags.
@@ -538,12 +571,15 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		opts.PreloadSkills = cmd.StringSlice("skill")
 	}
 
-	return opts, pluginMgr, loader, reg
+	return opts, pluginMgr, loader, reg, nil
 }
 
-func buildConversationRuntimeOptions(ctx context.Context, uiImpl ui.UI) (sdk.RuntimeOptions, *plugins.Manager, *artifacts.Loader, *commands.InMemoryRegistry, SessionFlags) {
+func buildConversationRuntimeOptions(ctx context.Context, uiImpl ui.UI) (sdk.RuntimeOptions, *plugins.Manager, *artifacts.Loader, *commands.InMemoryRegistry, SessionFlags, error) {
 	cmd := rootCmdFromContext(ctx)
-	rtOpts, pluginMgr, loader, reg := buildRuntimeOptions(ctx, uiImpl, cmd)
+	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, cmd)
+	if err != nil {
+		return sdk.RuntimeOptions{}, nil, nil, nil, SessionFlags{}, err
+	}
 	if loader != nil {
 		sdk.GlobalArtifactLoader = loader
 		rtOpts.ArtifactLoader = loader
@@ -555,7 +591,7 @@ func buildConversationRuntimeOptions(ctx context.Context, uiImpl ui.UI) (sdk.Run
 		sessionFlags = applyConversationFlags(&rtOpts, cmd)
 	}
 
-	return rtOpts, pluginMgr, loader, reg, sessionFlags
+	return rtOpts, pluginMgr, loader, reg, sessionFlags, nil
 }
 
 // writeLine writes a formatted line to w, ignoring write errors.
@@ -595,27 +631,16 @@ func artifactUserDirs(settings *ai.Settings) map[artifacts.ArtifactKind]string {
 	}
 }
 
-// getSettingsArtifactPaths extracts artifact paths from settings.json. The
-// flat schema uses Skills/Prompts/Themes string slices per the Pi spec.
-func getSettingsArtifactPaths(settings *ai.Settings) map[artifacts.ArtifactKind][]string {
-	if settings == nil {
-		return nil
+func getSettingsArtifactScopes(settings *ai.Settings) map[artifacts.SourceTier]map[artifacts.ArtifactKind][]string {
+	result := map[artifacts.SourceTier]map[artifacts.ArtifactKind][]string{
+		artifacts.TierUser: {}, artifacts.TierProject: {},
 	}
-
-	result := make(map[artifacts.ArtifactKind][]string)
-
-	if settings.Skills != nil {
-		result[artifacts.KindSkill] = settings.ResourcePaths("skills")
-	}
-	if settings.Prompts != nil {
-		result[artifacts.KindPrompt] = settings.ResourcePaths("prompts")
-	}
-	if settings.Themes != nil {
-		result[artifacts.KindTheme] = settings.ResourcePaths("themes")
-	}
-
-	if len(result) == 0 {
-		return nil
+	for kind, name := range map[artifacts.ArtifactKind]string{
+		artifacts.KindSkill: "skills", artifacts.KindPrompt: "prompts", artifacts.KindTheme: "themes",
+	} {
+		user, project := settings.ResourcePathsByScope(name)
+		result[artifacts.TierUser][kind] = user
+		result[artifacts.TierProject][kind] = project
 	}
 	return result
 }
@@ -624,13 +649,19 @@ func getSettingsArtifactPaths(settings *ai.Settings) map[artifacts.ArtifactKind]
 // precedence: TAU_PACKAGE_DIR, then packageDir in settings.json, then
 // <configDir>/packages.
 func packagesDirs() (userDir, projectDir string) {
+	settings, err := loadSettings()
+	if err != nil {
+		return packageDirsFromSettings(nil)
+	}
+	return packageDirsFromSettings(settings)
+}
+
+func packageDirsFromSettings(settings *ai.Settings) (userDir, projectDir string) {
 	var configured string
-	if settings, err := loadSettings(); err == nil && settings != nil {
+	if settings != nil {
 		configured = settings.PackageDir
 	}
-	userDir = paths.Dir("TAU_PACKAGE_DIR", configured, filepath.Join(configDir(), "packages"))
-	projectDir = ".tau/packages"
-	return
+	return paths.Dir("TAU_PACKAGE_DIR", configured, filepath.Join(configDir(), "packages")), ".tau/packages"
 }
 
 // isTTY returns true if stdin is a terminal.
@@ -746,23 +777,14 @@ func runLogin(ctx context.Context, cmd *cli.Command) error {
 
 	cfgDir := configDir()
 	settingsPath := filepath.Join(cfgDir, "settings.json")
-	settings, err := ai.LoadSettings(settingsPath)
-	if err != nil {
-		return cli.Exit(fmt.Sprintf("load settings: %v", err), ExitSubsystemError)
-	}
-
-	// Provider instance state lives in models.json under providers.<id>.
-	// The login command stores the provider credential and (if requested)
-	// sets the user's default provider/model.
+	// Provider endpoints belong in models.json; login only updates defaults.
 	if baseURL != "" || defaultModel != "" {
 		fmt.Fprintf(os.Stderr, "warning: --base-url and --default-model are deprecated; configure provider endpoints via models.json\n")
 	}
 	if defaultModel != "" && provider != "" {
-		settings.DefaultProvider = provider
-		settings.DefaultModel = defaultModel
-	}
-	if err := ai.SaveSettings(settingsPath, settings); err != nil {
-		return cli.Exit(fmt.Sprintf("save settings: %v", err), ExitSubsystemError)
+		if err := ai.UpdateSettings(ctx, settingsPath, map[string]any{"defaultProvider": provider, "defaultModel": defaultModel}); err != nil {
+			return cli.Exit(fmt.Sprintf("save settings: %v", err), ExitSubsystemError)
+		}
 	}
 
 	if usedOAuth {
@@ -893,7 +915,7 @@ func mergeProviderRefsWithEnv(refs []ai.CredentialRef) []ai.CredentialRef {
 
 	merged := append([]ai.CredentialRef(nil), refs...)
 	for _, provider := range ai.ListAvailableProviders() {
-		if ai.GetEnvAPIKey(provider) == "" {
+		if !ai.HasEnvCredentials(provider) {
 			continue
 		}
 		if _, ok := seen[provider]; ok {
@@ -915,7 +937,13 @@ func providerCredential(ctx context.Context, fb *store.FileBackend, ref ai.Crede
 	if err == nil {
 		return cred, nil
 	}
-	// Fall back to environment variables if the store has no credential.
+	if !errors.Is(err, ai.ErrCredentialNotFound) && !errors.Is(err, os.ErrNotExist) {
+		return cred, err
+	}
+	// Header-owned authentication is resolved by the provider at request time.
+	if len(ai.GetEnvHeaders(ref.Provider)) != 0 {
+		return ai.NewAPIKeyCredential(""), nil
+	}
 	if apiKey := ai.GetEnvAPIKey(ref.Provider); apiKey != "" {
 		return ai.NewAPIKeyCredential(apiKey), nil
 	}
@@ -1075,17 +1103,9 @@ func runModelsDiscover(ctx context.Context, cmd *cli.Command) (err error) {
 		return cli.Exit(fmt.Sprintf("open store: %v", err), ExitSubsystemError)
 	}
 
-	cred, err := fb.Get(ctx, providerKey)
+	cred, err := providerCredential(ctx, fb, ai.CredentialRef{Provider: providerKey})
 	if err != nil {
-		if errors.Is(err, ai.ErrCredentialNotFound) {
-			if envKey := ai.GetEnvAPIKey(providerKey); envKey != "" {
-				cred = ai.NewAPIKeyCredential(envKey)
-			} else {
-				return cli.Exit(fmt.Sprintf("no credential found for provider %q: run `tau login %s` first", providerKey, providerKey), ExitAuthError)
-			}
-		} else {
-			return cli.Exit(fmt.Sprintf("get credential for provider %q: %v", providerKey, err), ExitAuthError)
-		}
+		return cli.Exit(fmt.Sprintf("get credential for provider %q: %v", providerKey, err), ExitAuthError)
 	}
 
 	apiKey, err := getAPIKeyFromCredential(ctx, providerKey, cred, fb)
@@ -1112,6 +1132,10 @@ func runModelsDiscover(ctx context.Context, cmd *cli.Command) (err error) {
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	} else {
+		for name, value := range ai.GetEnvHeaders(providerKey) {
+			req.Header.Set(name, value)
+		}
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -1214,14 +1238,7 @@ func runSetModel(ctx context.Context, cmd *cli.Command) error {
 		settingsPath = filepath.Join(configDir(), "settings.json")
 	}
 
-	settings, err := ai.LoadSettings(settingsPath)
-	if err != nil {
-		return cli.Exit(fmt.Sprintf("load settings: %v", err), ExitSubsystemError)
-	}
-
-	settings.DefaultProvider = spec.Provider
-	settings.DefaultModel = spec.Model
-	if err := ai.SaveSettings(settingsPath, settings); err != nil {
+	if err := ai.UpdateSettings(ctx, settingsPath, map[string]any{"defaultProvider": spec.Provider, "defaultModel": spec.Model}); err != nil {
 		return cli.Exit(fmt.Sprintf("save settings: %v", err), ExitSubsystemError)
 	}
 
@@ -1233,7 +1250,10 @@ func runSetModel(ctx context.Context, cmd *cli.Command) error {
 // resolution chain a live session would: explicit override → settings →
 // env-var fallback. Honors --model on the root command if set.
 func runShowModel(ctx context.Context, cmd *cli.Command) error {
-	rtOpts, _, _, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), cmd, withoutPlugins())
+	rtOpts, _, _, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), cmd, withoutPlugins())
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	if explicit := cmd.String("model"); explicit != "" {
 		rtOpts.ExplicitModel = explicit
 	}
@@ -1414,7 +1434,10 @@ func runUpdate(ctx context.Context, cmd *cli.Command) error {
 		return nil
 	}
 	updateMgr.PluginReloader = func(ctx context.Context, pluginName string) error {
-		rtOpts, pluginMgr, _, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil)
+		rtOpts, pluginMgr, _, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil)
+		if err != nil {
+			return cli.Exit(err.Error(), ExitUserError)
+		}
 		defer func() {
 			if pluginMgr != nil {
 				reportShutdownError(pluginMgr.Shutdown(ctx))
@@ -1681,7 +1704,11 @@ func runSessionsList(ctx context.Context, cmd *cli.Command) error {
 		CWD:   cmd.String("cwd"),
 	}
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1873,7 +1900,11 @@ func runSessionsShow(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1897,7 +1928,11 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 	recliing := cmd.Args().Slice()[1:]
 
 	// Validate the session exists before doing any work.
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -1924,7 +1959,10 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 	uiImpl := choosePrintModeUI()
 
 	// Build runtime options, wiring the resume ID directly.
-	rtOpts, pluginMgr, loader, reg, sessionFlags := buildConversationRuntimeOptions(ctx, uiImpl)
+	rtOpts, pluginMgr, loader, reg, sessionFlags, err := buildConversationRuntimeOptions(ctx, uiImpl)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	GlobalCommandRegistry = reg
 	GlobalPluginManager = pluginMgr
 	// This path never opens the TUI, so the resource loader has no consumer here.
@@ -1934,7 +1972,6 @@ func runSessionsResume(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	// Override: target the explicit session ID instead of any auto-detection.
-	rtOpts.SessionsDir = sessionDirForCmd(cmd)
 	rtOpts.ResumeSessionID = id
 
 	rt, err := sdk.NewRuntime(rtOpts)
@@ -2032,7 +2069,11 @@ func runSessionsRename(ctx context.Context, cmd *cli.Command) error {
 	}
 	id, newName := args[0], args[1]
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2053,7 +2094,11 @@ func runSessionsMove(ctx context.Context, cmd *cli.Command) error {
 	}
 	id, newCWD := args[0], args[1]
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2074,7 +2119,11 @@ func runSessionsDelete(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2089,7 +2138,11 @@ func runSessionsDelete(ctx context.Context, cmd *cli.Command) error {
 
 // runSessionsCleanupEmpty handles the `tau sessions cleanup-empty` subcommand.
 func runSessionsCleanupEmpty(ctx context.Context, cmd *cli.Command) error {
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2123,7 +2176,11 @@ func runSessionsRestore(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2143,7 +2200,11 @@ func runSessionsCompact(ctx context.Context, cmd *cli.Command) error {
 	}
 	id := cmd.Args().First()
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2164,7 +2225,11 @@ func runSessionsSummarizeBranch(ctx context.Context, cmd *cli.Command) error {
 	}
 	id, branchTip := args[0], args[1]
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2189,7 +2254,11 @@ func runSessionsFork(ctx context.Context, cmd *cli.Command) error {
 		atEntry = &at
 	}
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2216,7 +2285,11 @@ func runSessionsExport(ctx context.Context, cmd *cli.Command) error {
 		NoCollapse: cmd.Bool("no-collapse"),
 	}
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2240,7 +2313,11 @@ func runSessionsShare(ctx context.Context, cmd *cli.Command) error {
 
 	isPublic := cmd.Bool("public")
 
-	sessCLI, err := session.NewCLI(sessionDirForCmd(cmd))
+	dir, err := sessionDirForCmd(cmd)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	sessCLI, err := session.NewCLI(dir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
 	}
@@ -2282,7 +2359,10 @@ func copyToClipboardWithXsel(text string) bool {
 func runRPC(ctx context.Context, cmd *cli.Command) error {
 	uiImpl := choosePrintModeUI()
 
-	rtOpts, pluginMgr, loader, reg := buildRuntimeOptions(ctx, uiImpl, nil)
+	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, nil)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	GlobalCommandRegistry = reg
 	GlobalPluginManager = pluginMgr
 	if loader != nil {
@@ -2340,7 +2420,10 @@ func runDaemon(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	uiImpl := ui.NewNoOpUI()
-	rtOpts, pluginMgr, loader, reg := buildRuntimeOptions(ctx, uiImpl, nil)
+	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, nil)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	GlobalCommandRegistry = reg
 	GlobalPluginManager = pluginMgr
 	if loader != nil {
@@ -2482,7 +2565,7 @@ func runExtensionsList(_ context.Context, _ *cli.Command) error {
 	}
 	var extensions []string
 	if settings != nil {
-		extensions = append(extensions, settings.Extensions...)
+		extensions = append(extensions, settings.ResourcePaths("extensions")...)
 	}
 	userDir, projectDir := packagesDirs()
 	piExtensions, err := piExtensionPackageLines(userDir, projectDir)
@@ -2527,7 +2610,10 @@ func runReload(ctx context.Context, cmd *cli.Command) error {
 		pluginName = args[0]
 	}
 
-	_, pluginMgr, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil)
+	_, pluginMgr, loader, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil)
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	defer func() {
 		if pluginMgr != nil {
 			reportShutdownError(pluginMgr.Shutdown(ctx))
@@ -2568,7 +2654,10 @@ func runReload(ctx context.Context, cmd *cli.Command) error {
 
 // runSkillsList handles the `tau skills list` subcommand.
 func runSkillsList(ctx context.Context, cmd *cli.Command) error {
-	_, _, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	_, _, loader, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	if loader == nil {
 		return cli.Exit("No artifact loader configured", ExitSubsystemError)
 	}
@@ -2633,7 +2722,10 @@ func runSkillsShow(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit("usage: tau skills show <skill-id>", ExitUserError)
 	}
 
-	_, _, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	_, _, loader, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	if loader == nil {
 		return cli.Exit("No artifact loader configured", ExitSubsystemError)
 	}
@@ -2693,7 +2785,10 @@ func runSkillsShow(ctx context.Context, cmd *cli.Command) error {
 
 // runPromptsList handles the `tau prompts list` subcommand.
 func runPromptsList(ctx context.Context, cmd *cli.Command) error {
-	_, _, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	_, _, loader, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	if loader == nil {
 		return cli.Exit("No artifact loader configured", ExitSubsystemError)
 	}
@@ -2748,7 +2843,10 @@ func runPromptsShow(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit("usage: tau prompts show <prompt-id>", ExitUserError)
 	}
 
-	_, _, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	_, _, loader, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	if loader == nil {
 		return cli.Exit("No artifact loader configured", ExitSubsystemError)
 	}
@@ -2813,7 +2911,10 @@ func themeSource(theme *artifacts.Theme) string {
 
 // runThemesList handles the `tau themes list` subcommand.
 func runThemesList(ctx context.Context, cmd *cli.Command) error {
-	_, _, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	_, _, loader, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	if loader == nil {
 		return cli.Exit("No artifact loader configured", ExitSubsystemError)
 	}
@@ -2865,7 +2966,10 @@ func runThemesShow(ctx context.Context, cmd *cli.Command) error {
 		return cli.Exit("usage: tau themes show <theme-id>", ExitUserError)
 	}
 
-	_, _, loader, _ := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	_, _, loader, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	if loader == nil {
 		return cli.Exit("No artifact loader configured", ExitSubsystemError)
 	}
@@ -3241,7 +3345,11 @@ func runConversationWithSignal(ctx context.Context, sigChan <-chan os.Signal, pr
 	// Set up runtime
 	uiImpl := choosePrintModeUI()
 
-	rtOpts, pluginMgr, loader, reg, sessionFlags := buildConversationRuntimeOptions(ctx, uiImpl)
+	rtOpts, pluginMgr, loader, reg, sessionFlags, err := buildConversationRuntimeOptions(ctx, uiImpl)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return ExitUserError
+	}
 	GlobalCommandRegistry = reg
 	GlobalPluginManager = pluginMgr
 	_ = pluginMgr
@@ -3393,7 +3501,11 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 
 	uiImpl := ui.NewNoOpUI()
 
-	rtOpts, pluginMgr, loader, reg, sessionFlags := buildConversationRuntimeOptions(ctx, uiImpl)
+	rtOpts, pluginMgr, loader, reg, sessionFlags, err := buildConversationRuntimeOptions(ctx, uiImpl)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return ExitUserError
+	}
 	GlobalCommandRegistry = reg
 	GlobalPluginManager = pluginMgr
 	if sessionFlags.SelectionError != nil {
@@ -4040,7 +4152,11 @@ func runConversationJSONWithSignal(ctx context.Context, sigChan <-chan os.Signal
 
 	// Set up runtime using the same bootstrap path as text mode
 	uiImpl := ui.NewNoOpUI()
-	rtOpts, pluginMgr, loader, reg, sessionFlags := buildConversationRuntimeOptions(ctx, uiImpl)
+	rtOpts, pluginMgr, loader, reg, sessionFlags, err := buildConversationRuntimeOptions(ctx, uiImpl)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return ExitUserError
+	}
 	GlobalCommandRegistry = reg
 	GlobalPluginManager = pluginMgr
 	rtOpts.UI = jsonUI
@@ -4198,14 +4314,17 @@ func printJSONMetaEvent() {
 	}
 }
 
-func preprocessPluginCLIArgs(args []string) ([]string, map[string]map[string]string) {
+func preprocessPluginCLIArgs(ctx context.Context, args []string) ([]string, map[string]map[string]string, error) {
 	if !mayContainPluginCLIFlags(args) {
-		return args, nil
+		return args, nil, nil
 	}
 
-	pluginFlagDefs := discoverPluginCLIFlags(args)
+	pluginFlagDefs, err := discoverPluginCLIFlags(ctx, args)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(pluginFlagDefs) == 0 {
-		return args, nil
+		return args, nil, nil
 	}
 
 	knownFlags := knownCLIFlags(append(RootFlags, ConversationFlags...))
@@ -4256,7 +4375,7 @@ func preprocessPluginCLIArgs(args []string) ([]string, map[string]map[string]str
 		resolved[pluginName][name] = value
 	}
 
-	return cleaned, resolved
+	return cleaned, resolved, nil
 }
 
 func mayContainPluginCLIFlags(args []string) bool {
@@ -4309,23 +4428,36 @@ func isKnownRootFlagToken(arg string) bool {
 	return ok
 }
 
-func discoverPluginCLIFlags(args []string) map[string]string {
+func discoverPluginCLIFlags(ctx context.Context, args []string) (owners map[string]string, err error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+	settings, err := loadSettings()
+	if err != nil {
+		return nil, err
+	}
 	cfgDir := configDir()
 	reg := commands.NewInMemoryRegistry()
 	mgr := plugins.NewManager(cfgDir, ui.NewNoOpUI(), reg)
-	settings, _ := loadSettings()
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), plugins.DefaultDrainTimeout)
+		defer cancel()
+		err = errors.Join(err, mgr.Shutdown(cleanupCtx))
+		if err != nil {
+			owners = nil
+		}
+	}()
 	if settings != nil {
 		mgr.SetSettings(settings)
 	}
 	for _, extPath := range extractExtensionPaths(args) {
 		mgr.AddExtensionPath(extPath)
 	}
-	if err := mgr.Discover(context.Background()); err != nil {
-		return nil
+	if err := mgr.Discover(ctx); err != nil {
+		return nil, err
 	}
-	defer func() { reportShutdownError(mgr.Shutdown(context.Background())) }()
 
-	owners := make(map[string]string)
+	owners = make(map[string]string)
 	for pluginName, flags := range mgr.RegisteredCLIFlags() {
 		for _, flag := range flags {
 			if flag.Name != "" {
@@ -4333,7 +4465,7 @@ func discoverPluginCLIFlags(args []string) map[string]string {
 			}
 		}
 	}
-	return owners
+	return owners, nil
 }
 
 func extractExtensionPaths(args []string) []string {

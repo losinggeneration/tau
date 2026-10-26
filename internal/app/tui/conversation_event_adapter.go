@@ -18,6 +18,10 @@ type conversationEventAdapter struct {
 	// lastErrorText dedupes the run-failure "error" event against the
 	// error assistant message (message_end) that carries the same text.
 	lastErrorText string
+	// assistantEntry is the session entry of the last finished assistant
+	// message; the tool executions it requested are tagged with it so the
+	// conversation model can drop history at that message.
+	assistantEntry string
 }
 
 func newConversationEventAdapter(app *App) *conversationEventAdapter {
@@ -51,6 +55,7 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 			app.noteNewMessage()
 			messageID, _ := plString(ev.Payload, "message_id")
 			a.finalizedAnonymousAssistant = false
+			a.assistantEntry = ""
 			app.clearUsageLimitWait()
 			app.ensureAssistantMessage(messageID)
 		case "user":
@@ -90,7 +95,11 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 		name, _ := plStringAny(ev.Payload, "name", "tool_name")
 		args, _ := plStringAny(ev.Payload, "input", "arguments")
 		toolCallID, _ := plStringAny(ev.Payload, "tool_call_id", "toolCallId")
+		before := len(app.conv.committed)
 		app.conv.AddToolCallWithID(toolCallID, name, args)
+		if a.assistantEntry != "" && len(app.conv.committed) > before {
+			app.conv.committed[len(app.conv.committed)-1].entryID = a.assistantEntry
+		}
 	case "tool_progress":
 		app.resetEmptyAssistantResponses()
 		app.conv.ClearThinking()
@@ -169,7 +178,8 @@ func (a *conversationEventAdapter) handleMessageEnd(ev sdk.Event) {
 			// scrolled away — the message boundary is the same point the user
 			// sees the new row appear.
 			app.noteNewMessage()
-			app.conv.AddUserMessageWithImages(content, images)
+			entryID, _ := plString(ev.Payload, "entry_id")
+			app.conv.AddPersistedUserMessage(entryID, content, images)
 		}
 		if messageID != "" {
 			if a.finalizedUserMessages == nil {
@@ -182,6 +192,19 @@ func (a *conversationEventAdapter) handleMessageEnd(ev sdk.Event) {
 	if role != "" && role != "assistant" {
 		return
 	}
+	entryID, _ := plString(ev.Payload, "entry_id")
+	if entryID == "" {
+		a.finishAssistantMessage(ev)
+		return
+	}
+	mark := app.conv.Revision()
+	a.finishAssistantMessage(ev)
+	app.conv.tagEntrySince(mark, entryID)
+	a.assistantEntry = entryID
+}
+
+func (a *conversationEventAdapter) finishAssistantMessage(ev sdk.Event) {
+	app := a.app
 	messageID := payloadMessageID(ev.Payload)
 	if messageID != "" {
 		if _, seen := a.finalizedAssistantMessages[messageID]; seen {

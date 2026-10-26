@@ -2,12 +2,16 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/losinggeneration/tau/ai"
+	"github.com/stretchr/testify/require"
 )
 
 func TestForkAtEntryRetainsLegacyCompaction(t *testing.T) {
@@ -612,4 +616,43 @@ func TestForkAtEntryKeepsSummaryUsageOnItsBranch(t *testing.T) {
 	if position := reader.CurrentPosition(); position != kept.ID {
 		t.Fatalf("summary usage moved the fork position to %q", position)
 	}
+}
+
+func TestCleanupStaleOwnersReportsReadFailuresAndContinues(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "a.owner")
+	if err := os.Symlink("a.owner", bad); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "b.owner")
+	if err := os.WriteFile(stale, []byte("99999999"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(dir, "c.owner")
+	if err := os.WriteFile(live, fmt.Appendf(nil, "%d", os.Getpid()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storage := &Storage{baseDir: dir}
+	err := storage.CleanupStaleOwners()
+	if err == nil || !strings.Contains(err.Error(), bad) {
+		t.Fatalf("expected owner read failure, got %v", err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale owner not removed: %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live owner removed: %v", err)
+	}
+}
+
+func TestRecursiveSessionDiscoveryReportsMissingRoot(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sessions")
+	storage, err := NewStorageAt(dir)
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(dir))
+	_, err = storage.findSessionFiles("*.jsonl")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	_, err = storage.ownerFiles()
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.ErrorIs(t, storage.CleanupStaleOwners(), os.ErrNotExist)
 }

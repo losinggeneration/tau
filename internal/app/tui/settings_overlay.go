@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -291,15 +290,7 @@ func (a *App) persistThemeSetting(value string) error {
 	if a == nil || a.settingsPath == "" {
 		return nil
 	}
-	settings, err := ai.LoadSettings(a.settingsPath)
-	if err != nil {
-		return fmt.Errorf("load settings: %w", err)
-	}
-	settings.Theme = value
-	if err := ai.SaveSettings(a.settingsPath, settings); err != nil {
-		return fmt.Errorf("write settings: %w", err)
-	}
-	return nil
+	return ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{"theme": value})
 }
 
 // persistLayoutSetting writes the chosen layout back to settings.json so the
@@ -310,15 +301,7 @@ func (a *App) persistLayoutSetting(mode LayoutMode) error {
 	if a == nil || a.settingsPath == "" {
 		return nil
 	}
-	settings, err := ai.LoadSettings(a.settingsPath)
-	if err != nil {
-		return fmt.Errorf("load settings: %w", err)
-	}
-	settings.LayoutMode = string(mode)
-	if err := ai.SaveSettings(a.settingsPath, settings); err != nil {
-		return fmt.Errorf("write settings: %w", err)
-	}
-	return nil
+	return ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{"layoutMode": string(mode)})
 }
 
 // persistModelThinkingSetting records the session's thinking level against the
@@ -328,20 +311,9 @@ func (a *App) persistModelThinkingSetting(modelKey, level string) error {
 	if a == nil || a.settingsPath == "" || modelKey == "" {
 		return nil
 	}
-	settings, err := ai.LoadSettings(a.settingsPath)
-	if err != nil {
-		return fmt.Errorf("load settings: %w", err)
-	}
-	if settings.Models == nil {
-		settings.Models = make(map[string]ai.ModelSettings)
-	}
-	ms := settings.Models[modelKey]
-	ms.ThinkingLevel = level
-	settings.Models[modelKey] = ms
-	if err := ai.SaveSettings(a.settingsPath, settings); err != nil {
-		return fmt.Errorf("write settings: %w", err)
-	}
-	return nil
+	return ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{
+		"models": map[string]any{modelKey: map[string]any{"thinkingLevel": level}},
+	})
 }
 
 // applySavedThinkingLevel applies the per-model thinking level configured in
