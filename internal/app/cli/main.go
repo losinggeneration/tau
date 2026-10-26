@@ -632,12 +632,13 @@ func getSettingsArtifactScopes(settings *ai.Settings) map[artifacts.SourceTier]m
 // packagesDirs returns the user and project package directories. User dir
 // precedence: TAU_PACKAGE_DIR, then packageDir in settings.json, then
 // <configDir>/packages.
-func packagesDirs() (userDir, projectDir string) {
+func packagesDirs() (userDir, projectDir string, err error) {
 	settings, err := loadSettings()
 	if err != nil {
-		return packageDirsFromSettings(nil)
+		return "", "", err
 	}
-	return packageDirsFromSettings(settings)
+	userDir, projectDir = packageDirsFromSettings(settings)
+	return userDir, projectDir, nil
 }
 
 func packageDirsFromSettings(settings *ai.Settings) (userDir, projectDir string) {
@@ -1277,7 +1278,10 @@ func runInstall(ctx context.Context, cmd *cli.Command) error {
 	cfg.Force = cmd.Bool("force")
 	cfg.Pi = cmd.Bool("pi")
 
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir, err := packagesDirs()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	mgr := packages.NewInstallManager(userDir, projectDir)
 	settings, err := loadSettings()
 	if err != nil {
@@ -1322,7 +1326,10 @@ func runUninstall(ctx context.Context, cmd *cli.Command) error {
 		scopeFlag = packages.ScopeUser
 	}
 
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir, err := packagesDirs()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	mgr := packages.NewManager(userDir, projectDir)
 
 	var scopesToCheck []packages.Scope
@@ -1408,8 +1415,16 @@ func runUpdate(ctx context.Context, cmd *cli.Command) error {
 
 	names := cmd.Args().Slice()
 
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir, err := packagesDirs()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	updateMgr := packages.NewUpdateManager(userDir, projectDir)
+	settings, err := loadSettings()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
+	updateMgr.NPMCommand = settings.NPMCommand
 
 	updateMgr.ArtifactReloader = func(ctx context.Context) error {
 		if sdk.GlobalArtifactLoader != nil {
@@ -1445,10 +1460,14 @@ func runUpdate(ctx context.Context, cmd *cli.Command) error {
 		names = installed
 	}
 
+	var updateErr error
 	for _, name := range names {
 		result, err := updateMgr.Update(ctx, name, scope)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "update %s: %v\n", name, err)
+			updateErr = errors.Join(updateErr, fmt.Errorf("update %s: %w", name, err))
+			if context.Cause(ctx) != nil {
+				break
+			}
 			continue
 		}
 
@@ -1459,6 +1478,9 @@ func runUpdate(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
+	if updateErr != nil {
+		return cli.Exit(updateErr.Error(), ExitSubsystemError)
+	}
 	return nil
 }
 
@@ -1467,7 +1489,10 @@ func runPackagesList(ctx context.Context, cmd *cli.Command) error {
 	userOnly := cmd.Bool("user")
 	projectOnly := cmd.Bool("project")
 
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir, err := packagesDirs()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	mgr := packages.NewManager(userDir, projectDir)
 
 	showUser := !projectOnly
@@ -1523,7 +1548,10 @@ func runPackagesInfo(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	name := cmd.Args().First()
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir, err := packagesDirs()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	mgr := packages.NewManager(userDir, projectDir)
 
 	var info *packages.Info
@@ -1631,7 +1659,10 @@ func runPackagesSearch(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	query := strings.ToLower(cmd.Args().First())
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir, err := packagesDirs()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	mgr := packages.NewManager(userDir, projectDir)
 
 	names, err := mgr.ListInstalled(packages.ScopeUser)
@@ -2551,7 +2582,10 @@ func runExtensionsList(_ context.Context, _ *cli.Command) error {
 	if settings != nil {
 		extensions = append(extensions, settings.ResourcePaths("extensions")...)
 	}
-	userDir, projectDir := packagesDirs()
+	userDir, projectDir, err := packagesDirs()
+	if err != nil {
+		return cli.Exit(err.Error(), ExitUserError)
+	}
 	piExtensions, err := piExtensionPackageLines(userDir, projectDir)
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("list pi extensions: %v", err), ExitSubsystemError)
@@ -3087,7 +3121,7 @@ func runPluginDoctor(ctx context.Context, cmd *cli.Command) error {
 				writeLine(os.Stdout, "Runtime: none required\n")
 			} else {
 				writeLine(os.Stdout, "Required: %s\n", manifest.Reqs.Runtime)
-				if err := packages.CheckRuntimeRequirement(manifest.Reqs.Runtime); err != nil {
+				if err := packages.CheckRuntimeRequirementContext(ctx, manifest.Reqs.Runtime); err != nil {
 					writeLine(os.Stdout, "Status: FAIL\n")
 					writeLine(os.Stdout, "Error: %v\n", err)
 				} else {

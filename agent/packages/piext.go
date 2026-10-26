@@ -51,6 +51,9 @@ func ParsePiPackage(dir string) (*PiPackage, error) {
 	if raw.Name == "" {
 		return nil, fmt.Errorf("package.json name is required")
 	}
+	if err := validatePackageName(raw.Name); err != nil {
+		return nil, err
+	}
 	if raw.Version == "" {
 		return nil, fmt.Errorf("package.json version is required")
 	}

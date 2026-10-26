@@ -80,7 +80,7 @@ func GenerateImages(ctx context.Context, model *Model, input []ContentBlock, opt
 	if err != nil {
 		return result, fmt.Errorf("marshal images request: %w", err)
 	}
-	baseURL, err := expandBaseURL(strings.TrimRight(model.BaseURL, "/"))
+	baseURL, err := expandBaseURLWithEnv(strings.TrimRight(model.BaseURL, "/"), cfg.providerEnvValue)
 	if err != nil {
 		return result, err
 	}

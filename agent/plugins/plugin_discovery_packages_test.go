@@ -421,3 +421,15 @@ func TestNativePluginHashIncludesManifestChanges(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, after, third.candidates.binaries[binary])
 }
+
+func TestPackageDiscoveryIgnoresStagedInstallations(t *testing.T) {
+	base := t.TempDir()
+	for _, name := range []string{".tau-install-pending", "@scope/.tau-install-recovery"} {
+		root := filepath.Join(base, name)
+		require.NoError(t, os.MkdirAll(root, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(root, "tau-package.toml"), []byte("invalid TOML ["), 0o600))
+	}
+	manager := NewManager(t.TempDir(), nil, nil)
+	require.NoError(t, manager.scanPackagesDir(base))
+	require.Empty(t, manager.binaries)
+}

@@ -3751,8 +3751,7 @@ func sessionSettings(sess sdk.Session) *ai.Settings {
 	return nil
 }
 
-// reapplySessionSettings pushes the session's settings into the display after
-// a successful /reload replaced them.
+// reapplySessionSettings uses admitted session settings even when old-plugin cleanup failed.
 func (a *App) reapplySessionSettings() {
 	if a == nil {
 		return

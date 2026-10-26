@@ -104,6 +104,9 @@ func OAuthProviderRefreshFuncs(providers ...oauth.Provider) map[string]RefreshFu
 // expected by the given provider. OAuth credentials are delegated to the
 // provider's GetAPIKey hook so provider-specific formats stay centralized.
 func APIKeyFromCredential(ctx context.Context, provider string, cred ai.Credential) (string, error) {
+	if err := context.Cause(ctx); err != nil {
+		return "", err
+	}
 	switch cred.Type {
 	case ai.CredentialTypeAPIKey:
 		if cred.APIKey == "" {

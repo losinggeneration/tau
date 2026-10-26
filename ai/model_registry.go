@@ -139,11 +139,16 @@ func (r *ModelRegistry) Provider(provider string) (ModelRegistryProvider, bool) 
 // ResolveAPIKey resolves a configured provider key at request time. An empty
 // result means no key is configured; stored credentials take precedence.
 func (r *ModelRegistry) ResolveAPIKey(ctx context.Context, provider string) (string, error) {
+	return r.ResolveAPIKeyWithEnv(ctx, provider, nil)
+}
+
+// ResolveAPIKeyWithEnv resolves configured references against scoped variables.
+func (r *ModelRegistry) ResolveAPIKeyWithEnv(ctx context.Context, provider string, env map[string]string) (string, error) {
 	p, ok := r.Provider(provider)
 	if !ok || p.APIKey == "" {
 		return "", nil
 	}
-	key, err := r.values.resolve(ctx, p.APIKey)
+	key, err := r.values.resolveWithEnv(ctx, p.APIKey, env)
 	if err != nil {
 		return "", fmt.Errorf("provider %s API key: %w", provider, err)
 	}

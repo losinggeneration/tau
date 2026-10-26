@@ -8963,6 +8963,8 @@ func TestSessionConfiguredCredentialPrecedence(t *testing.T) {
 		{name: "stored reference", credential: ai.Credential{Type: ai.CredentialTypeAPIKey, APIKey: "${TAU_STORED_REF}-key", Env: map[string]string{"TAU_STORED_REF": "stored"}}, configured: "$MISSING_SHOULD_NOT_RESOLVE", want: "stored-key"},
 		{name: "oauth", credential: ai.NewOAuthCredential("oauth", "refresh", time.Now().Add(time.Hour), ""), configured: "$MISSING_SHOULD_NOT_RESOLVE", want: "oauth"},
 		{name: "configured", storeErr: ai.ErrCredentialNotFound, configured: "$TAU_CONFIG_TEST_KEY", want: "configured"},
+		{name: "configured scoped reference", credential: ai.Credential{Type: ai.CredentialTypeAPIKey, Env: map[string]string{"TAU_CONFIG_TEST_KEY": "scoped-config"}}, configured: "$TAU_CONFIG_TEST_KEY", want: "scoped-config"},
+		{name: "scoped fallback", credential: ai.Credential{Type: ai.CredentialTypeAPIKey, Env: map[string]string{"ANTHROPIC_API_KEY": "scoped-fallback"}}, want: "scoped-fallback"},
 		{name: "environment", storeErr: ai.ErrCredentialNotFound, want: "environment"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -11511,4 +11513,215 @@ func TestReloadResourcesAppliesPluginConfigurationWithoutNamedRestart(t *testing
 	require.Same(t, next, future.(*agentSession).settings)
 	require.Nil(t, future.(ToolLoadout).DescribeTool("old-tool"))
 	require.NotNil(t, future.(ToolLoadout).DescribeTool("new-tool"))
+}
+
+func TestNewRuntimeReportsCredentialDirectoryFailure(t *testing.T) {
+	base := t.TempDir()
+	blocked := filepath.Join(base, "blocked")
+	require.NoError(t, os.WriteFile(blocked, []byte("not a directory"), 0o600))
+	t.Setenv("TAU_CONFIG_DIR", blocked)
+	registry, err := ai.LoadModelRegistry("")
+	require.NoError(t, err)
+	runtime, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ModelRegistry: registry})
+	require.ErrorContains(t, err, "credential")
+	require.Nil(t, runtime)
+}
+
+func TestPromptReadFailuresRejectStartupAndReload(t *testing.T) {
+	for _, name := range []string{"SYSTEM.md", "APPEND_SYSTEM.md"} {
+		t.Run(name, func(t *testing.T) {
+			_, model := registerRecordingProvider(t, "reply")
+			cwd := t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau"), 0o700))
+			path := filepath.Join(cwd, ".tau", name)
+			rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+			sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+			require.NoError(t, err)
+			concrete := sess.(*agentSession)
+			before := concrete.agent.Messages()
+			original := concrete.settings
+			require.NoError(t, os.Mkdir(path, 0o700))
+			err = sess.(SystemPromptReloader).ReloadSystemPrompt(t.Context())
+			require.Error(t, err)
+			require.Equal(t, before, concrete.agent.Messages())
+			err = concrete.ReloadResources(t.Context(), &ai.Settings{DefaultTools: []string{"read"}}, nil, nil, "")
+			require.Error(t, err)
+			require.Same(t, original, concrete.settings)
+			require.Equal(t, before, concrete.agent.Messages())
+			rejected, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+			require.Error(t, err)
+			require.Nil(t, rejected)
+		})
+	}
+}
+
+func TestContextReadFailuresRejectStartupAndReload(t *testing.T) {
+	for _, name := range []string{"AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"} {
+		t.Run(name, func(t *testing.T) {
+			_, model := registerRecordingProvider(t, "reply")
+			cwd := t.TempDir()
+			path := filepath.Join(cwd, name)
+			rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+			sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+			require.NoError(t, err)
+			concrete := sess.(*agentSession)
+			before := concrete.agent.Messages()
+			original := concrete.settings
+			require.NoError(t, os.Symlink(path, path))
+			err = sess.(SystemPromptReloader).ReloadSystemPrompt(t.Context())
+			require.ErrorContains(t, err, name)
+			require.Equal(t, before, concrete.agent.Messages())
+			err = concrete.ReloadResources(t.Context(), &ai.Settings{DefaultTools: []string{"read"}}, nil, nil, "")
+			require.ErrorContains(t, err, name)
+			require.Same(t, original, concrete.settings)
+			require.Equal(t, before, concrete.agent.Messages())
+			rejected, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+			require.ErrorContains(t, err, name)
+			require.Nil(t, rejected)
+			require.NoError(t, os.Remove(path))
+			require.NoError(t, os.WriteFile(path, []byte("recovered context"), 0o600))
+			require.NoError(t, concrete.ReloadSystemPrompt(t.Context()))
+			require.NotEqual(t, before, concrete.agent.Messages())
+		})
+	}
+}
+
+func TestContextReadFailureDoesNotFallBackToLowerPriorityFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "AGENTS.override.md")
+	require.NoError(t, os.Symlink(path, path))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("fallback"), 0o600))
+	var failures []error
+	file, found := loadContextFileFromDir(root, &failures)
+	require.True(t, found)
+	require.Equal(t, "fallback", file.content)
+	require.ErrorContains(t, errors.Join(failures...), "AGENTS.override.md")
+	_, err := buildContextFileAddendum("", root)
+	require.ErrorContains(t, err, "AGENTS.override.md")
+}
+
+func TestNoContextFilesBypassesContextReadFailure(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	cwd := t.TempDir()
+	path := filepath.Join(cwd, "AGENTS.md")
+	require.NoError(t, os.Symlink(path, path))
+	rt, err := NewRuntime(RuntimeOptions{NoContextFiles: true, Settings: &ai.Settings{}, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+	require.NoError(t, err)
+	require.NoError(t, sess.(SystemPromptReloader).ReloadSystemPrompt(t.Context()))
+}
+
+func TestContextGitProbeFailuresRejectPromptAdmission(t *testing.T) {
+	for _, phase := range []string{"git metadata", "common directory"} {
+		t.Run(phase, func(t *testing.T) {
+			cwd := t.TempDir()
+			if phase == "git metadata" {
+				path := filepath.Join(cwd, ".git")
+				require.NoError(t, os.Symlink(path, path))
+			} else {
+				gitDir := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main"), 0o600))
+				require.NoError(t, os.WriteFile(filepath.Join(cwd, ".git"), []byte("gitdir: "+gitDir), 0o600))
+				path := filepath.Join(gitDir, "commondir")
+				require.NoError(t, os.Symlink(path, path))
+			}
+			_, err := buildContextFileAddendum("", cwd)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestSystemPromptFilesStripOnlyInitialBOMAndKeepScopePrecedence(t *testing.T) {
+	for _, name := range []string{"SYSTEM.md", "APPEND_SYSTEM.md"} {
+		t.Run(name, func(t *testing.T) {
+			global, cwd := t.TempDir(), t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau"), 0o700))
+			load := loadSystemPrompt
+			if name == "APPEND_SYSTEM.md" {
+				load = loadAppendSystemPrompt
+			}
+			globalPath, projectPath := filepath.Join(global, name), filepath.Join(cwd, ".tau", name)
+			require.NoError(t, os.WriteFile(globalPath, []byte("\ufeffglobal"), 0o600))
+			body, err := load(global, cwd)
+			require.NoError(t, err)
+			require.Equal(t, "global", body)
+			require.NoError(t, os.WriteFile(projectPath, []byte("\ufeffproject\ufeffbody"), 0o600))
+			body, err = load(global, cwd)
+			require.NoError(t, err)
+			require.Equal(t, "project\ufeffbody", body)
+			require.NoError(t, os.WriteFile(projectPath, nil, 0o600))
+			body, err = load(global, cwd)
+			require.NoError(t, err)
+			require.Empty(t, body, "an empty project file still masks its global counterpart")
+		})
+	}
+}
+
+func TestContextGitHeadProbeFailureIsReported(t *testing.T) {
+	for _, worktree := range []bool{false, true} {
+		t.Run(fmt.Sprint(worktree), func(t *testing.T) {
+			cwd := t.TempDir()
+			gitDir := filepath.Join(cwd, ".git")
+			if worktree {
+				gitDir = t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(cwd, ".git"), []byte("gitdir: "+gitDir), 0o600))
+			} else {
+				require.NoError(t, os.Mkdir(gitDir, 0o700))
+			}
+			path := filepath.Join(gitDir, "HEAD")
+			require.NoError(t, os.Symlink(path, path))
+			_, err := buildContextFileAddendum("", cwd)
+			require.ErrorContains(t, err, "HEAD")
+		})
+	}
+}
+
+func TestPromptReloadOwnsSessionAndRuntimeOptionSlices(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	skills := artifacts.NewSkillRegistry(nil)
+	_, err := skills.Register(artifacts.Entry{Kind: artifacts.KindSkill, SourcePath: "calendar.md", Raw: []byte("---\nname: calendar\ndescription: calendar\n---\nPRIVATE_PRELOADED_BODY")})
+	require.NoError(t, err)
+	preloads := []string{"calendar"}
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, PreloadSkills: preloads, ArtifactLoader: &fakeArtifactLoader{skills: skills, prompts: artifacts.NewPromptRegistry(nil), themes: artifacts.NewThemeRegistry(nil)}, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	appends, denied := []string{"ORIGINAL_APPEND"}, []string{"bash"}
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: t.TempDir(), NoSession: true, AppendSystemPrompts: appends, ToolDenylist: denied})
+	require.NoError(t, err)
+	concrete := sess.(*agentSession)
+	before := concrete.agent.Messages()
+	preloads[0], appends[0], denied[0] = "missing", "MUTATED_APPEND", "read"
+	require.NoError(t, concrete.ReloadSystemPrompt(t.Context()))
+	require.Equal(t, before, concrete.agent.Messages(), "caller mutation must not change a reloaded prompt")
+	require.Equal(t, []string{"bash"}, concrete.toolDenylist)
+	require.Contains(t, concrete.agent.Messages()[0].Content[0].Text, "PRIVATE_PRELOADED_BODY")
+}
+
+func TestStoredProviderEnvironmentReachesRequestsAndSummaries(t *testing.T) {
+	provider, model := registerRecordingProvider(t, "reply")
+	credentials := &mockCredStore{getCred: ai.Credential{Type: ai.CredentialTypeAPIKey, APIKey: "stored", Env: map[string]string{"REQUEST_SECRET": "first"}}}
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ExplicitModel: model, CredentialStore: credentials})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	for _, secret := range []string{"first", "rotated"} {
+		credentials.getCred.Env = map[string]string{"REQUEST_SECRET": secret}
+		events, err := sess.Send(t.Context(), Message{Text: "hello"})
+		require.NoError(t, err)
+		for range events {
+		}
+		actual := provider.CompleteOptions()
+		require.Equal(t, secret, actual.Env["REQUEST_SECRET"])
+		s := sess.(*agentSession)
+		summary, err := s.compactionCompletionOptions(t.Context(), s.model, agent.ThinkingOff)
+		require.NoError(t, err)
+		require.Equal(t, secret, ai.ExtractSimpleStreamOptions(summary).Env["REQUEST_SECRET"])
+	}
 }

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 
@@ -133,7 +132,7 @@ func resolveVertexEndpoint(ctx context.Context, model *Model, o *options) (strin
 	}
 	auth := googleCloudAuth{APIKey: vertexAPIKey(o.apiKey)}
 	if auth.APIKey == "" && !o.noEnvCredentials {
-		auth.APIKey = cmp.Or(os.Getenv("GOOGLE_CLOUD_API_KEY"), os.Getenv("VERTEXAI_API_KEY"))
+		auth.APIKey = cmp.Or(o.providerEnvValue("GOOGLE_CLOUD_API_KEY"), o.providerEnvValue("VERTEXAI_API_KEY"))
 	}
 	if auth.APIKey != "" {
 		if baseURL == "" {
@@ -146,15 +145,15 @@ func resolveVertexEndpoint(ctx context.Context, model *Model, o *options) (strin
 		return "", auth, errors.New("vertex ai: ambient credentials disabled; supply an explicit API key")
 	}
 
-	project := cmp.Or(strings.TrimSpace(o.vertexProject), os.Getenv("GOOGLE_CLOUD_PROJECT"), os.Getenv("GCLOUD_PROJECT"))
+	project := cmp.Or(strings.TrimSpace(o.vertexProject), o.providerEnvValue("GOOGLE_CLOUD_PROJECT"), o.providerEnvValue("GCLOUD_PROJECT"))
 	if project == "" {
 		return "", auth, errors.New("vertex ai: missing project (set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or use WithVertexProject)")
 	}
-	location := cmp.Or(strings.TrimSpace(o.vertexLocation), os.Getenv("GOOGLE_CLOUD_LOCATION"))
+	location := cmp.Or(strings.TrimSpace(o.vertexLocation), o.providerEnvValue("GOOGLE_CLOUD_LOCATION"))
 	if location == "" {
 		return "", auth, errors.New("vertex ai: missing location (set GOOGLE_CLOUD_LOCATION or use WithVertexLocation)")
 	}
-	auth, err := getGoogleCloudCredentials(ctx)
+	auth, err := getGoogleCloudCredentials(ctx, o)
 	if err != nil {
 		return "", auth, fmt.Errorf("vertex ai: get credentials: %w", err)
 	}
@@ -193,14 +192,14 @@ func vertexAPIKey(key string) string {
 // getGoogleCloudCredentials gets a Vertex AI bearer token from
 // GOOGLE_ACCESS_TOKEN or Application Default Credentials
 // (GOOGLE_APPLICATION_CREDENTIALS, the gcloud ADC file, or the metadata server).
-func getGoogleCloudCredentials(ctx context.Context) (googleCloudAuth, error) {
-	if token := os.Getenv("GOOGLE_ACCESS_TOKEN"); token != "" {
+func getGoogleCloudCredentials(ctx context.Context, o *options) (googleCloudAuth, error) {
+	if token := o.providerEnvValue("GOOGLE_ACCESS_TOKEN"); token != "" {
 		return googleCloudAuth{BearerToken: token}, nil
 	}
 	// ponytail: credentials are detected per request; cache them per client if token exchanges show up in latency.
 	creds, err := credentials.DetectDefault(&credentials.DetectOptions{
 		Scopes:          []string{"https://www.googleapis.com/auth/cloud-platform"},
-		CredentialsFile: os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+		CredentialsFile: o.providerEnvValue("GOOGLE_APPLICATION_CREDENTIALS"),
 		Client:          http.DefaultClient,
 	})
 	if err != nil {

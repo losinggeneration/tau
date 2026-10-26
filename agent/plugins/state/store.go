@@ -2,11 +2,17 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 // KVEntry represents a key-value entry for listing.
@@ -25,11 +31,13 @@ type LogEntry struct {
 
 // Store manages state for a single plugin.
 type Store struct {
-	mu    sync.RWMutex
-	dir   string
-	kv    map[string]string
-	log   []LogEntry
-	logMu sync.Mutex
+	mu         sync.RWMutex
+	dir        string
+	baseDir    string
+	pluginName string
+	kv         map[string]string
+	log        []LogEntry
+	logMu      sync.Mutex
 }
 
 // KVEntries returns all KV entries as a slice.
@@ -58,16 +66,49 @@ func (s *Store) LogEntries() ([]LogEntry, error) {
 	return s.Log(), nil
 }
 
+func validateStateIdentity(baseDir, name string) error {
+	if !filepath.IsLocal(name) || strings.Contains(name, `\`) {
+		return fmt.Errorf("invalid plugin state identity %q", name)
+	}
+	parts := strings.Split(filepath.ToSlash(name), "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("invalid plugin state identity %q", name)
+		}
+	}
+	if len(parts) > 2 || len(parts) == 2 && !strings.HasPrefix(parts[0], "@") {
+		return fmt.Errorf("invalid plugin state identity %q", name)
+	}
+	for i := range parts {
+		info, err := os.Lstat(filepath.Join(append([]string{baseDir}, parts[:i+1]...)...))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("stat plugin state path: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("plugin state path must be a real directory")
+		}
+	}
+	return nil
+}
+
 // NewStore creates or opens a state store for a plugin.
 func NewStore(baseDir, pluginName string) (*Store, error) {
+	if err := validateStateIdentity(baseDir, pluginName); err != nil {
+		return nil, err
+	}
 	dir := filepath.Join(baseDir, pluginName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create plugin state dir: %w", err)
 	}
 
 	s := &Store{
-		dir: dir,
-		kv:  make(map[string]string),
+		dir:        dir,
+		baseDir:    baseDir,
+		pluginName: pluginName,
+		kv:         make(map[string]string),
 	}
 
 	if err := s.load(); err != nil {
@@ -90,11 +131,15 @@ func (s *Store) Set(key, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	oldVal := s.kv[key]
+	oldVal, existed := s.kv[key]
 	s.kv[key] = value
 
 	if err := s.save(); err != nil {
-		s.kv[key] = oldVal
+		if existed {
+			s.kv[key] = oldVal
+		} else {
+			delete(s.kv, key)
+		}
 		return fmt.Errorf("save state: %w", err)
 	}
 
@@ -106,13 +151,15 @@ func (s *Store) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.kv[key]; !ok {
+	oldVal, ok := s.kv[key]
+	if !ok {
 		return nil
 	}
 
 	delete(s.kv, key)
 
 	if err := s.save(); err != nil {
+		s.kv[key] = oldVal
 		return fmt.Errorf("save state: %w", err)
 	}
 
@@ -133,6 +180,7 @@ func (s *Store) Append(key, value string) error {
 	s.log = append(s.log, entry)
 
 	if err := s.saveLog(); err != nil {
+		s.log = s.log[:len(s.log)-1]
 		return fmt.Errorf("save log: %w", err)
 	}
 
@@ -146,13 +194,15 @@ func (s *Store) Clear() error {
 	s.logMu.Lock()
 	defer s.logMu.Unlock()
 
+	oldKV, oldLog := s.kv, s.log
 	s.kv = make(map[string]string)
-	s.log = nil
-
 	if err := s.save(); err != nil {
+		s.kv = oldKV
 		return fmt.Errorf("save state: %w", err)
 	}
+	s.log = nil
 	if err := s.saveLog(); err != nil {
+		s.log = oldLog
 		return fmt.Errorf("save log: %w", err)
 	}
 
@@ -161,18 +211,51 @@ func (s *Store) Clear() error {
 
 // Remove removes the entire state directory for this plugin.
 func (s *Store) Remove() error {
-	return os.RemoveAll(s.dir)
+	if err := validateStateIdentity(s.baseDir, s.pluginName); err != nil {
+		return err
+	}
+	return removeStateDirectory(s.baseDir, s.pluginName)
 }
 
 // RemovePlugin removes the state directory for a named plugin.
 // It is safe to call even if the directory does not exist.
 // The state directory path is: baseDir/plugin-state/pluginName.
 func RemovePlugin(baseDir, pluginName string) error {
-	path := filepath.Join(baseDir, "plugin-state", pluginName)
-	if err := os.RemoveAll(path); err != nil {
-		return fmt.Errorf("remove plugin state dir %q: %w", path, err)
+	if err := validateStateIdentity(filepath.Join(baseDir, "plugin-state"), pluginName); err != nil {
+		return err
 	}
-	return nil
+	return removeStateDirectory(filepath.Join(baseDir, "plugin-state"), pluginName)
+}
+
+func removeStateDirectory(baseDir, pluginName string) (err error) {
+	root, err := os.OpenRoot(baseDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	return root.RemoveAll(pluginName)
+}
+
+func (s *Store) openRoot() (root *os.Root, err error) {
+	if err := validateStateIdentity(s.baseDir, s.pluginName); err != nil {
+		return nil, err
+	}
+	base, err := os.OpenRoot(s.baseDir)
+	if err != nil {
+		return nil, err
+	}
+	root, err = base.OpenRoot(s.pluginName)
+	closeErr := base.Close()
+	if err != nil {
+		return nil, errors.Join(err, closeErr)
+	}
+	if closeErr != nil {
+		return nil, errors.Join(closeErr, root.Close())
+	}
+	return root, nil
 }
 
 // kvPath returns the path to the KV file.
@@ -187,82 +270,87 @@ func (s *Store) logPath() string {
 
 // load reads the state from disk.
 func (s *Store) load() (err error) {
-	// Load KV
-	kvFile, err := os.Open(s.kvPath())
+	root, err := s.openRoot()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return err
 	}
-	if err := json.NewDecoder(kvFile).Decode(&s.kv); err != nil {
-		if closeErr := kvFile.Close(); closeErr != nil {
-			return fmt.Errorf("close kv file after decode error: %w", closeErr)
-		}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	data, err := root.ReadFile("kv.json")
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := kvFile.Close(); err != nil {
-		return fmt.Errorf("close kv file: %w", err)
+	if err == nil {
+		if err := json.Unmarshal(data, &s.kv); err != nil {
+			return err
+		}
+		if s.kv == nil {
+			return fmt.Errorf("plugin KV state must be an object")
+		}
 	}
-
-	// Load log
-	logFile, err := os.Open(s.logPath())
+	data, err = root.ReadFile("log.jsonl")
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return err
 	}
-	defer func() {
-		if closeErr := logFile.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close log file: %w", closeErr)
-		}
-	}()
-
-	// Log is JSONL format
-	s.log = nil
-	dec := json.NewDecoder(logFile)
-	for dec.More() {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	for {
 		var entry LogEntry
-		if err := dec.Decode(&entry); err != nil {
+		if err := decoder.Decode(&entry); errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
 			return err
 		}
 		s.log = append(s.log, entry)
 	}
-
-	return nil
 }
 
-// save writes the KV to disk.
 func (s *Store) save() error {
 	data, err := json.MarshalIndent(s.kv, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.kvPath(), data, 0o600)
+	return s.writeFile("kv.json", data)
 }
 
-// saveLog writes the log to disk in JSONL format.
-func (s *Store) saveLog() (err error) {
-	f, err := os.OpenFile(s.logPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+func (s *Store) saveLog() error {
+	var data bytes.Buffer
+	encoder := json.NewEncoder(&data)
+	for _, entry := range s.log {
+		if err := encoder.Encode(entry); err != nil {
+			return err
+		}
+	}
+	return s.writeFile("log.jsonl", data.Bytes())
+}
+
+func (s *Store) writeFile(name string, data []byte) (err error) {
+	root, err := s.openRoot()
 	if err != nil {
 		return err
 	}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	temporary := ".tau-state-" + uuid.NewString()
+	file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	closed := false
 	defer func() {
-		if closeErr := f.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close log file: %w", closeErr)
+		if !closed {
+			err = errors.Join(err, file.Close())
+		}
+		if removeErr := root.Remove(temporary); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.Join(err, removeErr)
 		}
 	}()
-
-	for _, entry := range s.log {
-		data, err := json.Marshal(entry)
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(append(data, '\n')); err != nil {
-			return err
-		}
+	if _, err := file.Write(data); err != nil {
+		return err
 	}
-
-	return nil
+	closed = true
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return root.Rename(temporary, name)
 }

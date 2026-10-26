@@ -1,6 +1,7 @@
 package packages
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -304,4 +305,23 @@ func TestArtifactCounts(t *testing.T) {
 	assert.Equal(t, 2, prompts)
 	assert.Equal(t, 1, themes)
 	assert.Equal(t, 0, extensions)
+}
+
+func TestManifestRejectsUnsafePackageNames(t *testing.T) {
+	for _, name := range []string{".", "..", "../outside", "nested/name", "/absolute", `..\outside`, "@scope/../outside", "@scope/..", "@/name", "-option", ".tau-install-plugin", "@scope/.tau-install-plugin"} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(fmt.Sprintf("[package]\nname = %q\nversion = \"1\"\n[plugin]\napi_version = \"1\"\n", name)))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestManifestAcceptsSafeInstallationNames(t *testing.T) {
+	for _, name := range []string{"plugin", "my.plugin-1_2", "@scope/plugin", "@scope/my.plugin-1_2"} {
+		t.Run(name, func(t *testing.T) {
+			manifest, err := Parse([]byte(fmt.Sprintf("[package]\nname = %q\nversion = \"1\"\n[plugin]\napi_version = \"1\"\n", name)))
+			require.NoError(t, err)
+			require.Equal(t, name, manifest.Package.Name)
+		})
+	}
 }

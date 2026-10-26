@@ -190,3 +190,38 @@ func TestInstalledRootsReportsLinkedTargetStatFailure(t *testing.T) {
 	require.ErrorContains(t, err, "stat installed package")
 	require.Empty(t, got)
 }
+
+func TestInstalledRootsExcludePendingAndRecoveryPackages(t *testing.T) {
+	base := t.TempDir()
+	for _, name := range []string{"visible", ".tau-install-pending", ".tau-install-recovery", "@scope/visible", "@scope/.tau-install-pending"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(base, name), 0o700))
+	}
+	roots, err := InstalledRoots(base)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{filepath.Join(base, "visible"), filepath.Join(base, "@scope", "visible")}, roots)
+}
+
+func TestPackageIdentityRetainsAtScopedGitPaths(t *testing.T) {
+	identity, err := packageIdentity("file:///tmp/@scope/plugin", t.TempDir())
+	require.NoError(t, err)
+	require.Equal(t, "git:/tmp/@scope/plugin", identity)
+	pinned, err := packageIdentity("file:///tmp/@scope/plugin@feature/fix", t.TempDir())
+	require.NoError(t, err)
+	require.Equal(t, identity, pinned)
+}
+
+func TestInstalledRootsRecoversInterruptedPackages(t *testing.T) {
+	for _, name := range []string{"plugin", "@scope/plugin"} {
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			destination := filepath.Join(base, filepath.FromSlash(name))
+			previous := filepath.Join(packageRecoveryPath(destination), "previous")
+			require.NoError(t, os.MkdirAll(previous, 0o700))
+			require.NoError(t, (InstallSidecar{Source: "npm:" + name, Ref: "1.0.0"}).Write(previous))
+			roots, err := InstalledRoots(base)
+			require.NoError(t, err)
+			require.Equal(t, []string{destination}, roots)
+			require.NoDirExists(t, packageRecoveryPath(destination))
+		})
+	}
+}

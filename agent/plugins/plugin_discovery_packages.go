@@ -42,43 +42,12 @@ func (m *Manager) userPackageDir() string {
 
 // scanPackagesDir scans a packages directory for tau-package.toml files with [plugin] sections.
 func (m *Manager) scanPackagesDir(dir string) error {
-	entries, err := os.ReadDir(dir)
+	roots, err := packages.InstalledRoots(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read dir: %w", err)
+		return err
 	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
-			continue
-		}
-
-		pkgDir := filepath.Join(dir, entry.Name())
-		if entry.Type()&os.ModeSymlink != 0 {
-			resolved, err := filepath.EvalSymlinks(pkgDir)
-			if err == nil {
-				pkgDir = resolved
-			}
-		}
-		if entry.Name()[0] == '@' {
-			scopedEntries, err := os.ReadDir(pkgDir)
-			if err != nil {
-				continue
-			}
-			for _, scopedEntry := range scopedEntries {
-				if !scopedEntry.IsDir() && scopedEntry.Type()&os.ModeSymlink == 0 {
-					continue
-				}
-				if err := m.scanPackageDir(filepath.Join(pkgDir, scopedEntry.Name())); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-
-		if err := m.scanPackageDir(pkgDir); err != nil {
+	for _, root := range roots {
+		if err := m.scanPackageDir(root); err != nil {
 			return err
 		}
 	}

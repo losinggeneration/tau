@@ -1163,3 +1163,16 @@ func TestProxyToolNamespaceSurvivesReconstruction(t *testing.T) {
 		require.Contains(t, string(data), `"namespace":"dynamic_tools"`)
 	}
 }
+
+func TestExtractSimpleStreamOptionsOwnsProviderEnvironment(t *testing.T) {
+	env := map[string]string{"OPENAI_API_KEY": "scoped-key"}
+	option := ai.WithProviderEnv(env)
+	env["OPENAI_API_KEY"] = "mutated"
+	forwarded := extractSimpleStreamOptions([]ai.Option{option})
+	actual, ok := forwarded["env"].(map[string]string)
+	require.True(t, ok)
+	require.Equal(t, "scoped-key", actual["OPENAI_API_KEY"])
+	actual["OPENAI_API_KEY"] = "changed-forwarded"
+	again := extractSimpleStreamOptions([]ai.Option{option})
+	require.Equal(t, "scoped-key", again["env"].(map[string]string)["OPENAI_API_KEY"])
+}

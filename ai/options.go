@@ -25,6 +25,7 @@ type options struct {
 	timeoutSet                 bool
 	apiKey                     string
 	noEnvCredentials           bool
+	providerEnv                map[string]string
 	preferredTransport         Transport
 	transportOpts              *TransportOption
 	reasoning                  ReasoningLevel
@@ -87,14 +88,30 @@ func (o *options) envAPIKey(provider string) string {
 	if o.noEnvCredentials {
 		return ""
 	}
-	return GetEnvAPIKey(provider)
+	return getEnvAPIKey(provider, o.providerEnvValue)
 }
 
 func (o *options) envHeaders(provider string) map[string]string {
 	if o.noEnvCredentials {
 		return nil
 	}
-	return GetEnvHeaders(provider)
+	return getEnvHeaders(provider, o.providerEnvValue)
+}
+
+// WithProviderEnv supplies request-local environment overrides. Empty entries
+// fall back to the process environment.
+func WithProviderEnv(env map[string]string) Option {
+	owned := maps.Clone(env)
+	return func(o *options) { o.providerEnv = maps.Clone(owned) }
+}
+
+func (o *options) providerEnvValue(name string) string {
+	if o != nil {
+		if value := o.providerEnv[name]; value != "" {
+			return value
+		}
+	}
+	return os.Getenv(name)
 }
 
 // WithAPIKey sets the API key for authentication.
@@ -658,6 +675,7 @@ type SimpleStreamOptions struct {
 	ThinkingBudgets  *ThinkingBudgets
 	APIKey           string
 	NoEnvCredentials bool
+	Env              map[string]string
 	CacheRetention   string
 	SessionID        string
 	Transport        Transport
@@ -698,6 +716,9 @@ func BuildBaseOptions(model *Model, prompt *Context, opts *SimpleStreamOptions) 
 		result = append(result, WithReasoning(opts.Reasoning))
 	} else if model.API == APIAnthropicMessages {
 		result = append(result, WithThinkingEnabled(false))
+	}
+	if opts.Env != nil {
+		result = append(result, WithProviderEnv(opts.Env))
 	}
 	if opts.NoEnvCredentials {
 		result = append(result, WithoutEnvCredentials())
@@ -755,6 +776,7 @@ func ExtractSimpleStreamOptions(opts []Option) SimpleStreamOptions {
 		ThinkingBudgets:  o.thinkingBudgets,
 		APIKey:           o.apiKey,
 		NoEnvCredentials: o.noEnvCredentials,
+		Env:              maps.Clone(o.providerEnv),
 		OnPayload:        o.onPayload,
 		OnPayloadModel:   o.onPayloadWithModel,
 		OnResponse:       o.onResponse,

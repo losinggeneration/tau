@@ -7,12 +7,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -468,4 +471,184 @@ path = "skills"
 	info, err := os.Lstat(linkPath)
 	require.NoError(t, err)
 	assert.NotZero(t, info.Mode()&os.ModeSymlink, "--link should create a symlink, not a copy")
+}
+
+func TestExtractTarGzRejectsPathsOutsidePackage(t *testing.T) {
+	for _, name := range []string{"../escape", "nested/../../escape", "./../escape"} {
+		t.Run(name, func(t *testing.T) {
+			var archive bytes.Buffer
+			gz := gzip.NewWriter(&archive)
+			tw := tar.NewWriter(gz)
+			require.NoError(t, tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: 1, Typeflag: tar.TypeReg}))
+			_, err := tw.Write([]byte("x"))
+			require.NoError(t, err)
+			require.NoError(t, tw.Close())
+			require.NoError(t, gz.Close())
+			base := t.TempDir()
+			destination := filepath.Join(base, "package")
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			require.Error(t, extractTarGz(&archive, destination))
+			require.NoFileExists(t, filepath.Join(base, "escape"))
+		})
+	}
+}
+
+func TestExtractTarGzRejectsExistingSymlinkEscape(t *testing.T) {
+	var archive bytes.Buffer
+	gz := gzip.NewWriter(&archive)
+	tw := tar.NewWriter(gz)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "redirect/escaped", Mode: 0o600, Size: 1, Typeflag: tar.TypeReg}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	destination := t.TempDir()
+	outside := t.TempDir()
+	require.NoError(t, os.Symlink(outside, filepath.Join(destination, "redirect")))
+	require.Error(t, extractTarGz(&archive, destination))
+	require.NoFileExists(t, filepath.Join(outside, "escaped"))
+}
+
+type releaseTestTransport func(*http.Request) (*http.Response, error)
+
+func (f releaseTestTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type releaseTestBody struct {
+	io.Reader
+	closeErr error
+}
+
+func (b releaseTestBody) Close() error { return b.closeErr }
+
+func TestDownloadReleaseRetainsBodyCloseFailure(t *testing.T) {
+	original := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = original })
+	cause := errors.New("release body close failed")
+	http.DefaultClient = &http.Client{Transport: releaseTestTransport(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusBadGateway, Body: releaseTestBody{Reader: strings.NewReader("unavailable"), closeErr: cause}, Header: make(http.Header), Request: req}, nil
+	})}
+	err := downloadAndExtract(t.Context(), &ReleaseSection{URL: "https://release.invalid/archive"}, t.TempDir())
+	require.ErrorContains(t, err, "502")
+	require.ErrorIs(t, err, cause)
+}
+
+func TestDownloadReleaseRejectsBodyCompletionAfterCancellation(t *testing.T) {
+	var archive bytes.Buffer
+	gz := gzip.NewWriter(&archive)
+	tw := tar.NewWriter(gz)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "binary", Mode: 0o700, Size: 2}))
+	_, err := tw.Write([]byte("ok"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	hash := sha256.Sum256(archive.Bytes())
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	cause := errors.New("release cancelled")
+	original := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = original })
+	http.DefaultClient = &http.Client{Transport: releaseTestTransport(func(req *http.Request) (*http.Response, error) {
+		cancel(cause)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(archive.Bytes())), Header: make(http.Header), Request: req}, nil
+	})}
+	destination := filepath.Join(t.TempDir(), "rejected")
+	err = downloadAndExtract(ctx, &ReleaseSection{URL: "https://release.invalid/archive", SHA256: hex.EncodeToString(hash[:])}, destination)
+	require.ErrorIs(t, err, cause)
+	require.NoDirExists(t, destination)
+}
+
+func TestDownloadReleaseVerifiesBeforeExtracting(t *testing.T) {
+	for _, checksumOK := range []bool{false, true} {
+		t.Run(fmt.Sprint(checksumOK), func(t *testing.T) {
+			var archive bytes.Buffer
+			gz := gzip.NewWriter(&archive)
+			tw := tar.NewWriter(gz)
+			require.NoError(t, tw.WriteHeader(&tar.Header{Name: "binary", Mode: 0o750, Size: 2}))
+			_, err := tw.Write([]byte("ok"))
+			require.NoError(t, err)
+			require.NoError(t, tw.Close())
+			require.NoError(t, gz.Close())
+			hash := sha256.Sum256(archive.Bytes())
+			checksum := hex.EncodeToString(hash[:])
+			if !checksumOK {
+				checksum = strings.Repeat("0", 64)
+			}
+			original := http.DefaultClient
+			t.Cleanup(func() { http.DefaultClient = original })
+			http.DefaultClient = &http.Client{Transport: releaseTestTransport(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(archive.Bytes())), Header: make(http.Header), Request: req}, nil
+			})}
+			temp := t.TempDir()
+			t.Setenv("TMPDIR", temp)
+			destination := filepath.Join(t.TempDir(), "release")
+			err = downloadAndExtract(t.Context(), &ReleaseSection{URL: "https://release.invalid/archive", SHA256: checksum}, destination)
+			if checksumOK {
+				require.NoError(t, err)
+				body, err := os.ReadFile(filepath.Join(destination, "binary"))
+				require.NoError(t, err)
+				require.Equal(t, "ok", string(body))
+			} else {
+				require.ErrorContains(t, err, "hash mismatch")
+				require.NoDirExists(t, destination)
+			}
+			entries, err := os.ReadDir(temp)
+			require.NoError(t, err)
+			require.Empty(t, entries)
+		})
+	}
+}
+
+func TestReleaseExtractionRejectsCancelledAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("extraction cancelled")
+	cancel(cause)
+	destination := filepath.Join(t.TempDir(), "release")
+	err := extractTarGzContext(ctx, strings.NewReader("not an archive"), destination)
+	require.ErrorIs(t, err, cause)
+	require.NoDirExists(t, destination)
+}
+
+type releaseCancellingReader struct {
+	reader io.Reader
+	cancel context.CancelCauseFunc
+	cause  error
+}
+
+func (r releaseCancellingReader) Read(data []byte) (int, error) {
+	n, err := r.reader.Read(data)
+	r.cancel(r.cause)
+	return n, err
+}
+
+func TestArchiveReaderRetainsReadFailureAndCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	cause, readErr := errors.New("archive cancelled"), errors.New("archive read failed")
+	reader := archiveContextReader{ctx: ctx, reader: releaseCancellingReader{reader: releaseFailingReader{err: readErr}, cancel: cancel, cause: cause}}
+	_, err := reader.Read(make([]byte, 10))
+	require.ErrorIs(t, err, cause)
+	require.ErrorIs(t, err, readErr)
+}
+
+type releaseFailingReader struct{ err error }
+
+func (r releaseFailingReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestReleaseExtractionStopsWhenArchiveReadCancels(t *testing.T) {
+	var archive bytes.Buffer
+	gz := gzip.NewWriter(&archive)
+	tw := tar.NewWriter(gz)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "binary", Mode: 0o700, Size: 2}))
+	_, err := tw.Write([]byte("ok"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	cause := errors.New("archive read cancelled")
+	reader := releaseCancellingReader{reader: bytes.NewReader(archive.Bytes()), cancel: cancel, cause: cause}
+	destination := filepath.Join(t.TempDir(), "release")
+	err = extractTarGzContext(ctx, reader, destination)
+	require.ErrorIs(t, err, cause)
+	require.NoFileExists(t, filepath.Join(destination, "binary"))
 }

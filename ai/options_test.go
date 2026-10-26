@@ -807,3 +807,109 @@ func TestWithoutEnvCredentialsAtProviderBoundary(t *testing.T) {
 	require.True(t, simple.NoEnvCredentials)
 	require.True(t, applyOptions(BuildBaseOptions(model, &Context{}, &simple)).noEnvCredentials)
 }
+
+func TestProviderEnvironmentOwnsOverridesAndSimpleRoundTrip(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "ambient-key")
+	env := map[string]string{"OPENAI_API_KEY": "scoped-key"}
+	option := WithProviderEnv(env)
+	env["OPENAI_API_KEY"] = "mutated"
+	o := applyOptions([]Option{option})
+	require.Equal(t, "scoped-key", o.envAPIKey(ProviderOpenAI))
+	o.providerEnv["OPENAI_API_KEY"] = "changed-options"
+	require.Equal(t, "scoped-key", applyOptions([]Option{option}).envAPIKey(ProviderOpenAI))
+	simple := ExtractSimpleStreamOptions([]Option{option})
+	roundTrip := applyOptions(BuildBaseOptions(&Model{Provider: ProviderOpenAI}, &Context{}, &simple))
+	simple.Env["OPENAI_API_KEY"] = "changed-simple"
+	require.Equal(t, "scoped-key", roundTrip.envAPIKey(ProviderOpenAI))
+	require.Equal(t, "ambient-key", applyOptions([]Option{WithProviderEnv(map[string]string{"OPENAI_API_KEY": ""})}).envAPIKey(ProviderOpenAI))
+	require.Empty(t, applyOptions([]Option{option, WithoutEnvCredentials()}).envAPIKey(ProviderOpenAI))
+}
+
+func TestProviderEnvironmentResolvesKeysHeadersAndConfiguredReferences(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token")
+	t.Setenv("ANTHROPIC_API_KEY", "ambient-key")
+	env := map[string]string{"ANTHROPIC_AUTH_TOKEN": "scoped-token", "ANTHROPIC_API_KEY": "scoped-key", "CONFIG_SECRET": "scoped-config"}
+	o := applyOptions([]Option{WithProviderEnv(env)})
+	require.Equal(t, "scoped-key", o.envAPIKey(ProviderAnthropic))
+	require.Equal(t, "Bearer scoped-token", o.envHeaders(ProviderAnthropic)["Authorization"])
+	model := &Model{Provider: ProviderAnthropic, Headers: map[string]string{"X-Configured": "$CONFIG_SECRET"}, requestConfig: &modelRequestConfig{resolver: &configValueResolver{}, apiKey: "${CONFIG_SECRET}"}}
+	resolved, err := resolveRequestOptions(t.Context(), model, []Option{WithProviderEnv(env)})
+	require.NoError(t, err)
+	actual := applyOptions(resolved)
+	require.Equal(t, "scoped-config", actual.apiKey)
+	require.Equal(t, "scoped-config", actual.headers["X-Configured"])
+	require.Equal(t, "ambient-key", GetEnvAPIKey(ProviderAnthropic))
+	require.Equal(t, "Bearer ambient-token", GetEnvHeaders(ProviderAnthropic)["Authorization"])
+}
+
+func TestProviderEnvironmentCredentialsReachTransport(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "ambient-key")
+	t.Setenv("ANTHROPIC_API_KEY", "ambient-key")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
+	oldClient, oldTransport := http.DefaultClient, http.DefaultTransport
+	t.Cleanup(func() { http.DefaultClient, http.DefaultTransport = oldClient, oldTransport })
+	for _, tc := range []struct{ provider, api, variable, header, want string }{
+		{ProviderOpenAI, APIOpenAICompletions, "OPENAI_API_KEY", "Authorization", "Bearer scoped-key"},
+		{ProviderOpenAI, APIOpenAICompatible, "OPENAI_API_KEY", "Authorization", "Bearer scoped-key"},
+		{ProviderOpenAI, APIOpenAIResponses, "OPENAI_API_KEY", "Authorization", "Bearer scoped-key"},
+		{ProviderAnthropic, APIAnthropicMessages, "ANTHROPIC_API_KEY", "x-api-key", "scoped-key"},
+		{ProviderAnthropic, APIAnthropicMessages, "ANTHROPIC_AUTH_TOKEN", "Authorization", "Bearer scoped-key"},
+	} {
+		t.Run(tc.api+tc.variable, func(t *testing.T) {
+			requests := 0
+			failure := errors.New("isolated request")
+			transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				require.Equal(t, tc.want, req.Header.Get(tc.header))
+				require.NotContains(t, req.Header.Get(tc.header), "ambient")
+				return nil, failure
+			})
+			http.DefaultTransport, http.DefaultClient = transport, &http.Client{Transport: transport}
+			model := &Model{ID: "test", Provider: tc.provider, API: tc.api, BaseURL: "https://provider.invalid"}
+			client, err := GetClient(model)
+			require.NoError(t, err)
+			for _, complete := range []bool{false, true} {
+				opts := []Option{WithProviderEnv(map[string]string{tc.variable: "scoped-key"}), WithMaxRetries(0)}
+				if complete {
+					_, err = client.Complete(t.Context(), model, &Context{}, opts...)
+				} else {
+					err = client.Stream(t.Context(), model, &Context{}, func(context.Context, StreamEvent) {}, opts...)
+				}
+				require.Error(t, err)
+			}
+			require.Equal(t, 2, requests)
+		})
+	}
+}
+
+func TestProviderEnvironmentCloudEndpointAndBearerSelection(t *testing.T) {
+	o := applyOptions([]Option{WithProviderEnv(map[string]string{
+		"AZURE_OPENAI_RESOURCE_NAME": "scoped-resource", "AZURE_OPENAI_API_VERSION": "scoped-version",
+		"AZURE_OPENAI_DEPLOYMENT_NAME_MAP": "test=scoped-deployment",
+		"GOOGLE_CLOUD_PROJECT":             "scoped-project", "GOOGLE_CLOUD_LOCATION": "global", "GOOGLE_ACCESS_TOKEN": "scoped-bearer",
+		"AWS_REGION": "scoped-region", "AWS_BEARER_TOKEN_BEDROCK": "scoped-bedrock",
+	})})
+	base, version, deployment, err := resolveAzureConfig(&Model{ID: "test"}, o)
+	require.NoError(t, err)
+	require.Contains(t, base, "scoped-resource.openai.azure.com")
+	require.Equal(t, "scoped-version", version)
+	require.Equal(t, "scoped-deployment", deployment)
+	t.Setenv("GOOGLE_CLOUD_API_KEY", "")
+	t.Setenv("VERTEXAI_API_KEY", "")
+	endpoint, auth, err := resolveVertexEndpoint(t.Context(), &Model{ID: "test"}, o)
+	require.NoError(t, err)
+	require.Contains(t, endpoint, "projects/scoped-project/locations/global")
+	require.Equal(t, "scoped-bearer", auth.BearerToken)
+	require.Equal(t, "scoped-region", resolveBedrockRegion(o))
+	require.Equal(t, "scoped-bedrock", resolveBedrockBearerToken(o))
+}
+
+func TestProviderEnvironmentExpandsScopedCloudflareEndpoint(t *testing.T) {
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "ambient-account")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "ambient-gateway")
+	o := applyOptions([]Option{WithProviderEnv(map[string]string{"CLOUDFLARE_ACCOUNT_ID": "scoped-account", "CLOUDFLARE_GATEWAY_ID": "scoped-gateway"})})
+	endpoint, err := expandBaseURLWithEnv("https://gateway.invalid/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}", o.providerEnvValue)
+	require.NoError(t, err)
+	require.Equal(t, "https://gateway.invalid/scoped-account/scoped-gateway", endpoint)
+}

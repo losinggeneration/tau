@@ -1344,3 +1344,40 @@ func TestMergeSettingsMergesBashEnvironmentPerKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, MergeSettings(user, empty).Bash.EnvExtra)
 }
+
+func TestMergeSettingsRecursivelyMergesExtensionObjects(t *testing.T) {
+	user, err := parseSettings([]byte(`{"extension":{"retained":9007199254740993,"nested":{"keep":true,"replace":"user","items":[1,2]},"clear":{"old":true}}}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"extension":{"nested":{"replace":"project","items":[],"added":false},"clear":null}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	expected := `{"retained":9007199254740993,"nested":{"keep":true,"replace":"project","items":[],"added":false},"clear":null}`
+	require.JSONEq(t, expected, string(merged.Plugins["extension"]))
+	require.Contains(t, string(merged.Plugins["extension"]), "9007199254740993")
+	data, err := json.Marshal(merged)
+	require.NoError(t, err)
+	again, err := parseSettings(data)
+	require.NoError(t, err)
+	require.JSONEq(t, expected, string(again.Plugins["extension"]))
+	require.JSONEq(t, `{"retained":9007199254740993,"nested":{"keep":true,"replace":"user","items":[1,2]},"clear":{"old":true}}`, string(user.Plugins["extension"]))
+	require.NotContains(t, string(project.Plugins["extension"]), "retained")
+}
+
+func TestMergeSettingsRecursivelyMergesUnknownNestedObjects(t *testing.T) {
+	for _, group := range []string{"compaction", "retry", "thinkingBudgets", "terminal", "images", "markdown", "bash", "read", "branchSummary"} {
+		t.Run(group, func(t *testing.T) {
+			user, err := parseSettings([]byte(fmt.Sprintf(`{%q:{"future":{"retained":9007199254740993,"nested":{"keep":true,"change":"user"},"array":[1]}}}`, group)))
+			require.NoError(t, err)
+			project, err := parseSettings([]byte(fmt.Sprintf(`{%q:{"future":{"nested":{"change":"project"},"array":[]}}}`, group)))
+			require.NoError(t, err)
+			data, err := json.Marshal(MergeSettings(user, project))
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(data, &fields))
+			var nested map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(fields[group], &nested))
+			require.JSONEq(t, `{"retained":9007199254740993,"nested":{"keep":true,"change":"project"},"array":[]}`, string(nested["future"]))
+			require.Contains(t, string(fields[group]), "9007199254740993")
+		})
+	}
+}

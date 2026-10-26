@@ -1,11 +1,14 @@
 package packages
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // RequirementCheckError represents an error checking a runtime requirement.
@@ -31,6 +34,18 @@ func (e *RequirementCheckError) Error() string {
 // This function returns nil if the requirement is empty or satisfied,
 // or an error if the runtime is not found or does not meet the version constraint.
 func CheckRuntimeRequirement(req string) error {
+	return CheckRuntimeRequirementContext(context.Background(), req)
+}
+
+// CheckRuntimeRequirementContext bounds the runtime probe by its caller and a short deadline.
+func CheckRuntimeRequirementContext(ctx context.Context, req string) error {
+	return checkRuntimeRequirement(ctx, req, getRuntimeVersion)
+}
+
+func checkRuntimeRequirement(ctx context.Context, req string, probe func(context.Context, string) (string, error)) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 	if req == "" {
 		return nil
 	}
@@ -45,14 +60,22 @@ func CheckRuntimeRequirement(req string) error {
 	if err != nil {
 		return err
 	}
+	for _, operator := range []string{">=", "<=", "==", ">", "<", "="} {
+		if value, ok := strings.CutPrefix(constraint, operator); ok {
+			if _, valid := parseRequirementVersion(value); !valid {
+				return fmt.Errorf("invalid runtime version constraint %q", constraint)
+			}
+			break
+		}
+	}
 
 	// Find and execute the runtime to get its version
-	version, err := getRuntimeVersion(runtime)
+	version, err := probe(ctx, runtime)
+	if cause := context.Cause(ctx); cause != nil {
+		return errors.Join(err, cause)
+	}
 	if err != nil {
-		return &RequirementCheckError{
-			Runtime:  runtime,
-			NotFound: true,
-		}
+		return errors.Join(err, &RequirementCheckError{Runtime: runtime, NotFound: true})
 	}
 
 	// Check if version satisfies constraint
@@ -71,7 +94,7 @@ func CheckRuntimeRequirement(req string) error {
 // Format: <runtime>>=<version> or <runtime> <version>
 func parseRequirement(req string) (runtime string, constraint string, err error) {
 	// Supported operators
-	operators := []string{">=", "<=", ">", "<", "=", "=="}
+	operators := []string{">=", "<=", "==", ">", "<", "="}
 
 	var op string
 	var version string
@@ -121,7 +144,18 @@ var runtimeVersionCommand = map[string][]string{
 var versionRegex = regexp.MustCompile(`(\d+)(?:\.(\d+))?(?:\.(\d+))?`)
 
 // getRuntimeVersion executes the runtime and returns its version string.
-func getRuntimeVersion(runtime string) (string, error) {
+const runtimeVersionOutputLimit = 64 * 1024
+
+func getRuntimeVersion(ctx context.Context, runtime string) (string, error) {
+	return probeRuntimeVersion(ctx, runtime, func(cmd *exec.Cmd) error { return cmd.Run() })
+}
+
+func probeRuntimeVersion(ctx context.Context, runtime string, run func(*exec.Cmd) error) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := context.Cause(ctx); err != nil {
+		return "", err
+	}
 	// Build command for the runtime
 	var cmdArgs []string
 	if args, ok := runtimeVersionCommand[runtime]; ok {
@@ -135,19 +169,38 @@ func getRuntimeVersion(runtime string) (string, error) {
 		return "", fmt.Errorf("cannot determine version command for %q", runtime)
 	}
 
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	output, err := cmd.Output()
+	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+	cmd.WaitDelay = time.Second
+	var output runtimeVersionOutput
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	err := run(cmd)
+	if cause := context.Cause(ctx); cause != nil {
+		return "", errors.Join(err, cause)
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to get version: %w", err)
 	}
 
 	// Extract version from output
-	version := extractVersion(string(output))
+	version := extractVersion(output.String())
 	if version == "" {
-		return "", fmt.Errorf("could not parse version from output: %s", strings.TrimSpace(string(output)))
+		return "", fmt.Errorf("could not parse runtime version")
 	}
 
 	return version, nil
+}
+
+type runtimeVersionOutput struct{ buffer strings.Builder }
+
+func (output *runtimeVersionOutput) Len() int       { return output.buffer.Len() }
+func (output *runtimeVersionOutput) String() string { return output.buffer.String() }
+
+func (output *runtimeVersionOutput) Write(data []byte) (int, error) {
+	if len(data) > runtimeVersionOutputLimit-output.Len() {
+		return 0, fmt.Errorf("runtime version output exceeded limit")
+	}
+	return output.buffer.Write(data)
 }
 
 // extractVersion extracts the first semantic version from the output.
@@ -173,31 +226,22 @@ func extractVersion(output string) string {
 
 // satisfiesConstraint checks if the given version satisfies the constraint.
 func satisfiesConstraint(version, constraint string) bool {
-	// Parse the constraint (e.g., ">=3.11", "==1.21", ">2.0")
-	if len(constraint) < 2 {
+	var op, required string
+	for _, candidate := range []string{">=", "<=", "==", ">", "<", "="} {
+		if value, ok := strings.CutPrefix(constraint, candidate); ok {
+			op = candidate
+			required = value
+			break
+		}
+	}
+
+	vNums, valid := parseRequirementVersion(version)
+	if !valid {
 		return false
 	}
-
-	op := constraint[:2]
-	required := constraint[2:]
-
-	if len(constraint) == 3 && (constraint[0:1] == "=" || constraint[0:1] == ">" || constraint[0:1] == "<") {
-		op = constraint[0:1]
-		required = constraint[1:]
-	}
-
-	// Parse versions
-	vParts := strings.Split(version, ".")
-	rParts := strings.Split(required, ".")
-
-	vNums := make([]int, 3)
-	rNums := make([]int, 3)
-
-	for i := range min(len(vParts), 3) {
-		vNums[i], _ = strconv.Atoi(vParts[i])
-	}
-	for i := range min(len(rParts), 3) {
-		rNums[i], _ = strconv.Atoi(rParts[i])
+	rNums, valid := parseRequirementVersion(required)
+	if !valid {
+		return false
 	}
 
 	switch op {
@@ -241,4 +285,28 @@ func compareVersions(v, r []int) int {
 		}
 	}
 	return 0
+}
+
+func parseRequirementVersion(value string) ([]int, bool) {
+	parts := strings.Split(value, ".")
+	if len(parts) > 3 {
+		return nil, false
+	}
+	numbers := make([]int, 3)
+	for i, part := range parts {
+		if part == "" {
+			return nil, false
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return nil, false
+			}
+		}
+		number, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, false
+		}
+		numbers[i] = number
+	}
+	return numbers, true
 }

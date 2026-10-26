@@ -1940,7 +1940,8 @@ func TestPackagesDirsResolution(t *testing.T) {
 	t.Setenv("TAU_CONFIG_DIR", cfgDir)
 	t.Setenv("TAU_PACKAGE_DIR", "")
 
-	userDir, _ := packagesDirs()
+	userDir, _, err := packagesDirs()
+	require.NoError(t, err)
 	if want := filepath.Join(cfgDir, "packages"); userDir != want {
 		t.Fatalf("default = %q, want %q", userDir, want)
 	}
@@ -1949,13 +1950,15 @@ func TestPackagesDirsResolution(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(settings), 0o644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
-	userDir, _ = packagesDirs()
+	userDir, _, err = packagesDirs()
+	require.NoError(t, err)
 	if userDir != "/pkgs/settings" {
 		t.Fatalf("settings = %q, want /pkgs/settings", userDir)
 	}
 
 	t.Setenv("TAU_PACKAGE_DIR", "/pkgs/env")
-	userDir, _ = packagesDirs()
+	userDir, _, err = packagesDirs()
+	require.NoError(t, err)
 	if userDir != "/pkgs/env" {
 		t.Fatalf("env = %q, want /pkgs/env", userDir)
 	}
@@ -2773,7 +2776,8 @@ func TestReloadSessionReplacesPackageDirectory(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(cfgDir, "settings.json"), data, 0o600))
 	}
 	writeSettings("old")
-	user, project := packagesDirs()
+	user, project, err := packagesDirs()
+	require.NoError(t, err)
 	reg := commands.NewInMemoryRegistry()
 	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), PackagePaths: []string{project, user}, DisableSkills: true, DisableThemes: true, CommandsRegistry: reg})
 	require.NoError(t, err)
@@ -3165,4 +3169,38 @@ func TestReloadSessionRejectsUnpreparedArtifactLoader(t *testing.T) {
 	require.Equal(t, commands.Result{}, result)
 	require.Nil(t, sess.settings)
 	require.Same(t, before, loader.SkillRegistry())
+}
+
+func TestPackageCommandsRejectInvalidSettings(t *testing.T) {
+	for _, scope := range []string{"user", "project"} {
+		for _, entry := range []struct {
+			name string
+			run  func(context.Context, *cli.Command) error
+		}{
+			{"list", runPackagesList}, {"update", runUpdate},
+		} {
+			t.Run(scope+"/"+entry.name, func(t *testing.T) {
+				config := isolateBuildEnv(t)
+				root := t.TempDir()
+				t.Chdir(root)
+				path := filepath.Join(config, "settings.json")
+				if scope == "project" {
+					require.NoError(t, os.MkdirAll(filepath.Join(root, ".tau"), 0o700))
+					path = filepath.Join(root, ".tau", "settings.json")
+				}
+				require.NoError(t, os.WriteFile(path, []byte(`{"retry":`), 0o600))
+				command := &cli.Command{Name: entry.name, Action: entry.run, ExitErrHandler: func(context.Context, *cli.Command, error) {}}
+				require.ErrorContains(t, command.Run(t.Context(), []string{entry.name}), "load "+scope+" settings")
+			})
+		}
+	}
+}
+
+func TestPackageUpdateReportsFailuresInsteadOfSuccessfulExit(t *testing.T) {
+	isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	command := &cli.Command{Name: "update", Action: runUpdate, ExitErrHandler: func(context.Context, *cli.Command, error) {}}
+	err := command.Run(t.Context(), []string{"update", "missing-one", "missing-two"})
+	require.ErrorContains(t, err, "missing-one")
+	require.ErrorContains(t, err, "missing-two")
 }

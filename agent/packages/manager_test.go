@@ -2,13 +2,17 @@ package packages
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -455,17 +459,17 @@ func TestClassifyRef(t *testing.T) {
 		},
 		{
 			name:    "commit-pinned",
-			sidecar: InstallSidecar{Source: "https://github.com/user/repo", Ref: "abc123def456abc123def456abc123def456abcd", CommitSHA: "abc123def456abc123def456abc123def456abcd"},
+			sidecar: InstallSidecar{Source: "https://github.com/user/repo@abc123def456abc123def456abc123def456abcd", Ref: "abc123def456abc123def456abc123def456abcd", CommitSHA: "abc123def456abc123def456abc123def456abcd"},
 			want:    RefTypeCommit,
 		},
 		{
 			name:    "tag-pinned",
-			sidecar: InstallSidecar{Source: "https://github.com/user/repo", Ref: "v1.2.3", CommitSHA: "abc123"},
+			sidecar: InstallSidecar{Source: "https://github.com/user/repo@v1.2.3", Ref: "v1.2.3", CommitSHA: "abc123"},
 			want:    RefTypeTag,
 		},
 		{
 			name:    "branch-pinned",
-			sidecar: InstallSidecar{Source: "https://github.com/user/repo", Ref: "main", CommitSHA: "abc123"},
+			sidecar: InstallSidecar{Source: "https://github.com/user/repo@main", Ref: "main", CommitSHA: "abc123"},
 			want:    RefTypeBranch,
 		},
 		{
@@ -682,7 +686,7 @@ api_version = "1"
 	require.NoError(t, err)
 
 	sidecar := InstallSidecar{
-		Source:    "https://github.com/user/repo",
+		Source:    "https://github.com/user/repo@v1.0.0",
 		Ref:       "v1.0.0", // tag-pinned
 		CommitSHA: "abc123",
 		Scope:     string(ScopeUser),
@@ -903,4 +907,717 @@ func TestUnpinnedInstallSidecarPreservesUpdateMetadata(t *testing.T) {
 	// This ensures update behavior will re-resolve to latest tag
 	refType := ClassifyRef(loaded)
 	assert.Equal(t, RefTypeUnpinned, refType)
+}
+
+func TestUninstallRejectsCancelledAdmission(t *testing.T) {
+	root := t.TempDir()
+	manager := NewManager(root, t.TempDir())
+	path := filepath.Join(root, "retained")
+	require.NoError(t, os.MkdirAll(path, 0o700))
+	sentinel := filepath.Join(path, "sentinel")
+	require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("uninstall withdrawn")
+	cancel(cause)
+	require.ErrorIs(t, manager.Uninstall(ctx, "retained", ScopeUser), cause)
+	require.FileExists(t, sentinel)
+}
+
+func TestUpdateRejectsCancelledPinnedPackage(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	root := t.TempDir()
+	path := filepath.Join(root, "retained")
+	require.NoError(t, os.MkdirAll(path, 0o700))
+	require.NoError(t, (InstallSidecar{Source: "npm:retained", Pinned: true}).Write(path))
+	manager := NewUpdateManager(root, t.TempDir())
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("update withdrawn")
+	cancel(cause)
+	result, err := manager.Update(ctx, "retained", ScopeUser)
+	require.ErrorIs(t, err, cause)
+	require.Nil(t, result)
+}
+
+func TestUninstallRejectsEscapingName(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "packages")
+	require.NoError(t, os.MkdirAll(base, 0o700))
+	outside := filepath.Join(root, "outside")
+	require.NoError(t, os.MkdirAll(outside, 0o700))
+	sentinel := filepath.Join(outside, "sentinel")
+	require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+	manager := NewManager(base, t.TempDir())
+	require.Error(t, manager.Uninstall(t.Context(), "../outside", ScopeUser))
+	require.FileExists(t, sentinel)
+}
+
+func TestListInstalledExcludesPendingAndRecoveryPackages(t *testing.T) {
+	base := t.TempDir()
+	for _, name := range []string{"visible", ".tau-install-pending", "@scope/visible", "@scope/.tau-install-recovery"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(base, name), 0o700))
+	}
+	manager := NewManager(base, t.TempDir())
+	names, err := manager.ListInstalled(ScopeUser)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"visible", filepath.Join("@scope", "visible")}, names)
+}
+
+func TestUninstallRejectsScopedSymlinkEscape(t *testing.T) {
+	base := t.TempDir()
+	outside := t.TempDir()
+	require.NoError(t, os.Symlink(outside, filepath.Join(base, "@scope")))
+	destination := filepath.Join(outside, "plugin")
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	sentinel := filepath.Join(destination, "sentinel")
+	require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+	manager := NewManager(base, t.TempDir())
+	require.Error(t, manager.Uninstall(t.Context(), "@scope/plugin", ScopeUser))
+	require.FileExists(t, sentinel)
+}
+
+func TestUpdateRejectsChangedPackageIdentity(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	source := t.TempDir()
+	repo, err := git.PlainInit(source, false)
+	require.NoError(t, err)
+	tree, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(source, "tau-package.toml"), []byte("[package]\nname = \"unexpected\"\nversion = \"1\"\n[plugin]\napi_version = \"1\"\n"), 0o600))
+	_, err = tree.Add(".")
+	require.NoError(t, err)
+	hash, err := tree.Commit("different package", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+	require.NoError(t, err)
+	base := t.TempDir()
+	destination := filepath.Join(base, "original")
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	sentinel := filepath.Join(destination, "old")
+	require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+	manager := NewUpdateManager(base, t.TempDir())
+	require.ErrorContains(t, manager.updatePackage(t.Context(), destination, "file://"+source, "HEAD", hash.String(), ScopeUser), "identity")
+	require.FileExists(t, sentinel)
+}
+
+func TestUpdateUsesSelectedCommitAfterBranchMoves(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	root := t.TempDir()
+	for i, name := range []string{"plugin", "@scope/plugin"} {
+		t.Run(name, func(t *testing.T) {
+			source := filepath.Join(root, fmt.Sprint(i))
+			require.NoError(t, os.MkdirAll(source, 0o700))
+			repo, err := git.PlainInit(source, false)
+			require.NoError(t, err)
+			tree, err := repo.Worktree()
+			require.NoError(t, err)
+			manifest := fmt.Sprintf("[package]\nname = %q\nversion = \"1\"\n[plugin]\napi_version = \"1\"\n", name)
+			require.NoError(t, os.WriteFile(filepath.Join(source, "tau-package.toml"), []byte(manifest), 0o600))
+			commit := func(content string) plumbing.Hash {
+				require.NoError(t, os.WriteFile(filepath.Join(source, "content"), []byte(content), 0o600))
+				_, err := tree.Add(".")
+				require.NoError(t, err)
+				hash, err := tree.Commit(content, &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+				require.NoError(t, err)
+				return hash
+			}
+			selected := commit("selected")
+			head, err := repo.Head()
+			require.NoError(t, err)
+			ref := head.Name().String()
+			commit("later branch head")
+			base := t.TempDir()
+			destination := filepath.Join(base, filepath.FromSlash(name))
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(destination, "old"), []byte("old"), 0o600))
+			manager := NewUpdateManager(base, t.TempDir())
+			require.NoError(t, manager.updatePackage(t.Context(), destination, "file://"+source, ref, selected.String(), ScopeUser))
+			content, err := os.ReadFile(filepath.Join(destination, "content"))
+			require.NoError(t, err)
+			require.Equal(t, "selected", string(content))
+			require.NoFileExists(t, filepath.Join(destination, "old"))
+			sidecar, err := LoadSidecar(destination)
+			require.NoError(t, err)
+			require.Equal(t, selected.String(), sidecar.CommitSHA)
+			require.Equal(t, ref, sidecar.Ref)
+			require.Equal(t, string(ScopeUser), sidecar.Scope)
+		})
+	}
+}
+
+func TestUpdateReportsSuccessWithShortPreviousCommit(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	source := t.TempDir()
+	repo, err := git.PlainInit(source, false)
+	require.NoError(t, err)
+	tree, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(source, "tau-package.toml"), []byte("[package]\nname = \"plugin\"\nversion = \"1\"\n[plugin]\napi_version = \"1\"\n"), 0o600))
+	_, err = tree.Add(".")
+	require.NoError(t, err)
+	hash, err := tree.Commit("new", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+	require.NoError(t, err)
+	base := t.TempDir()
+	destination := filepath.Join(base, "plugin")
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	require.NoError(t, (InstallSidecar{Source: "file://" + source, Ref: "HEAD", CommitSHA: "old", Scope: string(ScopeUser)}).Write(destination))
+	manager := NewUpdateManager(base, t.TempDir())
+	reloads := 0
+	manager.ArtifactReloader = func(context.Context) error { reloads++; return nil }
+	result, err := manager.Update(t.Context(), "plugin", ScopeUser)
+	require.NoError(t, err)
+	require.True(t, result.Updated)
+	require.Equal(t, "old", result.OldCommit)
+	require.Equal(t, hash.String(), result.NewCommit)
+	require.Contains(t, result.Message, "old -> "+hash.String()[:7])
+	require.Equal(t, 1, reloads)
+}
+
+func TestPackageMutationsRejectUnknownScope(t *testing.T) {
+	manager := NewManager(t.TempDir(), t.TempDir())
+	updater := NewUpdateManager(manager.userDir, manager.projectDir)
+	scope := Scope("invalid")
+	require.Error(t, manager.CheckDuplicate("plugin", scope))
+	require.Error(t, manager.Uninstall(t.Context(), "plugin", scope))
+	_, err := updater.Update(t.Context(), "plugin", scope)
+	require.Error(t, err)
+}
+
+func TestListInstalledIncludesLinkedPackages(t *testing.T) {
+	base := t.TempDir()
+	linked := t.TempDir()
+	require.NoError(t, os.Symlink(linked, filepath.Join(base, "linked")))
+	require.NoError(t, os.MkdirAll(filepath.Join(base, "@scope"), 0o700))
+	require.NoError(t, os.Symlink(linked, filepath.Join(base, "@scope", "linked")))
+	manager := NewManager(base, t.TempDir())
+	names, err := manager.ListInstalled(ScopeUser)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"linked", filepath.Join("@scope", "linked")}, names)
+}
+
+func TestClassifyGitRefUsesRequestedPinRatherThanResolvedTag(t *testing.T) {
+	for _, test := range []struct {
+		source, ref string
+		want        RefType
+	}{
+		{"https://example.invalid/repo", "refs/tags/v1.0.0", RefTypeUnpinned},
+		{"https://example.invalid/repo@v1.0.0", "refs/tags/v1.0.0", RefTypeTag},
+		{"https://example.invalid/repo@main", "refs/heads/main", RefTypeBranch},
+		{"https://example.invalid/repo", "refs/heads/main", RefTypeUnpinned},
+	} {
+		t.Run(test.source+test.ref, func(t *testing.T) {
+			require.Equal(t, test.want, ClassifyRef(&InstallSidecar{Source: test.source, Ref: test.ref, CommitSHA: strings.Repeat("a", 40)}))
+		})
+	}
+}
+
+func TestUnpinnedGitUpdateAdvancesLatestTag(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	source := t.TempDir()
+	repo, err := git.PlainInit(source, false)
+	require.NoError(t, err)
+	tree, err := repo.Worktree()
+	require.NoError(t, err)
+	commit := func(version string) plumbing.Hash {
+		manifest := fmt.Sprintf("[package]\nname = \"plugin\"\nversion = %q\n[plugin]\napi_version = \"1\"\n", version)
+		require.NoError(t, os.WriteFile(filepath.Join(source, "tau-package.toml"), []byte(manifest), 0o600))
+		_, err := tree.Add(".")
+		require.NoError(t, err)
+		hash, err := tree.Commit(version, &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+		require.NoError(t, err)
+		_, err = repo.CreateTag("v"+version, hash, nil)
+		require.NoError(t, err)
+		return hash
+	}
+	first := commit("1.0.0")
+	base := t.TempDir()
+	installer := NewInstallManager(base, t.TempDir())
+	require.NoError(t, installer.Install(t.Context(), Config{Source: "file://" + source, Yes: true}))
+	second := commit("2.0.0")
+	updater := NewUpdateManager(base, t.TempDir())
+	result, err := updater.Update(t.Context(), "plugin", ScopeUser)
+	require.NoError(t, err)
+	require.True(t, result.Updated)
+	require.Equal(t, first.String(), result.OldCommit)
+	require.Equal(t, second.String(), result.NewCommit)
+	installed, err := Load(filepath.Join(base, "plugin", "tau-package.toml"))
+	require.NoError(t, err)
+	require.Equal(t, "2.0.0", installed.Package.Version)
+	sidecar, err := LoadSidecar(filepath.Join(base, "plugin"))
+	require.NoError(t, err)
+	require.Equal(t, "refs/tags/v2.0.0", sidecar.Ref)
+	require.Equal(t, RefTypeUnpinned, ClassifyRef(sidecar))
+	result, err = updater.Update(t.Context(), "plugin", ScopeUser)
+	require.NoError(t, err)
+	require.False(t, result.Updated)
+	require.Equal(t, "already up to date", result.Message)
+}
+
+func TestUninstallRetainsPackageWhenSidecarIsUnreadableOrMalformed(t *testing.T) {
+	for _, kind := range []string{"malformed", "directory", "loop"} {
+		t.Run(kind, func(t *testing.T) {
+			base := t.TempDir()
+			destination := filepath.Join(base, "plugin")
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			sentinel := filepath.Join(destination, "keep")
+			require.NoError(t, os.WriteFile(sentinel, []byte("original"), 0o600))
+			switch kind {
+			case "malformed":
+				require.NoError(t, os.WriteFile(sidecarPath(destination), []byte("{"), 0o600))
+			case "directory":
+				require.NoError(t, os.MkdirAll(sidecarPath(destination), 0o700))
+			case "loop":
+				require.NoError(t, os.Symlink(sidecarPath(destination), sidecarPath(destination)))
+			}
+			manager := NewManager(base, t.TempDir())
+			require.Error(t, manager.Uninstall(t.Context(), "plugin", ScopeUser))
+			require.FileExists(t, sentinel)
+		})
+	}
+}
+
+func TestUnpinnedNPMUpdateUsesPackageInstaller(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	for _, scope := range []Scope{ScopeUser, ScopeProject} {
+		t.Run(string(scope), func(t *testing.T) {
+			user, project := t.TempDir(), t.TempDir()
+			manager := NewUpdateManager(user, project)
+			destination := manager.mgr.InstallPath("plugin", scope)
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			require.NoError(t, (InstallSidecar{Source: "npm:plugin", Ref: "1.0.0", Scope: string(scope)}).Write(destination))
+			packs := 0
+			manager.installer.npmPack = func(ctx context.Context, spec, dir string) (string, error) {
+				packs++
+				require.Equal(t, "plugin", spec)
+				return writePiTarball(t, dir, `{"name":"plugin","version":"2.0.0"}`), nil
+			}
+			reloads := 0
+			manager.ArtifactReloader = func(context.Context) error {
+				reloads++
+				require.FileExists(t, filepath.Join(destination, "package.json"))
+				return nil
+			}
+			result, err := manager.Update(t.Context(), "plugin", scope)
+			require.NoError(t, err)
+			require.True(t, result.Updated)
+			require.Equal(t, "updated 1.0.0 -> 2.0.0", result.Message)
+			require.Equal(t, 1, packs)
+			require.Equal(t, 1, reloads)
+			sidecar, err := LoadSidecar(destination)
+			require.NoError(t, err)
+			require.Equal(t, "2.0.0", sidecar.Ref)
+			require.False(t, sidecar.Pinned)
+			result, err = manager.Update(t.Context(), "plugin", scope)
+			require.NoError(t, err)
+			require.False(t, result.Updated)
+			require.Equal(t, "already up to date", result.Message)
+			require.Equal(t, 2, packs)
+			require.Equal(t, 2, reloads)
+		})
+	}
+}
+
+func TestNPMUpdateFailureRetainsInstallation(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	for _, phase := range []string{"pack", "identity", "dependencies", "cancel"} {
+		t.Run(phase, func(t *testing.T) {
+			manager := NewUpdateManager(t.TempDir(), t.TempDir())
+			destination := manager.mgr.InstallPath("plugin", ScopeUser)
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			before := InstallSidecar{Source: "npm:plugin", Ref: "1.0.0"}
+			require.NoError(t, before.Write(destination))
+			require.NoError(t, os.WriteFile(filepath.Join(destination, "keep"), []byte("original"), 0o600))
+			cause := errors.New("npm update rejected")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			manager.installer.npmPack = func(ctx context.Context, spec, dir string) (string, error) {
+				if phase == "pack" {
+					return "", cause
+				}
+				metadata := `{"name":"plugin","version":"2.0.0"}`
+				if phase == "identity" {
+					metadata = `{"name":"other","version":"2.0.0"}`
+				}
+				if phase == "dependencies" {
+					metadata = `{"name":"plugin","version":"2.0.0","dependencies":{"dep":"1"}}`
+				}
+				archive := writePiTarball(t, dir, metadata)
+				if phase == "cancel" {
+					cancel(cause)
+				}
+				return archive, nil
+			}
+			manager.installer.npmInstall = func(context.Context, string, []string) error { return cause }
+			manager.ArtifactReloader = func(context.Context) error { t.Error("reloaded rejected update"); return nil }
+			result, err := manager.Update(ctx, "plugin", ScopeUser)
+			require.Error(t, err)
+			require.Nil(t, result)
+			if phase != "identity" {
+				require.ErrorIs(t, err, cause)
+			}
+			require.FileExists(t, filepath.Join(destination, "keep"))
+			after, err := LoadSidecar(destination)
+			require.NoError(t, err)
+			require.Equal(t, before, *after)
+			entries, err := packageEntriesWithoutLocks(manager.userDir)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+		})
+	}
+}
+
+func TestPinnedNPMUpdateNeverPacks(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	for _, previous := range []InstallSidecar{
+		{Source: "npm:plugin@1.0.0", Ref: "1.0.0", Pinned: true},
+		{Source: "npm:plugin@1.0.0", Ref: "1.0.0"},
+	} {
+		t.Run(fmt.Sprint(previous.Pinned), func(t *testing.T) {
+			manager := NewUpdateManager(t.TempDir(), t.TempDir())
+			destination := manager.mgr.InstallPath("plugin", ScopeUser)
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			require.NoError(t, previous.Write(destination))
+			calls := 0
+			manager.installer.npmPack = func(context.Context, string, string) (string, error) { calls++; return "", errors.New("must not pack") }
+			result, err := manager.Update(t.Context(), "plugin", ScopeUser)
+			require.NoError(t, err)
+			require.False(t, result.Updated)
+			require.Zero(t, calls)
+		})
+	}
+}
+
+func TestPiNPMUpdateRetainsPiMetadata(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	manager := NewUpdateManager(t.TempDir(), t.TempDir())
+	destination := manager.mgr.InstallPath("plugin", ScopeProject)
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	require.NoError(t, (InstallSidecar{Source: "npm:plugin", Ref: "1.0.0", Pi: true}).Write(destination))
+	manager.installer.npmPack = func(ctx context.Context, spec, dir string) (string, error) {
+		return writePiTarball(t, dir, `{"name":"plugin","version":"2.0.0","pi":{"extensions":["ext.js"]}}`), nil
+	}
+	manager.installer.ensureShim = func(context.Context, string) error { return nil }
+	manager.installer.lookPath = func(string) (string, error) { return "/node", nil }
+	artifactCalls, pluginCalls := 0, 0
+	manager.ArtifactReloader = func(context.Context) error { artifactCalls++; return nil }
+	manager.PluginReloader = func(ctx context.Context, name string) error {
+		pluginCalls++
+		require.Equal(t, "plugin", name)
+		return nil
+	}
+	result, err := manager.Update(t.Context(), "plugin", ScopeProject)
+	require.NoError(t, err)
+	require.True(t, result.Updated)
+	require.Equal(t, 1, artifactCalls)
+	require.Equal(t, 1, pluginCalls)
+	after, err := LoadSidecar(destination)
+	require.NoError(t, err)
+	require.True(t, after.Pi)
+	require.Equal(t, "2.0.0", after.Ref)
+	require.Equal(t, string(ScopeProject), after.Scope)
+	require.False(t, after.Pinned)
+}
+
+func TestNPMUpdateRejectsChangedSourceIdentity(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	manager := NewUpdateManager(t.TempDir(), t.TempDir())
+	destination := manager.mgr.InstallPath("plugin", ScopeUser)
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	require.NoError(t, (InstallSidecar{Source: "npm:other", Ref: "1.0.0"}).Write(destination))
+	packs := 0
+	manager.installer.npmPack = func(ctx context.Context, spec, dir string) (string, error) {
+		packs++
+		return writePiTarball(t, dir, `{"name":"other","version":"2.0.0"}`), nil
+	}
+	_, err := manager.Update(t.Context(), "plugin", ScopeUser)
+	require.ErrorContains(t, err, "identity")
+	require.Zero(t, packs)
+	require.NoDirExists(t, manager.mgr.InstallPath("other", ScopeUser))
+}
+
+func TestPiGitUpdateUsesSelectedRevisionAndRetainsFormat(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	source := t.TempDir()
+	repo, err := git.PlainInit(source, false)
+	require.NoError(t, err)
+	tree, err := repo.Worktree()
+	require.NoError(t, err)
+	commit := func(version string) plumbing.Hash {
+		require.NoError(t, os.WriteFile(filepath.Join(source, "package.json"), fmt.Appendf(nil, `{"name":"plugin","version":%q,"pi":{"prompts":["prompt.md"]}}`, version), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(source, "prompt.md"), []byte(version), 0o600))
+		_, err := tree.Add(".")
+		require.NoError(t, err)
+		hash, err := tree.Commit(version, &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+		require.NoError(t, err)
+		_, err = repo.CreateTag("v"+version, hash, nil)
+		require.NoError(t, err)
+		return hash
+	}
+	first := commit("1.0.0")
+	base := t.TempDir()
+	installer := NewInstallManager(base, t.TempDir())
+	require.NoError(t, installer.Install(t.Context(), Config{Source: "file://" + source, Yes: true, Pi: true}))
+	second := commit("2.0.0")
+	manager := NewUpdateManager(base, t.TempDir())
+	manager.installer.ensureShim = func(context.Context, string) error {
+		t.Error("resource-only package must not prepare shim")
+		return nil
+	}
+	result, err := manager.Update(t.Context(), "plugin", ScopeUser)
+	require.NoError(t, err)
+	require.True(t, result.Updated)
+	require.Equal(t, first.String(), result.OldCommit)
+	require.Equal(t, second.String(), result.NewCommit)
+	after, err := LoadSidecar(filepath.Join(base, "plugin"))
+	require.NoError(t, err)
+	require.True(t, after.Pi)
+	require.Equal(t, second.String(), after.CommitSHA)
+	content, err := os.ReadFile(filepath.Join(base, "plugin", "prompt.md"))
+	require.NoError(t, err)
+	require.Equal(t, "2.0.0", string(content))
+	manifest, err := Load(filepath.Join(base, "plugin", "tau-package.toml"))
+	require.NoError(t, err)
+	require.Equal(t, "2.0.0", manifest.Package.Version)
+	result, err = manager.Update(t.Context(), "plugin", ScopeUser)
+	require.NoError(t, err)
+	require.False(t, result.Updated)
+}
+
+func TestPiGitUpdateIdentityFailureRetainsPreviousInstall(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	source := t.TempDir()
+	repo, err := git.PlainInit(source, false)
+	require.NoError(t, err)
+	tree, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(source, "package.json"), []byte(`{"name":"other","version":"2.0.0","pi":{"prompts":["prompt.md"]}}`), 0o600))
+	_, err = tree.Add(".")
+	require.NoError(t, err)
+	hash, err := tree.Commit("changed identity", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+	require.NoError(t, err)
+	manager := NewUpdateManager(t.TempDir(), t.TempDir())
+	destination := manager.mgr.InstallPath("plugin", ScopeUser)
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	previous := InstallSidecar{Source: "file://" + source, Ref: "HEAD", CommitSHA: "old", Pi: true}
+	require.NoError(t, previous.Write(destination))
+	require.NoError(t, os.WriteFile(filepath.Join(destination, "keep"), []byte("original"), 0o600))
+	err = manager.updatePackage(t.Context(), destination, previous.Source, "HEAD", hash.String(), ScopeUser)
+	require.ErrorContains(t, err, "identity")
+	require.FileExists(t, filepath.Join(destination, "keep"))
+	after, err := LoadSidecar(destination)
+	require.NoError(t, err)
+	require.Equal(t, previous, *after)
+	require.NoDirExists(t, manager.mgr.InstallPath("other", ScopeUser))
+}
+
+func TestConventionGitUpdateRetainsResourcePackage(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	source := filepath.Join(t.TempDir(), "plugin")
+	require.NoError(t, os.MkdirAll(filepath.Join(source, "prompts"), 0o700))
+	repo, err := git.PlainInit(source, false)
+	require.NoError(t, err)
+	tree, err := repo.Worktree()
+	require.NoError(t, err)
+	commit := func(content string) plumbing.Hash {
+		require.NoError(t, os.WriteFile(filepath.Join(source, "prompts", "prompt.md"), []byte(content), 0o600))
+		_, err := tree.Add(".")
+		require.NoError(t, err)
+		hash, err := tree.Commit(content, &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+		require.NoError(t, err)
+		return hash
+	}
+	first := commit("first")
+	manager := NewUpdateManager(t.TempDir(), t.TempDir())
+	destination := manager.mgr.InstallPath("plugin", ScopeUser)
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	previous := InstallSidecar{Source: "file://" + source, Ref: "HEAD", CommitSHA: first.String()}
+	require.NoError(t, previous.Write(destination))
+	second := commit("second")
+	result, err := manager.Update(t.Context(), "plugin", ScopeUser)
+	require.NoError(t, err)
+	require.True(t, result.Updated)
+	require.Equal(t, second.String(), result.NewCommit)
+	data, err := os.ReadFile(filepath.Join(destination, "prompts", "prompt.md"))
+	require.NoError(t, err)
+	require.Equal(t, "second", string(data))
+}
+
+func TestConventionalManifestReportsResourceStatFailures(t *testing.T) {
+	for _, resource := range []string{"skills", "prompts", "themes", "extensions"} {
+		t.Run(resource, func(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(root, "prompts"), 0o700))
+			if resource == "prompts" {
+				require.NoError(t, os.Remove(filepath.Join(root, "prompts")))
+				require.NoError(t, os.Mkdir(filepath.Join(root, "skills"), 0o700))
+			}
+			target := filepath.Join(root, resource)
+			require.NoError(t, os.Symlink(target, target))
+			_, err := loadManifestOrConvention(root)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestNPMRangeAndTagUpdatesRetainRequestedSpecifier(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	for _, version := range []string{"latest", "next", "^1.0.0", "~1.0.0", "1.x", ">=1.0.0 <3.0.0"} {
+		for _, pinned := range []bool{false, true} {
+			t.Run(version+fmt.Sprint(pinned), func(t *testing.T) {
+				manager := NewUpdateManager(t.TempDir(), t.TempDir())
+				destination := manager.mgr.InstallPath("plugin", ScopeUser)
+				require.NoError(t, os.MkdirAll(destination, 0o700))
+				require.NoError(t, (InstallSidecar{Source: "npm:plugin@" + version, Ref: "1.0.0", Pinned: pinned}).Write(destination))
+				packs := 0
+				manager.installer.npmPack = func(ctx context.Context, spec, dir string) (string, error) {
+					packs++
+					require.Equal(t, "plugin@"+version, spec)
+					return writePiTarball(t, dir, `{"name":"plugin","version":"1.0.1"}`), nil
+				}
+				result, err := manager.Update(t.Context(), "plugin", ScopeUser)
+				require.NoError(t, err)
+				require.True(t, result.Updated)
+				require.Equal(t, 1, packs)
+				sidecar, err := LoadSidecar(destination)
+				require.NoError(t, err)
+				require.False(t, sidecar.Pinned)
+				require.Equal(t, "npm:plugin@"+version, sidecar.Source)
+			})
+		}
+	}
+}
+
+func TestUninstallWaitsForPackagePreparation(t *testing.T) {
+	for _, npm := range []bool{false, true} {
+		t.Run(fmt.Sprint(npm), func(t *testing.T) {
+			base := t.TempDir()
+			destination := filepath.Join(base, "plugin")
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			source := "/local/plugin"
+			if npm {
+				source = "npm:plugin"
+			}
+			require.NoError(t, (InstallSidecar{Source: source}).Write(destination))
+			sentinel := filepath.Join(destination, "old")
+			require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+			unlock, err := lockPackageWriter(t.Context(), destination)
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeoutCause(t.Context(), 30*time.Millisecond, errors.New("uninstall wait cancelled"))
+			defer cancel()
+			err = NewManager(base, t.TempDir()).Uninstall(ctx, "plugin", ScopeUser)
+			require.NoError(t, unlock())
+			require.ErrorIs(t, err, context.Cause(ctx))
+			require.FileExists(t, sentinel)
+			require.NoError(t, NewManager(base, t.TempDir()).Uninstall(t.Context(), "plugin", ScopeUser))
+			require.NoDirExists(t, destination)
+		})
+	}
+}
+
+func TestNPMUpdateRejectsStaleInstallationSnapshot(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	t.Setenv("TAU_OFFLINE", "")
+	base := t.TempDir()
+	destination := filepath.Join(base, "plugin")
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	previous := InstallSidecar{Source: "npm:plugin", Ref: "1.0.0", Scope: string(ScopeUser)}
+	current := previous
+	current.Ref = "2.0.0"
+	require.NoError(t, current.Write(destination))
+	manager := NewUpdateManager(base, t.TempDir())
+	called := false
+	manager.installer.npmPack = func(ctx context.Context, spec, dst string) (string, error) {
+		called = true
+		return writePiTarball(t, dst, `{"name":"plugin","version":"1.1.0"}`), nil
+	}
+	_, err := manager.updateNPM(t.Context(), "plugin", ScopeUser, destination, &previous)
+	require.ErrorContains(t, err, "changed during update")
+	require.False(t, called)
+	after, err := LoadSidecar(destination)
+	require.NoError(t, err)
+	require.Equal(t, current, *after)
+}
+
+func TestGitUpdateRejectsStaleInstallationSnapshot(t *testing.T) {
+	for _, pi := range []bool{false, true} {
+		t.Run(fmt.Sprint(pi), func(t *testing.T) {
+			source := t.TempDir()
+			repo, err := git.PlainInit(source, false)
+			require.NoError(t, err)
+			tree, err := repo.Worktree()
+			require.NoError(t, err)
+			if pi {
+				require.NoError(t, os.WriteFile(filepath.Join(source, "package.json"), []byte(`{"name":"plugin","version":"2.0.0","pi":{"prompts":["prompt.md"]}}`), 0o600))
+			} else {
+				require.NoError(t, os.WriteFile(filepath.Join(source, "tau-package.toml"), []byte("[package]\nname = 'plugin'\nversion = '2.0.0'\n[[prompts]]\npath = 'prompt.md'\n"), 0o600))
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(source, "prompt.md"), []byte("candidate"), 0o600))
+			_, err = tree.Add(".")
+			require.NoError(t, err)
+			hash, err := tree.Commit("candidate", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+			require.NoError(t, err)
+			base := t.TempDir()
+			destination := filepath.Join(base, "plugin")
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			previous := InstallSidecar{Source: "file://" + source, CommitSHA: "previous", Pi: pi}
+			current := previous
+			current.CommitSHA = "newer installation"
+			require.NoError(t, current.Write(destination))
+			require.NoError(t, os.WriteFile(filepath.Join(destination, "keep"), []byte("current"), 0o600))
+			err = NewUpdateManager(base, t.TempDir()).updatePackageExpected(t.Context(), destination, previous.Source, "HEAD", hash.String(), ScopeUser, &previous)
+			require.ErrorContains(t, err, "changed during update")
+			require.FileExists(t, filepath.Join(destination, "keep"))
+			after, err := LoadSidecar(destination)
+			require.NoError(t, err)
+			require.Equal(t, current, *after)
+			require.NoFileExists(t, filepath.Join(destination, "prompt.md"))
+		})
+	}
+}
+
+func TestPiNPMUpdateRejectsStaleInstallationSnapshot(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	t.Setenv("TAU_OFFLINE", "")
+	base := t.TempDir()
+	destination := filepath.Join(base, "plugin")
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	previous := InstallSidecar{Source: "npm:plugin", Ref: "1.0.0", Pi: true}
+	current := previous
+	current.Ref = "2.0.0"
+	require.NoError(t, current.Write(destination))
+	manager := NewUpdateManager(base, t.TempDir())
+	manager.installer.npmPack = func(ctx context.Context, spec, dst string) (string, error) {
+		return writePiTarball(t, dst, `{"name":"plugin","version":"1.1.0","dependencies":{"dep":"1"},"pi":{"extensions":["extension.ts"]}}`), nil
+	}
+	setup := false
+	manager.installer.npmInstall = func(context.Context, string, []string) error { setup = true; return nil }
+	manager.installer.ensureShim = func(context.Context, string) error { setup = true; return nil }
+	_, err := manager.updateNPM(t.Context(), "plugin", ScopeUser, destination, &previous)
+	require.ErrorContains(t, err, "changed during update")
+	require.False(t, setup)
+	after, err := LoadSidecar(destination)
+	require.NoError(t, err)
+	require.Equal(t, current, *after)
+}
+
+func TestUpdateRecoversInterruptedInstallationBeforeReadingMetadata(t *testing.T) {
+	t.Setenv("TAU_OFFLINE", "")
+	t.Setenv("PI_OFFLINE", "")
+	base := t.TempDir()
+	destination := filepath.Join(base, "plugin")
+	previous := filepath.Join(packageRecoveryPath(destination), "previous")
+	require.NoError(t, os.MkdirAll(previous, 0o700))
+	require.NoError(t, (InstallSidecar{Source: "npm:plugin@1.0.0", Ref: "1.0.0", Pinned: true}).Write(previous))
+	result, err := NewUpdateManager(base, t.TempDir()).Update(t.Context(), "plugin", ScopeUser)
+	require.NoError(t, err)
+	require.False(t, result.Updated)
+	require.Contains(t, result.Message, "version-pinned")
+	require.FileExists(t, sidecarPath(destination))
+	require.NoDirExists(t, packageRecoveryPath(destination))
 }

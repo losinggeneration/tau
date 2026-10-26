@@ -1235,3 +1235,33 @@ func TestMemoryRefreshRetainsCancellationAndProviderFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestAPIKeyFromCredentialRejectsCancelledAdmissionForEveryType(t *testing.T) {
+	cause := errors.New("cancel credential conversion")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(cause)
+	for _, credential := range []ai.Credential{
+		ai.NewAPIKeyCredential(""), ai.NewAPIKeyCredential("literal"), ai.NewNoneCredential(),
+		ai.NewOAuthCredential("access", "refresh", time.Now().Add(time.Hour), "scope"),
+	} {
+		key, err := APIKeyFromCredential(ctx, "anthropic", credential)
+		require.Empty(t, key)
+		require.ErrorIs(t, err, cause)
+	}
+}
+
+func TestAPIKeyFromCredentialScopesEnvironment(t *testing.T) {
+	t.Setenv("TAU_CREDENTIAL_OVERRIDE", "ambient-secret")
+	credential := ai.NewAPIKeyCredential("$TAU_CREDENTIAL_OVERRIDE")
+	credential.Env = map[string]string{"TAU_CREDENTIAL_OVERRIDE": "scoped-secret"}
+	for _, backend := range []CredentialStore{
+		NewMemoryBackend(Options{}), NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), Options{}),
+	} {
+		require.NoError(t, backend.Set(t.Context(), "anthropic", credential))
+		stored, err := backend.Get(t.Context(), "anthropic")
+		require.NoError(t, err)
+		key, err := APIKeyFromCredential(t.Context(), "anthropic", stored)
+		require.NoError(t, err)
+		require.Equal(t, "scoped-secret", key)
+	}
+}

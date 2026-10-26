@@ -1,6 +1,7 @@
 package packages
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/paths"
@@ -28,19 +30,10 @@ func packageIdentity(source, base string) (string, error) {
 	}
 	if spec, ok := strings.CutPrefix(source, "npm:"); ok {
 		name := parseNpmSpec(spec).Name
-		parts := strings.Split(name, "/")
-		if len(parts) > 2 || (len(parts) == 2 && !strings.HasPrefix(parts[0], "@")) {
-			return "", fmt.Errorf("invalid npm package name %q", name)
+		if err := validatePackageName(name); err != nil {
+			return "", err
 		}
-		for _, part := range parts {
-			part = strings.TrimPrefix(part, "@")
-			if part == "" || part == "." || part == ".." || strings.ContainsAny(part, `\:@ `) {
-				return "", fmt.Errorf("invalid npm package name %q", name)
-			}
-		}
-		if strings.HasPrefix(name, "@") && len(parts) != 2 {
-			return "", fmt.Errorf("invalid npm package name %q", name)
-		}
+
 		return "npm:" + name, nil
 	}
 	gitSource, explicit := strings.CutPrefix(source, "git:")
@@ -48,6 +41,7 @@ func packageIdentity(source, base string) (string, error) {
 		gitSource = source
 	}
 	if explicit || isGitURL(source) || strings.HasPrefix(source, "ssh://") {
+		gitSource, _ = parseSourceRef(gitSource)
 		if strings.HasPrefix(gitSource, "git@") && !strings.Contains(gitSource, "://") {
 			hostPath := strings.TrimPrefix(gitSource, "git@")
 			host, path, ok := strings.Cut(hostPath, ":")
@@ -63,9 +57,6 @@ func packageIdentity(source, base string) (string, error) {
 			return "", fmt.Errorf("parse git source: %w", err)
 		}
 		path := u.Path
-		if index := strings.LastIndex(path, "@"); index >= 0 {
-			path = path[:index]
-		}
 		path = strings.TrimSuffix(strings.TrimSuffix(path, "/"), ".git")
 		if (u.Host == "" && u.Scheme != "file") || path == "" || path == "/" {
 			return "", fmt.Errorf("invalid git source %q", source)
@@ -97,8 +88,15 @@ func InstalledRoots(base string) ([]string, error) {
 		}
 		return nil, fmt.Errorf("read packages directory: %w", err)
 	}
+	entries, err = recoverInstalledEntries(base, entries)
+	if err != nil {
+		return nil, err
+	}
 	var roots []string
 	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tau-install-") {
+			continue
+		}
 		path := filepath.Join(base, entry.Name())
 		info, err := os.Stat(path)
 		if errors.Is(err, os.ErrNotExist) {
@@ -115,7 +113,14 @@ func InstalledRoots(base string) ([]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("read scoped packages: %w", err)
 			}
+			scoped, err = recoverInstalledEntries(path, scoped)
+			if err != nil {
+				return nil, err
+			}
 			for _, child := range scoped {
+				if strings.HasPrefix(child.Name(), ".tau-install-") {
+					continue
+				}
 				childPath := filepath.Join(path, child.Name())
 				info, err := os.Stat(childPath)
 				if errors.Is(err, os.ErrNotExist) {
@@ -134,6 +139,38 @@ func InstalledRoots(base string) ([]string, error) {
 	}
 
 	return roots, nil
+}
+
+func recoverInstalledEntries(base string, entries []os.DirEntry) ([]os.DirEntry, error) {
+	recovered := false
+	for _, entry := range entries {
+		name, ok := strings.CutPrefix(entry.Name(), ".tau-install-recovery-")
+		if !ok {
+			continue
+		}
+		if err := validatePackageName(name); err != nil {
+			return nil, fmt.Errorf("invalid recovery identity: %w", err)
+		}
+		// Discovery is synchronous; bound its wait on an active package writer.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		unlock, err := lockPackageWriter(ctx, filepath.Join(base, name))
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		if err := unlock(); err != nil {
+			return nil, err
+		}
+		recovered = true
+	}
+	if recovered {
+		entries, err := os.ReadDir(base)
+		if err != nil {
+			return nil, fmt.Errorf("read recovered packages: %w", err)
+		}
+		return entries, nil
+	}
+	return entries, nil
 }
 
 // ResolvePackageSources resolves configured local sources and already installed

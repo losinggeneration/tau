@@ -129,7 +129,7 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 		} else if strings.TrimRight(output, "\n") != "" {
 			app.conv.AddSystem(output)
 		}
-		if command, _ := plString(ev.Payload, "command"); command == "reload" && !isErr {
+		if command, _ := plString(ev.Payload, "command"); command == "reload" {
 			app.reapplySessionSettings()
 		}
 	case "tool_cancelled", "tool_canceled":

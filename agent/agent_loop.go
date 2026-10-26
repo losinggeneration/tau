@@ -1465,6 +1465,19 @@ func streamAssistantResponse(
 	if apiKey != "" {
 		streamOpts = append(append([]ai.Option(nil), opts...), ai.WithAPIKey(apiKey))
 	}
+	if config.ProviderEnv != nil {
+		provider := ""
+		if model != nil {
+			provider = model.Provider
+		}
+		env, err := config.ProviderEnv(ctx, provider)
+		if err != nil {
+			return nil, fmt.Errorf("get provider environment: %w", err)
+		}
+		if env != nil {
+			streamOpts = append(slices.Clone(streamOpts), ai.WithProviderEnv(env))
+		}
+	}
 
 	// Like upstream streamSimple, the response budget defaults to the model cap
 	// and never exceeds the room the prompt leaves in the context window.

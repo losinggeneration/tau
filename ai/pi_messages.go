@@ -109,7 +109,7 @@ func (c *piMessagesClient) Stream(ctx context.Context, model *Model, prompt *Con
 	if err != nil {
 		return fmt.Errorf("marshal pi-messages request: %w", err)
 	}
-	baseURL, err := expandBaseURL(strings.TrimRight(model.BaseURL, "/"))
+	baseURL, err := expandBaseURLWithEnv(strings.TrimRight(model.BaseURL, "/"), cfg.providerEnvValue)
 	if err != nil {
 		return err
 	}

@@ -2,11 +2,11 @@ package packages
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +36,9 @@ func findRelease(manifest *Manifest) *ReleaseSection {
 
 // downloadAndExtract downloads a release tarball, verifies its sha256, and extracts it.
 func downloadAndExtract(ctx context.Context, release *ReleaseSection, destDir string) (err error) {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 	// Download the tarball
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, release.URL, nil)
 	if err != nil {
@@ -44,11 +47,11 @@ func downloadAndExtract(ctx context.Context, release *ReleaseSection, destDir st
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("download release: %w", err)
+		return fmt.Errorf("download release: %w", errors.Join(err, context.Cause(ctx)))
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close response body: %w", closeErr)
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close response body: %w", closeErr))
 		}
 	}()
 
@@ -56,18 +59,30 @@ func downloadAndExtract(ctx context.Context, release *ReleaseSection, destDir st
 		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	archive, err := os.CreateTemp("", "tau-release-*.tar.gz")
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return fmt.Errorf("create release archive: %w", err)
 	}
-
-	// Verify sha256
-	if err := verifySHA256(data, release.SHA256); err != nil {
+	defer func() {
+		err = errors.Join(err, archive.Close())
+		if removeErr := os.Remove(archive.Name()); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, removeErr)
+		}
+	}()
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(archive, hash), archiveContextReader{ctx: ctx, reader: resp.Body}); err != nil {
+		return fmt.Errorf("read release archive: %w", errors.Join(err, context.Cause(ctx)))
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := verifySHA256Digest(hex.EncodeToString(hash.Sum(nil)), release.SHA256); err != nil {
 		return fmt.Errorf("sha256 verification failed: %w", err)
 	}
-
-	// Extract tarball
-	if err := extractTarGz(bytes.NewReader(data), destDir); err != nil {
+	if _, err := archive.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind release archive: %w", err)
+	}
+	if err := extractTarGzContext(ctx, archive, destDir); err != nil {
 		return fmt.Errorf("extract tarball: %w", err)
 	}
 
@@ -77,13 +92,15 @@ func downloadAndExtract(ctx context.Context, release *ReleaseSection, destDir st
 // verifySHA256 verifies that the data matches the expected sha256 hash.
 // Supports hex-encoded hash format.
 func verifySHA256(data []byte, expected string) error {
+	hash := sha256.Sum256(data)
+	return verifySHA256Digest(hex.EncodeToString(hash[:]), expected)
+}
+
+func verifySHA256Digest(actual, expected string) error {
 	expected = strings.TrimSpace(expected)
 	if expected == "" {
 		return fmt.Errorf("empty sha256")
 	}
-
-	hash := sha256.Sum256(data)
-	actual := hex.EncodeToString(hash[:])
 
 	if !strings.EqualFold(actual, expected) {
 		return fmt.Errorf("hash mismatch: got %s, want %s", actual, expected)
@@ -92,19 +109,37 @@ func verifySHA256(data []byte, expected string) error {
 }
 
 // extractTarGz extracts a tar.gz archive to destDir.
-func extractTarGz(r io.Reader, destDir string) (err error) {
+func extractTarGz(r io.Reader, destDir string) error {
+	return extractTarGzContext(context.Background(), r, destDir)
+}
+
+func extractTarGzContext(ctx context.Context, r io.Reader, destDir string) (err error) {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return fmt.Errorf("create release root: %w", err)
+	}
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		return fmt.Errorf("open release root: %w", err)
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
 	gzR, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("create gzip reader: %w", err)
 	}
 	defer func() {
-		if closeErr := gzR.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close gzip reader: %w", closeErr)
+		if closeErr := gzR.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close gzip reader: %w", closeErr))
 		}
 	}()
 
 	tr := tar.NewReader(gzR)
 	for {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -113,31 +148,30 @@ func extractTarGz(r io.Reader, destDir string) (err error) {
 			return fmt.Errorf("read tar header: %w", err)
 		}
 
-		target := strings.TrimPrefix(header.Name, "/")
-		target = strings.TrimPrefix(target, "./")
-		if target == "" {
-			continue
+		target := filepath.FromSlash(strings.TrimPrefix(header.Name, "/"))
+		if !filepath.IsLocal(target) {
+			return fmt.Errorf("release archive path escapes package: %q", header.Name)
 		}
-
-		targetPath := filepath.Join(destDir, target)
+		target = filepath.Clean(target)
+		targetPath := target
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, os.FileMode(header.Mode)); err != nil {
+			if err := root.MkdirAll(targetPath, os.FileMode(header.Mode)&0o777); err != nil {
 				return fmt.Errorf("create dir %s: %w", targetPath, err)
 			}
 		case tar.TypeReg:
 			// Create parent directories
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 				return fmt.Errorf("create parent dir for %s: %w", targetPath, err)
 			}
 
-			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			f, err := root.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode)&0o777)
 			if err != nil {
 				return fmt.Errorf("create file %s: %w", targetPath, err)
 			}
 
-			if _, err := io.Copy(f, tr); err != nil {
+			if _, err := io.Copy(f, archiveContextReader{ctx: ctx, reader: tr}); err != nil {
 				if closeErr := f.Close(); closeErr != nil {
 					return fmt.Errorf("write file %s: %w; close file: %w", targetPath, err, closeErr)
 				}
@@ -161,4 +195,20 @@ func mustParseURL(rawURL string) *url.URL {
 		panic(err)
 	}
 	return u
+}
+
+type archiveContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r archiveContextReader) Read(data []byte) (int, error) {
+	if err := context.Cause(r.ctx); err != nil {
+		return 0, err
+	}
+	n, err := r.reader.Read(data)
+	if cause := context.Cause(r.ctx); cause != nil {
+		return n, errors.Join(err, cause)
+	}
+	return n, err
 }

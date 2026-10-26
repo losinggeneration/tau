@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -115,6 +116,9 @@ func (m *Manifest) Validate() error {
 	if m.Package.Name == "" {
 		return fmt.Errorf("missing required [package].name")
 	}
+	if err := validatePackageName(m.Package.Name); err != nil {
+		return err
+	}
 	if m.Package.Version == "" {
 		return fmt.Errorf("missing required [package].version")
 	}
@@ -125,6 +129,50 @@ func (m *Manifest) Validate() error {
 	hasExtensions := len(m.AllExtensions()) > 0
 	if !hasPlugin && !hasSkills && !hasPrompts && !hasThemes && !hasExtensions {
 		return fmt.Errorf("package has no [plugin] and no artifact sections (skills/prompts/themes/extensions)")
+	}
+	return nil
+}
+
+// validatePackageName limits installation identities to one component or an npm scope pair.
+func validatePackageName(name string) error {
+	parts := strings.Split(name, "/")
+	if strings.HasPrefix(name, "@") && len(parts) == 2 {
+		parts[0] = strings.TrimPrefix(parts[0], "@")
+	} else if len(parts) != 1 {
+		return fmt.Errorf("invalid package name %q", name)
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, "-") || strings.HasPrefix(part, ".tau-install-") {
+			return fmt.Errorf("invalid package name %q", name)
+		}
+		for _, r := range part {
+			valid := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.'
+			if !valid {
+				return fmt.Errorf("invalid package name %q", name)
+			}
+		}
+	}
+	return nil
+}
+
+// validatePackageParent rejects scope-directory redirects outside the configured root.
+func validatePackageParent(base, name string) error {
+	if err := validatePackageName(name); err != nil {
+		return err
+	}
+	scope, _, scoped := strings.Cut(name, "/")
+	if !scoped {
+		return nil
+	}
+	info, err := os.Lstat(filepath.Join(base, scope))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat package scope: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("package scope %q must be a real directory", scope)
 	}
 	return nil
 }

@@ -35,7 +35,11 @@ func TelemetryEnabled() bool {
 
 // HasVertexADC checks the configured or default ADC path on each discovery.
 func HasVertexADC() bool {
-	if path := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); path != "" {
+	return hasVertexADCWithEnv(os.Getenv)
+}
+
+func hasVertexADCWithEnv(lookup func(string) string) bool {
+	if path := lookup("GOOGLE_APPLICATION_CREDENTIALS"); path != "" {
 		return fileExists(path)
 	}
 	return fileExists(filepath.Join(userHomeDir(), ".config", "gcloud", "application_default_credentials.json"))
@@ -237,31 +241,35 @@ func registryProviderOrder() []string {
 // at call time wins over this environment-fallback helper; callers should
 // always check an explicit key first.
 func GetEnvAPIKey(provider string) string {
+	return getEnvAPIKey(provider, os.Getenv)
+}
+
+func getEnvAPIKey(provider string, lookup func(string) string) string {
 	// Special-cased providers consult more than the single registry entry.
 	switch provider {
 	case ProviderAnthropic:
 		// OAuth token takes priority over the regular API key.
-		if key := os.Getenv("ANTHROPIC_OAUTH_TOKEN"); key != "" {
+		if key := lookup("ANTHROPIC_OAUTH_TOKEN"); key != "" {
 			return key
 		}
-		return os.Getenv("ANTHROPIC_API_KEY")
+		return lookup("ANTHROPIC_API_KEY")
 
 	case ProviderGitHubCopilot, ProviderOpenAICodex:
-		if key := os.Getenv("COPILOT_GITHUB_TOKEN"); key != "" {
+		if key := lookup("COPILOT_GITHUB_TOKEN"); key != "" {
 			return key
 		}
-		if key := os.Getenv("GH_TOKEN"); key != "" {
+		if key := lookup("GH_TOKEN"); key != "" {
 			return key
 		}
-		return os.Getenv("GITHUB_TOKEN")
+		return lookup("GITHUB_TOKEN")
 
 	case ProviderGoogleVertex:
 		// GOOGLE_CLOUD_API_KEY takes priority.
-		if key := os.Getenv("GOOGLE_CLOUD_API_KEY"); key != "" {
+		if key := lookup("GOOGLE_CLOUD_API_KEY"); key != "" {
 			return key
 		}
 		// ADC auth requires credentials + project + location.
-		if HasVertexADC() && HasVertexProject() && HasVertexLocation() {
+		if hasVertexADCWithEnv(lookup) && (lookup("GOOGLE_CLOUD_PROJECT") != "" || lookup("GCLOUD_PROJECT") != "") && lookup("GOOGLE_CLOUD_LOCATION") != "" {
 			return "<authenticated>"
 		}
 		return ""
@@ -269,22 +277,22 @@ func GetEnvAPIKey(provider string) string {
 	case ProviderAmazonBedrock:
 		// Multiple credential sources: profile, IAM keys, bearer token,
 		// ECS task role, IRSA. Any of them authenticates the client.
-		if os.Getenv("AWS_PROFILE") != "" {
+		if lookup("AWS_PROFILE") != "" {
 			return "<authenticated>"
 		}
-		if os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "" {
+		if lookup("AWS_ACCESS_KEY_ID") != "" && lookup("AWS_SECRET_ACCESS_KEY") != "" {
 			return "<authenticated>"
 		}
-		if os.Getenv("AWS_BEARER_TOKEN_BEDROCK") != "" {
+		if lookup("AWS_BEARER_TOKEN_BEDROCK") != "" {
 			return "<authenticated>"
 		}
-		if os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != "" {
+		if lookup("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != "" {
 			return "<authenticated>"
 		}
-		if os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "" {
+		if lookup("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "" {
 			return "<authenticated>"
 		}
-		if os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
+		if lookup("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
 			return "<authenticated>"
 		}
 		return ""
@@ -292,15 +300,15 @@ func GetEnvAPIKey(provider string) string {
 	case ProviderHuggingFace:
 		// HF_TOKEN is the primary var; HUGGINGFACE_HUB_TOKEN is a widely-used
 		// alias that the public helper also recognizes.
-		if key := os.Getenv("HF_TOKEN"); key != "" {
+		if key := lookup("HF_TOKEN"); key != "" {
 			return key
 		}
-		return os.Getenv("HUGGINGFACE_HUB_TOKEN")
+		return lookup("HUGGINGFACE_HUB_TOKEN")
 	}
 
 	// Plain API-key providers: read the single entry from EnvVarRegistry.
 	if envVar, ok := EnvVarRegistry[provider]; ok {
-		return os.Getenv(envVar)
+		return lookup(envVar)
 	}
 	return ""
 }
@@ -315,8 +323,12 @@ func ShareViewerURL() string {
 // GetEnvHeaders returns provider-owned authentication headers. Bearer tokens
 // are kept separate from API keys to avoid activating OAuth request shaping.
 func GetEnvHeaders(provider string) map[string]string {
+	return getEnvHeaders(provider, os.Getenv)
+}
+
+func getEnvHeaders(provider string, lookup func(string) string) map[string]string {
 	if provider == ProviderAnthropic {
-		if token := os.Getenv("ANTHROPIC_AUTH_TOKEN"); token != "" {
+		if token := lookup("ANTHROPIC_AUTH_TOKEN"); token != "" {
 			return map[string]string{"Authorization": "Bearer " + token}
 		}
 	}
@@ -327,4 +339,14 @@ func GetEnvHeaders(provider string) map[string]string {
 // credentials or performing network calls.
 func HasEnvCredentials(provider string) bool {
 	return len(GetEnvHeaders(provider)) != 0 || GetEnvAPIKey(provider) != ""
+}
+
+// ProviderEnvAPIKey resolves a key from scoped variables before process values.
+func ProviderEnvAPIKey(provider string, env map[string]string) string {
+	return (&options{providerEnv: env}).envAPIKey(provider)
+}
+
+// ProviderEnvHeaders resolves header-owned authentication from scoped variables.
+func ProviderEnvHeaders(provider string, env map[string]string) map[string]string {
+	return (&options{providerEnv: env}).envHeaders(provider)
 }

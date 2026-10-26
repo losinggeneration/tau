@@ -3,6 +3,7 @@ package packages
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,26 +13,29 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/gofrs/flock"
 )
 
-// IsOfflineMode returns true if the PI_OFFLINE environment variable is set
-// to indicate offline mode operation. When true, network operations like
-// fetching package updates should be skipped.
+// IsOfflineMode reports whether Tau or Pi has disabled package network operations.
 func IsOfflineMode() bool {
-	val := os.Getenv("PI_OFFLINE")
-	if val == "" {
-		return false
+	for _, name := range []string{"TAU_OFFLINE", "PI_OFFLINE"} {
+		switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+		case "1", "true", "yes":
+			return true
+		}
 	}
-	val = strings.ToLower(strings.TrimSpace(val))
-	return val == "1" || val == "true" || val == "yes"
+	return false
 }
 
 // Config holds configuration for installing packages.
 type Config struct {
+	expected *InstallSidecar
 	// Source is the git URL, GitHub shorthand, or local path to install from.
 	Source string
 	// Force skips the already-installed check.
@@ -104,6 +108,10 @@ func NewInstallManager(userDir, projectDir string) *InstallManager {
 // PromptTrust displays the trust prompt and returns true if the user accepts.
 // If cfg.Yes is true, it skips the prompt and returns true.
 func (m *InstallManager) PromptTrust(ctx context.Context, cfg Config, manifest *Manifest, reader io.Reader) (bool, error) {
+	if err := context.Cause(ctx); err != nil {
+		return false, err
+	}
+
 	if cfg.Yes {
 		return true, nil
 	}
@@ -144,7 +152,14 @@ func (m *InstallManager) PromptTrust(ctx context.Context, cfg Config, manifest *
 	}
 	scanner := bufio.NewScanner(reader)
 	if !scanner.Scan() {
-		return false, fmt.Errorf("read trust prompt response")
+		err := scanner.Err()
+		if err == nil {
+			err = io.EOF
+		}
+		return false, fmt.Errorf("read trust prompt response: %w", errors.Join(err, context.Cause(ctx)))
+	}
+	if err := context.Cause(ctx); err != nil {
+		return false, err
 	}
 	answer := strings.TrimSpace(strings.ToLower(scanner.Text()))
 
@@ -165,11 +180,27 @@ func (m *InstallManager) InstallFromGit(ctx context.Context, source string, cfg 
 // Install installs a package based on the configuration.
 // It determines the source type and delegates to the appropriate method.
 func (m *InstallManager) Install(ctx context.Context, cfg Config) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+
+	if IsOfflineMode() && (strings.HasPrefix(cfg.Source, "npm:") || isGitURL(cfg.Source)) {
+		if cfg.Pi && strings.HasPrefix(cfg.Source, "npm:") {
+			return fmt.Errorf("tau install --pi needs network; re-run online")
+		}
+		return fmt.Errorf("offline mode: remote package installation skipped")
+	}
+
 	// --link is only supported for local paths
 	if cfg.Link && isGitURL(cfg.Source) {
 		return fmt.Errorf("--link is only supported for local paths, not git URLs")
 	}
 
+	if strings.HasPrefix(cfg.Source, "npm:") {
+		if err := validatePackageName(parseNpmSpec(strings.TrimPrefix(cfg.Source, "npm:")).Name); err != nil {
+			return err
+		}
+	}
 	// Check for npm: prefix
 	if strings.HasPrefix(cfg.Source, "npm:") {
 		if cfg.Pi {
@@ -226,6 +257,12 @@ func isGitURL(source string) bool {
 
 // installFromLocal installs a package from a local directory.
 func (m *InstallManager) installFromLocal(ctx context.Context, cfg Config) error {
+	source, err := filepath.Abs(cfg.Source)
+	if err != nil {
+		return fmt.Errorf("resolve local package source: %w", err)
+	}
+	cfg.Source = source
+
 	// Verify source is a valid directory
 	info, err := os.Stat(cfg.Source)
 	if err != nil {
@@ -242,7 +279,7 @@ func (m *InstallManager) installFromLocal(ctx context.Context, cfg Config) error
 		return m.installPiFromLocal(ctx, cfg, info)
 	}
 
-	manifest, err := loadManifestOrConvention(cfg.Source)
+	manifest, err := loadManifestOrConventionContext(ctx, cfg.Source)
 	if err != nil {
 		return fmt.Errorf("load package metadata from %s: %w", cfg.Source, err)
 	}
@@ -286,59 +323,41 @@ func (m *InstallManager) installFromLocal(ctx context.Context, cfg Config) error
 		return fmt.Errorf("create packages dir: %w", err)
 	}
 
+	if err := validatePackageParent(installBase, pkgName); err != nil {
+		return err
+	}
 	installPath := filepath.Join(installBase, pkgName)
-
-	// Remove existing installation if force
-	if cfg.Force {
-		if err := os.RemoveAll(installPath); err != nil {
-			return fmt.Errorf("remove existing installation: %w", err)
-		}
+	if err := validateLocalReplacement(cfg.Source, installPath); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(installPath), 0o700); err != nil {
+		return fmt.Errorf("create package parent: %w", err)
 	}
 
-	// Handle --link: create symlink instead of copying
-	if cfg.Link {
-		// Remove existing symlink if any
-		if err := os.Remove(installPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove existing symlink: %w", err)
+	err = stagePackageExpected(ctx, installPath, cfg.expected, func(staged string) error {
+		if err := validatePackageParent(installBase, pkgName); err != nil {
+			return err
 		}
-
-		// Create symlink pointing to source
-		if err := os.Symlink(cfg.Source, installPath); err != nil {
-			return fmt.Errorf("create symlink: %w", err)
+		if !cfg.Force {
+			if err := NewManager(m.userDir, m.projectDir).CheckDuplicate(pkgName, scope); err != nil {
+				return err
+			}
 		}
-
-		// Write sidecar with commitSHA as empty for non-git sources
-		sidecar := InstallSidecar{
-			Source:      cfg.Source,
-			Ref:         "",
-			CommitSHA:   "",
-			InstalledAt: info.ModTime().Format("2006-01-02T15:04:05Z07:00"),
-			Scope:       string(scope),
+		if err := validateLocalReplacement(cfg.Source, installPath); err != nil {
+			return err
 		}
-		if err := sidecar.Write(installPath); err != nil {
-			return fmt.Errorf("write install sidecar: %w", err)
+		if cfg.Link {
+			if err := os.Symlink(cfg.Source, staged); err != nil {
+				return fmt.Errorf("create symlink: %w", err)
+			}
+		} else if err := copyDirContext(ctx, cfg.Source, staged); err != nil {
+			return fmt.Errorf("copy package: %w", err)
 		}
-
-		m.notifyReloaders(ctx, pkgName, manifest)
-
-		return nil
-	}
-
-	// Copy directory to install path
-	if err := copyDir(cfg.Source, installPath); err != nil {
-		return fmt.Errorf("copy package: %w", err)
-	}
-
-	// Write install sidecar with commitSHA as empty for local paths
-	sidecar := InstallSidecar{
-		Source:      cfg.Source,
-		Ref:         "",
-		CommitSHA:   "",
-		InstalledAt: info.ModTime().Format("2006-01-02T15:04:05Z07:00"),
-		Scope:       string(scope),
-	}
-	if err := sidecar.Write(installPath); err != nil {
-		return fmt.Errorf("write install sidecar: %w", err)
+		sidecar := InstallSidecar{Source: cfg.Source, InstalledAt: info.ModTime().Format("2006-01-02T15:04:05Z07:00"), Scope: string(scope)}
+		return sidecar.Write(staged)
+	})
+	if err != nil {
+		return err
 	}
 
 	m.notifyReloaders(ctx, pkgName, manifest)
@@ -346,8 +365,176 @@ func (m *InstallManager) installFromLocal(ctx context.Context, cfg Config) error
 	return nil
 }
 
+func validateLocalReplacement(source, destination string) error {
+	info, err := os.Lstat(destination)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat replacement destination: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	resolvedSource, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return fmt.Errorf("resolve replacement source: %w", err)
+	}
+	resolvedDestination, err := filepath.EvalSymlinks(destination)
+	if err != nil {
+		return fmt.Errorf("resolve replacement destination: %w", err)
+	}
+	resolvedSource, err = filepath.Abs(resolvedSource)
+	if err != nil {
+		return err
+	}
+	resolvedDestination, err = filepath.Abs(resolvedDestination)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(resolvedDestination, resolvedSource)
+	if err != nil {
+		return fmt.Errorf("compare replacement paths: %w", err)
+	}
+	if filepath.IsLocal(rel) {
+		return errors.New("replacement source must not be inside its destination")
+	}
+	return nil
+}
+
+// lockPackageWriter uses a persistent sibling lock file so independent managers
+// and processes share ownership even while the destination is renamed.
+func lockPackageWriter(ctx context.Context, destination string) (func() error, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(destination))
+	if err != nil {
+		return nil, fmt.Errorf("resolve package writer parent: %w", err)
+	}
+	lockPath := filepath.Join(parent, ".tau-install-lock-"+filepath.Base(destination))
+	if info, err := os.Lstat(lockPath); err == nil {
+		if !info.Mode().IsRegular() {
+			return nil, errors.New("package writer lock must be a regular file")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat package writer lock: %w", err)
+	}
+	lock := flock.New(lockPath)
+	acquired, err := lock.TryLockContext(ctx, 10*time.Millisecond)
+	if err != nil || !acquired {
+		if err == nil {
+			err = errors.New("package writer lock not acquired")
+		}
+		return nil, errors.Join(fmt.Errorf("acquire package writer: %w", err), context.Cause(ctx), lock.Close())
+	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	if err := recoverPackageReplacement(destination); err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	return lock.Close, nil
+}
+
+func packageRecoveryPath(destination string) string {
+	return filepath.Join(filepath.Dir(destination), ".tau-install-recovery-"+filepath.Base(destination))
+}
+
+func recoverPackageReplacement(destination string) error {
+	recovery := packageRecoveryPath(destination)
+	info, err := os.Lstat(recovery)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat package recovery: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("package recovery must be a real directory")
+	}
+	if _, err := os.Lstat(destination); errors.Is(err, os.ErrNotExist) {
+		previous := filepath.Join(recovery, "previous")
+		if _, err := os.Lstat(previous); err == nil {
+			if err := os.Rename(previous, destination); err != nil {
+				return fmt.Errorf("restore interrupted package from %s: %w", previous, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat previous package: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("stat recovery destination: %w", err)
+	}
+	if err := os.RemoveAll(recovery); err != nil {
+		return fmt.Errorf("remove package recovery: %w", err)
+	}
+	return nil
+}
+
+// stageLocalPackage prepares a sibling before moving the previous installation aside.
+func stageLocalPackage(ctx context.Context, destination string, prepare func(string) error) error {
+	return stagePackageExpected(ctx, destination, nil, prepare)
+}
+
+func stagePackageExpected(ctx context.Context, destination string, expected *InstallSidecar, prepare func(string) error) (err error) {
+	unlock, err := lockPackageWriter(ctx, destination)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, unlock()) }()
+	if err := checkPackageSnapshot(destination, expected); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp(filepath.Dir(destination), ".tau-install-*")
+	if err != nil {
+		return fmt.Errorf("stage package: %w", err)
+	}
+	keepRecovery := false
+	defer func() {
+		if !keepRecovery {
+			err = errors.Join(err, os.RemoveAll(dir))
+		}
+	}()
+	staged := filepath.Join(dir, "package")
+	if err := prepare(staged); err != nil {
+		return err
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := checkPackageSnapshot(destination, expected); err != nil {
+		return err
+	}
+	recovery := packageRecoveryPath(destination)
+	if err := os.Rename(dir, recovery); err != nil {
+		return fmt.Errorf("publish package recovery: %w", err)
+	}
+	dir = recovery
+	staged = filepath.Join(dir, "package")
+	backup := filepath.Join(dir, "previous")
+	previous := false
+	if _, err := os.Lstat(destination); err == nil {
+		if err := os.Rename(destination, backup); err != nil {
+			return fmt.Errorf("save previous package: %w", err)
+		}
+		previous = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat installed package: %w", err)
+	}
+	if err := os.Rename(staged, destination); err != nil {
+		if previous {
+			if restoreErr := os.Rename(backup, destination); restoreErr != nil {
+				keepRecovery = true
+				return fmt.Errorf("restore package from %s: %w", backup, errors.Join(err, restoreErr))
+			}
+		}
+		return fmt.Errorf("admit package: %w", err)
+	}
+	return nil
+}
+
 // installFromGit installs a package from a git URL with optional ref.
-func (m *InstallManager) installFromGit(ctx context.Context, cfg Config) error {
+func (m *InstallManager) installFromGit(ctx context.Context, cfg Config) (err error) {
 	// Parse source: <git-url>[@<ref>]
 	gitURL, ref := parseSourceRef(cfg.Source)
 
@@ -365,7 +552,7 @@ func (m *InstallManager) installFromGit(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { err = errors.Join(err, os.RemoveAll(tmpDir)) }()
 
 	// Clone the repository
 	cloneOpts := &git.CloneOptions{
@@ -378,38 +565,32 @@ func (m *InstallManager) installFromGit(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("clone repository: %w", err)
 	}
 
-	// Resolve ref if specified
-	var commitSHA string
 	if ref != "" {
-		resolvedRef, err := resolveRef(ctx, repo, ref)
-		if err != nil {
-			return fmt.Errorf("resolve ref %q: %w", ref, err)
-		}
-		ref = resolvedRef
-
-		// Get commit hash for the resolved ref
-		hash, err := repo.ResolveRevision(plumbing.Revision(ref))
-		if err == nil {
-			commitSHA = hash.String()
-		}
+		ref, err = resolveRef(ctx, repo, ref)
 	} else {
-		// Resolve to latest tag or default branch
-		resolvedRef, err := resolveToLatest(ctx, repo)
-		if err != nil {
-			return fmt.Errorf("resolve latest ref: %w", err)
-		}
-		ref = resolvedRef
-		hash, err := repo.ResolveRevision(plumbing.Revision(ref))
-		if err == nil {
-			commitSHA = hash.String()
-		}
+		ref, err = resolveToLatest(ctx, repo)
 	}
+	if err != nil {
+		return fmt.Errorf("resolve package revision: %w", err)
+	}
+	hash, err := repo.ResolveRevision(plumbing.Revision(ref))
+	if err != nil {
+		return fmt.Errorf("resolve package commit: %w", err)
+	}
+	tree, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("open package worktree: %w", err)
+	}
+	if err := tree.Checkout(&git.CheckoutOptions{Hash: *hash}); err != nil {
+		return fmt.Errorf("checkout package commit: %w", err)
+	}
+	commitSHA := hash.String()
 
 	if cfg.Pi {
 		return m.installPiFromGitDir(ctx, cfg, tmpDir, ref, commitSHA, commitTime(repo))
 	}
 
-	manifest, err := loadManifestOrConvention(tmpDir)
+	manifest, err := loadManifestOrConventionContext(ctx, tmpDir)
 	if err != nil {
 		return fmt.Errorf("load package metadata: %w", err)
 	}
@@ -433,144 +614,43 @@ func (m *InstallManager) installFromGit(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("install declined")
 	}
 
-	// Check for matching release for current platform
-	release := findRelease(manifest)
-	if release != nil && release.URL != "" && release.SHA256 != "" {
-		// Download and extract the release instead of using cloned source
-		installPath := filepath.Join(m.userDir, pkgName) // always user scope for releases
-		if scope == ScopeProject {
-			installPath = filepath.Join(m.projectDir, pkgName)
-		}
-
-		// Create parent directory if needed
-		if err := os.MkdirAll(filepath.Dir(installPath), 0o700); err != nil {
-			return fmt.Errorf("create packages dir: %w", err)
-		}
-
-		// Remove existing installation if force
-		if cfg.Force {
-			if err := os.RemoveAll(installPath); err != nil {
-				return fmt.Errorf("remove existing installation: %w", err)
-			}
-		}
-
-		if err := downloadAndExtract(ctx, release, installPath); err != nil {
-			return fmt.Errorf("download release: %w", err)
-		}
-
-		// Write install sidecar
-		sidecar := InstallSidecar{
-			Source:      cfg.Source,
-			Ref:         ref,
-			CommitSHA:   commitSHA,
-			InstalledAt: strings.TrimSuffix(commitTime(repo), "\n"),
-			Scope:       string(scope),
-		}
-		if err := sidecar.Write(installPath); err != nil {
-			return fmt.Errorf("write install sidecar: %w", err)
-		}
-
-		// Clean up cloned repo (we got the release instead)
-		_ = os.RemoveAll(tmpDir)
-
-		m.notifyReloaders(ctx, pkgName, manifest)
-
-		return nil
-	}
-
-	// No matching release; check for source-build fallback
-	if manifest.Build.Command != "" {
-		// Source-build fallback: run the build command
-		installPath := filepath.Join(m.userDir, pkgName) // always user scope for source builds
-		if scope == ScopeProject {
-			installPath = filepath.Join(m.projectDir, pkgName)
-		}
-
-		// Create parent directory if needed
-		if err := os.MkdirAll(filepath.Dir(installPath), 0o700); err != nil {
-			return fmt.Errorf("create packages dir: %w", err)
-		}
-
-		// Remove existing installation if force
-		if cfg.Force {
-			if err := os.RemoveAll(installPath); err != nil {
-				return fmt.Errorf("remove existing installation: %w", err)
-			}
-		}
-
-		// Run the build command in the cloned repo
-		if err := m.runBuildCommand(ctx, tmpDir, manifest.Build.Command); err != nil {
-			return fmt.Errorf("source build failed: %w", err)
-		}
-
-		// Move cloned repo (with built artifacts) to install path
-		if err := os.Rename(tmpDir, installPath); err != nil {
-			// Fallback: copy if rename fails (cross-filesystem)
-			if err := copyDir(tmpDir, installPath); err != nil {
-				return fmt.Errorf("install package: %w", err)
-			}
-			_ = os.RemoveAll(tmpDir)
-		}
-
-		// Write install sidecar
-		sidecar := InstallSidecar{
-			Source:      cfg.Source,
-			Ref:         ref,
-			CommitSHA:   commitSHA,
-			InstalledAt: strings.TrimSuffix(commitTime(repo), "\n"),
-			Scope:       string(scope),
-		}
-		if err := sidecar.Write(installPath); err != nil {
-			return fmt.Errorf("write install sidecar: %w", err)
-		}
-
-		m.notifyReloaders(ctx, pkgName, manifest)
-
-		return nil
-	}
-
-	// No matching release and no build section; use cloned source as-is
-	// Determine install path
-	var installBase string
-	switch scope {
-	case ScopeProject:
+	installBase := m.userDir
+	if scope == ScopeProject {
 		installBase = m.projectDir
-	case ScopeUser:
-		installBase = m.userDir
+	}
+	if err := validatePackageParent(installBase, pkgName); err != nil {
+		return err
 	}
 	installPath := filepath.Join(installBase, pkgName)
-
-	// Create parent directory if needed
-	if err := os.MkdirAll(installBase, 0o700); err != nil {
-		return fmt.Errorf("create packages dir: %w", err)
+	if err := os.MkdirAll(filepath.Dir(installPath), 0o700); err != nil {
+		return fmt.Errorf("create package parent: %w", err)
 	}
-
-	// Remove existing installation if force
-	if cfg.Force {
-		if err := os.RemoveAll(installPath); err != nil {
-			return fmt.Errorf("remove existing installation: %w", err)
+	sidecar := InstallSidecar{Source: cfg.Source, Ref: ref, CommitSHA: commitSHA, InstalledAt: strings.TrimSuffix(commitTime(repo), "\n"), Scope: string(scope)}
+	err = stagePackageExpected(ctx, installPath, cfg.expected, func(staged string) error {
+		if !cfg.Force {
+			if err := NewManager(m.userDir, m.projectDir).CheckDuplicate(pkgName, scope); err != nil {
+				return err
+			}
 		}
-	}
-
-	// Move cloned repo to install path
-	if err := os.Rename(tmpDir, installPath); err != nil {
-		// Fallback: copy if rename fails (cross-filesystem)
-		if err := copyDir(tmpDir, installPath); err != nil {
-			return fmt.Errorf("install package: %w", err)
+		release := findRelease(manifest)
+		if release != nil && release.URL != "" && release.SHA256 != "" {
+			if err := downloadAndExtract(ctx, release, staged); err != nil {
+				return fmt.Errorf("download release: %w", err)
+			}
+		} else {
+			if manifest.Build.Command != "" {
+				if err := m.runBuildCommand(ctx, tmpDir, manifest.Build.Command); err != nil {
+					return fmt.Errorf("source build failed: %w", err)
+				}
+			}
+			if err := copyDirContext(ctx, tmpDir, staged); err != nil {
+				return fmt.Errorf("copy package: %w", err)
+			}
 		}
-		_ = os.RemoveAll(tmpDir)
-	}
-
-	// Write install sidecar
-	sidecar := InstallSidecar{
-		Source:      cfg.Source,
-		Ref:         ref,
-		CommitSHA:   commitSHA,
-		InstalledAt: strings.TrimSuffix(commitTime(repo), "\n"),
-		Scope:       string(scope),
-	}
-	if err := sidecar.Write(installPath); err != nil {
-		return fmt.Errorf("write install sidecar: %w", err)
+		return sidecar.Write(staged)
+	})
+	if err != nil {
+		return err
 	}
 
 	m.notifyReloaders(ctx, pkgName, manifest)
@@ -579,10 +659,17 @@ func (m *InstallManager) installFromGit(ctx context.Context, cfg Config) error {
 }
 
 func loadManifestOrConvention(root string) (*Manifest, error) {
+	return loadManifestOrConventionContext(context.Background(), root)
+}
+
+func loadManifestOrConventionContext(ctx context.Context, root string) (*Manifest, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	manifestPath := filepath.Join(root, "tau-package.toml")
 	manifest, err := Load(manifestPath)
 	if err == nil {
-		if err := CheckRuntimeRequirement(manifest.Reqs.Runtime); err != nil {
+		if err := CheckRuntimeRequirementContext(ctx, manifest.Reqs.Runtime); err != nil {
 			return nil, fmt.Errorf("runtime requirement not satisfied: %w", err)
 		}
 		return manifest, nil
@@ -607,6 +694,9 @@ func loadManifestOrConvention(root string) (*Manifest, error) {
 		{path: "extensions", dst: &manifest.Extensions},
 	} {
 		info, statErr := os.Stat(filepath.Join(root, entry.path))
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat conventional %s resource: %w", entry.path, statErr)
+		}
 		if statErr == nil && info.IsDir() {
 			*entry.dst = append(*entry.dst, ArtifactPath{Path: entry.path})
 		}
@@ -620,7 +710,15 @@ func loadManifestOrConvention(root string) (*Manifest, error) {
 
 // Example: "github.com/user/repo@v1.0.0" -> ("github.com/user/repo", "v1.0.0")
 func parseSourceRef(source string) (gitURL, ref string) {
-	if idx := strings.LastIndex(source, "@"); idx > 0 {
+	if idx := strings.LastIndex(source, "@"); idx > 0 && source[idx-1] != '/' {
+		if scheme := strings.Index(source, "://"); scheme >= 0 {
+			authorityEnd := strings.Index(source[scheme+3:], "/")
+			if authorityEnd < 0 || idx < scheme+3+authorityEnd {
+				return source, ""
+			}
+		} else if strings.HasPrefix(source, "git@") && idx == 3 {
+			return source, ""
+		}
 		return source[:idx], source[idx+1:]
 	}
 	return source, ""
@@ -727,7 +825,55 @@ func npmCommand(ctx context.Context, command []string, args ...string) *exec.Cmd
 type NpmSpec struct {
 	Name    string // package name, e.g. "@foo/bar" or "lodash"
 	Version string // optional version, e.g. "1.2.3" or "latest"
-	Pinned  bool   // true if version was explicitly specified
+	Pinned  bool   // true for an exact semantic version
+}
+
+var exactNPMVersion = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
+
+func isExactNPMVersion(version string) bool {
+	parts := exactNPMVersion.FindStringSubmatch(strings.TrimSpace(version))
+	if parts == nil {
+		return false
+	}
+	for _, part := range parts[1:4] {
+		n, err := strconv.ParseUint(part, 10, 64)
+		if err != nil || n > 9007199254740991 {
+			return false
+		}
+	}
+	for _, part := range strings.Split(parts[4], ".") {
+		if len(part) < 2 || part[0] != '0' {
+			continue
+		}
+		numeric := true
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			return false
+		}
+	}
+	return true
+}
+
+func validateNPMVersion(requested NpmSpec, actual string) error {
+	if !isExactNPMVersion(actual) {
+		return fmt.Errorf("npm archive has an invalid version")
+	}
+	if requested.Pinned {
+		normalize := func(version string) string {
+			version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+			version, _, _ = strings.Cut(version, "+")
+			return version
+		}
+		if normalize(requested.Version) != normalize(actual) {
+			return fmt.Errorf("npm archive version does not match requested version")
+		}
+	}
+	return nil
 }
 
 // parseNpmSpec parses an npm package specifier (without the "npm:" prefix).
@@ -738,45 +884,12 @@ type NpmSpec struct {
 //   - "@types/node@18.0.0" -> NpmSpec{Name: "@types/node", Version: "18.0.0", Pinned: true}
 func parseNpmSpec(spec string) NpmSpec {
 	spec = strings.TrimSpace(spec)
-
-	// Check if this is a scoped package (starts with @)
-	if strings.HasPrefix(spec, "@") {
-		// Scoped package - find the second @ for version separator
-		// e.g., "@types/node@18.0.0"
-		// First @ is part of the scope, second @ separates name from version
-		slashIndex := strings.IndexByte(spec, '/')
-		if slashIndex != -1 && slashIndex < len(spec)-1 {
-			// Find @ after the slash
-			afterSlash := spec[slashIndex+1:]
-			atIndex := strings.IndexByte(afterSlash, '@')
-			if atIndex != -1 {
-				// @types/node@18.0.0 -> name="@types/node", version="18.0.0"
-				name := spec[:slashIndex+1+atIndex]
-				version := afterSlash[atIndex+1:]
-				return NpmSpec{
-					Name:    name,
-					Version: version,
-					Pinned:  true,
-				}
-			}
-		}
-		// Scoped package without version: @types/node
-		return NpmSpec{Name: spec, Version: "", Pinned: false}
+	index := strings.LastIndexByte(spec, '@')
+	if index <= 0 {
+		return NpmSpec{Name: spec}
 	}
-
-	// Non-scoped package - simple split on @
-	atIndex := strings.IndexByte(spec, '@')
-	if atIndex == -1 {
-		return NpmSpec{Name: spec, Version: "", Pinned: false}
-	}
-
-	name := spec[:atIndex]
-	version := spec[atIndex+1:]
-	return NpmSpec{
-		Name:    name,
-		Version: version,
-		Pinned:  true,
-	}
+	name, version := spec[:index], spec[index+1:]
+	return NpmSpec{Name: name, Version: version, Pinned: isExactNPMVersion(version)}
 }
 
 // latestTag returns the latest tag from a list of tag refs using simple version sort.
@@ -816,7 +929,15 @@ func commitTime(repo *git.Repository) string {
 }
 
 // UninstallFromNPM uninstalls an npm package by name.
-func (m *InstallManager) UninstallFromNPM(ctx context.Context, name string, scope Scope) error {
+func (m *InstallManager) UninstallFromNPM(ctx context.Context, name string, scope Scope) (err error) {
+	if err := validatePackageName(name); err != nil {
+		return err
+	}
+
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+
 	// Determine the install base directory
 	var installBase string
 	switch scope {
@@ -828,21 +949,22 @@ func (m *InstallManager) UninstallFromNPM(ctx context.Context, name string, scop
 		return fmt.Errorf("unknown scope: %v", scope)
 	}
 
-	// For user scope, npm packages are installed globally, so we need to uninstall
-	// from the npm registry AND remove our tracking directory
-	if scope == ScopeUser {
-		// Run npm uninstall -g to remove from global node_modules
-		cmd := npmCommand(ctx, m.NPMCommand, "uninstall", name, "-g")
-		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			// Don't fail on npm uninstall errors - we still want to clean up our tracking
-			fmt.Fprintf(os.Stderr, "warning: npm uninstall -g %s failed: %v\n", name, err)
-		}
-	}
-
 	// Remove our tracking directory
+	if err := validatePackageParent(installBase, name); err != nil {
+		return err
+	}
 	installPath := filepath.Join(installBase, name)
+	unlock, err := lockPackageWriter(ctx, installPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer func() { err = errors.Join(err, unlock()) }()
+	if err := validatePackageParent(installBase, name); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(installPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove package directory: %w", err)
 	}
@@ -867,141 +989,208 @@ func (m *InstallManager) runBuildCommand(ctx context.Context, dir, command strin
 
 // copyDir copies a directory from src to dst.
 func copyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	return copyDirContext(context.Background(), src, dst)
+}
+
+func copyDirContext(ctx context.Context, src, dst string) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	source, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return fmt.Errorf("resolve package source: %w", err)
+	}
+	source, err = filepath.Abs(source)
+	if err != nil {
+		return fmt.Errorf("resolve package source: %w", err)
+	}
+	destination, err := filepath.Abs(dst)
+	if err != nil {
+		return fmt.Errorf("resolve package destination: %w", err)
+	}
+	parent := destination
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(parent)
+		if resolveErr == nil {
+			suffix, relErr := filepath.Rel(parent, destination)
+			if relErr != nil {
+				return fmt.Errorf("resolve package destination suffix: %w", relErr)
+			}
+			destination = filepath.Join(resolved, suffix)
+			break
+		}
+		if !errors.Is(resolveErr, os.ErrNotExist) {
+			return fmt.Errorf("resolve package destination: %w", resolveErr)
+		}
+		parent = filepath.Dir(parent)
+	}
+	rel, err := filepath.Rel(source, destination)
+	if err != nil {
+		return fmt.Errorf("compare package paths: %w", err)
+	}
+	if filepath.IsLocal(rel) {
+		return errors.New("package destination must not be inside its source")
+	}
+	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
 		if err != nil {
 			return err
 		}
-		rel, _ := filepath.Rel(src, path)
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return fmt.Errorf("relative package path: %w", err)
+		}
 		dstPath := filepath.Join(dst, rel)
 		if info.IsDir() {
 			return os.MkdirAll(dstPath, info.Mode())
 		}
-		return copyFile(path, dstPath)
+		return copyFileContext(ctx, path, dstPath)
 	})
 }
 
 // copyFile copies a file from src to dst.
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
+func copyFile(src, dst string) error { return copyFileContext(context.Background(), src, dst) }
+
+func copyFileContext(ctx context.Context, src, dst string) (err error) {
+	if err := context.Cause(ctx); err != nil {
 		return err
 	}
-	return os.WriteFile(dst, data, 0o600)
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("stat package file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("package source must be a regular file: %s", src)
+	}
+	input, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open package file: %w", err)
+	}
+	defer func() { err = errors.Join(err, input.Close()) }()
+	output, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("create package file: %w", err)
+	}
+	defer func() { err = errors.Join(err, output.Close()) }()
+	buffer := make([]byte, 32*1024)
+	for {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		n, readErr := input.Read(buffer)
+		if n > 0 {
+			if _, err := output.Write(buffer[:n]); err != nil {
+				return fmt.Errorf("copy package file: %w", err)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read package file: %w", readErr)
+		}
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return output.Chmod(info.Mode().Perm())
 }
 
 // installFromNPM installs a package from the npm registry.
-func (m *InstallManager) installFromNPM(ctx context.Context, cfg Config) error {
-	// Parse the npm spec (without "npm:" prefix)
-	spec := strings.TrimPrefix(cfg.Source, "npm:")
-	spec = strings.TrimSpace(spec)
-	parsed := parseNpmSpec(spec)
-
-	// Determine install scope
+func (m *InstallManager) installFromNPM(ctx context.Context, cfg Config) (err error) {
+	parsed := parseNpmSpec(strings.TrimSpace(strings.TrimPrefix(cfg.Source, "npm:")))
 	scope := ScopeUser
+	base := m.userDir
 	if cfg.Project {
 		scope = ScopeProject
+		base = m.projectDir
 	}
-
-	// Check for duplicate installation
 	if !cfg.Force {
-		mgr := NewManager(m.userDir, m.projectDir)
-		if err := mgr.CheckDuplicate(parsed.Name, scope); err != nil {
+		if err := NewManager(m.userDir, m.projectDir).CheckDuplicate(parsed.Name, scope); err != nil {
 			return err
 		}
 	}
-
-	// Determine install path
-	var installBase string
-	switch scope {
-	case ScopeProject:
-		installBase = m.projectDir
-	case ScopeUser:
-		installBase = m.userDir
+	if err := validatePackageParent(base, parsed.Name); err != nil {
+		return err
 	}
-
-	// Create parent directory if needed
-	if err := os.MkdirAll(installBase, 0o700); err != nil {
-		return fmt.Errorf("create packages dir: %w", err)
+	destination := filepath.Join(base, parsed.Name)
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return fmt.Errorf("create package parent: %w", err)
 	}
-
-	// Calculate install path for the package
-	installPath := filepath.Join(installBase, parsed.Name)
-
-	// Remove existing installation if force
-	if cfg.Force {
-		if err := os.RemoveAll(installPath); err != nil {
-			return fmt.Errorf("remove existing installation: %w", err)
+	var manifest *Manifest
+	err = stagePackageExpected(ctx, destination, cfg.expected, func(staged string) error {
+		if !cfg.Force {
+			if err := NewManager(m.userDir, m.projectDir).CheckDuplicate(parsed.Name, scope); err != nil {
+				return err
+			}
 		}
+		archiveDir, err := os.MkdirTemp(filepath.Dir(staged), "archive-")
+		if err != nil {
+			return fmt.Errorf("create npm archive directory: %w", err)
+		}
+		spec := parsed.Name
+		if parsed.Version != "" {
+			spec += "@" + parsed.Version
+		}
+		archive, err := m.npmPackPackage(ctx, spec, archiveDir)
+		if err != nil {
+			return fmt.Errorf("npm pack: %w", err)
+		}
+		if err := extractNpmPackageContext(ctx, archive, staged); err != nil {
+			return err
+		}
+		data, err := os.ReadFile(filepath.Join(staged, "package.json"))
+		if err != nil {
+			return fmt.Errorf("read npm metadata: %w", err)
+		}
+		var pkg struct {
+			Name         string                     `json:"name"`
+			Version      string                     `json:"version"`
+			Dependencies map[string]json.RawMessage `json:"dependencies"`
+		}
+		if err := json.Unmarshal(data, &pkg); err != nil {
+			return fmt.Errorf("parse npm metadata: %w", err)
+		}
+		if pkg.Name != parsed.Name || pkg.Version == "" {
+			return fmt.Errorf("npm archive identity does not match requested package %q", parsed.Name)
+		}
+		if err := validateNPMVersion(parsed, pkg.Version); err != nil {
+			return err
+		}
+		if len(pkg.Dependencies) > 0 {
+			if err := m.installPiDeps(ctx, staged, nil); err != nil {
+				return fmt.Errorf("install npm dependencies: %w", err)
+			}
+		}
+		manifest, err = Load(filepath.Join(staged, "tau-package.toml"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if manifest != nil && manifest.Package.Name != parsed.Name {
+			return fmt.Errorf("native manifest identity %q does not match npm package %q", manifest.Package.Name, parsed.Name)
+		}
+		sidecar := InstallSidecar{Source: cfg.Source, Ref: pkg.Version, InstalledAt: time.Now().Format(time.RFC3339), Scope: string(scope), Pinned: parsed.Pinned}
+		return sidecar.Write(staged)
+	})
+	if err != nil {
+		return err
 	}
-
-	// Install npm package
-	installArgs := []string{"install"}
-	if parsed.Version != "" {
-		installArgs = append(installArgs, parsed.Name+"@"+parsed.Version)
-	} else {
-		installArgs = append(installArgs, parsed.Name)
-	}
-
-	if scope == ScopeUser {
-		// Global install
-		installArgs = append(installArgs, "-g")
-	} else {
-		// Project-scoped install - use prefix
-		installArgs = append(installArgs, "--prefix", installBase)
-	}
-
-	cmd := npmCommand(ctx, m.NPMCommand, installArgs...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("npm install failed: %w", err)
-	}
-
-	// Get the actual installed version for the sidecar
-	version := parsed.Version
-	if version == "" {
-		version = getInstalledNpmVersion(installPath)
-	}
-
-	// Write install sidecar
-	sidecar := InstallSidecar{
-		Source:      cfg.Source,
-		Ref:         version, // Use version as "ref" for npm packages
-		CommitSHA:   "",
-		InstalledAt: strings.TrimPrefix(installedAt(), "\n"),
-		Scope:       string(scope),
-		Pinned:      parsed.Pinned,
-	}
-	if err := sidecar.Write(installPath); err != nil {
-		return fmt.Errorf("write install sidecar: %w", err)
-	}
-
-	// The npm path has no manifest in hand; load it opportunistically so a
-	// package that ships a plugin still triggers a plugin reload.
-	manifest, _ := Load(filepath.Join(installPath, "tau-package.toml"))
 	m.notifyReloaders(ctx, parsed.Name, manifest)
-
 	return nil
 }
 
-// getInstalledNpmVersion returns the version from an installed npm package's package.json.
-func getInstalledNpmVersion(installPath string) string {
-	pkgJSONPath := filepath.Join(installPath, "package.json")
-	data, err := os.ReadFile(pkgJSONPath)
+func checkPackageSnapshot(destination string, expected *InstallSidecar) error {
+	if expected == nil {
+		return nil
+	}
+	current, err := LoadSidecar(destination)
 	if err != nil {
-		return ""
+		return fmt.Errorf("package changed during update: %w", err)
 	}
-	// Simple JSON parsing to extract version
-	var version string
-	re := regexp.MustCompile(`"version"\s*:\s*"([^"]+)"`)
-	matches := re.FindSubmatch(data)
-	if matches != nil {
-		version = string(matches[1])
+	if *current != *expected {
+		return errors.New("package changed during update")
 	}
-	return version
-}
-
-// installedAt returns the current timestamp as an ISO 8601 string.
-func installedAt() string {
-	return strings.TrimPrefix(os.Getenv("SOURCE_DATE_EPOCH"), "")
+	return nil
 }

@@ -249,6 +249,7 @@ func (c *anthropicClient) stream(ctx context.Context, model *Model, prompt *Cont
 
 	transport := c.transport.withHeaders(headers)
 	transport.timeout = o.timeout
+	transport.providerEnv = o.providerEnv
 	if baseURL := requestBaseURL(model, apiKey); baseURL != "" {
 		transport.baseURL = baseURL
 	}

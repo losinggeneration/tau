@@ -2,8 +2,10 @@ package packages
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +16,7 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParsePiPackage(t *testing.T) {
@@ -449,4 +452,106 @@ func TestGenerateManifestQuotesLaunchArguments(t *testing.T) {
 	if manifest.Run.Command != want {
 		t.Fatalf("command = %q, want %q", manifest.Run.Command, want)
 	}
+}
+
+func TestParsePiPackageRejectsEscapingName(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"../outside","version":"1","pi":{"prompts":[]}}`), 0o600))
+	_, err := ParsePiPackage(root)
+	require.Error(t, err)
+}
+
+func TestInstallPiOfflineDependenciesRetainExistingDestination(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "1")
+	source := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(source, "package.json"), []byte(`{"name":"pi-pkg","version":"1","dependencies":{"dependency":"1"},"pi":{"prompts":[]}}`), 0o600))
+	base := t.TempDir()
+	destination := filepath.Join(base, "pi-pkg")
+	require.NoError(t, os.MkdirAll(destination, 0o700))
+	sentinel := filepath.Join(destination, "sentinel")
+	require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+	manager := NewInstallManager(base, t.TempDir())
+	require.ErrorContains(t, manager.Install(t.Context(), Config{Source: source, Yes: true, Pi: true, Force: true}), "needs network")
+	require.FileExists(t, sentinel)
+}
+
+func TestFailedPiReplacementRetainsPreviousPackage(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	for _, phase := range []string{"dependencies", "shim", "node"} {
+		t.Run(phase, func(t *testing.T) {
+			source := t.TempDir()
+			dependencies := ""
+			if phase == "dependencies" {
+				dependencies = `,"dependencies":{"dependency":"1"}`
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(source, "package.json"), []byte(`{"name":"pi-pkg","version":"1","pi":{"extensions":["./ext.js"]}`+dependencies+`}`), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(source, "ext.js"), []byte("export default function() {}"), 0o600))
+			base := t.TempDir()
+			destination := filepath.Join(base, "pi-pkg")
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			sentinel := filepath.Join(destination, "old")
+			require.NoError(t, os.WriteFile(sentinel, []byte("keep"), 0o600))
+			cause := errors.New("injected setup failure")
+			manager := NewInstallManager(base, t.TempDir())
+			manager.npmInstall = func(context.Context, string, []string) error { return cause }
+			manager.ensureShim = func(context.Context, string) error {
+				if phase == "shim" {
+					return cause
+				}
+				return nil
+			}
+			manager.lookPath = func(string) (string, error) { return "", cause }
+			require.ErrorIs(t, manager.Install(t.Context(), Config{Source: source, Pi: true, Force: true, Yes: true}), cause)
+			require.FileExists(t, sentinel)
+			entries, err := packageEntriesWithoutLocks(base)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+		})
+	}
+}
+
+func TestExtractNpmPackageRejectsEscapingPathsAndRedirects(t *testing.T) {
+	for _, entry := range []string{"package/../../escape", "../escape", "/absolute", "package/redirect/escape"} {
+		t.Run(entry, func(t *testing.T) {
+			var archive bytes.Buffer
+			gz := gzip.NewWriter(&archive)
+			tw := tar.NewWriter(gz)
+			require.NoError(t, tw.WriteHeader(&tar.Header{Name: entry, Mode: 0o600, Size: 1, Typeflag: tar.TypeReg}))
+			_, err := tw.Write([]byte("x"))
+			require.NoError(t, err)
+			require.NoError(t, tw.Close())
+			require.NoError(t, gz.Close())
+			base := t.TempDir()
+			tarball := filepath.Join(base, "package.tgz")
+			require.NoError(t, os.WriteFile(tarball, archive.Bytes(), 0o600))
+			destination := filepath.Join(base, "destination")
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			outside := t.TempDir()
+			require.NoError(t, os.Symlink(outside, filepath.Join(destination, "redirect")))
+			require.Error(t, extractNpmPackage(tarball, destination))
+			require.NoFileExists(t, filepath.Join(base, "escape"))
+			require.NoFileExists(t, filepath.Join(outside, "escape"))
+		})
+	}
+}
+
+func TestPiNPMRejectsArchiveWithDifferentIdentity(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	base := filepath.Join(t.TempDir(), "packages")
+	manager := NewInstallManager(base, t.TempDir())
+	manager.npmPack = func(ctx context.Context, spec, dst string) (string, error) {
+		return writePiTarball(t, dst, `{"name":"different","version":"1","pi":{"prompts":["prompt.md"]}}`), nil
+	}
+	require.ErrorContains(t, manager.Install(t.Context(), Config{Source: "npm:requested", Pi: true, Yes: true}), "identity")
+	require.NoDirExists(t, base)
+}
+
+func TestNpmExtractionRejectsCancelledAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("npm extraction cancelled")
+	cancel(cause)
+	destination := filepath.Join(t.TempDir(), "package")
+	err := extractNpmPackageContext(ctx, "missing.tar.gz", destination)
+	require.ErrorIs(t, err, cause)
+	require.NoDirExists(t, destination)
 }

@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
+	"github.com/losinggeneration/tau/agent/plugins/state"
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/ui"
 	"github.com/stretchr/testify/assert"
@@ -136,4 +139,52 @@ func TestGetConfigSettingsOverrideRegistrationDefaults(t *testing.T) {
 	response, err = manager.host.GetConfig(ctx, &proto.GetConfigRequest{})
 	require.NoError(t, err)
 	require.JSONEq(t, `{"mode":"configured","other":false,"missing":"fallback"}`, response.Value)
+}
+
+func TestGetConfigUsesRecursivelyMergedScopeSettings(t *testing.T) {
+	user, err := ai.ParseSettings([]byte(`{"plugin":{"nested":{"user":true,"mode":"user"},"secret":"configured"}}`))
+	require.NoError(t, err)
+	project, err := ai.ParseSettings([]byte(`{"plugin":{"nested":{"mode":"project"}}}`))
+	require.NoError(t, err)
+	manager := NewManager(t.TempDir(), nil, nil)
+	manager.SetSettings(ai.MergeSettings(user, project))
+	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("tau-plugin-name", "plugin"))
+	response, err := manager.host.GetConfig(ctx, &proto.GetConfigRequest{})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"nested":{"user":true,"mode":"project"},"secret":"configured"}`, response.Value)
+	response, err = manager.host.GetConfig(ctx, &proto.GetConfigRequest{Key: "nested"})
+	require.NoError(t, err)
+	require.True(t, response.Exists)
+	require.JSONEq(t, `{"user":true,"mode":"project"}`, response.Value)
+}
+
+func TestStateStoreInitializationSharesOneWriter(t *testing.T) {
+	manager := NewManager(t.TempDir(), ui.NewNoOpUI(), nil)
+	host := NewHostService(manager)
+	const workers = 32
+	stores := make([]*state.Store, workers)
+	failures := make([]error, workers)
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	for i := range workers {
+		group.Go(func() { <-start; stores[i], failures[i] = host.getStateStore("plugin") })
+	}
+	close(start)
+	group.Wait()
+	for i := range workers {
+		require.NoError(t, failures[i])
+		require.Same(t, stores[0], stores[i])
+	}
+	for i := range workers {
+		group.Go(func() { failures[i] = stores[i].Set(strconv.Itoa(i), "value") })
+	}
+	group.Wait()
+	for _, err := range failures {
+		require.NoError(t, err)
+	}
+	reopened, err := state.NewStore(manager.stateDir, "plugin")
+	require.NoError(t, err)
+	entries, err := reopened.KVEntries()
+	require.NoError(t, err)
+	require.Len(t, entries, workers)
 }

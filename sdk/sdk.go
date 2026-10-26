@@ -787,7 +787,8 @@ type agentSession struct {
 	clientFactory func(*ai.Model) (ai.Client, error)
 	// credentialProvider resolves the active provider credential for direct SDK
 	// model calls outside the agent loop, such as compaction summarization.
-	credentialProvider func(context.Context, string) (string, error)
+	credentialProvider  func(context.Context, string) (string, error)
+	providerEnvironment func(context.Context, string) (map[string]string, error)
 	// credStore holds the session's stored credentials, whose metadata can
 	// limit the models an account offers.
 	credStore        store.CredentialStore
@@ -2330,6 +2331,15 @@ func (s *agentSession) compactionCompletionOptions(ctx context.Context, model *a
 	if providerKey == "" {
 		return opts, nil
 	}
+	if s.providerEnvironment != nil {
+		env, err := s.providerEnvironment(ctx, providerKey)
+		if err != nil {
+			return nil, err
+		}
+		if env != nil {
+			opts = append(opts, ai.WithProviderEnv(env))
+		}
+	}
 	apiKey, err := s.credentialProvider(ctx, providerKey)
 	if err != nil {
 		return nil, fmt.Errorf("summary credentials for %s: %w", providerKey, err)
@@ -2848,7 +2858,10 @@ func (s *agentSession) ReloadSystemPrompt(ctx context.Context) error {
 	if s.runDone != nil || s.agent.State().IsStreaming {
 		return errors.New("cannot reload system prompt while session is processing")
 	}
-	prompt := s.runtime.buildSystemPrompt(s.cwd, s.artifactLoader, s.systemPromptOverride, s.appendSystemPrompts, s.logger)
+	prompt, err := s.runtime.buildSystemPrompt(s.cwd, s.artifactLoader, s.systemPromptOverride, s.appendSystemPrompts)
+	if err != nil {
+		return err
+	}
 	return s.reloadSystemPromptLocked(prompt)
 }
 
@@ -5023,9 +5036,10 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 	if credStore == nil {
 		authPath := filepath.Join(paths.ConfigDir(), "auth.json")
 		fileBackend := store.NewFileBackend(authPath, store.Options{RefreshFuncs: store.OAuthProviderRefreshFuncs()})
-		if err := fileBackend.EnsureDir(); err == nil {
-			credStore = fileBackend
+		if err := fileBackend.EnsureDir(); err != nil {
+			return nil, fmt.Errorf("ensure credential directory: %w", err)
 		}
+		credStore = fileBackend
 	}
 
 	r := &runtime{
@@ -5046,7 +5060,7 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 		provider:         opts.Provider,
 		apiKey:           opts.APIKey,
 		thinkingLevel:    opts.ThinkingLevel,
-		preloadSkills:    opts.PreloadSkills,
+		preloadSkills:    slices.Clone(opts.PreloadSkills),
 		logger:           logging.OrDiscard(opts.Logger),
 		openSessions:     make(map[string]struct{}),
 	}
@@ -5532,7 +5546,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	}
 
 	credentialProvider := func(ctx context.Context, provider string) (string, error) {
-		if err := ctx.Err(); err != nil {
+		if err := context.Cause(ctx); err != nil {
 			return "", err
 		}
 		providerKey := provider
@@ -5548,12 +5562,14 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 			return r.apiKey, nil
 		}
 
+		var scopedEnv map[string]string
 		if credStore != nil {
 			cred, err := credStore.Get(ctx, providerKey)
 			if err != nil && !errors.Is(err, ai.ErrCredentialNotFound) {
 				return "", fmt.Errorf("get credentials for %s: %w", providerKey, err)
 			}
 			if err == nil {
+				scopedEnv = cred.Env
 				if cred.NeedsReauth {
 					return "", ai.ErrCredentialNeedsReauth{Provider: providerKey}
 				}
@@ -5567,17 +5583,17 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 			}
 		}
 
-		if key, err := r.modelRegistry.ResolveAPIKey(ctx, providerKey); err != nil {
+		if key, err := r.modelRegistry.ResolveAPIKeyWithEnv(ctx, providerKey, scopedEnv); err != nil {
 			return "", err
 		} else if key != "" {
 			return key, nil
 		}
 
 		if !r.noEnvCredentials {
-			if len(ai.GetEnvHeaders(providerKey)) != 0 {
+			if len(ai.ProviderEnvHeaders(providerKey, scopedEnv)) != 0 {
 				return "", nil
 			}
-			if envAPIKey := ai.GetEnvAPIKey(providerKey); envAPIKey != "" {
+			if envAPIKey := ai.ProviderEnvAPIKey(providerKey, scopedEnv); envAPIKey != "" {
 				envOverrideLoggedOncePtr.Do(func() {
 					sessionLogger.Info("NOTICE: using API key from environment", "provider", providerKey)
 				})
@@ -5586,6 +5602,29 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		}
 
 		return "", nil
+	}
+
+	providerEnvironment := func(ctx context.Context, provider string) (map[string]string, error) {
+		if err := context.Cause(ctx); err != nil {
+			return nil, err
+		}
+		if r.apiKey != "" || credStore == nil {
+			return nil, nil
+		}
+		if provider == "" {
+			provider = sessionProviderKey
+		}
+		cred, err := credStore.Get(ctx, provider)
+		if errors.Is(err, ai.ErrCredentialNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get provider environment for %s: %w", provider, err)
+		}
+		if cred.NeedsReauth {
+			return nil, ai.ErrCredentialNeedsReauth{Provider: provider}
+		}
+		return maps.Clone(cred.Env), nil
 	}
 
 	clientFactory := func(m *ai.Model) (ai.Client, error) {
@@ -5638,6 +5677,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		agent.WithTransport(transport),
 		agent.WithClientFactory(clientFactory),
 		agent.WithAPIKeyProvider(credentialProvider),
+		agent.WithProviderEnvironment(providerEnvironment),
 	)
 
 	// Honor the thinking level from SessionOptions or RuntimeOptions if set.
@@ -5708,7 +5748,11 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		loader = GlobalArtifactLoader
 	}
 
-	agentCfg.SystemPrompt = r.buildSystemPrompt(cwd, loader, opts.SystemPrompt, opts.AppendSystemPrompts, sessionLogger)
+	resolvedPrompt, promptErr := r.buildSystemPrompt(cwd, loader, opts.SystemPrompt, opts.AppendSystemPrompts)
+	if promptErr != nil {
+		return nil, fmt.Errorf("build system prompt: %w", promptErr)
+	}
+	agentCfg.SystemPrompt = resolvedPrompt
 
 	sessionID := opts.SessionID
 	requestedSessionID := opts.SessionID
@@ -6144,16 +6188,17 @@ agentCreation:
 		runtime:                     r,
 		clientFactory:               clientFactory,
 		credentialProvider:          credentialProvider,
+		providerEnvironment:         providerEnvironment,
 		credStore:                   credStore,
 		artifactLoader:              loader,
 		sessionStartReason:          sessionStartReason,
 		previousSessionFile:         previousSessionFile,
 		thinkingLevel:               agent.ThinkingLevel(sessionThinkingLevel),
 		systemPromptOverride:        opts.SystemPrompt,
-		appendSystemPrompts:         opts.AppendSystemPrompts,
+		appendSystemPrompts:         slices.Clone(opts.AppendSystemPrompts),
 		toolAllowlist:               slices.Clone(opts.ToolAllowlist),
 		defaultToolNames:            resolveDefaultToolSelection(settings),
-		toolDenylist:                opts.ToolDenylist,
+		toolDenylist:                slices.Clone(opts.ToolDenylist),
 		approveProjectFiles:         opts.ApproveProjectFiles,
 		sessionFileBeforeRename:     newSessionFilePath,
 		pendingHeader:               pendingHeader,
@@ -6445,7 +6490,13 @@ func loadContextFileFromDir(dir string, errs *[]error) (contextFile, bool) {
 	for _, name := range []string{"AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"} {
 		path := filepath.Join(dir, name)
 		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() {
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				*errs = append(*errs, fmt.Errorf("stat context file %s: %w", path, err))
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
 			continue
 		}
 		data, err := os.ReadFile(path)
@@ -6483,9 +6534,14 @@ func findShadowedContextFile(cwd string, errs *[]error) string {
 func findGitPaths(cwd string, errs *[]error) (repoDir, commonGitDir string, ok bool) {
 	for dir := cwd; ; {
 		gitPath := filepath.Join(dir, ".git")
-		if info, err := os.Stat(gitPath); err == nil {
+		info, statErr := os.Stat(gitPath)
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			*errs = append(*errs, fmt.Errorf("stat %s: %w", gitPath, statErr))
+			return "", "", false
+		}
+		if statErr == nil {
 			if info.IsDir() {
-				return dir, gitPath, pathExists(filepath.Join(gitPath, "HEAD"))
+				return dir, gitPath, contextGitHeadExists(gitPath, errs)
 			}
 			data, err := os.ReadFile(gitPath)
 			if err != nil {
@@ -6500,7 +6556,7 @@ func findGitPaths(cwd string, errs *[]error) (repoDir, commonGitDir string, ok b
 			if !filepath.IsAbs(gitDir) {
 				gitDir = filepath.Join(dir, gitDir)
 			}
-			if !pathExists(filepath.Join(gitDir, "HEAD")) {
+			if !contextGitHeadExists(gitDir, errs) {
 				return "", "", false
 			}
 			commonGitDir = gitDir
@@ -6509,6 +6565,9 @@ func findGitPaths(cwd string, errs *[]error) (repoDir, commonGitDir string, ok b
 				if !filepath.IsAbs(commonGitDir) {
 					commonGitDir = filepath.Join(gitDir, commonGitDir)
 				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				*errs = append(*errs, fmt.Errorf("read %s: %w", filepath.Join(gitDir, "commondir"), err))
+				return "", "", false
 			}
 			return dir, commonGitDir, true
 		}
@@ -6520,8 +6579,12 @@ func findGitPaths(cwd string, errs *[]error) (repoDir, commonGitDir string, ok b
 	}
 }
 
-func pathExists(path string) bool {
+func contextGitHeadExists(gitDir string, errs *[]error) bool {
+	path := filepath.Join(gitDir, "HEAD")
 	_, err := os.Stat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		*errs = append(*errs, fmt.Errorf("stat %s: %w", path, err))
+	}
 	return err == nil
 }
 
@@ -6535,20 +6598,20 @@ func canonicalPath(path string) string {
 // buildSystemPrompt resolves the session system prompt from SYSTEM.md, the
 // context files, the skills catalog, preloaded skills, APPEND_SYSTEM.md, and
 // the explicit overrides, reading every source from disk on each call.
-func (r *runtime) buildSystemPrompt(cwd string, loader ArtifactLoader, override string, appends []string, logger *slog.Logger) string {
+func (r *runtime) buildSystemPrompt(cwd string, loader ArtifactLoader, override string, appends []string) (string, error) {
 	var skills *artifacts.SkillRegistry
 	if loader != nil {
 		skills = loader.SkillRegistry()
 	}
-	return r.buildSystemPromptWithSkills(cwd, skills, override, appends, logger)
+	return r.buildSystemPromptWithSkills(cwd, skills, override, appends)
 }
 
-func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.SkillRegistry, override string, appends []string, logger *slog.Logger) string {
+func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.SkillRegistry, override string, appends []string) (string, error) {
 	addendumParts := []string{fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd)}
 	if !r.noContextFiles {
 		contextAddendum, err := buildContextFileAddendum(paths.ConfigDir(), cwd)
 		if err != nil {
-			logger.Warn("context files", "error", err)
+			return "", fmt.Errorf("load context files: %w", err)
 		}
 		if contextAddendum != "" {
 			addendumParts = append(addendumParts, contextAddendum)
@@ -6564,7 +6627,11 @@ func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.Skil
 			}
 		}
 	}
-	if appendSys, err := loadAppendSystemPrompt(paths.ConfigDir(), cwd); err == nil && appendSys != "" {
+	appendSys, err := loadAppendSystemPrompt(paths.ConfigDir(), cwd)
+	if err != nil {
+		return "", err
+	}
+	if appendSys != "" {
 		addendumParts = append(addendumParts, appendSys)
 	}
 	for _, p := range appends {
@@ -6574,7 +6641,11 @@ func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.Skil
 	}
 
 	var prompt string
-	if sys, err := loadSystemPrompt(paths.ConfigDir(), cwd); err == nil && sys != "" {
+	sys, err := loadSystemPrompt(paths.ConfigDir(), cwd)
+	if err != nil {
+		return "", err
+	}
+	if sys != "" {
 		prompt = sys
 	}
 	if override != "" {
@@ -6583,7 +6654,7 @@ func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.Skil
 	if prompt != "" {
 		prompt += "\n\n"
 	}
-	return prompt + strings.Join(addendumParts, "\n\n")
+	return prompt + strings.Join(addendumParts, "\n\n"), nil
 }
 
 // loadSystemPrompt reads SYSTEM.md from <cwd>/.tau first, then
@@ -6600,7 +6671,7 @@ func loadSystemPrompt(homeDir, cwd string) (body string, err error) {
 	for _, path := range candidates {
 		data, readErr := os.ReadFile(path)
 		if readErr == nil {
-			return string(data), nil
+			return strings.TrimPrefix(string(data), "\ufeff"), nil
 		}
 		if !os.IsNotExist(readErr) {
 			return "", fmt.Errorf("read %s: %w", path, readErr)
@@ -6622,7 +6693,7 @@ func loadAppendSystemPrompt(homeDir, cwd string) (string, error) {
 	for _, path := range candidates {
 		data, readErr := os.ReadFile(path)
 		if readErr == nil {
-			return string(data), nil
+			return strings.TrimPrefix(string(data), "\ufeff"), nil
 		}
 		if !os.IsNotExist(readErr) {
 			return "", fmt.Errorf("read %s: %w", path, readErr)
@@ -7057,7 +7128,10 @@ func (s *agentSession) ReloadResources(ctx context.Context, settings *ai.Setting
 	} else if s.artifactLoader != nil {
 		skills = s.artifactLoader.SkillRegistry()
 	}
-	prompt := s.runtime.buildSystemPromptWithSkills(s.cwd, skills, s.systemPromptOverride, s.appendSystemPrompts, s.logger)
+	prompt, err := s.runtime.buildSystemPromptWithSkills(s.cwd, skills, s.systemPromptOverride, s.appendSystemPrompts)
+	if err != nil {
+		return err
+	}
 	admitted := false
 	admit := func() error {
 		if err := context.Cause(ctx); err != nil {

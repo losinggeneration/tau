@@ -467,6 +467,9 @@ func extractSimpleStreamOptions(opts []ai.Option) map[string]any {
 	simpleOpts := ai.ExtractSimpleStreamOptions(opts)
 
 	options := make(map[string]any)
+	if simpleOpts.Env != nil {
+		options["env"] = simpleOpts.Env
+	}
 	if simpleOpts.CacheRetention != "" {
 		options["cacheRetention"] = simpleOpts.CacheRetention
 	}

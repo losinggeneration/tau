@@ -856,10 +856,10 @@ func TestSessionSettingsDriveStartupAndSuccessfulReload(t *testing.T) {
 	t.Cleanup(func() { _ = a.chat.Close() })
 	assert.True(t, a.hideSkillCommands, "startup ignored merged session settings")
 
-	sess.settings = &ai.Settings{}
 	a.conversationEvents = newConversationEventAdapter(a)
 	a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "output": "boom", "is_error": true}})
-	assert.True(t, a.hideSkillCommands, "failed reload reapplied settings")
+	assert.True(t, a.hideSkillCommands, "rejected reload changed settings")
+	sess.settings = &ai.Settings{}
 	a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "output": "reloaded"}})
 	assert.False(t, a.hideSkillCommands, "successful reload did not reapply settings")
 	a.chat.mu.Lock()
@@ -1086,11 +1086,11 @@ func TestWheelSettingsReloadThroughToolkit(t *testing.T) {
 				switch phase {
 				case 0:
 					assert.Equal(t, before+6, position())
-					sess.settings, err = ai.ParseSettings([]byte(fmt.Sprintf(`{"fullscreenWheelScrollLines":2,"layoutMode":%q}`, mode)))
-					require.NoError(t, err)
 					a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "is_error": true}})
 				case 1:
 					assert.Equal(t, before+6, position(), "failed reload changed wheel count")
+					sess.settings, err = ai.ParseSettings([]byte(fmt.Sprintf(`{"fullscreenWheelScrollLines":2,"layoutMode":%q}`, mode)))
+					require.NoError(t, err)
 					a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload"}})
 				case 2:
 					assert.Equal(t, before+20, position(), "Alt or reload applied twice")
@@ -1157,4 +1157,22 @@ func TestPausedEventShowsPauseUntilResponseStarts(t *testing.T) {
 	if got := a.workingMessage(); got != defaultWorkingMessage {
 		t.Fatalf("workingMessage after resume = %q, want %q", got, defaultWorkingMessage)
 	}
+}
+
+func TestReloadCleanupFailureAppliesAdmittedSessionSettings(t *testing.T) {
+	startup, err := ai.ParseSettings([]byte(`{"hideThinkingBlock":true,"enableSkillCommands":false}`))
+	require.NoError(t, err)
+	sess := &settingsSession{fakeSession: &fakeSession{}, settings: startup}
+	app, err := New(Options{Session: sess})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, app.chat.Close()) })
+	require.True(t, app.hideSkillCommands)
+	sess.settings = &ai.Settings{}
+	app.conversationEvents = newConversationEventAdapter(app)
+	app.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "output": "old plugin cleanup failed", "is_error": true}})
+	require.False(t, app.hideSkillCommands)
+	app.chat.mu.Lock()
+	hidden := app.chat.hideThinkingBlock
+	app.chat.mu.Unlock()
+	require.False(t, hidden)
 }

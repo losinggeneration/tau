@@ -410,7 +410,7 @@ func classifySystemOne(ctx context.Context, model *Model, input ClassifierContex
 	}
 	request := map[string]any{"state": input.State, "questions": questions}
 	payload := map[string]any{"model": model.ID}
-	baseURL, err := expandBaseURL(strings.TrimRight(model.BaseURL, "/"))
+	baseURL, err := expandBaseURLWithEnv(strings.TrimRight(model.BaseURL, "/"), cfg.providerEnvValue)
 	if err != nil {
 		return nil, err
 	}

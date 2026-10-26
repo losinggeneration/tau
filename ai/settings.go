@@ -832,7 +832,7 @@ func MergeSettingsInternal(user, project *Settings) *Settings {
 
 // MergeSettings deep-merges project over user settings. Project scalars
 // override when non-zero. Project lists replace (no concat — Pi semantics).
-// Embedded groups merge per-field; project nil json.RawMessage within Plugins
+// Objects merge recursively; project nil json.RawMessage within Plugins
 // signals explicit removal.
 func MergeSettings(user, project *Settings) *Settings {
 	if user == nil {
@@ -992,7 +992,7 @@ func MergeSettings(user, project *Settings) *Settings {
 	out.BranchSummary = mergeBranchSummary(user.BranchSummary, project.BranchSummary)
 	out.Models = mergeModelSettingsMap(user.Models, project.Models)
 
-	// Plugins: project shadows user per-key. nil raw value = explicit removal.
+	// Plugin objects merge recursively. A nil raw value explicitly removes a key.
 	out.Plugins = make(map[string]json.RawMessage, len(user.Plugins)+len(project.Plugins))
 	for k, v := range user.Plugins {
 		out.Plugins[k] = slices.Clone(v)
@@ -1001,7 +1001,7 @@ func MergeSettings(user, project *Settings) *Settings {
 		if v == nil {
 			delete(out.Plugins, k)
 		} else {
-			out.Plugins[k] = slices.Clone(v)
+			out.Plugins[k] = mergeSettingsValue(user.Plugins[k], v)
 		}
 	}
 	return &out
@@ -1320,9 +1320,20 @@ func mergeSettingsPresence(base, override map[string]json.RawMessage) map[string
 		out[key] = slices.Clone(value)
 	}
 	for key, value := range override {
-		out[key] = slices.Clone(value)
+		out[key] = mergeSettingsValue(base[key], value)
 	}
 	return out
+}
+
+func mergeSettingsValue(base, override json.RawMessage) json.RawMessage {
+	if bytes.HasPrefix(bytes.TrimSpace(base), []byte("{")) && bytes.HasPrefix(bytes.TrimSpace(override), []byte("{")) {
+		merged, err := mergeSettingsJSON(base, override)
+		if err == nil {
+			return merged
+		}
+		// Keep malformed programmatic overrides visible to serialization validation.
+	}
+	return slices.Clone(override)
 }
 
 func marshalPresentSettings(value any, present map[string]json.RawMessage) ([]byte, error) {

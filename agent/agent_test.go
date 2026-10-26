@@ -3782,3 +3782,23 @@ func TestListenerPanicOnIdleAppendReturnsError(t *testing.T) {
 	assert.ErrorContains(t, err, "listener broke")
 	assert.Len(t, a.State().Messages, 1)
 }
+
+func TestProviderEnvironmentFailureRejectsRequest(t *testing.T) {
+	cause := errors.New("scoped credential rejected")
+	requests := 0
+	a, err := New(Config{
+		Model:       &ai.Model{ID: "test", Provider: "test"},
+		ProviderEnv: func(context.Context, string) (map[string]string, error) { return nil, cause },
+		ClientFactory: func(*ai.Model) (ai.Client, error) {
+			return stubClient{stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+				requests++
+				handler(ctx, ai.Done{Message: ai.AssistantMessage{Role: "assistant", StopReason: ai.StopReasonStop}})
+				return nil
+			}}, nil
+		},
+	})
+	require.NoError(t, err)
+	err = a.Prompt(t.Context(), NewUserMessage("hello"))
+	require.ErrorIs(t, err, cause)
+	require.Zero(t, requests)
+}

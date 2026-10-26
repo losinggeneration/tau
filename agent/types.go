@@ -176,6 +176,7 @@ type Config struct {
 	ThinkingLevel   ThinkingLevel
 	StreamHandler   StreamHandler
 	APIKeyProvider  APIKeyProvider
+	ProviderEnv     func(context.Context, string) (map[string]string, error)
 	ClientFactory   ClientFactory
 	StreamFn        StreamFunc
 
@@ -659,7 +660,8 @@ type AgentLoopConfig struct {
 	// Resolves API key dynamically for each LLM call.
 	// Important for short-lived OAuth tokens that may expire during tool execution.
 	// Return nil when no key is available.
-	GetAPIKey func(ctx context.Context, provider string) (string, error)
+	GetAPIKey   func(ctx context.Context, provider string) (string, error)
+	ProviderEnv func(context.Context, string) (map[string]string, error)
 
 	// Optional custom client factory. When nil, ai.GetClient is used.
 	ClientFactory ClientFactory

@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -510,6 +509,7 @@ func GetClient(model *Model) (Client, error) {
 
 // HTTPTransport is an HTTP transport for making API requests.
 type HTTPTransport struct {
+	providerEnv  map[string]string
 	httpClient   *http.Client
 	baseURL      string
 	headers      http.Header
@@ -591,7 +591,7 @@ func (t *HTTPTransport) Do(ctx context.Context, method, path string, body any) (
 		}
 	}
 
-	baseURL, err := expandBaseURL(t.baseURL)
+	baseURL, err := expandBaseURLWithEnv(t.baseURL, (&options{providerEnv: t.providerEnv}).providerEnvValue)
 	if err != nil {
 		return nil, err
 	}
@@ -668,13 +668,13 @@ func responseMetadata(resp *http.Response) ProviderResponse {
 
 // expandBaseURL fills the Cloudflare account and gateway placeholders that
 // catalog base URLs carry from the environment.
-func expandBaseURL(baseURL string) (string, error) {
+func expandBaseURLWithEnv(baseURL string, lookup func(string) string) (string, error) {
 	for _, name := range []string{"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"} {
 		placeholder := "{" + name + "}"
 		if !strings.Contains(baseURL, placeholder) {
 			continue
 		}
-		value := strings.TrimSpace(os.Getenv(name))
+		value := strings.TrimSpace(lookup(name))
 		if value == "" {
 			return "", fmt.Errorf("base URL %s requires %s", baseURL, name)
 		}

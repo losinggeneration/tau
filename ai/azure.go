@@ -10,7 +10,6 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 )
 
@@ -157,7 +156,7 @@ func resolveAzureConfig(model *Model, o *options) (baseURL, apiVersion, deployme
 	if o != nil && strings.TrimSpace(o.azureAPIVersion) != "" {
 		apiVersion = strings.TrimSpace(o.azureAPIVersion)
 	} else {
-		apiVersion = strings.TrimSpace(os.Getenv("AZURE_OPENAI_API_VERSION"))
+		apiVersion = strings.TrimSpace(o.providerEnvValue("AZURE_OPENAI_API_VERSION"))
 	}
 	if apiVersion == "" {
 		apiVersion = azureAPIVersion
@@ -166,10 +165,10 @@ func resolveAzureConfig(model *Model, o *options) (baseURL, apiVersion, deployme
 	if o != nil && strings.TrimSpace(o.azureBaseURL) != "" {
 		baseURL = strings.TrimSpace(o.azureBaseURL)
 	} else {
-		baseURL = strings.TrimSpace(os.Getenv("AZURE_OPENAI_BASE_URL"))
+		baseURL = strings.TrimSpace(o.providerEnvValue("AZURE_OPENAI_BASE_URL"))
 	}
 
-	resourceName := strings.TrimSpace(os.Getenv("AZURE_OPENAI_RESOURCE_NAME"))
+	resourceName := strings.TrimSpace(o.providerEnvValue("AZURE_OPENAI_RESOURCE_NAME"))
 	if o != nil && strings.TrimSpace(o.azureResourceName) != "" {
 		resourceName = strings.TrimSpace(o.azureResourceName)
 	}
@@ -190,7 +189,7 @@ func resolveAzureConfig(model *Model, o *options) (baseURL, apiVersion, deployme
 		deploymentName = strings.TrimSpace(o.azureDeploymentName)
 	}
 	if deploymentName == "" {
-		deploymentName = parseAzureDeploymentNameMap(os.Getenv("AZURE_OPENAI_DEPLOYMENT_NAME_MAP"))[model.ID]
+		deploymentName = parseAzureDeploymentNameMap(o.providerEnvValue("AZURE_OPENAI_DEPLOYMENT_NAME_MAP"))[model.ID]
 	}
 	if deploymentName == "" {
 		deploymentName = model.ID

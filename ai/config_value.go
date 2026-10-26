@@ -57,7 +57,7 @@ func (r *configValueResolver) resolve(ctx context.Context, value string) (string
 }
 
 func (r *configValueResolver) resolveWithEnv(ctx context.Context, value string, env map[string]string) (string, error) {
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return "", err
 	}
 	if command, ok := strings.CutPrefix(value, "!"); ok {
@@ -94,13 +94,19 @@ func (r *configValueResolver) resolveWithEnv(ctx context.Context, value string, 
 }
 
 func (r *configValueResolver) command(ctx context.Context, command string) (string, error) {
+	if err := context.Cause(ctx); err != nil {
+		return "", err
+	}
 	r.mu.Lock()
 	if cached, ok := r.commands[command]; ok {
 		r.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", context.Cause(ctx)
 		case <-cached.done:
+			if err := context.Cause(ctx); err != nil {
+				return "", errors.Join(err, cached.err)
+			}
 			return cached.value, cached.err
 		}
 	}
@@ -116,8 +122,8 @@ func (r *configValueResolver) command(ctx context.Context, command string) (stri
 	}
 	commandCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	value, err := execute(commandCtx, command)
-	if commandCtx.Err() != nil {
-		err = errors.Join(commandCtx.Err(), err)
+	if cause := context.Cause(commandCtx); cause != nil {
+		err = errors.Join(cause, err)
 	}
 	cancel()
 	value = strings.TrimSpace(value)
@@ -141,13 +147,16 @@ func (r *configValueResolver) command(ctx context.Context, command string) (stri
 	return value, err
 }
 
-type configOutput struct{ strings.Builder }
+type configOutput struct{ buffer strings.Builder }
+
+func (b *configOutput) Len() int       { return b.buffer.Len() }
+func (b *configOutput) String() string { return b.buffer.String() }
 
 func (b *configOutput) Write(p []byte) (int, error) {
 	if len(p) > configCommandOutputLimit-b.Len() {
 		return 0, errors.New("configuration command output exceeded limit")
 	}
-	return b.Builder.Write(p)
+	return b.buffer.Write(p)
 }
 
 func executeConfigCommand(ctx context.Context, command string) (string, error) {
@@ -192,7 +201,7 @@ func resolveRequestOptions(ctx context.Context, model *Model, opts []Option) ([]
 	key := o.apiKey
 	if key == "" && cfg != nil && cfg.apiKey != "" {
 		var err error
-		key, err = cfg.resolver.resolve(ctx, cfg.apiKey)
+		key, err = cfg.resolver.resolveWithEnv(ctx, cfg.apiKey, o.providerEnv)
 		if err != nil {
 			return nil, fmt.Errorf("provider %s API key: %w", model.Provider, err)
 		}
@@ -201,7 +210,7 @@ func resolveRequestOptions(ctx context.Context, model *Model, opts []Option) ([]
 	for name, value := range model.Headers {
 		if cfg != nil {
 			var err error
-			value, err = cfg.resolver.resolve(ctx, value)
+			value, err = cfg.resolver.resolveWithEnv(ctx, value, o.providerEnv)
 			if err != nil {
 				return nil, fmt.Errorf("provider %s configured header: %w", model.Provider, err)
 			}

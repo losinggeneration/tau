@@ -114,6 +114,7 @@ func (t *HTTPTransport) withRequestOptions(model *Model, o *options) *HTTPTransp
 		clone.refreshCreds, clone.provider = o.transportOpts.RefreshCreds, o.transportOpts.Provider
 	}
 	clone.timeout = o.timeout
+	clone.providerEnv = o.providerEnv
 
 	return clone
 }

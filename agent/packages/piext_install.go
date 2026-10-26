@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,7 +38,7 @@ func (m *InstallManager) installPiFromGitDir(ctx context.Context, cfg Config, di
 	return m.installPiFromDir(ctx, cfg, dir, sidecar)
 }
 
-func (m *InstallManager) installPiFromNPM(ctx context.Context, cfg Config) error {
+func (m *InstallManager) installPiFromNPM(ctx context.Context, cfg Config) (err error) {
 	if IsOfflineMode() {
 		return fmt.Errorf("tau install --pi needs network; re-run online")
 	}
@@ -46,7 +47,7 @@ func (m *InstallManager) installPiFromNPM(ctx context.Context, cfg Config) error
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { err = errors.Join(err, os.RemoveAll(tmpDir)) }()
 
 	spec := parseNpmSpec(strings.TrimSpace(strings.TrimPrefix(cfg.Source, "npm:")))
 	pkgSpec := spec.Name
@@ -58,10 +59,20 @@ func (m *InstallManager) installPiFromNPM(ctx context.Context, cfg Config) error
 		return fmt.Errorf("npm pack: %w", err)
 	}
 	extractDir := filepath.Join(tmpDir, "package")
-	if err := extractNpmPackage(tarball, extractDir); err != nil {
+	if err := extractNpmPackageContext(ctx, tarball, extractDir); err != nil {
 		return fmt.Errorf("extract npm package: %w", err)
 	}
 
+	pkg, err := ParsePiPackage(extractDir)
+	if err != nil {
+		return err
+	}
+	if pkg.Name != spec.Name {
+		return fmt.Errorf("npm archive identity does not match requested package %q", spec.Name)
+	}
+	if err := validateNPMVersion(spec, pkg.Version); err != nil {
+		return err
+	}
 	sidecar := InstallSidecar{
 		Source:      cfg.Source,
 		InstalledAt: time.Now().Format(time.RFC3339),
@@ -75,6 +86,9 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 	pkg, err := ParsePiPackage(sourceDir)
 	if err != nil {
 		return fmt.Errorf("load pi package metadata from %s: %w", sourceDir, err)
+	}
+	if pkg.HasDeps && IsOfflineMode() {
+		return fmt.Errorf("tau install --pi needs network; re-run online")
 	}
 	manifest := piManifestForPrompt(pkg)
 
@@ -102,70 +116,85 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 		return fmt.Errorf("install declined")
 	}
 
+	if err := validatePackageParent(installBase, pkg.Name); err != nil {
+		return err
+	}
 	installPath := filepath.Join(installBase, pkg.Name)
+	if err := validateLocalReplacement(sourceDir, installPath); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(installPath), 0o700); err != nil {
 		return fmt.Errorf("create packages dir: %w", err)
 	}
-	if cfg.Force {
-		if err := os.RemoveAll(installPath); err != nil {
-			return fmt.Errorf("remove existing installation: %w", err)
+	var loaded *Manifest
+	err = stagePackageExpected(ctx, installPath, cfg.expected, func(staged string) error {
+		if err := validatePackageParent(installBase, pkg.Name); err != nil {
+			return err
 		}
-	}
-	if cfg.Link && sourceDir == cfg.Source {
-		if err := os.Remove(installPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove existing symlink: %w", err)
+		if err := validateLocalReplacement(sourceDir, installPath); err != nil {
+			return err
 		}
-		if err := os.Symlink(cfg.Source, installPath); err != nil {
-			return fmt.Errorf("create symlink: %w", err)
+		if !cfg.Force {
+			if err := NewManager(m.userDir, m.projectDir).CheckDuplicate(pkg.Name, scope); err != nil {
+				return err
+			}
 		}
-	} else if err := copyDir(sourceDir, installPath); err != nil {
-		return fmt.Errorf("copy package: %w", err)
-	}
+		if cfg.Link && sourceDir == cfg.Source {
+			if err := os.Symlink(cfg.Source, staged); err != nil {
+				return fmt.Errorf("create symlink: %w", err)
+			}
+		} else if err := copyDirContext(ctx, sourceDir, staged); err != nil {
+			return fmt.Errorf("copy package: %w", err)
+		}
 
-	if pkg.HasDeps {
-		if IsOfflineMode() {
-			return fmt.Errorf("tau install --pi needs network; re-run online")
+		if pkg.HasDeps {
+			if err := m.installPiDeps(ctx, staged, pkg.PeerDeps); err != nil {
+				return fmt.Errorf("install pi package dependencies: %w", err)
+			}
 		}
-		if err := m.installPiDeps(ctx, installPath, pkg.PeerDeps); err != nil {
-			return fmt.Errorf("install pi package dependencies: %w", err)
-		}
-	}
 
-	var shimDir, nodeBin string
-	if len(pkg.Extensions) > 0 {
-		shimDir = filepath.Join(filepath.Dir(m.userDir), "pi-ext-shim")
-		if err := m.ensurePiShim(ctx, shimDir); err != nil {
-			return fmt.Errorf("ensure pi-ext-shim: %w", err)
+		var shimDir, nodeBin string
+		if len(pkg.Extensions) > 0 {
+			shimDir = filepath.Join(filepath.Dir(m.userDir), "pi-ext-shim")
+			if err := m.ensurePiShim(ctx, shimDir); err != nil {
+				return fmt.Errorf("ensure pi-ext-shim: %w", err)
+			}
+			nodeBin, err = m.findNode()
+			if err != nil {
+				return fmt.Errorf("find node: %w", err)
+			}
 		}
-		nodeBin, err = m.findNode()
+		manifestBytes, err := GenerateManifest(pkg, shimDir, nodeBin)
 		if err != nil {
-			return fmt.Errorf("find node: %w", err)
+			return fmt.Errorf("generate manifest: %w", err)
 		}
-	}
-	manifestBytes, err := GenerateManifest(pkg, shimDir, nodeBin)
+		if err := os.WriteFile(filepath.Join(staged, "tau-package.toml"), manifestBytes, 0o600); err != nil {
+			return fmt.Errorf("write generated manifest: %w", err)
+		}
+
+		if sidecar.InstalledAt == "" {
+			sidecar.InstalledAt = time.Now().Format(time.RFC3339)
+		}
+		if sidecar.Ref == "" && strings.HasPrefix(sidecar.Source, "npm:") {
+			sidecar.Ref = pkg.Version
+		}
+		sidecar.Scope = string(scope)
+		sidecar.Pi = true
+		if err := sidecar.Write(staged); err != nil {
+			return fmt.Errorf("write install sidecar: %w", err)
+		}
+
+		var loadErr error
+		loaded, loadErr = Load(filepath.Join(staged, "tau-package.toml"))
+		if loadErr != nil {
+			return fmt.Errorf("load generated manifest: %w", loadErr)
+		}
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("generate manifest: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(installPath, "tau-package.toml"), manifestBytes, 0o600); err != nil {
-		return fmt.Errorf("write generated manifest: %w", err)
+		return err
 	}
 
-	if sidecar.InstalledAt == "" {
-		sidecar.InstalledAt = time.Now().Format(time.RFC3339)
-	}
-	if sidecar.Ref == "" && strings.HasPrefix(sidecar.Source, "npm:") {
-		sidecar.Ref = pkg.Version
-	}
-	sidecar.Scope = string(scope)
-	sidecar.Pi = true
-	if err := sidecar.Write(installPath); err != nil {
-		return fmt.Errorf("write install sidecar: %w", err)
-	}
-
-	loaded, err := Load(filepath.Join(installPath, "tau-package.toml"))
-	if err != nil {
-		return fmt.Errorf("load generated manifest: %w", err)
-	}
 	m.notifyReloaders(ctx, pkg.Name, loaded)
 	return nil
 }
@@ -226,20 +255,38 @@ func (m *InstallManager) npmPackPackage(ctx context.Context, spec, dst string) (
 }
 
 func extractNpmPackage(tarball, dst string) error {
+	return extractNpmPackageContext(context.Background(), tarball, dst)
+}
+
+func extractNpmPackageContext(ctx context.Context, tarball, dst string) (err error) {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return fmt.Errorf("create npm package root: %w", err)
+	}
+	root, err := os.OpenRoot(dst)
+	if err != nil {
+		return fmt.Errorf("open npm package root: %w", err)
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
 	file, err := os.Open(tarball)
 	if err != nil {
 		return fmt.Errorf("open tarball: %w", err)
 	}
-	defer func() { _ = file.Close() }()
+	defer func() { err = errors.Join(err, file.Close()) }()
 
 	gz, err := gzip.NewReader(file)
 	if err != nil {
 		return fmt.Errorf("read gzip: %w", err)
 	}
-	defer func() { _ = gz.Close() }()
+	defer func() { err = errors.Join(err, gz.Close()) }()
 
 	tr := tar.NewReader(gz)
 	for {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -248,27 +295,30 @@ func extractNpmPackage(tarball, dst string) error {
 			return fmt.Errorf("read tar: %w", err)
 		}
 		rel := strings.TrimPrefix(filepath.Clean(filepath.FromSlash(hdr.Name)), "package"+string(os.PathSeparator))
-		if rel == "." || rel == "" || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		if !filepath.IsLocal(rel) {
+			return fmt.Errorf("npm archive path escapes package: %q", hdr.Name)
+		}
+		if rel == "." {
 			continue
 		}
-		path := filepath.Join(dst, rel)
+		path := rel
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(path, 0o700); err != nil {
+			if err := root.MkdirAll(path, 0o700); err != nil {
 				return fmt.Errorf("create tar dir: %w", err)
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			if err := root.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 				return fmt.Errorf("create tar file dir: %w", err)
 			}
-			out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			out, err := root.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
 			if err != nil {
 				return fmt.Errorf("create tar file: %w", err)
 			}
-			if _, err := io.Copy(out, tr); err != nil {
+			if _, err := io.Copy(out, archiveContextReader{ctx: ctx, reader: tr}); err != nil {
 				closeErr := out.Close()
 				if closeErr != nil {
-					return fmt.Errorf("copy tar file: %w; close: %v", err, closeErr)
+					return fmt.Errorf("copy tar file: %w", errors.Join(err, closeErr))
 				}
 				return fmt.Errorf("copy tar file: %w", err)
 			}

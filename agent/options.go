@@ -1,6 +1,7 @@
 package agent // import "github.com/losinggeneration/tau/agent"
 
 import (
+	"context"
 	"slices"
 
 	"github.com/losinggeneration/tau/ai"
@@ -182,4 +183,9 @@ func NewConfig(opts ...Option) Config {
 // WithRequestOptions configures provider options for each assistant request.
 func WithRequestOptions(opts ...ai.Option) Option {
 	return func(c *Config) { c.RequestOptions = slices.Clone(opts) }
+}
+
+// WithProviderEnvironment resolves scoped credential variables for each request.
+func WithProviderEnvironment(resolve func(context.Context, string) (map[string]string, error)) Option {
+	return func(c *Config) { c.ProviderEnv = resolve }
 }

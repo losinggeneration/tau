@@ -286,10 +286,10 @@ func resolveBedrockRegion(o *options) string {
 	if o != nil && o.bedrockRegion != "" {
 		return o.bedrockRegion
 	}
-	if region := os.Getenv("AWS_REGION"); region != "" {
+	if region := o.providerEnvValue("AWS_REGION"); region != "" {
 		return region
 	}
-	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" {
+	if region := o.providerEnvValue("AWS_DEFAULT_REGION"); region != "" {
 		return region
 	}
 	return "us-east-1"
@@ -307,7 +307,7 @@ func resolveBedrockBearerToken(o *options) string {
 			return ""
 		}
 	}
-	return os.Getenv("AWS_BEARER_TOKEN_BEDROCK")
+	return o.providerEnvValue("AWS_BEARER_TOKEN_BEDROCK")
 }
 
 func buildBedrockConverseInput(model *Model, prompt *Context, o *options) (*bedrockruntime.ConverseStreamInput, error) {

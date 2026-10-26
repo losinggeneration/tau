@@ -22,8 +22,9 @@ import (
 // HostService implements the Host service that plugins call.
 type HostService struct {
 	proto.UnimplementedHostServer
-	manager *Manager
-	stateMu sync.Map // plugin name -> *state.Store
+	manager     *Manager
+	stateMu     sync.Mutex
+	stateStores map[string]*state.Store
 }
 
 // NewHostService creates a new Host service.
@@ -33,15 +34,20 @@ func NewHostService(m *Manager) *HostService {
 
 // getStateStore returns the state store for a plugin, creating it if needed.
 func (h *HostService) getStateStore(pluginName string) (*state.Store, error) {
-	if store, ok := h.stateMu.Load(pluginName); ok {
-		return store.(*state.Store), nil
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	if store, ok := h.stateStores[pluginName]; ok {
+		return store, nil
 	}
 
 	store, err := state.NewStore(h.manager.stateDir, pluginName)
 	if err != nil {
 		return nil, err
 	}
-	h.stateMu.Store(pluginName, store)
+	if h.stateStores == nil {
+		h.stateStores = make(map[string]*state.Store)
+	}
+	h.stateStores[pluginName] = store
 	return store, nil
 }
 

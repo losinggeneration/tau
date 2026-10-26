@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -215,5 +216,73 @@ func TestRequestConfigEnvOptOutKeepsExplicitReferences(t *testing.T) {
 	o := applyOptions(resolved)
 	if !o.noEnvCredentials || o.apiKey != "configured-key" || o.headers["Authorization"] != "Bearer configured-key" || o.headers["X-Configured"] != "configured-key" {
 		t.Fatal("explicit configured references or opt-out were lost")
+	}
+}
+
+func TestConfigValuesRetainCancellationCause(t *testing.T) {
+	cause := errors.New("credential request cancelled")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(cause)
+	for _, value := range []string{"literal", "$VARIABLE", "!command"} {
+		_, err := (&configValueResolver{}).resolve(ctx, value)
+		if !errors.Is(err, cause) {
+			t.Errorf("entry lost cancellation cause: %v", err)
+		}
+	}
+	for _, failure := range []error{nil, errors.New("executor failed")} {
+		ctx, cancel := context.WithCancelCause(t.Context())
+		resolver := &configValueResolver{execute: func(context.Context, string) (string, error) { cancel(cause); return "secret", failure }}
+		value, err := resolver.resolve(ctx, "!command")
+		if value != "" || !errors.Is(err, cause) {
+			t.Errorf("completion lost cancellation cause: %v", err)
+		}
+		if failure != nil && !errors.Is(err, failure) {
+			t.Errorf("completion lost executor failure: %v", err)
+		}
+		if strings.Contains(fmt.Sprint(err), "secret") {
+			t.Error("error exposed output")
+		}
+	}
+}
+
+func TestConfigCommandQueuedWaitRetainsCancellationCause(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	resolver := &configValueResolver{execute: func(context.Context, string) (string, error) { close(entered); <-release; return "value", nil }}
+	done := make(chan error, 1)
+	go func() { _, err := resolver.resolve(t.Context(), "!command"); done <- err }()
+	<-entered
+	cause := errors.New("cancel credential waiter")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(cause)
+	_, err := resolver.command(ctx, "command")
+	close(release)
+	if ownerErr := <-done; ownerErr != nil {
+		t.Fatal(ownerErr)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("queued wait lost cause: %v", err)
+	}
+}
+
+func TestCredentialEnvironmentFallbackMatchesUpstream(t *testing.T) {
+	t.Setenv("TAU_SCOPED_CREDENTIAL", "ambient-secret")
+	resolver := &configValueResolver{}
+	for _, env := range []map[string]string{nil, {}, {"TAU_SCOPED_CREDENTIAL": ""}} {
+		value, err := resolver.resolveWithEnv(t.Context(), "${TAU_SCOPED_CREDENTIAL}", env)
+		if err != nil || value != "ambient-secret" {
+			t.Errorf("empty or missing scope entry must fall through: %v", err)
+		}
+	}
+	value, err := resolver.resolveWithEnv(t.Context(), "${TAU_SCOPED_CREDENTIAL}", map[string]string{"TAU_SCOPED_CREDENTIAL": "scoped-secret"})
+	if err != nil || value != "scoped-secret" {
+		t.Errorf("nonempty scope entry must win: %v", err)
+	}
+}
+
+func TestConfigOutputBoundsStringWriters(t *testing.T) {
+	var output configOutput
+	_, err := io.WriteString(&output, strings.Repeat("x", configCommandOutputLimit+1))
+	if err == nil || output.Len() > configCommandOutputLimit {
+		t.Fatal("string writer bypassed credential command output limit")
 	}
 }

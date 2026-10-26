@@ -2,9 +2,11 @@ package packages
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -67,6 +69,21 @@ func (m *Manager) InstallPath(pkgName string, scope Scope) string {
 // CheckDuplicate checks whether a package with the given name is already
 // installed at the specified scope. Returns ErrAlreadyInstalled if found.
 func (m *Manager) CheckDuplicate(pkgName string, scope Scope) error {
+	if scope != ScopeUser && scope != ScopeProject {
+		return fmt.Errorf("unknown scope: %v", scope)
+	}
+
+	if err := validatePackageName(pkgName); err != nil {
+		return err
+	}
+
+	base := m.userDir
+	if scope == ScopeProject {
+		base = m.projectDir
+	}
+	if err := validatePackageParent(base, pkgName); err != nil {
+		return err
+	}
 	dir := m.InstallPath(pkgName, scope)
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -80,7 +97,10 @@ func (m *Manager) CheckDuplicate(pkgName string, scope Scope) error {
 	}
 	// Verify it looks like a real package install by checking for the sidecar
 	// or a manifest. If the dir is empty or non-package, allow install.
-	entries, _ := os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read package directory: %w", err)
+	}
 	if len(entries) == 0 {
 		return nil
 	}
@@ -116,39 +136,53 @@ func (m *Manager) ListInstalled(scope Scope) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("unknown scope: %v", scope)
 	}
-	entries, err := os.ReadDir(base)
+	roots, err := InstalledRoots(base)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read packages dir %s: %w", base, err)
+		return nil, err
 	}
 	var names []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+	for _, root := range roots {
+		name, err := filepath.Rel(base, root)
+		if err != nil {
+			return nil, fmt.Errorf("resolve installed package name: %w", err)
 		}
-		if strings.HasPrefix(e.Name(), "@") {
-			scopedEntries, err := os.ReadDir(filepath.Join(base, e.Name()))
-			if err != nil {
-				return nil, fmt.Errorf("read scoped packages dir %s: %w", filepath.Join(base, e.Name()), err)
-			}
-			for _, scoped := range scopedEntries {
-				if scoped.IsDir() {
-					names = append(names, filepath.Join(e.Name(), scoped.Name()))
-				}
-			}
-			continue
-		}
-		names = append(names, e.Name())
+		names = append(names, name)
 	}
+
 	return names, nil
 }
 
 // Uninstall removes a package from the specified scope.
-// For npm packages, it also removes from the npm registry if user scope.
-func (m *Manager) Uninstall(ctx context.Context, name string, scope Scope) error {
+// Removal is package-local, including npm archives.
+func (m *Manager) Uninstall(ctx context.Context, name string, scope Scope) (err error) {
+	if scope != ScopeUser && scope != ScopeProject {
+		return fmt.Errorf("unknown scope: %v", scope)
+	}
+
+	if err := validatePackageName(name); err != nil {
+		return err
+	}
+
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+
+	base := m.userDir
+	if scope == ScopeProject {
+		base = m.projectDir
+	}
+	if err := validatePackageParent(base, name); err != nil {
+		return err
+	}
 	installPath := m.InstallPath(name, scope)
+	unlock, err := lockPackageWriter(ctx, installPath)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, unlock()) }()
+	if err := validatePackageParent(base, name); err != nil {
+		return err
+	}
 
 	// Check if package exists
 	if _, err := os.Stat(installPath); err != nil {
@@ -158,13 +192,10 @@ func (m *Manager) Uninstall(ctx context.Context, name string, scope Scope) error
 		return fmt.Errorf("stat package: %w", err)
 	}
 
-	// Load sidecar to check if this is an npm package
-	sidecar, _ := LoadSidecar(installPath)
-	if sidecar != nil && strings.HasPrefix(sidecar.Source, "npm:") {
-		// This is an npm package - use InstallManager for npm uninstall
-		installMgr := NewInstallManager(m.userDir, m.projectDir)
-		installMgr.NPMCommand = m.NPMCommand
-		return installMgr.UninstallFromNPM(ctx, name, scope)
+	// Reject malformed metadata before removal.
+	_, err = LoadSidecar(installPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load package sidecar: %w", err)
 	}
 
 	// Regular package removal
@@ -189,6 +220,10 @@ type UpdateManager struct {
 	userDir    string
 	projectDir string
 	mgr        *Manager
+	installer  *InstallManager
+
+	// NPMCommand replaces the npm executable with an argv prefix.
+	NPMCommand []string
 
 	// ArtifactReloader is called after a successful update to reload artifact registries.
 	ArtifactReloader func(context.Context) error
@@ -203,6 +238,7 @@ func NewUpdateManager(userDir, projectDir string) *UpdateManager {
 		userDir:    userDir,
 		projectDir: projectDir,
 		mgr:        NewManager(userDir, projectDir),
+		installer:  NewInstallManager(userDir, projectDir),
 	}
 }
 
@@ -222,6 +258,12 @@ func ClassifyRef(sidecar *InstallSidecar) RefType {
 	// Non-git sources (e.g., local path installs) have no ref or commit SHA
 	if sidecar.CommitSHA == "" && sidecar.Ref == "" {
 		return RefTypeLink
+	}
+
+	if sidecar.Source != "" && sidecar.CommitSHA != "" {
+		if _, requested := parseSourceRef(sidecar.Source); requested == "" {
+			return RefTypeUnpinned
+		}
 	}
 
 	ref := sidecar.Ref
@@ -303,37 +345,51 @@ type UpdateResult struct {
 
 // Update updates a package to the latest version based on its ref type.
 func (m *UpdateManager) Update(ctx context.Context, name string, scope Scope) (*UpdateResult, error) {
+	if scope != ScopeUser && scope != ScopeProject {
+		return nil, fmt.Errorf("unknown scope: %v", scope)
+	}
+
+	if err := validatePackageName(name); err != nil {
+		return nil, err
+	}
+
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+
 	// Check if offline mode is enabled
 	if IsOfflineMode() {
 		return nil, fmt.Errorf("offline mode: update skipped")
 	}
 
+	base := m.userDir
+	if scope == ScopeProject {
+		base = m.projectDir
+	}
+	if err := validatePackageParent(base, name); err != nil {
+		return nil, err
+	}
 	installPath := m.mgr.InstallPath(name, scope)
 
-	// Check if package exists
-	if _, err := os.Stat(installPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("package %q not found", name)
-		}
-		return nil, fmt.Errorf("stat package: %w", err)
-	}
-
-	// Load sidecar
-	sidecar, err := LoadSidecar(installPath)
+	sidecar, err := readPackageForUpdate(ctx, installPath)
 	if err != nil {
-		return nil, fmt.Errorf("load sidecar: %w", err)
+		return nil, err
 	}
 
 	result := &UpdateResult{Name: name}
-
-	// Classify the ref type
-	refType := ClassifyRef(sidecar)
-
-	// Check if this is a pinned npm package - pinned packages cannot be updated
-	if sidecar.Pinned && strings.HasPrefix(sidecar.Source, "npm:") {
-		result.Message = "version-pinned npm package - cannot update"
-		return result, nil
+	if strings.HasPrefix(sidecar.Source, "npm:") {
+		requested := parseNpmSpec(strings.TrimPrefix(sidecar.Source, "npm:"))
+		if requested.Name != name {
+			return nil, fmt.Errorf("npm source identity %q does not match installed package %q", requested.Name, name)
+		}
+		// Old sidecars can lack a source version while retaining an explicit pin.
+		if requested.Pinned || (sidecar.Pinned && requested.Version == "") {
+			result.Message = "version-pinned npm package - cannot update"
+			return result, nil
+		}
+		return m.updateNPM(ctx, name, scope, installPath, sidecar)
 	}
+	refType := ClassifyRef(sidecar)
 
 	switch refType {
 	case RefTypeLink:
@@ -356,7 +412,11 @@ func (m *UpdateManager) Update(ctx context.Context, name string, scope Scope) (*
 	result.OldCommit = sidecar.CommitSHA
 
 	// Re-clone the repo and get the latest commit
-	newCommit, newRef, err := m.fetchLatest(ctx, sidecar.Source, sidecar.Ref)
+	oldRef := sidecar.Ref
+	if refType == RefTypeUnpinned {
+		oldRef = ""
+	}
+	newCommit, newRef, err := m.fetchLatest(ctx, sidecar.Source, oldRef)
 	if err != nil {
 		return nil, fmt.Errorf("fetch latest: %w", err)
 	}
@@ -370,12 +430,12 @@ func (m *UpdateManager) Update(ctx context.Context, name string, scope Scope) (*
 	}
 
 	// Update the package
-	if err := m.updatePackage(ctx, installPath, sidecar.Source, newRef, newCommit, scope); err != nil {
+	if err := m.updatePackageExpected(ctx, installPath, sidecar.Source, newRef, newCommit, scope, sidecar); err != nil {
 		return nil, fmt.Errorf("update package: %w", err)
 	}
 
 	result.Updated = true
-	result.Message = fmt.Sprintf("updated %s -> %s", result.OldCommit[:7], result.NewCommit[:7])
+	result.Message = fmt.Sprintf("updated %s -> %s", result.OldCommit[:min(7, len(result.OldCommit))], result.NewCommit[:min(7, len(result.NewCommit))])
 
 	// Reload artifacts after successful update.
 	if m.ArtifactReloader != nil {
@@ -398,6 +458,29 @@ func (m *UpdateManager) Update(ctx context.Context, name string, scope Scope) (*
 	return result, nil
 }
 
+func (m *UpdateManager) updateNPM(ctx context.Context, name string, scope Scope, path string, previous *InstallSidecar) (*UpdateResult, error) {
+	m.installer.NPMCommand = slices.Clone(m.NPMCommand)
+	if err := m.installer.Install(ctx, Config{Source: previous.Source, Force: true, Yes: true, Project: scope == ScopeProject, Pi: previous.Pi, expected: previous}); err != nil {
+		return nil, fmt.Errorf("update npm package: %w", err)
+	}
+	current, err := LoadSidecar(path)
+	if err != nil {
+		return nil, fmt.Errorf("load updated npm sidecar: %w", err)
+	}
+	result := &UpdateResult{Name: name, Message: "already up to date"}
+	if current.Ref != previous.Ref {
+		result.Updated = true
+		result.Message = fmt.Sprintf("updated %s -> %s", previous.Ref, current.Ref)
+	}
+	manifest, err := Load(filepath.Join(path, "tau-package.toml"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return result, fmt.Errorf("load updated manifest: %w", err)
+	}
+	notifier := InstallManager{ArtifactReloader: m.ArtifactReloader, PluginReloader: m.PluginReloader}
+	notifier.notifyReloaders(ctx, name, manifest)
+	return result, nil
+}
+
 // fetchLatest fetches the latest commit for a given source and ref.
 func (m *UpdateManager) fetchLatest(ctx context.Context, source, oldRef string) (commit, ref string, err error) {
 	gitURL, _ := parseSourceRef(source)
@@ -407,7 +490,7 @@ func (m *UpdateManager) fetchLatest(ctx context.Context, source, oldRef string) 
 	if err != nil {
 		return "", "", fmt.Errorf("create temp dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { err = errors.Join(err, os.RemoveAll(tmpDir)) }()
 
 	cloneOpts := &git.CloneOptions{
 		URL:      gitURL,
@@ -442,6 +525,29 @@ func (m *UpdateManager) fetchLatest(ctx context.Context, source, oldRef string) 
 
 // updatePackage replaces the package directory with fresh content.
 func (m *UpdateManager) updatePackage(ctx context.Context, installPath, source, ref, commitSHA string, scope Scope) error {
+	return m.updatePackageExpected(ctx, installPath, source, ref, commitSHA, scope, nil)
+}
+
+func (m *UpdateManager) updatePackageExpected(ctx context.Context, installPath, source, ref, commitSHA string, scope Scope, expected *InstallSidecar) (err error) {
+	base := m.userDir
+	if scope == ScopeProject {
+		base = m.projectDir
+	}
+	name, err := filepath.Rel(base, installPath)
+	if err != nil {
+		return fmt.Errorf("resolve installed package identity: %w", err)
+	}
+	name = filepath.ToSlash(name)
+	if err := validatePackageParent(base, name); err != nil {
+		return err
+	}
+	if !isCommitHash(commitSHA) {
+		return fmt.Errorf("invalid update commit identity")
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+
 	gitURL, _ := parseSourceRef(source)
 	gitURL = normalizeGitURL(gitURL)
 
@@ -450,7 +556,7 @@ func (m *UpdateManager) updatePackage(ctx context.Context, installPath, source, 
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { err = errors.Join(err, os.RemoveAll(tmpDir)) }()
 
 	cloneOpts := &git.CloneOptions{
 		URL:      gitURL,
@@ -466,12 +572,6 @@ func (m *UpdateManager) updatePackage(ctx context.Context, installPath, source, 
 		return fmt.Errorf("open repo: %w", err)
 	}
 
-	// Resolve the ref and checkout
-	resolvedRef, err := resolveRef(ctx, repo, ref)
-	if err != nil {
-		return fmt.Errorf("resolve ref: %w", err)
-	}
-
 	w, err := repo.Worktree()
 	if err != nil {
 		return fmt.Errorf("get worktree: %w", err)
@@ -483,11 +583,40 @@ func (m *UpdateManager) updatePackage(ctx context.Context, installPath, source, 
 		return fmt.Errorf("checkout: %w", err)
 	}
 
+	previous, err := LoadSidecar(installPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load previous sidecar: %w", err)
+	}
+	if previous != nil && previous.Pi {
+		m.installer.NPMCommand = slices.Clone(m.NPMCommand)
+		pkg, err := ParsePiPackage(tmpDir)
+		if err != nil {
+			return err
+		}
+		if pkg.Name != name {
+			return fmt.Errorf("updated Pi package identity %q does not match %q", pkg.Name, name)
+		}
+		return m.installer.installPiFromGitDir(ctx, Config{Source: source, Force: true, Yes: true, Project: scope == ScopeProject, Pi: true, expected: expected}, tmpDir, ref, commitSHA, commitTimeFromHash(repo, commitSHA))
+	}
+
 	// Load manifest to check for build section
 	manifestPath := filepath.Join(tmpDir, "tau-package.toml")
 	manifest, err := Load(manifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		manifest, err = loadManifestOrConventionContext(ctx, tmpDir)
+		if err == nil {
+			manifest.Package.Name = name
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("load manifest: %w", err)
+	}
+
+	if manifest.Package.Name != name {
+		return fmt.Errorf("updated package identity %q does not match %q", manifest.Package.Name, name)
+	}
+	if err := CheckRuntimeRequirementContext(ctx, manifest.Reqs.Runtime); err != nil {
+		return fmt.Errorf("updated package runtime: %w", err)
 	}
 
 	// If there's a build section, run the build
@@ -501,33 +630,20 @@ func (m *UpdateManager) updatePackage(ctx context.Context, installPath, source, 
 	// Get commit time for sidecar
 	commitTimeStr := commitTimeFromHash(repo, commitSHA)
 
-	// Remove old install
-	if err := os.RemoveAll(installPath); err != nil {
-		return fmt.Errorf("remove old install: %w", err)
-	}
-
-	// Move new content to install path
-	if err := os.Rename(tmpDir, installPath); err != nil {
-		// Fallback: copy if rename fails
-		if err := copyDir(tmpDir, installPath); err != nil {
-			return fmt.Errorf("install: %w", err)
-		}
-		_ = os.RemoveAll(tmpDir)
-	}
-
 	// Update sidecar
 	sidecar := InstallSidecar{
 		Source:      source,
-		Ref:         resolvedRef,
+		Ref:         ref,
 		CommitSHA:   commitSHA,
 		InstalledAt: commitTimeStr,
 		Scope:       string(scope),
 	}
-	if err := sidecar.Write(installPath); err != nil {
-		return fmt.Errorf("write sidecar: %w", err)
-	}
-
-	return nil
+	return stagePackageExpected(ctx, installPath, expected, func(staged string) error {
+		if err := copyDirContext(ctx, tmpDir, staged); err != nil {
+			return fmt.Errorf("copy updated package: %w", err)
+		}
+		return sidecar.Write(staged)
+	})
 }
 
 // commitTimeFromHash returns the commit time for a given commit hash.
@@ -538,4 +654,17 @@ func commitTimeFromHash(repo *git.Repository, hashStr string) string {
 		return ""
 	}
 	return commit.Author.When.String()
+}
+
+func readPackageForUpdate(ctx context.Context, path string) (sidecar *InstallSidecar, err error) {
+	unlock, err := lockPackageWriter(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, unlock()) }()
+	sidecar, err = LoadSidecar(path)
+	if err != nil {
+		return nil, fmt.Errorf("load sidecar for update: %w", err)
+	}
+	return sidecar, nil
 }
