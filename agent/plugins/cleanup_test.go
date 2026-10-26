@@ -70,3 +70,16 @@ func TestShutdownPluginReportsHostSocketCloseFailure(t *testing.T) {
 	assert.Empty(t, mgr.HostSocketPath("socket"))
 	assert.NoFileExists(t, path)
 }
+
+func TestShutdownRetainsFailureFromCleanupThatOutlivesCaller(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	manager.cleanupGrace = 10 * time.Millisecond
+	release := make(chan struct{})
+	manager.plugins["late"] = &PluginInfo{Name: "late", Cleanup: func() { <-release; panic("late cleanup failure") }}
+	err := manager.ShutdownPlugin(t.Context(), "late", time.Second)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	close(release)
+	err = manager.Shutdown(t.Context())
+	require.ErrorContains(t, err, "late cleanup failure")
+	require.ErrorContains(t, manager.Shutdown(t.Context()), "late cleanup failure")
+}

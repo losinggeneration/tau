@@ -322,3 +322,6 @@ func (l *Loader) registerCommands() {
 
 	l.commandSources = currentSources
 }
+
+// SkillRegistry returns the uncommitted skills for prompt preparation.
+func (p *PreparedReload) SkillRegistry() *SkillRegistry { return p.skills }

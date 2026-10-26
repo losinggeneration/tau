@@ -411,7 +411,11 @@ type App struct {
 	// workingMu for the same reason.
 	usageLimitWaitUntil time.Time
 	usageLimitProvider  string
-	workingMu           sync.Mutex
+	// pausedSince/Target drive the run message while a pause flag holds
+	// provider requests.
+	pausedSince  time.Time
+	pausedTarget string
+	workingMu    sync.Mutex
 
 	// themeColors resolves discovered theme files to their colour tokens.
 	// Nil means only the built-in token sets are available.
@@ -2811,6 +2815,9 @@ func (a *App) workingMessage() string {
 	}
 	a.workingMu.Lock()
 	defer a.workingMu.Unlock()
+	if !a.pausedSince.IsZero() {
+		return fmt.Sprintf("paused by flag %q since %s", a.pausedTarget, a.pausedSince.Format(time.TimeOnly))
+	}
 	if !a.usageLimitWaitUntil.IsZero() {
 		label := "usage limit"
 		if a.usageLimitProvider != "" {
@@ -2839,13 +2846,27 @@ func (a *App) setUsageLimitWait(provider string, until time.Time) {
 	a.workingMu.Unlock()
 }
 
-// clearUsageLimitWait restores the ordinary run message. Safe to call from
-// the app loop.
+// setPaused switches the run message to the pause notice until cleared. Safe
+// to call from the app loop.
+func (a *App) setPaused(target string) {
+	if a == nil {
+		return
+	}
+	a.workingMu.Lock()
+	a.pausedSince = time.Now()
+	a.pausedTarget = target
+	a.workingMu.Unlock()
+}
+
+// clearUsageLimitWait restores the ordinary run message after a usage-limit
+// wait or a pause. Safe to call from the app loop.
 func (a *App) clearUsageLimitWait() {
 	if a == nil {
 		return
 	}
 	a.workingMu.Lock()
+	a.pausedSince = time.Time{}
+	a.pausedTarget = ""
 	a.usageLimitProvider = ""
 	a.usageLimitWaitUntil = time.Time{}
 	a.workingMu.Unlock()
@@ -4536,6 +4557,9 @@ func (a *App) handleEvent(ev sdk.Event) {
 			}
 		}
 		a.setUsageLimitWait(provider, until)
+	case "paused":
+		target, _ := plString(ev.Payload, "target")
+		a.setPaused(target)
 	case "usage":
 		a.refreshFooterStats(a.loopContext())
 	case "tool_call":

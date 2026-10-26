@@ -93,6 +93,7 @@ type MarkdownSettings struct {
 // CompactionSettings controls auto-compaction. Matches agent/compaction.Settings.
 // CompactionModelOverride provides explicit per-model token budgets.
 type CompactionModelOverride struct {
+	present          map[string]json.RawMessage
 	ReserveTokens    *int `json:"reserveTokens,omitempty"`
 	KeepRecentTokens *int `json:"keepRecentTokens,omitempty"`
 }
@@ -164,6 +165,7 @@ type RetrySettings struct {
 // ProviderRetrySettings configures provider requests independently of agent retries.
 // Pointers preserve explicit zero values when merging settings scopes.
 type ProviderRetrySettings struct {
+	present         map[string]json.RawMessage
 	TimeoutMs       *int `json:"timeoutMs,omitempty"`
 	MaxRetries      *int `json:"maxRetries,omitempty"`
 	MaxRetryDelayMs *int `json:"maxRetryDelayMs,omitempty"`
@@ -201,6 +203,7 @@ type ThinkingBudgetsSettings struct {
 // enabledModels uses. A nested providers shape is not an option: the settings
 // parser rejects a top-level `providers` key (deprecated schema).
 type ModelSettings struct {
+	present map[string]json.RawMessage
 	// ThinkingLevel overrides the reasoning/thinking effort used with this
 	// model. Valid values match ai.ThinkingLevels ("off" through "xhigh").
 	// Empty means no override — the defaultThinkingLevel applies.
@@ -481,6 +484,9 @@ func parseSettings(data []byte) (*Settings, error) {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, fmt.Errorf("parse settings: %w", err)
+	}
+	if probe == nil {
+		return nil, fmt.Errorf("parse settings: expected a JSON object")
 	}
 	if _, ok := probe["providers"]; ok {
 		return nil, fmt.Errorf("settings.json uses the deprecated {default, providers} shape; this version of tau uses the flat schema documented as the flat schema — re-create your settings.json with defaultProvider/defaultModel/etc. or rename the existing file out of the way")
@@ -849,6 +855,8 @@ func MergeSettings(user, project *Settings) *Settings {
 	out.resourceScopes = make(map[string][2]settingsResourceScope)
 	for _, kind := range []string{"skills", "prompts", "themes", "extensions"} {
 		if scopes, ok := user.resourceScopes[kind]; ok {
+			scopes[0].entries = slices.Clone(scopes[0].entries)
+			scopes[1].entries = slices.Clone(scopes[1].entries)
 			out.resourceScopes[kind] = scopes
 		} else {
 			out.resourceScopes[kind] = [2]settingsResourceScope{{slices.Clone(user.resourceEntries(kind)), user.resourceBases[kind]}, {}}
@@ -1067,6 +1075,7 @@ func mergeCompaction(u, p CompactionSettings) CompactionSettings {
 	}
 	for key, value := range p.ModelOverrides {
 		existing := overrides[key]
+		existing.present = mergeSettingsPresence(existing.present, value.present)
 		if value.ReserveTokens != nil {
 			existing.ReserveTokens = value.ReserveTokens
 		}
@@ -1076,6 +1085,7 @@ func mergeCompaction(u, p CompactionSettings) CompactionSettings {
 		overrides[key] = existing
 	}
 	for key, value := range overrides {
+		value.present = mergeSettingsPresence(value.present, nil)
 		if value.ReserveTokens != nil {
 			value.ReserveTokens = new(*value.ReserveTokens)
 		}
@@ -1125,6 +1135,7 @@ func mergeRetry(u, p RetrySettings) RetrySettings {
 		u.Provider.MaxRetryDelayMs = p.Provider.MaxRetryDelayMs
 	}
 	u.present = mergeSettingsPresence(u.present, p.present)
+	u.Provider.present = mergeSettingsPresence(u.Provider.present, p.Provider.present)
 	if u.Provider.TimeoutMs != nil {
 		u.Provider.TimeoutMs = new(*u.Provider.TimeoutMs)
 	}
@@ -1207,8 +1218,15 @@ func mergeBash(u, p BashSettings) BashSettings {
 	if p.EnvAllowlist != nil {
 		u.EnvAllowlist = p.EnvAllowlist
 	}
+	u.EnvExtra = maps.Clone(u.EnvExtra)
 	if p.EnvExtra != nil {
-		u.EnvExtra = p.EnvExtra
+		if len(p.EnvExtra) == 0 {
+			u.EnvExtra = make(map[string]string)
+		}
+		if u.EnvExtra == nil {
+			u.EnvExtra = make(map[string]string)
+		}
+		maps.Copy(u.EnvExtra, p.EnvExtra)
 	}
 	if p.CommandPrefix != "" || p.present["commandPrefix"] != nil {
 		u.CommandPrefix = p.CommandPrefix
@@ -1220,7 +1238,6 @@ func mergeBash(u, p BashSettings) BashSettings {
 		u.KillGraceMs = p.KillGraceMs
 	}
 	u.EnvAllowlist = slices.Clone(u.EnvAllowlist)
-	u.EnvExtra = maps.Clone(u.EnvExtra)
 	return u
 }
 
@@ -1247,6 +1264,10 @@ func mergeBranchSummary(u, p BranchSummarySettings) BranchSummarySettings {
 // per key and per field. Keys are "provider/model-id" strings.
 func mergeModelSettingsMap(u, p map[string]ModelSettings) map[string]ModelSettings {
 	u = maps.Clone(u)
+	for key, value := range u {
+		value.present = mergeSettingsPresence(value.present, nil)
+		u[key] = value
+	}
 	if len(p) == 0 {
 		return u
 	}
@@ -1255,7 +1276,8 @@ func mergeModelSettingsMap(u, p map[string]ModelSettings) map[string]ModelSettin
 	}
 	for key, ps := range p {
 		us := u[key]
-		if ps.ThinkingLevel != "" {
+		us.present = mergeSettingsPresence(us.present, ps.present)
+		if ps.ThinkingLevel != "" || ps.present["thinkingLevel"] != nil {
 			us.ThinkingLevel = ps.ThinkingLevel
 		}
 		u[key] = us
@@ -1293,11 +1315,13 @@ func prettyJSON(data []byte) ([]byte, error) {
 }
 
 func mergeSettingsPresence(base, override map[string]json.RawMessage) map[string]json.RawMessage {
-	out := maps.Clone(base)
-	if out == nil {
-		out = map[string]json.RawMessage{}
+	out := make(map[string]json.RawMessage, len(base)+len(override))
+	for key, value := range base {
+		out[key] = slices.Clone(value)
 	}
-	maps.Copy(out, override)
+	for key, value := range override {
+		out[key] = slices.Clone(value)
+	}
 	return out
 }
 
@@ -1311,9 +1335,14 @@ func marshalPresentSettings(value any, present map[string]json.RawMessage) ([]by
 		return nil, err
 	}
 	current := reflect.ValueOf(value)
+	known := make(map[string]bool, current.NumField())
 	for i := range current.NumField() {
 		field := current.Type().Field(i)
 		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		known[name] = true
 		if present[name] == nil || fields[name] != nil {
 			continue
 		}
@@ -1322,6 +1351,11 @@ func marshalPresentSettings(value any, present map[string]json.RawMessage) ([]by
 			return nil, fmt.Errorf("marshal settings field %s: %w", name, err)
 		}
 		fields[name] = raw
+	}
+	for name, raw := range present {
+		if !known[name] {
+			fields[name] = slices.Clone(raw)
+		}
 	}
 	return json.Marshal(fields)
 }
@@ -1420,7 +1454,13 @@ func (s *Settings) UnmarshalJSON(data []byte) error {
 
 func (s Settings) MarshalJSON() ([]byte, error) {
 	type plain Settings
-	return marshalPresentSettings(plain(s), s.present)
+	present := make(map[string]json.RawMessage, len(s.present))
+	for key, value := range s.present {
+		if _, known := knownSettingsKey(key); known {
+			present[key] = value
+		}
+	}
+	return marshalPresentSettings(plain(s), present)
 }
 
 func (s *BashSettings) UnmarshalJSON(data []byte) error {
@@ -1531,4 +1571,49 @@ func (s *Settings) ResolveFullscreenWheelScrollLines() int {
 		return 0
 	}
 	return int(min(100, max(1, lines)))
+}
+
+func (s *ProviderRetrySettings) UnmarshalJSON(data []byte) error {
+	type plain ProviderRetrySettings
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*s = ProviderRetrySettings(value)
+	return json.Unmarshal(data, &s.present)
+}
+
+func (s ProviderRetrySettings) MarshalJSON() ([]byte, error) {
+	type plain ProviderRetrySettings
+	return marshalPresentSettings(plain(s), s.present)
+}
+
+func (s *CompactionModelOverride) UnmarshalJSON(data []byte) error {
+	type plain CompactionModelOverride
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*s = CompactionModelOverride(value)
+	return json.Unmarshal(data, &s.present)
+}
+
+func (s CompactionModelOverride) MarshalJSON() ([]byte, error) {
+	type plain CompactionModelOverride
+	return marshalPresentSettings(plain(s), s.present)
+}
+
+func (s *ModelSettings) UnmarshalJSON(data []byte) error {
+	type plain ModelSettings
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*s = ModelSettings(value)
+	return json.Unmarshal(data, &s.present)
+}
+
+func (s ModelSettings) MarshalJSON() ([]byte, error) {
+	type plain ModelSettings
+	return marshalPresentSettings(plain(s), s.present)
 }

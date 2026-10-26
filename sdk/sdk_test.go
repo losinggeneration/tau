@@ -8678,11 +8678,11 @@ func TestPluginManagerSessionStartupAndReload(t *testing.T) {
 	require.Equal(t, "registered output", result.Content)
 	require.JSONEq(t, `[1,null]`, string(result.StructuredContent))
 
-	require.NoError(t, mgr.ReloadNamed(t.Context(), "loadout"))
+	preparedReload, err := mgr.PrepareReload(t.Context(), s.settings)
+	require.NoError(t, err)
+	require.NoError(t, s.ReloadResources(t.Context(), s.settings, nil, preparedReload, "loadout"))
 	require.Equal(t, 1, first.closed)
 	require.Equal(t, 1, second.initialized)
-	mgr.RefreshToolRegistry()
-	require.NoError(t, s.ReloadToolRegistry(t.Context()))
 	require.ElementsMatch(t, []string{"ext_lookup"}, s.ActiveTools())
 	require.Nil(t, s.DescribeTool("ext_removed"))
 	require.Nil(t, s.DescribeTool("ext_denied"))
@@ -11265,4 +11265,250 @@ func mustReadSession(t *testing.T, s *agentSession) *sessionpkg.Reader {
 	reader, err := sessionpkg.ReadFile(s.sessionWriter.Path())
 	require.NoError(t, err)
 	return reader
+}
+
+func TestReloadResourcesPreservesSessionWhenAdmissionFails(t *testing.T) {
+	for _, phase := range []string{"plugin startup", "prompt persistence", "staged prompt persistence", "success"} {
+		t.Run(phase, func(t *testing.T) {
+			_, model := registerRecordingProvider(t, "reply")
+			cwd := t.TempDir()
+			require.NoError(t, os.MkdirAll(filepath.Join(cwd, ".tau"), 0o700))
+			promptPath := filepath.Join(cwd, ".tau", "SYSTEM.md")
+			require.NoError(t, os.WriteFile(promptPath, []byte("original prompt"), 0o600))
+			original := &ai.Settings{DefaultTools: []string{"read"}}
+			rt, err := NewRuntime(RuntimeOptions{Settings: original, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+			sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+			require.NoError(t, err)
+			s := sess.(*agentSession)
+			before := s.agent.Messages()
+			oldSettings := s.settings
+			loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: cwd})
+			require.NoError(t, err)
+			registry := loader.SkillRegistry()
+			prepared, err := loader.Prepare(artifacts.ReloadOptions{})
+			require.NoError(t, err)
+			var preparedPlugins *agentplugins.PreparedReload
+			cause := errors.New("startup rejected")
+			candidateCleaned := false
+			if phase == "plugin startup" || phase == "staged prompt persistence" {
+				cfg := t.TempDir()
+				require.NoError(t, os.MkdirAll(filepath.Join(cfg, "extensions"), 0o700))
+				require.NoError(t, os.WriteFile(filepath.Join(cfg, "extensions", "broken"), []byte("binary"), 0o700))
+				manager := agentplugins.NewManager(cfg, nil, nil, agentplugins.WithPluginConnector(func(context.Context, string, *agentplugins.Manifest, string, string) (proto.PluginClient, func(), error) {
+					if phase == "plugin startup" {
+						return nil, nil, cause
+					}
+					return &loadoutPluginClient{registrations: &proto.Registrations{}}, func() { candidateCleaned = true }, nil
+				}))
+				preparedPlugins, err = manager.PrepareReload(t.Context(), &ai.Settings{})
+				require.NoError(t, err)
+			}
+			if phase == "prompt persistence" || phase == "staged prompt persistence" {
+				storage, err := sessionpkg.NewStorageAt(t.TempDir())
+				require.NoError(t, err)
+				writer, err := storage.Create(sessionpkg.NewHeader(cwd, nil, nil))
+				require.NoError(t, err)
+				require.NoError(t, writer.Close())
+				s.sessionWriter = writer
+				s.pendingInitialTranscript = nil
+			}
+			require.NoError(t, os.WriteFile(promptPath, []byte("proposed prompt"), 0o600))
+			next := &ai.Settings{DefaultTools: []string{"read", "grep"}}
+			err = s.ReloadResources(t.Context(), next, prepared, preparedPlugins, "")
+			if phase == "success" {
+				require.NoError(t, err)
+				require.Same(t, next, s.settings)
+				require.NotSame(t, registry, loader.SkillRegistry())
+				require.Contains(t, agentMessageText(s.agent.Messages()[0]), "proposed prompt")
+			} else {
+				require.Error(t, err)
+				if phase == "plugin startup" {
+					require.ErrorIs(t, err, cause)
+				}
+				if phase == "staged prompt persistence" {
+					require.True(t, candidateCleaned)
+				}
+				future, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+				require.NoError(t, err)
+				require.Same(t, oldSettings, future.(*agentSession).settings)
+				require.Same(t, oldSettings, s.settings)
+				require.Same(t, registry, loader.SkillRegistry())
+				require.Equal(t, before, s.agent.Messages())
+			}
+		})
+	}
+}
+
+type reloadShutdownClient struct {
+	loadoutPluginClient
+	shutdown func() error
+}
+
+func (c *reloadShutdownClient) Shutdown(context.Context, *proto.ShutdownRequest, ...grpc.CallOption) (*proto.ShutdownResponse, error) {
+	if err := c.shutdown(); err != nil {
+		return nil, err
+	}
+	return &proto.ShutdownResponse{Graceful: true}, nil
+}
+
+func TestReloadResourcesSettlesAfterAdmittedShutdownFailure(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	cwd := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(cwd, ".tau"), 0o700))
+	promptPath := filepath.Join(cwd, ".tau", "SYSTEM.md")
+	require.NoError(t, os.WriteFile(promptPath, []byte("old prompt"), 0o600))
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "replace")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("admitted shutdown failure")
+	first := &reloadShutdownClient{loadoutPluginClient: loadoutPluginClient{registrations: &proto.Registrations{Tools: []*proto.ToolRegistration{{Name: "old-tool"}}}}, shutdown: func() error { cancel(cause); return cause }}
+	second := &loadoutPluginClient{registrations: &proto.Registrations{Tools: []*proto.ToolRegistration{{Name: "new-tool"}}}}
+	connections := 0
+	manager := agentplugins.NewManager(cfg, nil, nil, agentplugins.WithPluginConnector(func(context.Context, string, *agentplugins.Manifest, string, string) (proto.PluginClient, func(), error) {
+		connections++
+		if connections == 1 {
+			return first, func() { first.closed++ }, nil
+		}
+		return second, func() { second.closed++ }, nil
+	}))
+	_, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	rt, err := NewRuntime(RuntimeOptions{PluginManager: manager, NoBuiltinTools: true, Settings: &ai.Settings{}, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+	require.NoError(t, err)
+	s := sess.(*agentSession)
+	next := &ai.Settings{Read: ai.ReadSettings{LineCap: 7}}
+	prepared, err := manager.PrepareReload(ctx, next)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(promptPath, []byte("new prompt"), 0o600))
+	require.ErrorIs(t, s.ReloadResources(ctx, next, nil, prepared, "replace"), cause)
+	require.Same(t, next, s.settings)
+	require.Contains(t, agentMessageText(s.agent.Messages()[0]), "new prompt")
+	require.Nil(t, s.DescribeTool("old-tool"))
+	require.NotNil(t, s.DescribeTool("new-tool"))
+	require.Equal(t, 1, first.closed)
+	require.Equal(t, 0, second.closed)
+}
+
+func TestReloadResourcesUsesPreparedSkillsInDurablePrompt(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	cwd := t.TempDir()
+	skillsDir := filepath.Join(cwd, "skills")
+	skillDir := filepath.Join(skillsDir, "prepared-skill")
+	require.NoError(t, os.MkdirAll(skillDir, 0o700))
+	skillPath := filepath.Join(skillDir, "SKILL.md")
+	require.NoError(t, os.WriteFile(skillPath, []byte("---\nname: prepared-skill\ndescription: ORIGINAL_SKILL_DESCRIPTION\n---\nbody"), 0o600))
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: cwd, UserDirs: map[artifacts.ArtifactKind]string{artifacts.KindSkill: skillsDir}})
+	require.NoError(t, err)
+	rt, err := NewRuntime(RuntimeOptions{ArtifactLoader: loader, Settings: &ai.Settings{}, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd})
+	require.NoError(t, err)
+	s := sess.(*agentSession)
+	events, err := sess.Send(t.Context(), Message{Text: "materialize"})
+	require.NoError(t, err)
+	collectSessionEvents(t, events)
+	require.NoError(t, os.WriteFile(skillPath, []byte("---\nname: prepared-skill\ndescription: PREPARED_SKILL_DESCRIPTION\n---\nbody"), 0o600))
+	prepared, err := loader.Prepare(artifacts.ReloadOptions{UserDirs: map[artifacts.ArtifactKind]string{artifacts.KindSkill: skillsDir}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(skillPath, []byte("---\nname: prepared-skill\ndescription: LATER_DISK_DESCRIPTION\n---\nbody"), 0o600))
+	require.NoError(t, s.ReloadResources(t.Context(), s.settings, prepared, nil, ""))
+	prompt := agentMessageText(s.agent.Messages()[0])
+	require.Contains(t, prompt, "PREPARED_SKILL_DESCRIPTION")
+	require.NotContains(t, prompt, "ORIGINAL_SKILL_DESCRIPTION")
+	require.NotContains(t, prompt, "LATER_DISK_DESCRIPTION")
+	entries := sessionEntries(mustReadSession(t, s))
+	raw, err := json.Marshal(entries)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "PREPARED_SKILL_DESCRIPTION")
+}
+
+func TestPausedBy(t *testing.T) {
+	dir := t.TempDir()
+	var nameReads int
+	name := func(n string) func() string {
+		return func() string { nameReads++; return n }
+	}
+
+	target, err := pausedBy(filepath.Join(dir, "missing"), "id-1", name("bot"))
+	if err != nil || target != "" {
+		t.Fatalf("missing dir: target=%q err=%v, want no pause", target, err)
+	}
+	target, err = pausedBy(dir, "id-1", name("bot"))
+	if err != nil || target != "" || nameReads != 0 {
+		t.Fatalf("empty dir: target=%q err=%v nameReads=%d, want no pause and no name read", target, err, nameReads)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "bot"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ id, name, want string }{
+		{"id-1", "bot", "bot"},
+		{"id-1", "", ""},
+		{"id-1", "other", ""},
+		{"bot", "", "bot"},
+	} {
+		got, err := pausedBy(dir, tc.id, name(tc.name))
+		if err != nil || got != tc.want {
+			t.Errorf("pausedBy(id=%q, name=%q) = %q, %v; want %q", tc.id, tc.name, got, err, tc.want)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "id-1"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pausedBy(dir, "id-1", name("bot")); err != nil || got != "id-1" {
+		t.Fatalf("id flag: got %q, %v; want id-1", got, err)
+	}
+}
+
+func TestReloadResourcesAppliesPluginConfigurationWithoutNamedRestart(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_, model := registerRecordingProvider(t, "reply")
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "configured")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	old := &ai.Settings{Plugins: map[string]json.RawMessage{"configured": json.RawMessage(`{"mode":"old"}`)}}
+	next := &ai.Settings{Plugins: map[string]json.RawMessage{"configured": json.RawMessage(`{"mode":"new"}`)}}
+	calls := 0
+	manager := agentplugins.NewManager(cfg, nil, nil, agentplugins.WithPluginConnector(func(context.Context, string, *agentplugins.Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		tool := "old-tool"
+		if calls > 1 {
+			tool = "new-tool"
+		}
+		return &loadoutPluginClient{registrations: &proto.Registrations{Tools: []*proto.ToolRegistration{{Name: tool}}}}, func() {}, nil
+	}))
+	manager.SetSettings(old)
+	_, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	rt, err := NewRuntime(RuntimeOptions{PluginManager: manager, NoBuiltinTools: true, Settings: old, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	s := sess.(*agentSession)
+	require.NotNil(t, s.DescribeTool("old-tool"))
+	prepared, err := manager.PrepareReload(t.Context(), next)
+	require.NoError(t, err)
+	require.NoError(t, s.ReloadResources(t.Context(), next, nil, prepared, ""))
+	require.Equal(t, 2, calls)
+	require.Same(t, next, s.settings)
+	require.Nil(t, s.DescribeTool("old-tool"))
+	require.NotNil(t, s.DescribeTool("new-tool"))
+	future, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	require.Same(t, next, future.(*agentSession).settings)
+	require.Nil(t, future.(ToolLoadout).DescribeTool("old-tool"))
+	require.NotNil(t, future.(ToolLoadout).DescribeTool("new-tool"))
 }

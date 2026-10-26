@@ -246,7 +246,7 @@ func TestIsClientEventType(t *testing.T) {
 		"tool_call", "tool_progress", "tool_result",
 		"usage", "error", "interrupt",
 		"model_change", "thinking_level_change",
-		"queue_update", "compaction_start", "compaction_end",
+		"queue_update", "compaction_start", "compaction_end", "paused",
 		"ui_confirm", "ui_select", "ui_input",
 		"ui_notify", "ui_set_status", "ui_set_widget",
 	}

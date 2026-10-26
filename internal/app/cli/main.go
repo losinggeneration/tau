@@ -234,9 +234,9 @@ func openStore() (*store.FileBackend, error) {
 
 // reloadSession reloads settings, artifacts, plugins, tools, and the system
 // prompt for /reload.
-// Settings files, artifact discovery, and session settings are validated
+// Settings files, artifact/plugin discovery, and session settings are validated
 // before anything is replaced, so those failures leave the previous state.
-// Plugin restarts happen after that commit and report their own failures.
+// SDK sessions stage plugin startups and persist the prompt before admission.
 func reloadSession(ctx context.Context, plugin string, sess commands.CommandSession) (commands.Result, error) {
 	if err := context.Cause(ctx); err != nil {
 		return commands.Result{}, err
@@ -261,44 +261,28 @@ func reloadSession(ctx context.Context, plugin string, sess commands.CommandSess
 		if err != nil {
 			return commands.Result{}, fmt.Errorf("reload artifacts: %w", err)
 		}
+	} else if sdk.GlobalArtifactLoader != nil {
+		return commands.Result{}, errors.New("artifact loader does not support prepared reload")
 	}
-	if err := context.Cause(ctx); err != nil {
-		return commands.Result{}, err
-	}
-	if reloader, ok := sess.(sdk.SettingsReloader); ok {
-		if err := reloader.ReloadSettings(ctx, settings); err != nil {
-			return commands.Result{}, fmt.Errorf("reload session settings: %w", err)
-		}
-	}
-	switch {
-	case prepared != nil:
-		prepared.Commit()
-	case sdk.GlobalArtifactLoader != nil:
-		if err := sdk.GlobalArtifactLoader.Reload(ctx); err != nil {
-			return commands.Result{}, fmt.Errorf("reload artifacts: %w", err)
-		}
-	}
+	var preparedPlugins *plugins.PreparedReload
 	if GlobalPluginManager != nil {
-		GlobalPluginManager.SetSettings(settings)
-		if plugin != "" {
-			err = GlobalPluginManager.ReloadNamed(ctx, plugin)
-		} else {
-			err = GlobalPluginManager.Reload(ctx)
-		}
+		preparedPlugins, err = GlobalPluginManager.PrepareReload(ctx, settings)
 		if err != nil {
 			return commands.Result{}, fmt.Errorf("reload plugins: %w", err)
 		}
 	}
-	if reloader, ok := sess.(sdk.ToolRegistryReloader); ok {
-		if err := reloader.ReloadToolRegistry(ctx); err != nil {
-			return commands.Result{}, fmt.Errorf("reload tool registry: %w", err)
-		}
+
+	if err := context.Cause(ctx); err != nil {
+		return commands.Result{}, err
 	}
-	if reloader, ok := sess.(sdk.SystemPromptReloader); ok {
-		if err := reloader.ReloadSystemPrompt(ctx); err != nil {
-			return commands.Result{}, fmt.Errorf("reload system prompt: %w", err)
-		}
+	reloader, ok := sess.(sdk.ResourceReloader)
+	if !ok {
+		return commands.Result{}, errors.New("session does not support coordinated resource reload")
 	}
+	if err := reloader.ReloadResources(ctx, settings, prepared, preparedPlugins, plugin); err != nil {
+		return commands.Result{}, fmt.Errorf("reload resources: %w", err)
+	}
+
 	output := "reloaded settings, artifacts, and plugins"
 	if plugin != "" {
 		output = fmt.Sprintf("reloaded settings, artifacts, and plugin %q", plugin)

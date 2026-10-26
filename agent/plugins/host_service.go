@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
@@ -158,63 +158,49 @@ func (h *HostService) GetConfig(ctx context.Context, req *proto.GetConfigRequest
 		return &proto.GetConfigResponse{Exists: false}, fmt.Errorf("plugin name not found in metadata")
 	}
 
-	// Priority order: CLI flags > settings.json > defaults
-	// 1. Check CLI flags first (highest priority).
-	if req.Key != "" {
-		if cliVal := h.manager.getCLIFlag(pluginName, req.Key); cliVal != "" {
-			// Wrap as JSON string for consistency.
-			val, _ := json.Marshal(cliVal)
-			return &proto.GetConfigResponse{
-				Value:  string(val),
-				Exists: true,
-			}, nil
+	h.manager.mu.RLock()
+	defaults := maps.Clone(h.manager.cliFlags[pluginName])
+	overrides := maps.Clone(h.manager.cliFlagOverrides[pluginName])
+	settings := h.manager.settings
+	var configured json.RawMessage
+	if settings != nil {
+		configured = slices.Clone(settings.Plugins[pluginName])
+	}
+	h.manager.mu.RUnlock()
+	values := make(map[string]json.RawMessage)
+	for key, value := range defaults {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("encode plugin default: %w", err)
 		}
-	} else {
-		// Return all CLI flags as a map.
-		h.manager.mu.RLock()
-		if flags, ok := h.manager.cliFlags[pluginName]; ok && len(flags) > 0 {
-			h.manager.mu.RUnlock()
-			val, _ := json.Marshal(flags)
-			return &proto.GetConfigResponse{
-				Value:  string(val),
-				Exists: true,
-			}, nil
-		}
-		h.manager.mu.RUnlock()
+		values[key] = encoded
 	}
-
-	// 2. Check settings.json (plugins.<name>.<key>).
-	settings := h.manager.getSettings()
-	if settings == nil || settings.Plugins == nil {
-		return &proto.GetConfigResponse{Exists: false}, nil
-	}
-
-	pluginConfig, ok := settings.Plugins[pluginName]
-	if !ok {
-		return &proto.GetConfigResponse{Exists: false}, nil
-	}
-
-	// Look for the specific key within the plugin's config.
-	if req.Key != "" {
+	if len(configured) > 0 {
 		var config map[string]json.RawMessage
-		if err := json.Unmarshal(pluginConfig, &config); err != nil {
-			return &proto.GetConfigResponse{Exists: false}, fmt.Errorf("parse plugin config: %w", err)
+		if err := json.Unmarshal(configured, &config); err != nil {
+			return nil, fmt.Errorf("parse plugin config: %w", err)
 		}
-		val, ok := config[req.Key]
-		if !ok {
-			return &proto.GetConfigResponse{Exists: false}, nil
-		}
-		return &proto.GetConfigResponse{
-			Value:  string(val),
-			Exists: true,
-		}, nil
+		maps.Copy(values, config)
 	}
-
-	// If no key specified, return the entire plugin config as JSON.
-	return &proto.GetConfigResponse{
-		Value:  string(pluginConfig),
-		Exists: true,
-	}, nil
+	for key, value := range overrides {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("encode plugin CLI value: %w", err)
+		}
+		values[key] = encoded
+	}
+	if req.Key != "" {
+		value, exists := values[req.Key]
+		return &proto.GetConfigResponse{Value: string(value), Exists: exists}, nil
+	}
+	if len(values) == 0 && len(configured) == 0 {
+		return &proto.GetConfigResponse{}, nil
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("encode plugin config: %w", err)
+	}
+	return &proto.GetConfigResponse{Value: string(encoded), Exists: true}, nil
 }
 
 // ToolProgress implements Host.ToolProgress.
@@ -477,9 +463,16 @@ func (m *Manager) ResolveCLIFlags(pluginName string, flags map[string]string) {
 	if _, ok := m.cliFlags[pluginName]; !ok {
 		m.cliFlags[pluginName] = make(map[string]string)
 	}
+	if m.cliFlagOverrides == nil {
+		m.cliFlagOverrides = make(map[string]map[string]string)
+	}
+	if m.cliFlagOverrides[pluginName] == nil {
+		m.cliFlagOverrides[pluginName] = make(map[string]string)
+	}
 	// Merge CLI values (CLI overrides defaults).
 	for k, v := range flags {
 		m.cliFlags[pluginName][k] = v
+		m.cliFlagOverrides[pluginName][k] = v
 	}
 }
 
@@ -585,7 +578,10 @@ func (m *Manager) getCLIFlag(pluginName, key string) string {
 // validatePluginConfig validates the plugin's settings.json config against its JSON Schema.
 // If validation fails, the plugin load is rejected with a clear error.
 func (m *Manager) validatePluginConfig(pluginName, schemaStr string) error {
-	settings := m.getSettings()
+	return validatePluginSettings(m.getSettings(), pluginName, schemaStr)
+}
+
+func validatePluginSettings(settings *ai.Settings, pluginName, schemaStr string) error {
 	if settings == nil || settings.Plugins == nil {
 		// No settings means nothing to validate.
 		return nil
@@ -619,24 +615,6 @@ func (m *Manager) validatePluginConfig(pluginName, schemaStr string) error {
 	}
 
 	return nil
-}
-
-// splitLines splits content into lines.
-func splitLines(content string) []string {
-	return strings.Split(content, "\n")
-}
-
-// trimSpace returns s with leading and trailing whitespace removed.
-func trimSpace(s string) string {
-	start := 0
-	end := len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
 }
 
 // SetCustomMessageSender routes extension context to the active session.

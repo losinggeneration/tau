@@ -19,11 +19,15 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/ui"
 	baseui "github.com/losinggeneration/tau/ui"
 	"github.com/stretchr/testify/require"
@@ -96,21 +100,19 @@ func TestPrepareHostSocket_FileModeAndPath(t *testing.T) {
 		t.Errorf("HostSocketPath = %q, want %q", got, path)
 	}
 
-	// A second prepare for the same name closes the previous listener+server
-	// and replaces them at the same path (filename is deterministic per pid
-	// to avoid leaking socket files across plugin reloads).
+	// Replacement sockets use distinct paths so staged startup can coexist with the old process.
 	path2, err := mgr.prepareHostSocketLocked("plugin-A")
 	if err != nil {
 		t.Fatalf("second prepareHostSocket: %v", err)
 	}
-	if path2 != path {
-		t.Errorf("expected same path (pid-stable); got %q vs %q", path2, path)
-	}
+	require.NotEqual(t, path, path2)
+	_, err = os.Stat(path)
+	require.ErrorIs(t, err, os.ErrNotExist)
 	if _, err := os.Stat(path2); err != nil {
 		t.Errorf("socket missing after reload: %v", err)
 	}
-	// Verify the map entry is still present and points at the same struct.
-	if hs := mgr.hostSockets["plugin-A"]; hs == nil || hs.path != path {
+	// The manager owns the replacement socket.
+	if hs := mgr.hostSockets["plugin-A"]; hs == nil || hs.path != path2 {
 		t.Errorf("hostSockets map state lost across reload")
 	}
 }
@@ -337,10 +339,8 @@ func TestEventResponse_MarshalsResponseData(t *testing.T) {
 	}
 }
 
-// TestPrepareHostSocket_StalePathRemoved ensures prepare cleans up any stale
-// socket file at the chosen path (e.g. after a crashed previous launch) and
-// that a non-ENOENT stat error is surfaced.
-func TestPrepareHostSocket_StalePathRemoved(t *testing.T) {
+// TestPrepareHostSocket_DistinctPath leaves unrelated prior socket paths untouched.
+func TestPrepareHostSocket_DistinctPath(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
 	mgr := NewManager(t.TempDir(), nil, nil)
@@ -349,7 +349,7 @@ func TestPrepareHostSocket_StalePathRemoved(t *testing.T) {
 		t.Fatalf("first prepare: %v", err)
 	}
 	// Force-close via manager so we leave a stale file behind.
-	mgr.closeHostSocketLocked("plugin-D")
+	require.NoError(t, mgr.closeHostSocketLocked("plugin-D"))
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("setup: stale socket still present: %v", err)
 	}
@@ -360,9 +360,10 @@ func TestPrepareHostSocket_StalePathRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second prepare (stale present): %v", err)
 	}
-	if path2 != path {
-		t.Errorf("expected reuse of stale path; got new %q vs %q", path2, path)
-	}
+	require.NotEqual(t, path, path2)
+	stale, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "stale", string(stale))
 	if _, err := os.Stat(path2); err != nil {
 		t.Errorf("new socket missing: %v", err)
 	}
@@ -1231,4 +1232,1279 @@ func TestDiscoverRejectsCancelledContextBeforeReplacingCandidates(t *testing.T) 
 	require.Equal(t, "hash", m.binaries["retained"])
 	require.ErrorIs(t, m.ReloadNamed(ctx, ""), cause)
 	require.Equal(t, "hash", m.binaries["retained"])
+}
+
+func TestReloadNamedRetainsShutdownFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+	m := NewManager(t.TempDir(), nil, nil)
+	cause := errors.New("reload shutdown failed")
+	cleaned := false
+	m.plugins["missing"] = &PluginInfo{Name: "missing", Path: filepath.Join(t.TempDir(), "missing"), grpcClient: &shutdownResultClient{err: cause}, Cleanup: func() { cleaned = true }}
+	require.ErrorIs(t, m.ReloadNamed(t.Context(), "missing"), cause)
+	require.True(t, cleaned)
+	require.NotContains(t, m.plugins, "missing")
+}
+
+func TestReloadRejectsDiscoveryBeforeReattemptingPlugins(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	m := NewManager(cfg, nil, nil)
+	bad := filepath.Join(cfg, "extensions", "broken")
+	require.NoError(t, os.MkdirAll(bad, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(bad, "package.json"), []byte(`{"pi":`), 0o600))
+	previous := &PluginInfo{Name: "deferred", Path: "deferred", deregistered: true}
+	m.plugins["deferred"] = previous
+	called := false
+	m.loadFn = func(context.Context, string, ...string) (*PluginInfo, error) {
+		called = true
+		return &PluginInfo{Name: "deferred"}, nil
+	}
+	require.ErrorContains(t, m.Reload(t.Context()), "parse Pi manifest")
+	require.False(t, called)
+	require.Same(t, previous, m.plugins["deferred"])
+}
+
+func TestReloadRetainsDeregisteredRetryFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	m := NewManager(cfg, nil, nil)
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "deferred")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	cause := errors.New("deferred load failed")
+	m.failureConfig[path] = FailureConfig{MaxAttempts: 1}
+	m.plugins["deferred"] = &PluginInfo{Name: "deferred", Path: path, deregistered: true}
+	calls := 0
+	m.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		return nil, nil, cause
+	}
+	require.ErrorIs(t, m.Reload(t.Context()), cause)
+	require.Equal(t, 1, calls)
+	require.True(t, m.plugins["deferred"].deregistered)
+}
+
+func TestReloadKeepsRunningPluginWhenReplacementFails(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "running")
+	require.NoError(t, os.WriteFile(path, []byte("replacement"), 0o700))
+	cause := errors.New("replacement refused")
+	var replacementSocket string
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(_ context.Context, _ string, _ *Manifest, _ string, socket string) (proto.PluginClient, func(), error) {
+		replacementSocket = socket
+		return nil, nil, cause
+	}))
+	oldSocket, err := m.prepareHostSocketLocked("running")
+	require.NoError(t, err)
+	cleaned := false
+	original := &PluginInfo{Name: "running", Path: path, Hash: "old", Cleanup: func() { cleaned = true }, Registrations: Registrations{Tools: []ToolRegistration{{Name: "old-tool"}}}}
+	m.plugins[original.Name] = original
+	m.registerPlugin(original)
+	t.Cleanup(func() { require.NoError(t, m.Shutdown(t.Context())) })
+	require.ErrorIs(t, m.ReloadNamed(t.Context(), "running"), cause)
+	require.False(t, cleaned)
+	require.Same(t, original, m.plugins["running"])
+	require.Equal(t, oldSocket, m.HostSocketPath("running"))
+	require.NotEqual(t, oldSocket, replacementSocket)
+	_, err = os.Stat(oldSocket)
+	require.NoError(t, err)
+	require.Len(t, m.Tools(), 1)
+	require.Equal(t, "old-tool", m.Tools()[0].Name)
+}
+
+func TestReloadReplacesPluginOnlyAfterStartup(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "running")
+	require.NoError(t, os.WriteFile(path, []byte("replacement"), 0o700))
+	oldCleaned := false
+	nextCleaned := false
+	var nextSocket string
+	m := NewManager(cfg, nil, nil)
+	oldSocket, err := m.prepareHostSocketLocked("running")
+	require.NoError(t, err)
+	m.plugins["running"] = &PluginInfo{Name: "running", Path: path, Hash: "old", Cleanup: func() { oldCleaned = true }}
+	m.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		require.False(t, oldCleaned)
+		_, statErr := os.Stat(oldSocket)
+		require.NoError(t, statErr)
+		nextSocket = m.HostSocketPath("running")
+		return &mockPluginClient{gracefulResponse: true}, func() { nextCleaned = true }, nil
+	}
+	t.Cleanup(func() { require.NoError(t, m.Shutdown(t.Context())) })
+	require.NoError(t, m.ReloadNamed(t.Context(), "running"))
+	require.True(t, oldCleaned)
+	require.False(t, nextCleaned)
+	require.NotEqual(t, oldSocket, nextSocket)
+	require.Equal(t, nextSocket, m.HostSocketPath("running"))
+	_, err = os.Stat(oldSocket)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(nextSocket)
+	require.NoError(t, err)
+	require.NotEqual(t, "old", m.plugins["running"].Hash)
+}
+
+func TestReloadRetainsRunningPluginAfterCanceledStartup(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "running")
+	require.NoError(t, os.WriteFile(path, []byte("replacement"), 0o700))
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("startup canceled")
+	oldCleaned, nextCleaned := false, false
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return &mockPluginClient{gracefulResponse: true, onInitialize: func(*proto.InitRequest) { cancel(cause) }}, func() { nextCleaned = true }, nil
+	}))
+	oldSocket, err := m.prepareHostSocketLocked("running")
+	require.NoError(t, err)
+	previous := &PluginInfo{Name: "running", Path: path, Hash: "old", Cleanup: func() { oldCleaned = true }}
+	m.plugins["running"] = previous
+	t.Cleanup(func() { require.NoError(t, m.Shutdown(t.Context())) })
+	require.ErrorIs(t, m.ReloadNamed(ctx, "running"), cause)
+	require.False(t, oldCleaned)
+	require.True(t, nextCleaned)
+	require.Same(t, previous, m.plugins["running"])
+	require.Equal(t, oldSocket, m.HostSocketPath("running"))
+}
+
+func TestReloadNamedRetriesDeregisteredPlugin(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "deferred")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	calls := 0
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}))
+	m.plugins["deferred"] = &PluginInfo{Name: "deferred", Path: path, deregistered: true}
+	t.Cleanup(func() { require.NoError(t, m.Shutdown(t.Context())) })
+	require.NoError(t, m.ReloadNamed(t.Context(), "deferred"))
+	require.Equal(t, 1, calls)
+	require.False(t, m.plugins["deferred"].deregistered)
+}
+
+func TestAttemptLoadWithRetryRetainsCancellationCause(t *testing.T) {
+	for _, stage := range []string{"before load", "after failed load"} {
+		t.Run(stage, func(t *testing.T) {
+			m := NewManager(t.TempDir(), nil, nil)
+			m.failureConfig["plugin"] = FailureConfig{MaxAttempts: 2, BackoffBase: time.Hour, BackoffFactor: 1}
+			ctx, cancel := context.WithCancelCause(t.Context())
+			cause := errors.New("retry canceled")
+			calls := 0
+			m.loadFn = func(context.Context, string, ...string) (*PluginInfo, error) {
+				calls++
+				cancel(cause)
+				return nil, errors.New("load failed")
+			}
+			if stage == "before load" {
+				cancel(cause)
+			}
+			_, err := m.AttemptLoadWithRetry(ctx, "plugin", "")
+			require.ErrorIs(t, err, cause)
+			if stage == "before load" {
+				require.Zero(t, calls)
+			} else {
+				require.Equal(t, 1, calls)
+			}
+		})
+	}
+}
+
+func TestReloadRejectsAllReplacementsBeforeRemovingPlugins(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	good := filepath.Join(dir, "a-good")
+	bad := filepath.Join(dir, "z-bad")
+	for _, path := range []string{good, bad} {
+		require.NoError(t, os.WriteFile(path, []byte("replacement"), 0o700))
+	}
+	cause := errors.New("bad replacement")
+	candidateCleaned := false
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(_ context.Context, path string, _ *Manifest, _ string, _ string) (proto.PluginClient, func(), error) {
+		if path == bad {
+			return nil, nil, cause
+		}
+		return &mockPluginClient{gracefulResponse: true}, func() { candidateCleaned = true }, nil
+	}))
+	originals := make(map[string]*PluginInfo)
+	for _, name := range []string{"a-good", "z-bad", "missing"} {
+		name := name
+		socket, err := m.prepareHostSocketLocked(name)
+		require.NoError(t, err)
+		info := &PluginInfo{Name: name, Path: filepath.Join(dir, name), Hash: "old", Cleanup: func() { t.Errorf("old %s cleaned during rejected reload", name) }}
+		m.plugins[name] = info
+		originals[name] = info
+		t.Cleanup(func() {
+			require.NoError(t, m.closeHostSocketLocked(name))
+			_, err := os.Stat(socket)
+			require.ErrorIs(t, err, os.ErrNotExist)
+		})
+	}
+	require.ErrorIs(t, m.Reload(t.Context()), cause)
+	for name, info := range originals {
+		require.Same(t, info, m.plugins[name])
+		require.NotEmpty(t, m.HostSocketPath(name))
+	}
+	// Successful candidates are released when any later candidate fails.
+	require.True(t, candidateCleaned)
+}
+
+func TestReloadRetainsPolicyWhenReplacementStagingFails(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "running")
+	require.NoError(t, os.WriteFile(path, []byte("replacement"), 0o700))
+	oldSettings := &ai.Settings{ExtensionDir: dir}
+	cause := errors.New("startup rejected")
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return nil, nil, cause
+	}))
+	m.SetSettings(oldSettings)
+	m.binaries[path] = "original"
+	m.manifestPaths["retained"] = "manifest"
+	m.packageBinaries = map[string]bool{"package": true}
+	m.packageManifests["manifest"] = &Manifest{}
+	m.plugins["running"] = &PluginInfo{Name: "running", Path: path, Hash: "original"}
+	prepared, err := m.PrepareReload(t.Context(), &ai.Settings{})
+	require.NoError(t, err)
+	require.ErrorIs(t, prepared.Reload(t.Context(), "running"), cause)
+	require.Same(t, oldSettings, m.getSettings())
+	require.Equal(t, map[string]string{path: "original"}, m.binaries)
+	require.Equal(t, map[string]string{"retained": "manifest"}, m.manifestPaths)
+	require.Contains(t, m.packageBinaries, "package")
+	require.Contains(t, m.packageManifests, "manifest")
+}
+
+func TestReloadRejectsNewPluginBeforeRemovingCurrentPlugin(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "new-plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	cause := errors.New("new plugin rejected")
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return nil, nil, cause
+	}))
+	cleaned := false
+	previous := &PluginInfo{Name: "missing", Path: filepath.Join(dir, "missing"), Cleanup: func() { cleaned = true }}
+	m.plugins["missing"] = previous
+	require.ErrorIs(t, m.Reload(t.Context()), cause)
+	require.False(t, cleaned)
+	require.Same(t, previous, m.plugins["missing"])
+	require.NotContains(t, m.plugins, "new-plugin")
+}
+
+func TestReloadRejectsDeregisteredRetryBeforeRemovingCurrentPlugin(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "deferred")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	cause := errors.New("retry rejected")
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return nil, nil, cause
+	}))
+	m.failureConfig[path] = FailureConfig{MaxAttempts: 1}
+	m.loadFn = func(context.Context, string, ...string) (*PluginInfo, error) { return nil, cause }
+	deferred := &PluginInfo{Name: "deferred", Path: path, deregistered: true}
+	m.plugins["deferred"] = deferred
+	cleaned := false
+	previous := &PluginInfo{Name: "missing", Path: filepath.Join(dir, "missing"), Cleanup: func() { cleaned = true }}
+	m.plugins["missing"] = previous
+	require.ErrorIs(t, m.Reload(t.Context()), cause)
+	require.False(t, cleaned)
+	require.Same(t, previous, m.plugins["missing"])
+	require.Same(t, deferred, m.plugins["deferred"])
+}
+
+func TestReloadStagesDeregisteredRetryUntilSuccess(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "deferred")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	calls := 0
+	m := NewManager(cfg, nil, nil)
+	original := &PluginInfo{Name: "deferred", Path: path, deregistered: true}
+	m.plugins["deferred"] = original
+	m.failureConfig[path] = FailureConfig{MaxAttempts: 2, BackoffBase: 0, BackoffFactor: 1}
+	m.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		require.Same(t, original, m.plugins["deferred"])
+		if calls == 1 {
+			return nil, nil, errors.New("transient")
+		}
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}
+	t.Cleanup(func() { require.NoError(t, m.Shutdown(t.Context())) })
+	require.NoError(t, m.Reload(t.Context()))
+	require.Equal(t, 2, calls)
+	require.NotSame(t, original, m.plugins["deferred"])
+	require.False(t, m.plugins["deferred"].deregistered)
+}
+
+func TestPreparedReloadRetainsCurrentPluginsWhenAdmissionRejects(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "candidate"), []byte("binary"), 0o700))
+	candidateCleaned := false
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return &mockPluginClient{gracefulResponse: true}, func() { candidateCleaned = true }, nil
+	}))
+	oldCleaned := false
+	old := &PluginInfo{Name: "missing", Path: "missing", Cleanup: func() { oldCleaned = true }}
+	m.plugins["missing"] = old
+	prepared, err := m.PrepareReload(t.Context(), &ai.Settings{})
+	require.NoError(t, err)
+	cause := errors.New("prompt persistence rejected")
+	require.ErrorIs(t, prepared.ReloadWithAdmission(t.Context(), "", func() error { return cause }), cause)
+	require.True(t, candidateCleaned)
+	require.False(t, oldCleaned)
+	require.Same(t, old, m.plugins["missing"])
+	require.NotContains(t, m.plugins, "candidate")
+}
+
+func TestPluginStartupRejectsMalformedManifestBeforeConnecting(t *testing.T) {
+	for _, operation := range []string{"load", "handshake"} {
+		t.Run(operation, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "plugin")
+			require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+			manifestPath := filepath.Join(dir, "tau-package.toml")
+			require.NoError(t, os.WriteFile(manifestPath, []byte("[plugin]\napi_version = ["), 0o600))
+			connected := false
+			cause := errors.New("unexpected connector call")
+			manager := NewManager(t.TempDir(), nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+				connected = true
+				return nil, nil, cause
+			}))
+			manager.manifestPaths[path] = manifestPath
+			var err error
+			if operation == "load" {
+				_, err = manager.Load(t.Context(), path, manifestPath)
+			} else {
+				_, err = manager.Handshake(t.Context(), path)
+			}
+			require.Error(t, err)
+			require.False(t, connected)
+			require.NotErrorIs(t, err, cause)
+			require.Empty(t, manager.plugins)
+		})
+	}
+}
+
+func TestReloadStartupHostReadsCandidateConfigWithoutPublishingSideEffects(t *testing.T) {
+	for _, outcome := range []string{"reject", "admit"} {
+		t.Run(outcome, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			cfg := t.TempDir()
+			dir := filepath.Join(cfg, "extensions")
+			require.NoError(t, os.MkdirAll(dir, 0o700))
+			path := filepath.Join(dir, "candidate")
+			require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+			manager := NewManager(cfg, nil, nil)
+			old := &ai.Settings{Plugins: map[string]json.RawMessage{"candidate": json.RawMessage(`{"mode":"old"}`)}}
+			manager.SetSettings(old)
+			proposed := &ai.Settings{Plugins: map[string]json.RawMessage{"candidate": json.RawMessage(`{"mode":"proposed"}`)}}
+			var configValue string
+			var mutationCode codes.Code
+			var candidateSocket string
+			manager.connectPlugin = func(ctx context.Context, _ string, _ *Manifest, _ string, socket string) (proto.PluginClient, func(), error) {
+				candidateSocket = socket
+				connection, err := grpc.NewClient("unix://"+socket, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				if err != nil {
+					return nil, nil, err
+				}
+				defer func() { require.NoError(t, connection.Close()) }()
+				host := proto.NewHostClient(connection)
+				rpcCtx, cancel := context.WithTimeout(metadata.NewOutgoingContext(ctx, metadata.Pairs("tau-plugin-name", "candidate")), 100*time.Millisecond)
+				defer cancel()
+				response, err := host.GetConfig(rpcCtx, &proto.GetConfigRequest{Key: "mode"})
+				if err != nil {
+					return nil, nil, err
+				}
+				configValue = response.Value
+				_, err = host.StateSet(rpcCtx, &proto.StateSetRequest{Key: "startup", Value: "\"must not persist\""})
+				mutationCode = status.Code(err)
+				for _, method := range proto.Host_ServiceDesc.Methods {
+					if method.MethodName == "GetConfig" || method.MethodName == "Log" {
+						continue
+					}
+					err := connection.Invoke(rpcCtx, "/plugins.Host/"+method.MethodName, &emptypb.Empty{}, &emptypb.Empty{})
+					if status.Code(err) != codes.FailedPrecondition {
+						return nil, nil, fmt.Errorf("startup method %s returned %w", method.MethodName, err)
+					}
+				}
+				return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+			}
+			prepared, err := manager.PrepareReload(t.Context(), proposed)
+			require.NoError(t, err)
+			cause := errors.New("reject admission")
+			err = prepared.ReloadWithAdmission(t.Context(), "", func() error {
+				if outcome == "reject" {
+					return cause
+				}
+				return nil
+			})
+			if outcome == "reject" {
+				require.ErrorIs(t, err, cause)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, `"proposed"`, configValue)
+			require.Equal(t, codes.FailedPrecondition, mutationCode)
+			if outcome == "admit" {
+				t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+				connection, err := grpc.NewClient("unix://"+candidateSocket, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				require.NoError(t, err)
+				defer func() { require.NoError(t, connection.Close()) }()
+				rpcCtx, cancel := context.WithTimeout(metadata.NewOutgoingContext(t.Context(), metadata.Pairs("tau-plugin-name", "candidate")), time.Second)
+				defer cancel()
+				host := proto.NewHostClient(connection)
+				_, err = host.StateSet(rpcCtx, &proto.StateSetRequest{Key: "admitted", Value: `"persisted"`})
+				require.NoError(t, err)
+				response, err := host.StateGet(rpcCtx, &proto.StateGetRequest{Key: "admitted"})
+				require.NoError(t, err)
+				require.True(t, response.Exists)
+				require.Equal(t, `"persisted"`, response.Value)
+				require.Same(t, proposed, manager.getSettings())
+			} else {
+				require.Same(t, old, manager.getSettings())
+				require.Empty(t, manager.plugins)
+				require.NoDirExists(t, filepath.Join(cfg, "plugin-state", "candidate"))
+			}
+		})
+	}
+}
+
+func TestNamedReloadDoesNotStartUnrelatedNewPlugins(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "unrelated"), []byte("binary"), 0o700))
+	calls := 0
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		return nil, nil, errors.New("unrelated startup")
+	}))
+	require.NoError(t, manager.ReloadNamed(t.Context(), "selected"))
+	require.Zero(t, calls)
+}
+
+func TestReloadRejectsCancellationBeforeRemovalWithoutAdmissionCallback(t *testing.T) {
+	t.Chdir(t.TempDir())
+	manager := NewManager(t.TempDir(), nil, nil)
+	old := &PluginInfo{Name: "missing", Path: "missing"}
+	manager.plugins["missing"] = old
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("canceled before removal")
+	manager.mu.Lock()
+	cancel(cause)
+	admitted, err := manager.reloadCandidates(ctx, "", nil, nil)
+	manager.mu.Unlock()
+	require.ErrorIs(t, err, cause)
+	require.False(t, admitted)
+	require.Same(t, old, manager.plugins["missing"])
+}
+
+func TestPluginStartupJoinsCleanupFailure(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	manager := NewManager(cfg, nil, nil)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("initialize canceled")
+	manager.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return &mockPluginClient{onInitialize: func(*proto.InitRequest) { cancel(cause) }}, func() { panic("cleanup rejected") }, nil
+	}
+	var startupErr error
+	require.NotPanics(t, func() { _, startupErr = manager.Load(ctx, path) })
+	require.ErrorIs(t, startupErr, cause)
+	require.ErrorContains(t, startupErr, "cleanup rejected")
+	require.Empty(t, manager.HostSocketPath("plugin"))
+	require.Empty(t, manager.plugins)
+}
+
+type nilStartupResponseClient struct {
+	mockPluginClient
+	phase string
+}
+
+func (c *nilStartupResponseClient) Initialize(context.Context, *proto.InitRequest, ...grpc.CallOption) (*proto.InitResponse, error) {
+	if c.phase == "initialize" {
+		return nil, nil
+	}
+	return &proto.InitResponse{ApiVersion: "1"}, nil
+}
+
+func (c *nilStartupResponseClient) ListRegistrations(context.Context, *proto.ListRegistrationsRequest, ...grpc.CallOption) (*proto.Registrations, error) {
+	return nil, nil
+}
+
+func TestPluginStartupRejectsNilResponsesWithoutLeakingCandidate(t *testing.T) {
+	for _, phase := range []string{"initialize", "registrations"} {
+		t.Run(phase, func(t *testing.T) {
+			cfg := t.TempDir()
+			path := filepath.Join(cfg, "plugin")
+			require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+			cleaned := false
+			manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+				return &nilStartupResponseClient{phase: phase}, func() { cleaned = true }, nil
+			}))
+			var startupErr error
+			require.NotPanics(t, func() { _, startupErr = manager.Load(t.Context(), path) })
+			require.ErrorContains(t, startupErr, phase)
+			require.True(t, cleaned)
+			require.Empty(t, manager.HostSocketPath("plugin"))
+			require.Empty(t, manager.plugins)
+		})
+	}
+}
+
+func TestRunPluginHashDoesNotHideResourceReadFailure(t *testing.T) {
+	for _, operation := range []string{"startup", "handshake"} {
+		t.Run(operation, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "plugin")
+			require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+			manifestPath := filepath.Join(root, "tau-package.toml")
+			require.NoError(t, os.WriteFile(manifestPath, []byte("[plugin]\napi_version='1'\n[run]\ncommand='./plugin'\n"), 0o600))
+			require.NoError(t, os.Symlink("missing", filepath.Join(root, "required-resource")))
+			manager := NewManager(t.TempDir(), nil, nil)
+			manifest, err := parseManifest(manifestPath)
+			require.NoError(t, err)
+			if operation == "startup" {
+				_, err = manager.pluginHash(path, manifest, manifestPath)
+			} else {
+				_, _, _, err = manager.handshakeMetadata(path)
+			}
+			require.Error(t, err)
+			require.ErrorIs(t, err, os.ErrNotExist)
+		})
+	}
+}
+
+func TestInitialPluginLoadCanReadHostConfiguration(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	manager := NewManager(cfg, nil, nil)
+	manager.ResolveCLIFlags("plugin", map[string]string{"mode": "cli"})
+	var value string
+	manager.connectPlugin = func(ctx context.Context, _ string, _ *Manifest, _ string, socket string) (proto.PluginClient, func(), error) {
+		connection, err := grpc.NewClient("unix://"+socket, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return nil, nil, err
+		}
+		defer func() { require.NoError(t, connection.Close()) }()
+		rpcCtx, cancel := context.WithTimeout(metadata.NewOutgoingContext(ctx, metadata.Pairs("tau-plugin-name", "plugin")), 100*time.Millisecond)
+		defer cancel()
+		response, err := proto.NewHostClient(connection).GetConfig(rpcCtx, &proto.GetConfigRequest{Key: "mode"})
+		if err != nil {
+			return nil, nil, err
+		}
+		value = response.Value
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}
+	_, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	require.Equal(t, `"cli"`, value)
+	require.False(t, manager.hostSockets["plugin"].staging.Load())
+}
+
+func TestReloadRejectsOldHostCallsDuringShutdown(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	manager := NewManager(cfg, nil, nil)
+	var oldSocket string
+	var shutdownCode codes.Code
+	calls := 0
+	manager.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		if calls == 1 {
+			return &hostShutdownClient{shutdown: func() {
+				connection, err := grpc.NewClient("unix://"+oldSocket, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				require.NoError(t, err)
+				defer func() { require.NoError(t, connection.Close()) }()
+				rpcCtx, cancel := context.WithTimeout(metadata.NewOutgoingContext(t.Context(), metadata.Pairs("tau-plugin-name", "plugin")), 100*time.Millisecond)
+				defer cancel()
+				_, err = proto.NewHostClient(connection).GetConfig(rpcCtx, &proto.GetConfigRequest{Key: "mode"})
+				shutdownCode = status.Code(err)
+			}}, func() {}, nil
+		}
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}
+	_, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	oldSocket = manager.HostSocketPath("plugin")
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	require.NoError(t, manager.ReloadNamed(t.Context(), "plugin"))
+	require.Equal(t, codes.FailedPrecondition, shutdownCode)
+}
+
+type hostShutdownClient struct {
+	mockPluginClient
+	shutdown func()
+}
+
+func (c *hostShutdownClient) Shutdown(context.Context, *proto.ShutdownRequest, ...grpc.CallOption) (*proto.ShutdownResponse, error) {
+	c.shutdown()
+	return &proto.ShutdownResponse{Graceful: true}, nil
+}
+
+func TestAttemptLoadWithRetryRetainsCleanupFailure(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	path := filepath.Join(t.TempDir(), "plugin")
+	manager.failureConfig[path] = FailureConfig{MaxAttempts: 1}
+	cause := errors.New("startup rejected")
+	manager.loadFn = func(context.Context, string, ...string) (*PluginInfo, error) {
+		manager.mu.Lock()
+		manager.plugins["plugin"] = &PluginInfo{Name: "plugin", Path: path, Cleanup: func() { panic("retry cleanup rejected") }}
+		manager.mu.Unlock()
+		return nil, cause
+	}
+	_, err := manager.AttemptLoadWithRetry(t.Context(), path, "")
+	require.ErrorIs(t, err, cause)
+	require.ErrorContains(t, err, "retry cleanup rejected")
+	require.Empty(t, manager.plugins)
+}
+
+func TestAttemptLoadWithRetryCancellationRetainsAttemptFailure(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	path := filepath.Join(t.TempDir(), "plugin")
+	manager.failureConfig[path] = FailureConfig{MaxAttempts: 2}
+	cause := errors.New("retry canceled")
+	failure := errors.New("initial attempt failed")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	manager.loadFn = func(context.Context, string, ...string) (*PluginInfo, error) { cancel(cause); return nil, failure }
+	_, err := manager.AttemptLoadWithRetry(ctx, path, "")
+	require.ErrorIs(t, err, cause)
+	require.ErrorIs(t, err, failure)
+}
+
+func TestPluginStartupRejectsExpiredInitialization(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	cleaned := false
+	manager.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return &expiredInitializationClient{}, func() { cleaned = true }, nil
+	}
+	_, err := manager.startPlugin(t.Context(), "plugin", nil, "", DefaultRPCConfig{Initialize: time.Millisecond})
+	if err == nil {
+		require.NoError(t, manager.closeHostSocketLocked("plugin"))
+	}
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.True(t, cleaned)
+	require.Empty(t, manager.hostSockets)
+}
+
+type expiredInitializationClient struct{ mockPluginClient }
+
+func (c *expiredInitializationClient) Initialize(ctx context.Context, req *proto.InitRequest, opts ...grpc.CallOption) (*proto.InitResponse, error) {
+	<-ctx.Done()
+	return c.mockPluginClient.Initialize(ctx, req, opts...)
+}
+
+func TestPluginStartupRetainsCancellationAlongsideRPCFailure(t *testing.T) {
+	for _, phase := range []string{"connect", "initialize", "registrations"} {
+		t.Run(phase, func(t *testing.T) {
+			manager := NewManager(t.TempDir(), nil, nil)
+			cause := errors.New("startup withdrawn")
+			failure := errors.New("RPC failed")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			cleaned := false
+			manager.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+				cleanup := func() { cleaned = true }
+				if phase == "connect" {
+					cancel(cause)
+					return nil, cleanup, failure
+				}
+				return &canceledStartupClient{phase: phase, cancel: func() { cancel(cause) }, failure: failure}, cleanup, nil
+			}
+			_, err := manager.startPlugin(ctx, "plugin", nil, "", DefaultRPCTimeouts)
+			require.ErrorIs(t, err, cause)
+			require.ErrorIs(t, err, failure)
+			require.True(t, cleaned)
+			require.Empty(t, manager.hostSockets)
+		})
+	}
+}
+
+type canceledStartupClient struct {
+	mockPluginClient
+	phase   string
+	cancel  func()
+	failure error
+}
+
+func (c *canceledStartupClient) Initialize(ctx context.Context, req *proto.InitRequest, opts ...grpc.CallOption) (*proto.InitResponse, error) {
+	if c.phase == "initialize" {
+		c.cancel()
+		return nil, c.failure
+	}
+	return c.mockPluginClient.Initialize(ctx, req, opts...)
+}
+
+func (c *canceledStartupClient) ListRegistrations(context.Context, *proto.ListRegistrationsRequest, ...grpc.CallOption) (*proto.Registrations, error) {
+	c.cancel()
+	return nil, c.failure
+}
+
+func TestReloadRetryRetainsEveryStartupFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	first := errors.New("first connection rejected")
+	second := errors.New("second connection rejected")
+	calls := 0
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		if calls == 1 {
+			return nil, nil, first
+		}
+		return nil, nil, second
+	}))
+	previous := &PluginInfo{Name: "plugin", Path: path, deregistered: true}
+	manager.plugins["plugin"] = previous
+	manager.failureConfig[path] = FailureConfig{MaxAttempts: 2}
+	err := manager.Reload(t.Context())
+	require.ErrorIs(t, err, first)
+	require.ErrorIs(t, err, second)
+	require.Same(t, previous, manager.plugins["plugin"])
+	require.Equal(t, 2, calls)
+	require.Empty(t, manager.hostSockets)
+}
+
+func TestLoadRejectsDuplicateWithoutChangingRunningPlugin(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	calls := 0
+	cleaned := false
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		if calls > 1 {
+			return nil, nil, errors.New("duplicate connector must not run")
+		}
+		return &mockPluginClient{gracefulResponse: true}, func() { cleaned = true }, nil
+	}))
+	original, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	socket := manager.HostSocketPath("plugin")
+	_, err = manager.Load(t.Context(), path)
+	require.ErrorContains(t, err, "already loaded")
+	require.Equal(t, 1, calls)
+	require.Same(t, original, manager.plugins["plugin"])
+	require.Equal(t, socket, manager.HostSocketPath("plugin"))
+	require.FileExists(t, socket)
+	require.False(t, cleaned)
+}
+
+func TestRetryLoadRejectsDuplicateWithoutCleaningRunningPlugin(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	path := filepath.Join(t.TempDir(), "plugin")
+	cleaned := false
+	previous := &PluginInfo{Name: "plugin", Path: path, Cleanup: func() { cleaned = true }}
+	manager.plugins["plugin"] = previous
+	manager.failureConfig[path] = FailureConfig{MaxAttempts: 1}
+	manager.loadFn = manager.Load
+	_, err := manager.AttemptLoadWithRetry(t.Context(), path, "")
+	require.ErrorContains(t, err, "already loaded")
+	require.False(t, cleaned)
+	require.Same(t, previous, manager.plugins["plugin"])
+}
+
+func TestRetryLoadPreservesPluginAdmittedAfterRetryCheck(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	path := filepath.Join(t.TempDir(), "plugin")
+	manager.failureConfig[path] = FailureConfig{MaxAttempts: 1}
+	cleaned := false
+	previous := &PluginInfo{Name: "plugin", Path: path, Cleanup: func() { cleaned = true }}
+	manager.loadFn = func(ctx context.Context, path string, manifest ...string) (*PluginInfo, error) {
+		manager.mu.Lock()
+		manager.plugins["plugin"] = previous
+		manager.mu.Unlock()
+		return manager.Load(ctx, path, manifest...)
+	}
+	_, err := manager.AttemptLoadWithRetry(t.Context(), path, "")
+	require.ErrorContains(t, err, "already loaded")
+	require.False(t, cleaned)
+	require.Same(t, previous, manager.plugins["plugin"])
+}
+
+func TestHandshakeCloseReportsCleanupPanicAndRemovesSocket(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	calls := 0
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return &mockPluginClient{}, func() { calls++; panic("handshake cleanup rejected") }, nil
+	}))
+	result, err := manager.Handshake(t.Context(), path)
+	require.NoError(t, err)
+	socket := manager.HostSocketPath("plugin")
+	t.Cleanup(func() { require.NoError(t, manager.closeHostSocketLocked("plugin")) })
+	var closeErr error
+	require.NotPanics(t, func() { closeErr = result.Close() })
+	require.ErrorContains(t, closeErr, "handshake cleanup rejected")
+	require.NoFileExists(t, socket)
+	require.Empty(t, manager.hostSockets)
+	require.ErrorContains(t, result.Close(), "handshake cleanup rejected")
+	require.Equal(t, 1, calls)
+}
+
+func TestHandshakeRejectsRunningPluginWithoutReplacingEndpoint(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	calls := 0
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}))
+	previous, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	socket := manager.HostSocketPath("plugin")
+	result, err := manager.Handshake(t.Context(), path)
+	if result != nil {
+		require.NoError(t, result.Close())
+	}
+	require.ErrorContains(t, err, "already loaded")
+	require.Equal(t, 1, calls)
+	require.Same(t, previous, manager.plugins["plugin"])
+	require.Equal(t, socket, manager.HostSocketPath("plugin"))
+	require.FileExists(t, socket)
+}
+
+func TestHandshakeCloseDoesNotRemoveLaterLoadedEndpoint(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}))
+	probe, err := manager.Handshake(t.Context(), path)
+	require.NoError(t, err)
+	_, err = manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	socket := manager.HostSocketPath("plugin")
+	require.NoError(t, probe.Close())
+	require.Equal(t, socket, manager.HostSocketPath("plugin"))
+	require.FileExists(t, socket)
+}
+
+func TestReloadRetainsExplicitCLIFlagsAndRefreshesDefaults(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	calls := 0
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		defaultValue := "old"
+		if calls > 1 {
+			defaultValue = "new"
+		}
+		return &loadoutFlagClient{flags: []*proto.CLIFlag{{Name: "mode", DefaultValue: defaultValue}, {Name: "default", DefaultValue: defaultValue}}}, func() {}, nil
+	}))
+	_, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	manager.ResolveCLIFlags("plugin", map[string]string{"mode": "explicit"})
+	require.NoError(t, manager.ReloadNamed(t.Context(), "plugin"))
+	require.Equal(t, "explicit", manager.getCLIFlag("plugin", "mode"))
+	require.Equal(t, "new", manager.getCLIFlag("plugin", "default"))
+}
+
+type loadoutFlagClient struct {
+	mockPluginClient
+	flags []*proto.CLIFlag
+}
+
+func (c *loadoutFlagClient) ListRegistrations(context.Context, *proto.ListRegistrationsRequest, ...grpc.CallOption) (*proto.Registrations, error) {
+	return &proto.Registrations{CliFlags: c.flags}, nil
+}
+
+func (c *loadoutFlagClient) Shutdown(context.Context, *proto.ShutdownRequest, ...grpc.CallOption) (*proto.ShutdownResponse, error) {
+	return &proto.ShutdownResponse{Graceful: true}, nil
+}
+
+func TestLoadValidatesPluginConfigurationWithoutReenteringManagerLock(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	manifest := filepath.Join(cfg, "tau-package.toml")
+	require.NoError(t, os.WriteFile(manifest, []byte("[plugin]\napi_version='1'\n[config_schema]\nschema='''{\"type\":\"object\",\"required\":[\"mode\"],\"properties\":{\"mode\":{\"type\":\"string\"}}}'''\n"), 0o600))
+	calls := 0
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}))
+	manager.SetSettings(&ai.Settings{Plugins: map[string]json.RawMessage{"plugin": json.RawMessage(`{"mode":42}`)}})
+	_, err := manager.Load(t.Context(), path, manifest)
+	require.ErrorContains(t, err, "config validation")
+	require.Equal(t, 0, calls)
+	manager.SetSettings(&ai.Settings{Plugins: map[string]json.RawMessage{"plugin": json.RawMessage(`{"mode":"valid"}`)}})
+	_, err = manager.Load(t.Context(), path, manifest)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	require.Equal(t, 1, calls)
+}
+
+func TestReattemptDeregisteredRetainsOriginalUntilAdmitted(t *testing.T) {
+	for _, outcome := range []string{"reject", "admit", "cancel"} {
+		t.Run(outcome, func(t *testing.T) {
+			cfg := t.TempDir()
+			path := filepath.Join(cfg, "plugin")
+			require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+			manager := NewManager(cfg, nil, nil)
+			previous := &PluginInfo{Name: "plugin", Path: path, deregistered: true}
+			manager.plugins["plugin"] = previous
+			manager.failureConfig[path] = FailureConfig{MaxAttempts: 1}
+			cause := errors.New("retry rejected")
+			calls := 0
+			manager.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+				calls++
+				require.Same(t, previous, manager.plugins["plugin"])
+				if outcome == "reject" {
+					return nil, nil, cause
+				}
+				return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+			}
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			if outcome == "cancel" {
+				cancel(cause)
+			}
+			err := manager.ReattemptDeregistered(ctx)
+			if outcome == "admit" {
+				require.NoError(t, err)
+				require.NotSame(t, previous, manager.plugins["plugin"])
+				require.False(t, manager.plugins["plugin"].deregistered)
+				t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+			} else {
+				require.ErrorIs(t, err, cause)
+				require.Same(t, previous, manager.plugins["plugin"])
+			}
+			if outcome == "cancel" {
+				require.Equal(t, 0, calls)
+			} else {
+				require.Equal(t, 1, calls)
+			}
+		})
+	}
+}
+
+func TestReattemptDeregisteredUsesOriginalManifestPath(t *testing.T) {
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "plugin")
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	manifestPath := filepath.Join(cfg, "custom.toml")
+	require.NoError(t, os.WriteFile(manifestPath, []byte("[plugin]\napi_version='1'\n"), 0o600))
+	manager := NewManager(cfg, nil, nil, WithPluginConnector(func(_ context.Context, _ string, manifest *Manifest, selected, _ string) (proto.PluginClient, func(), error) {
+		require.NotNil(t, manifest)
+		require.Equal(t, manifestPath, selected)
+		return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+	}))
+	manager.plugins["plugin"] = &PluginInfo{Name: "plugin", Path: path, ManifestPath: manifestPath, deregistered: true}
+	manager.failureConfig[path] = FailureConfig{MaxAttempts: 1}
+	require.NoError(t, manager.ReattemptDeregistered(t.Context()))
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	require.Equal(t, manifestPath, manager.plugins["plugin"].ManifestPath)
+}
+
+func TestReloadDoesNotLeakCandidatesWithSamePluginName(t *testing.T) {
+	t.Chdir(t.TempDir())
+	manager := NewManager(t.TempDir(), nil, nil)
+	root := t.TempDir()
+	for _, dir := range []string{"a", "z"} {
+		path := filepath.Join(root, dir, "plugin")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+		manager.AddExtensionPath(path)
+	}
+	calls, cleaned := 0, 0
+	manager.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		return &mockPluginClient{gracefulResponse: true}, func() { cleaned++ }, nil
+	}
+	require.NoError(t, manager.Reload(t.Context()))
+	require.Equal(t, 1, calls)
+	require.Equal(t, filepath.Join(root, "a", "plugin"), manager.plugins["plugin"].Path)
+	require.NoError(t, manager.Shutdown(t.Context()))
+	require.Equal(t, calls, cleaned)
+	require.Empty(t, manager.hostSockets)
+}
+
+func TestReloadStagesMovedPluginBeforeRemovingOriginal(t *testing.T) {
+	for _, outcome := range []string{"admit", "reject"} {
+		t.Run(outcome, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			cfg := t.TempDir()
+			oldPath := filepath.Join(cfg, "old", "plugin")
+			newPath := filepath.Join(cfg, "new", "plugin")
+			require.NoError(t, os.MkdirAll(filepath.Dir(newPath), 0o700))
+			require.NoError(t, os.WriteFile(newPath, []byte("binary"), 0o700))
+			cause := errors.New("moved startup rejected")
+			cleaned := false
+			calls := 0
+			manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+				calls++
+				require.False(t, cleaned)
+				if outcome == "reject" {
+					return nil, nil, cause
+				}
+				return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+			}))
+			manager.AddExtensionPath(newPath)
+			previous := &PluginInfo{Name: "plugin", Path: oldPath, Cleanup: func() { cleaned = true }}
+			manager.plugins["plugin"] = previous
+			err := manager.Reload(t.Context())
+			t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+			require.Equal(t, 1, calls)
+			if outcome == "reject" {
+				require.ErrorIs(t, err, cause)
+				require.False(t, cleaned)
+				require.Same(t, previous, manager.plugins["plugin"])
+			} else {
+				require.NoError(t, err)
+				require.True(t, cleaned)
+				require.Equal(t, newPath, manager.plugins["plugin"].Path)
+			}
+		})
+	}
+}
+
+func TestPluginStartupAdmissionClosesAfterManagerShutdown(t *testing.T) {
+	for _, operation := range []string{"Load", "Handshake", "Reload", "prepared reload", "AutoLoad", "retry", "deregistered retry"} {
+		t.Run(operation, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			cfg := t.TempDir()
+			path := filepath.Join(cfg, "extensions", "plugin")
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+			require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+			calls := 0
+			manager := NewManager(cfg, nil, nil, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+				calls++
+				return &mockPluginClient{gracefulResponse: true}, func() {}, nil
+			}))
+			manager.binaries[path] = "hash"
+			manager.failureConfig[path] = FailureConfig{MaxAttempts: 2}
+			attempts := 0
+			originalLoad := manager.loadFn
+			manager.loadFn = func(ctx context.Context, path string, manifest ...string) (*PluginInfo, error) {
+				attempts++
+				return originalLoad(ctx, path, manifest...)
+			}
+			prepared, err := manager.PrepareReload(t.Context(), &ai.Settings{})
+			require.NoError(t, err)
+			require.NoError(t, manager.Shutdown(t.Context()))
+			defer func() { require.NoError(t, manager.Shutdown(t.Context())) }()
+			switch operation {
+			case "Load":
+				_, err = manager.Load(t.Context(), path)
+			case "Handshake":
+				var probe *HandshakeResult
+				probe, err = manager.Handshake(t.Context(), path)
+				if probe != nil {
+					require.NoError(t, probe.Close())
+				}
+			case "Reload":
+				err = manager.Reload(t.Context())
+			case "prepared reload":
+				err = prepared.Reload(t.Context(), "")
+			case "AutoLoad":
+				err = manager.AutoLoad(t.Context())
+			case "deregistered retry":
+				err = manager.ReattemptDeregistered(t.Context())
+			case "retry":
+				_, err = manager.AttemptLoadWithRetry(t.Context(), path, "")
+			}
+			require.ErrorContains(t, err, "shut down")
+			require.Equal(t, 0, calls)
+			require.Equal(t, 0, attempts)
+			require.Empty(t, manager.plugins)
+			require.Empty(t, manager.hostSockets)
+		})
+	}
+}
+
+func TestShutdownRetainsCancellationAlongsideRPCFailure(t *testing.T) {
+	for _, response := range []*proto.ShutdownResponse{nil, {}, {Error: "drain failed"}} {
+		t.Run(fmt.Sprintf("%v", response), func(t *testing.T) {
+			cause := errors.New("shutdown withdrawn")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			manager := NewManager(t.TempDir(), nil, nil)
+			cleaned := false
+			manager.plugins["plugin"] = &PluginInfo{Name: "plugin", grpcClient: &failedShutdownClient{cancel: func() { cancel(cause) }, response: response}, Cleanup: func() { cleaned = true }}
+			err := manager.Shutdown(ctx)
+			require.ErrorIs(t, err, cause)
+			require.True(t, cleaned)
+		})
+	}
+	cause := errors.New("shutdown withdrawn")
+	failure := errors.New("shutdown RPC disconnected")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	manager := NewManager(t.TempDir(), nil, nil)
+	manager.plugins["plugin"] = &PluginInfo{Name: "plugin", grpcClient: &failedShutdownClient{cancel: func() { cancel(cause) }, failure: failure}}
+	err := manager.Shutdown(ctx)
+	require.ErrorIs(t, err, cause)
+	require.ErrorIs(t, err, failure)
+}
+
+type failedShutdownClient struct {
+	mockPluginClient
+	cancel   func()
+	failure  error
+	response *proto.ShutdownResponse
+}
+
+func (c *failedShutdownClient) Shutdown(context.Context, *proto.ShutdownRequest, ...grpc.CallOption) (*proto.ShutdownResponse, error) {
+	c.cancel()
+	return c.response, c.failure
+}
+
+func TestShutdownRemovesRegistrationsAndDoesNotRepeatCleanup(t *testing.T) {
+	for _, operation := range []string{"all", "one"} {
+		t.Run(operation, func(t *testing.T) {
+			registry := commands.NewInMemoryRegistry()
+			manager := NewManager(t.TempDir(), nil, registry)
+			cleaned := 0
+			info := &PluginInfo{Name: "plugin", Path: "/plugin", Cleanup: func() { cleaned++ }, Registrations: Registrations{Tools: []ToolRegistration{{Name: "lookup"}}, Commands: []CommandRegistration{{Name: "lookup"}}}}
+			manager.plugins[info.Name] = info
+			manager.registerPlugin(info)
+			require.NotEmpty(t, manager.Tools())
+			if operation == "one" {
+				require.NoError(t, manager.ShutdownPlugin(t.Context(), "plugin", time.Second))
+			} else {
+				require.NoError(t, manager.Shutdown(t.Context()))
+			}
+			require.Empty(t, manager.plugins)
+			require.Empty(t, manager.Tools())
+			_, _, exists := registry.Lookup("lookup")
+			require.False(t, exists)
+			require.NoError(t, manager.Shutdown(t.Context()))
+			require.Equal(t, 1, cleaned)
+		})
+	}
+}
+
+func TestAttemptLoadWithRetryStopsAfterConcurrentShutdown(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	path := filepath.Join(t.TempDir(), "plugin")
+	manager.failureConfig[path] = FailureConfig{MaxAttempts: 3}
+	failure := errors.New("first startup failed")
+	attempts := 0
+	manager.loadFn = func(context.Context, string, ...string) (*PluginInfo, error) {
+		attempts++
+		require.NoError(t, manager.Shutdown(t.Context()))
+		return nil, failure
+	}
+	_, err := manager.AttemptLoadWithRetry(t.Context(), path, "")
+	require.ErrorIs(t, err, failure)
+	require.ErrorContains(t, err, "shut down")
+	require.Equal(t, 1, attempts)
+}
+
+func TestPluginStartupRejectsNilRegistrationEntries(t *testing.T) {
+	for _, kind := range []string{"tool", "command", "flag", "model"} {
+		t.Run(kind, func(t *testing.T) {
+			manager := NewManager(t.TempDir(), nil, nil)
+			path := filepath.Join(t.TempDir(), "plugin")
+			require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+			regs := &proto.Registrations{}
+			switch kind {
+			case "tool":
+				regs.Tools = []*proto.ToolRegistration{nil}
+			case "command":
+				regs.Commands = []*proto.CommandRegistration{nil}
+			case "flag":
+				regs.CliFlags = []*proto.CLIFlag{nil}
+			case "model":
+				regs.VirtualModels = []*proto.VirtualModelRegistration{nil}
+			}
+			cleaned := false
+			manager.connectPlugin = func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+				return &invalidRegistrationsClient{registrations: regs}, func() { cleaned = true }, nil
+			}
+			require.NotPanics(t, func() { _, err := manager.Load(t.Context(), path); require.ErrorContains(t, err, "registration") })
+			require.True(t, cleaned)
+			require.Empty(t, manager.plugins)
+			require.Empty(t, manager.hostSockets)
+		})
+	}
+}
+
+type invalidRegistrationsClient struct {
+	mockPluginClient
+	registrations *proto.Registrations
+}
+
+func (c *invalidRegistrationsClient) ListRegistrations(context.Context, *proto.ListRegistrationsRequest, ...grpc.CallOption) (*proto.Registrations, error) {
+	return c.registrations, nil
+}
+
+func TestReloadReplacesSlashCommandMetadataAndRemovesStaleCommands(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	path := filepath.Join(cfg, "extensions", "plugin")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, []byte("binary"), 0o700))
+	registry := commands.NewInMemoryRegistry()
+	calls := 0
+	manager := NewManager(cfg, nil, registry, WithPluginConnector(func(context.Context, string, *Manifest, string, string) (proto.PluginClient, func(), error) {
+		calls++
+		regs := &proto.Registrations{Commands: []*proto.CommandRegistration{{Name: "shared", Description: "new"}, {Name: "added"}}}
+		if calls == 1 {
+			regs.Commands = []*proto.CommandRegistration{{Name: "shared", Description: "old"}, {Name: "removed"}}
+		}
+		return &invalidRegistrationsClient{mockPluginClient: mockPluginClient{gracefulResponse: true}, registrations: regs}, func() {}, nil
+	}))
+	_, err := manager.Load(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, manager.Shutdown(t.Context())) })
+	require.NoError(t, manager.ReloadNamed(t.Context(), "plugin"))
+	_, metadata, exists := registry.Lookup("shared")
+	require.True(t, exists)
+	require.Equal(t, "new", metadata.Description)
+	_, _, exists = registry.Lookup("removed")
+	require.False(t, exists)
+	_, _, exists = registry.Lookup("added")
+	require.True(t, exists)
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, manager.Reload(t.Context()))
+	require.Empty(t, registry.List())
 }

@@ -1211,3 +1211,27 @@ func TestExplicitRefreshRetainsTerminalProviderCause(t *testing.T) {
 		})
 	}
 }
+
+func TestMemoryRefreshRetainsCancellationAndProviderFailure(t *testing.T) {
+	for _, method := range []string{"Get", "RefreshOAuth"} {
+		t.Run(method, func(t *testing.T) {
+			cause := errors.New("refresh withdrawn")
+			failure := errors.New("provider disconnected")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			refresh := func(context.Context) error { cancel(cause); return failure }
+			backend := NewMemoryBackend(Options{RefreshFuncs: map[string]RefreshFunc{"provider": func(ctx context.Context, _ ai.Credential) (ai.Credential, error) {
+				return ai.Credential{}, refresh(ctx)
+			}}})
+			require.NoError(t, backend.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")))
+			var err error
+			if method == "Get" {
+				_, err = backend.Get(ctx, "provider")
+			} else {
+				_, err = backend.RefreshOAuth(ctx, "provider", terminalRefreshProvider{refresh: refresh})
+			}
+			require.ErrorIs(t, err, cause)
+			require.ErrorIs(t, err, failure)
+			require.Equal(t, "old", backend.creds["provider"].AccessToken)
+		})
+	}
+}

@@ -23,8 +23,7 @@ import (
 // authFile represents Pi's flat on-disk auth.json schema: provider id -> credential.
 type authFile map[string]authCredential
 
-// clone returns an independent copy. Callers mutate what readFile hands back,
-// so the cache must never be the thing they get.
+// clone owns nested metadata used by refresh conflict snapshots.
 func (a authFile) clone() authFile {
 	out := make(authFile, len(a))
 	for key, value := range a {
@@ -55,24 +54,6 @@ func cloneAuthJSON(value any) any {
 	default:
 		return value
 	}
-}
-
-// fileStamp identifies a version of auth.json on disk.
-//
-// Size is part of it because mtime alone is not enough: filesystem timestamp
-// granularity is coarse enough that two writes can share an mtime, and a cache
-// keyed on mtime would then serve the first write's contents forever.
-type fileStamp struct {
-	modTime time.Time
-	size    int64
-}
-
-func stampOf(info os.FileInfo) fileStamp {
-	return fileStamp{modTime: info.ModTime(), size: info.Size()}
-}
-
-func (s fileStamp) matches(info os.FileInfo) bool {
-	return s.modTime.Equal(info.ModTime()) && s.size == info.Size()
 }
 
 type authCredential struct {
@@ -205,14 +186,6 @@ type FileBackend struct {
 	refreshFuncs map[string]RefreshFunc
 	margin       time.Duration
 	refreshMu    sync.Map
-	// cache holds the last parsed contents; cacheStamp identifies which
-	// on-disk version it came from and cacheValid says whether it means
-	// anything yet. Guarded by cacheMu, which is separate from f.mu so
-	// callers already holding f.mu cannot deadlock.
-	cache      authFile
-	cacheStamp fileStamp
-	cacheValid bool
-	cacheMu    sync.Mutex
 }
 
 // NewFileBackend creates a new file-backed credential store at the given path.
@@ -221,7 +194,6 @@ func NewFileBackend(path string, opts Options) *FileBackend {
 		path:         path,
 		refreshFuncs: opts.refreshFuncs(),
 		margin:       opts.expiryMargin(),
-		cache:        make(authFile),
 	}
 }
 
@@ -274,6 +246,9 @@ func (f *FileBackend) Get(ctx context.Context, provider string) (ai.Credential, 
 	}
 
 	refreshed, err := refreshFn(ctx, cred)
+	if cause := context.Cause(ctx); cause != nil {
+		return cred, errors.Join(cause, err)
+	}
 	if err != nil {
 		if isErrCredentialNeedsReauth(err) {
 			cred.NeedsReauth = true
@@ -380,6 +355,9 @@ func (f *FileBackend) RefreshOAuth(ctx context.Context, provider string, oauthPr
 
 	// Refresh
 	refreshed, err := oauthProvider.RefreshToken(ctx, oauthCreds)
+	if cause := context.Cause(ctx); cause != nil {
+		return cred, errors.Join(cause, err)
+	}
 	if err != nil {
 		// Check for terminal error
 		if isErrCredentialNeedsReauth(err) {
@@ -462,9 +440,7 @@ func (f *FileBackend) writeRefreshedCredential(ctx context.Context, key string, 
 // The cross-process lock is held across the *whole* sequence, not just the
 // write. Holding it only for the write loses updates: two processes both read
 // {a:1}, each adds its own key, each writes the full map back, and whichever
-// finishes second erases the other's credential. Re-reading from disk under the
-// lock (rather than from cache) is the other half — a cached copy taken before
-// the lock was acquired is exactly the stale base that causes the loss.
+// finishes second erases the other's credential.
 func (f *FileBackend) mutate(ctx context.Context, fn func(authFile) error) (err error) {
 	if err := context.Cause(ctx); err != nil {
 		return err
@@ -486,7 +462,7 @@ func (f *FileBackend) mutate(ctx context.Context, fn func(authFile) error) (err 
 		}
 	}()
 
-	af, err := f.readFileFromDisk()
+	af, err := f.readFile()
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -550,47 +526,9 @@ func acquireCredentialLock(ctx context.Context, platform string, lock func() err
 	return errors.New("credential lock retries exhausted")
 }
 
-// readFile returns the stored credentials, serving a cached copy when the file
-// has not changed since it was read.
-//
-// The returned map is always a copy. Handing out the cache itself let a caller
-// mutate it in place: writeCredential added its entry to the live cache before
-// attempting the write, so a failed write left the cache advertising a
-// credential that was never persisted.
+// readFile reads the current file because external writers can preserve metadata.
 func (f *FileBackend) readFile() (authFile, error) {
-	f.cacheMu.Lock()
-	defer f.cacheMu.Unlock()
-
-	info, err := os.Stat(f.path)
-	if err != nil {
-		return nil, err
-	}
-
-	if f.cacheValid && f.cacheStamp.matches(info) {
-		return f.cache.clone(), nil
-	}
-
-	af, err := parseAuthFile(f.path)
-	if err != nil {
-		return nil, err
-	}
-
-	f.cache = af
-	f.cacheStamp = stampOf(info)
-	f.cacheValid = true
-
-	return af.clone(), nil
-}
-
-// readFileFromDisk bypasses the cache. Callers holding the cross-process lock
-// use it so their read-modify-write starts from what is actually on disk rather
-// than from whatever this process saw last.
-func (f *FileBackend) readFileFromDisk() (authFile, error) {
-	af, err := parseAuthFile(f.path)
-	if err != nil {
-		return nil, err
-	}
-	return af, nil
+	return parseAuthFile(f.path)
 }
 
 func parseAuthFile(path string) (authFile, error) {
@@ -671,19 +609,6 @@ func (f *FileBackend) writeFileLocked(af authFile) (err error) {
 	if err := os.Rename(tmpName, f.path); err != nil {
 		return fmt.Errorf("replace auth.json: %w", err)
 	}
-
-	// Stamp the cache from the file's real metadata. Using time.Now() here
-	// recorded an instant later than the file's own mtime, so a subsequent
-	// write by another process could land in between and be treated as stale.
-	f.cacheMu.Lock()
-	f.cache = af.clone()
-	if info, statErr := os.Stat(f.path); statErr == nil {
-		f.cacheStamp = stampOf(info)
-		f.cacheValid = true
-	} else {
-		f.cacheValid = false
-	}
-	f.cacheMu.Unlock()
 
 	return nil
 }

@@ -344,3 +344,80 @@ func TestGeneratedPiPackageQuotedCommandDiscovery(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, data, unchanged)
 }
+
+func TestPackageDiscoveryRecognizesTOMLPluginTables(t *testing.T) {
+	for _, header := range []string{"[plugin] # plugin configuration", `["plugin"]`, `['plugin']`} {
+		t.Run(header, func(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(root, "tau-package.toml"), []byte(header+"\napi_version='1'\n[run]\ncommand='node extension.js'\n"), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(root, "extension.js"), []byte("extension"), 0o600))
+			manager := NewManager(t.TempDir(), nil, nil)
+			require.NoError(t, manager.scanPackageDir(root))
+			require.Contains(t, manager.binaries, root)
+			require.Equal(t, filepath.Join(root, "tau-package.toml"), manager.manifestPaths[root])
+			nested := NewManager(t.TempDir(), nil, nil)
+			require.NoError(t, nested.scanNestedManifestPlugins(filepath.Dir(root)))
+			require.Contains(t, nested.binaries, root)
+			require.Equal(t, filepath.Join(root, "tau-package.toml"), nested.manifestPaths[root])
+		})
+	}
+}
+
+func TestFindPluginBinaryFollowsSymlinkTargetType(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "support"), 0o700))
+	require.NoError(t, os.Symlink("support", filepath.Join(root, "a-support")))
+	executable := filepath.Join(root, "z-plugin")
+	require.NoError(t, os.WriteFile(executable, []byte("binary"), 0o700))
+	selected, err := findPluginBinary(root, nil)
+	require.NoError(t, err)
+	require.Equal(t, executable, selected)
+	require.NoError(t, os.Remove(executable))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "support", "real"), []byte("binary"), 0o700))
+	require.NoError(t, os.Symlink(filepath.Join("support", "real"), executable))
+	selected, err = findPluginBinary(root, nil)
+	require.NoError(t, err)
+	require.Equal(t, executable, selected)
+}
+
+func TestFindPluginBinaryReportsTargetStatFailure(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.Symlink("loop", filepath.Join(root, "loop")))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "z-plugin"), []byte("binary"), 0o700))
+	_, err := findPluginBinary(root, nil)
+	require.Error(t, err)
+	var pathErr *os.PathError
+	require.ErrorAs(t, err, &pathErr)
+}
+
+func TestNativePluginHashIncludesManifestChanges(t *testing.T) {
+	t.Chdir(t.TempDir())
+	cfg := t.TempDir()
+	root := filepath.Join(cfg, "packages", "native")
+	require.NoError(t, os.MkdirAll(root, 0o700))
+	binary := filepath.Join(root, "plugin")
+	require.NoError(t, os.WriteFile(binary, []byte("binary"), 0o700))
+	manifestPath := filepath.Join(root, "tau-package.toml")
+	write := func(prefix string) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(manifestPath, []byte("[plugin]\napi_version='1'\ntool_prefix='"+prefix+"'\n"), 0o600))
+	}
+	write("old_")
+	manager := NewManager(cfg, nil, nil)
+	first, err := manager.PrepareReload(t.Context(), &ai.Settings{})
+	require.NoError(t, err)
+	before := first.candidates.binaries[binary]
+	require.NotEmpty(t, before)
+	write("new_")
+	second, err := manager.PrepareReload(t.Context(), &ai.Settings{})
+	require.NoError(t, err)
+	after := second.candidates.binaries[binary]
+	require.NotEqual(t, before, after)
+	hash, _, selected, err := manager.handshakeMetadata(binary)
+	require.NoError(t, err)
+	require.Equal(t, manifestPath, selected)
+	require.Equal(t, after, hash)
+	third, err := manager.PrepareReload(t.Context(), &ai.Settings{})
+	require.NoError(t, err)
+	require.Equal(t, after, third.candidates.binaries[binary])
+}

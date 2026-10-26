@@ -810,6 +810,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform Transfo
 		FlushContextMessages:  a.flushCustomMessages,
 		PrepareNextTurn:       a.config.PrepareNextTurn,
 		OnProviderStreamEvent: a.config.OnProviderStreamEvent,
+		PausedBy:              a.config.PausedBy,
 		FinishTurn:            a.config.FinishTurn,
 		PrepareRequest:        a.prepareRequest,
 		Model:                 a.state.Model,

@@ -65,11 +65,14 @@ func (m *Manager) waitForShimReady(ctx context.Context, manifest *Manifest) erro
 	if !manifestNeedsManagedShim(manifest) {
 		return nil
 	}
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return fmt.Errorf("wait for pi-ext-shim setup: %w", err)
 	}
 	if m.shimClosed {
 		return errors.New("pi-ext-shim setup manager is shut down")
+	}
+	if piext.IsShimCurrent(m.shimDir()) {
+		return nil
 	}
 	m.startShimEnsureLocked(ctx, m.shimDir())
 	setup := m.shimSetup
@@ -79,7 +82,7 @@ func (m *Manager) waitForShimReady(ctx context.Context, manifest *Manifest) erro
 	case <-ctx.Done():
 	}
 	m.mu.Lock()
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return fmt.Errorf("wait for pi-ext-shim setup: %w", err)
 	}
 	if m.shimClosed {

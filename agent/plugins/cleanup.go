@@ -19,7 +19,11 @@ func (m *Manager) runCleanup(ctx context.Context, name string, cleanup func()) e
 	m.cleanups.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
-				done <- fmt.Errorf("cleanup plugin %s: panic: %v", name, r)
+				err := fmt.Errorf("cleanup plugin %s: panic: %v", name, r)
+				m.cleanupMu.Lock()
+				m.cleanupErr = errors.Join(m.cleanupErr, err)
+				m.cleanupMu.Unlock()
+				done <- err
 			}
 		}()
 		cleanup()
@@ -46,7 +50,9 @@ func (m *Manager) waitCleanups(ctx context.Context) error {
 	defer cancel()
 	select {
 	case <-done:
-		return nil
+		m.cleanupMu.Lock()
+		defer m.cleanupMu.Unlock()
+		return m.cleanupErr
 	case <-waitCtx.Done():
 		return errors.Join(errors.New("plugin cleanup still running"), waitCtx.Err())
 	}

@@ -6466,3 +6466,75 @@ func TestOutputSchemaKeepsExplicitErrorsAndUnconstrainedJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestRunAgentLoopHoldsProviderRequestWhilePaused(t *testing.T) {
+	oldInterval := pausePollInterval
+	pausePollInterval = time.Millisecond
+	t.Cleanup(func() { pausePollInterval = oldInterval })
+
+	var (
+		mu       sync.Mutex
+		paused   = "peak"
+		checks   int
+		streamed bool
+	)
+	pausedBy := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		checks++
+		if checks == 3 {
+			paused = ""
+		}
+		return paused
+	}
+	client := stubClient{
+		stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+			mu.Lock()
+			streamed = true
+			if paused != "" {
+				t.Error("provider called while paused")
+			}
+			mu.Unlock()
+			handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: ai.AssistantMessage{
+				Role:       "assistant",
+				Timestamp:  time.Now().UnixMilli(),
+				Content:    []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "ok"}},
+				StopReason: ai.StopReasonStop,
+			}})
+			return nil
+		},
+	}
+	config := AgentLoopConfig{
+		Model:         &ai.Model{ID: "test", Provider: ai.ProviderOpenAI},
+		ConvertToLlm:  DefaultConvertToLlm,
+		ClientFactory: func(model *ai.Model) (ai.Client, error) { return client, nil },
+		PausedBy:      pausedBy,
+	}
+
+	var events []Event
+	_, err := RunAgentLoop(context.Background(), []*Message{NewUserMessage("hi")},
+		&AgentContext{Model: config.Model}, config, func(event Event) { events = append(events, event) })
+	if err != nil {
+		t.Fatalf("RunAgentLoop: %v", err)
+	}
+	if !streamed {
+		t.Fatal("provider never called after the flag cleared")
+	}
+	var pausedEvents []Paused
+	for _, event := range events {
+		if p, ok := event.(Paused); ok {
+			pausedEvents = append(pausedEvents, p)
+		}
+	}
+	if len(pausedEvents) != 1 || pausedEvents[0].Target != "peak" {
+		t.Fatalf("paused events = %v, want one for target peak", pausedEvents)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	config.PausedBy = func() string { cancel(); return "peak" }
+	_, err = RunAgentLoop(ctx, []*Message{NewUserMessage("hi")},
+		&AgentContext{Model: config.Model}, config, func(Event) {})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled while paused", err)
+	}
+}

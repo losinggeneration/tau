@@ -7,10 +7,12 @@ import (
 	"testing"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
+	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/ui"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -106,4 +108,32 @@ func TestToolProgressNestedRecords(t *testing.T) {
 	cancel()
 	_, err = host.ToolProgress(ctx, &proto.ToolProgressEvent{ToolCallId: "parent"})
 	require.Equal(t, codes.Canceled, status.Code(err))
+}
+
+func TestGetConfigHonorsExplicitEmptyCLIValue(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	manager.SetSettings(&ai.Settings{Plugins: map[string]json.RawMessage{"plugin": json.RawMessage(`{"mode":"configured"}`)}})
+	manager.ResolveCLIFlags("plugin", map[string]string{"mode": ""})
+	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("tau-plugin-name", "plugin"))
+	response, err := manager.host.GetConfig(ctx, &proto.GetConfigRequest{Key: "mode"})
+	require.NoError(t, err)
+	require.True(t, response.Exists)
+	require.Equal(t, `""`, response.Value)
+}
+
+func TestGetConfigSettingsOverrideRegistrationDefaults(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	manager.SetSettings(&ai.Settings{Plugins: map[string]json.RawMessage{"plugin": json.RawMessage(`{"mode":"configured","other":false}`)}})
+	manager.registerPlugin(&PluginInfo{Name: "plugin", Registrations: Registrations{CLIFlags: []CLIFlag{{Name: "mode", DefaultValue: "default"}, {Name: "missing", DefaultValue: "fallback"}}}})
+	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("tau-plugin-name", "plugin"))
+	response, err := manager.host.GetConfig(ctx, &proto.GetConfigRequest{Key: "mode"})
+	require.NoError(t, err)
+	require.Equal(t, `"configured"`, response.Value)
+	response, err = manager.host.GetConfig(ctx, &proto.GetConfigRequest{Key: "missing"})
+	require.NoError(t, err)
+	require.True(t, response.Exists)
+	require.Equal(t, `"fallback"`, response.Value)
+	response, err = manager.host.GetConfig(ctx, &proto.GetConfigRequest{})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"mode":"configured","other":false,"missing":"fallback"}`, response.Value)
 }

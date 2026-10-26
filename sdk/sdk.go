@@ -2802,6 +2802,10 @@ func (s *agentSession) ReloadToolRegistry(ctx context.Context) error {
 	if s.pluginManager == nil || s.runtime.noTools {
 		return nil
 	}
+	return s.reloadToolRegistryLocked()
+}
+
+func (s *agentSession) reloadToolRegistryLocked() error {
 	tools := slices.DeleteFunc(slices.Clone(s.agent.State().Tools), func(tool agent.Tool) bool {
 		return slices.Contains(s.pluginToolNames, tool.Name)
 	})
@@ -2845,6 +2849,10 @@ func (s *agentSession) ReloadSystemPrompt(ctx context.Context) error {
 		return errors.New("cannot reload system prompt while session is processing")
 	}
 	prompt := s.runtime.buildSystemPrompt(s.cwd, s.artifactLoader, s.systemPromptOverride, s.appendSystemPrompts, s.logger)
+	return s.reloadSystemPromptLocked(prompt)
+}
+
+func (s *agentSession) reloadSystemPromptLocked(prompt string) error {
 	messages := s.agent.Messages()
 	if first := slices.IndexFunc(messages, isInitialSystemBaseline); first >= 0 && agentMessageText(messages[first]) == prompt {
 		return nil
@@ -2945,6 +2953,10 @@ func (s *agentSession) ReloadSettings(ctx context.Context, settings *ai.Settings
 	if s.runDone != nil || s.agent.State().IsStreaming {
 		return errors.New("cannot reload settings while session is processing")
 	}
+	return s.reloadSettingsLocked(settings)
+}
+
+func (s *agentSession) reloadSettingsLocked(settings *ai.Settings) error {
 	limits, err := settings.ResolveCompaction(s.model)
 	if err != nil {
 		return err
@@ -4470,6 +4482,12 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 				"resets_at": e.ResetsAt.Format(time.RFC3339),
 			},
 		})
+	case agent.Paused:
+		s.emit(ch, Event{
+			Type:      "paused",
+			SessionID: s.id,
+			Payload:   map[string]any{"target": e.Target},
+		})
 	case agent.MessageStart:
 		if e.Message != nil {
 			var parentID string
@@ -4736,6 +4754,33 @@ func (s *agentSession) getLastAssistantText() string {
 		}
 	}
 	return ""
+}
+
+// pausedBy returns the flag file in dir that names the session by id or by
+// display name, or "" when none does. The name is only resolved when dir holds
+// flags, since it reads the session file. A missing dir means no flags.
+func pausedBy(dir, id string, name func() string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read pause dir: %w", err)
+	}
+	if len(entries) == 0 {
+		return "", nil
+	}
+	flags := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		flags[entry.Name()] = true
+	}
+	if id != "" && flags[id] {
+		return id, nil
+	}
+	if n := name(); n != "" && flags[n] {
+		return n, nil
+	}
+	return "", nil
 }
 
 // getSessionName returns the session display name from the session file.
@@ -5692,6 +5737,14 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	agentCfg.PrepareRequest = func(ctx context.Context, request agent.PrepareRequestContext) (*agent.AgentRequestUpdate, error) {
 		return hookSession.prepareVirtualRequest(ctx, request)
 	}
+	pauseDir := filepath.Join(paths.ConfigDir(), "paused")
+	agentCfg.PausedBy = func() string {
+		target, err := pausedBy(pauseDir, hookSession.id, hookSession.getSessionName)
+		if err != nil {
+			hookSession.logger.Error("check pause flags", "dir", pauseDir, "error", err)
+		}
+		return target
+	}
 	agentCfg.GetStartupMessages = func(ctx context.Context) ([]*agent.Message, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -6483,6 +6536,14 @@ func canonicalPath(path string) string {
 // context files, the skills catalog, preloaded skills, APPEND_SYSTEM.md, and
 // the explicit overrides, reading every source from disk on each call.
 func (r *runtime) buildSystemPrompt(cwd string, loader ArtifactLoader, override string, appends []string, logger *slog.Logger) string {
+	var skills *artifacts.SkillRegistry
+	if loader != nil {
+		skills = loader.SkillRegistry()
+	}
+	return r.buildSystemPromptWithSkills(cwd, skills, override, appends, logger)
+}
+
+func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.SkillRegistry, override string, appends []string, logger *slog.Logger) string {
 	addendumParts := []string{fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd)}
 	if !r.noContextFiles {
 		contextAddendum, err := buildContextFileAddendum(paths.ConfigDir(), cwd)
@@ -6493,16 +6554,13 @@ func (r *runtime) buildSystemPrompt(cwd string, loader ArtifactLoader, override 
 			addendumParts = append(addendumParts, contextAddendum)
 		}
 	}
-	if loader != nil {
-		if reg := loader.SkillRegistry(); reg != nil {
-			if catalog := artifacts.FormatSkillsCatalog(reg.List()); catalog != "" {
-				addendumParts = append(addendumParts, catalog)
-			}
-			for _, skillID := range r.preloadSkills {
-				if skill, found := reg.Get(skillID); found {
-					addendumParts = append(addendumParts, fmt.Sprintf("<skill name=%q location=%q>\nReferences are relative to %s.\n\n%s</skill>",
-						skill.ID, skill.SourcePath, skill.BaseDir, skill.Body))
-				}
+	if skills != nil {
+		if catalog := artifacts.FormatSkillsCatalog(skills.List()); catalog != "" {
+			addendumParts = append(addendumParts, catalog)
+		}
+		for _, skillID := range r.preloadSkills {
+			if skill, found := skills.Get(skillID); found {
+				addendumParts = append(addendumParts, fmt.Sprintf("<skill name=%q location=%q>\nReferences are relative to %s.\n\n%s</skill>", skill.ID, skill.SourcePath, skill.BaseDir, skill.Body))
 			}
 		}
 	}
@@ -6959,4 +7017,73 @@ func discoverSessionTools(ctx context.Context, loadout ToolLoadout, req *proto.T
 		return nil, fmt.Errorf("encode tool discovery: %w", err)
 	}
 	return data, nil
+}
+
+// ResourceReloader admits prepared resources while the session is idle.
+type ResourceReloader interface {
+	ReloadResources(context.Context, *ai.Settings, *artifacts.PreparedReload, *plugins.PreparedReload, string) error
+}
+
+func (s *agentSession) ReloadResources(ctx context.Context, settings *ai.Settings, prepared *artifacts.PreparedReload, preparedPlugins *plugins.PreparedReload, name string) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if s.closed {
+		return errors.New("session closed")
+	}
+	if s.runDone != nil || s.agent.State().IsStreaming {
+		return errors.New("cannot reload resources while session is processing")
+	}
+	if _, err := settings.ResolveCompaction(s.model); err != nil {
+		return err
+	}
+	if _, err := s.settings.ResolveCompaction(s.model); err != nil {
+		return err
+	}
+	if _, _, err := settingsQueueModes(settings); err != nil {
+		return err
+	}
+	if _, err := settings.ResolveTransport(); err != nil {
+		return err
+	}
+	var skills *artifacts.SkillRegistry
+	if prepared != nil {
+		skills = prepared.SkillRegistry()
+	} else if s.artifactLoader != nil {
+		skills = s.artifactLoader.SkillRegistry()
+	}
+	prompt := s.runtime.buildSystemPromptWithSkills(s.cwd, skills, s.systemPromptOverride, s.appendSystemPrompts, s.logger)
+	admitted := false
+	admit := func() error {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		if err := s.reloadSystemPromptLocked(prompt); err != nil {
+			return err
+		}
+		admitted = true
+		return nil
+	}
+	var reloadErr error
+	if preparedPlugins != nil {
+		reloadErr = preparedPlugins.ReloadWithAdmission(ctx, name, admit)
+	} else {
+		reloadErr = admit()
+	}
+	if !admitted {
+		return reloadErr
+	}
+	if prepared != nil {
+		prepared.Commit()
+	}
+	reloadErr = errors.Join(reloadErr, s.reloadSettingsLocked(settings))
+	if s.pluginManager != nil && !s.runtime.noTools {
+		reloadErr = errors.Join(reloadErr, s.reloadToolRegistryLocked())
+	}
+	return reloadErr
 }

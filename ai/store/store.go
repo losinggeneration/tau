@@ -202,6 +202,9 @@ func (m *MemoryBackend) Get(ctx context.Context, provider string) (ai.Credential
 
 	expected := authFile{key: credentialToAuthCredential(cred)}.clone()[key]
 	refreshed, err := refreshFn(ctx, cred)
+	if cause := context.Cause(ctx); cause != nil {
+		return cred, errors.Join(cause, err)
+	}
 	if err != nil {
 		if isErrCredentialNeedsReauth(err) {
 			cred.NeedsReauth = true
@@ -307,6 +310,9 @@ func (m *MemoryBackend) RefreshOAuth(ctx context.Context, provider string, oauth
 
 	// Refresh
 	refreshed, err := oauthProvider.RefreshToken(ctx, oauthCreds)
+	if cause := context.Cause(ctx); cause != nil {
+		return cred, errors.Join(cause, err)
+	}
 	if err != nil {
 		// Check for terminal error
 		if isErrCredentialNeedsReauth(err) {

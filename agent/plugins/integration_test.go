@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
+	"github.com/stretchr/testify/require"
 )
 
 // TestIntegrationPluginDiscovery tests the plugin discovery mechanism.
@@ -87,10 +88,10 @@ command = "./hello-python"
 	if len(mgr.binaries) != 1 {
 		t.Fatalf("expected 1 plugin, got %d", len(mgr.binaries))
 	}
-	if _, ok := mgr.binaries[pluginPath]; !ok {
-		t.Fatalf("expected plugin executable %q to be registered", pluginPath)
+	if _, ok := mgr.binaries[pluginDir]; !ok {
+		t.Fatalf("expected plugin directory %q to be registered", pluginDir)
 	}
-	if got := mgr.manifestPaths[pluginPath]; got != manifestPath {
+	if got := mgr.manifestPaths[pluginDir]; got != manifestPath {
 		t.Fatalf("expected manifest path %q, got %q", manifestPath, got)
 	}
 }
@@ -610,7 +611,7 @@ func TestIntegrationRetryAndDeregistration(t *testing.T) {
 	}
 
 	// Verify ReattemptDeregistered doesn't panic with an empty deregistered map.
-	mgr.ReattemptDeregistered(ctx)
+	require.NoError(t, mgr.ReattemptDeregistered(ctx))
 
 	// Verify Reload also calls ReattemptDeregistered without panic.
 	mgr.Reload(ctx)

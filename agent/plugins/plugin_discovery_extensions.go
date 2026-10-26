@@ -1,7 +1,12 @@
 package plugins
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -9,7 +14,9 @@ import (
 
 	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/packages"
+	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/paths"
+	"github.com/pelletier/go-toml/v2"
 )
 
 // pluginDirs returns the plugin search paths.
@@ -169,6 +176,19 @@ func (m *Manager) scanDir(dir string) error {
 		return fmt.Errorf("read dir: %w", err)
 	}
 
+	rootManifest := filepath.Join(dir, "tau-package.toml")
+	if data, err := os.ReadFile(rootManifest); err == nil {
+		var manifest Manifest
+		if err := toml.Unmarshal(data, &manifest); err != nil {
+			return fmt.Errorf("parse root extension manifest: %w", err)
+		}
+		if manifest.Plugin != nil {
+			return m.scanPackageDir(dir)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read root extension manifest: %w", err)
+	}
+
 	extensionEntries, err := packages.PiResourcePaths(dir, []string{"."}, packages.ResourceKindExtension)
 	if err != nil {
 		return fmt.Errorf("collect Pi extensions: %w", err)
@@ -224,8 +244,7 @@ func (m *Manager) scanDir(dir string) error {
 func (m *Manager) scanNestedManifestPlugins(root string) error {
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			m.logger.Warn("plugin extension walk failed", "path", path, "error", err)
-			return nil
+			return fmt.Errorf("walk plugin extensions: %w", err)
 		}
 		if !d.IsDir() {
 			return nil
@@ -237,31 +256,34 @@ func (m *Manager) scanNestedManifestPlugins(root string) error {
 		manifestPath := filepath.Join(path, "tau-package.toml")
 		data, err := os.ReadFile(manifestPath)
 		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("read extension manifest: %w", err)
+			}
 			if isIgnoredPluginSupportDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !hasPluginSection(data) {
+
+		var manifest Manifest
+		if err := toml.Unmarshal(data, &manifest); err != nil {
+			return fmt.Errorf("parse plugin extension manifest: %w", err)
+		}
+		if manifest.Plugin == nil {
 			return nil
 		}
 
-		manifest, err := parseManifest(manifestPath)
-		if err != nil {
-			m.logger.Warn("plugin extension manifest parse failed", "path", manifestPath, "error", err)
-			return filepath.SkipDir
+		binaryPath := path
+		if !manifest.HasRunCommand() {
+			binaryPath, err = findPluginBinary(path, &manifest)
+			if err != nil {
+				return fmt.Errorf("find plugin extension binary: %w", err)
+			}
 		}
 
-		binaryPath, err := findPluginBinary(path, manifest)
+		hash, err := pluginDiscoveryHash(path, manifestPath, &manifest, binaryPath, m.computeHash)
 		if err != nil {
-			m.logger.Warn("plugin extension binary not found", "dir", path, "error", err)
-			return filepath.SkipDir
-		}
-
-		hash, err := m.computeHash(binaryPath)
-		if err != nil {
-			m.logger.Warn("plugin extension hash failed", "path", binaryPath, "error", err)
-			return filepath.SkipDir
+			return fmt.Errorf("hash plugin extension: %w", err)
 		}
 
 		m.mu.Lock()
@@ -331,4 +353,136 @@ func (m *Manager) scanExtensionCandidates() error {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) discoverReloadCandidates(ctx context.Context) (err error) {
+	m.mu.RLock()
+	binaries := maps.Clone(m.binaries)
+	manifestPaths := maps.Clone(m.manifestPaths)
+	packageBinaries := maps.Clone(m.packageBinaries)
+	packageManifests := maps.Clone(m.packageManifests)
+	m.mu.RUnlock()
+	defer func() {
+		if err == nil {
+			return
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.binaries = binaries
+		m.manifestPaths = manifestPaths
+		m.packageBinaries = packageBinaries
+		m.packageManifests = packageManifests
+	}()
+	if err := m.scanExtensionCandidates(); err != nil {
+		return err
+	}
+	if err := m.scanConfiguredPackages(); err != nil {
+		return fmt.Errorf("discover configured packages: %w", err)
+	}
+	m.filterConfiguredExtensions()
+	return context.Cause(ctx)
+}
+
+// PreparedReload contains plugin candidates discovered without changing live state.
+type PreparedReload struct {
+	manager    *Manager
+	candidates *Manager
+}
+
+// PrepareReload validates discovery with the proposed settings without restarting plugins.
+func (m *Manager) PrepareReload(ctx context.Context, settings *ai.Settings) (*PreparedReload, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+	if settings == nil {
+		settings = &ai.Settings{}
+	}
+	m.mu.RLock()
+	candidates := &Manager{
+		configDir: m.configDir, settings: settings, logger: m.logger,
+		extensionPaths: slices.Clone(m.extensionPaths),
+		binaries:       make(map[string]string), manifestPaths: make(map[string]string),
+		packageManifests: make(map[string]*Manifest),
+	}
+	m.mu.RUnlock()
+	if err := candidates.discoverReloadCandidates(ctx); err != nil {
+		return nil, err
+	}
+	return &PreparedReload{manager: m, candidates: candidates}, nil
+}
+
+// Reload admits the prepared candidates and restarts the selected plugins.
+func (p *PreparedReload) Reload(ctx context.Context, name string) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return p.ReloadWithAdmission(ctx, name, nil)
+}
+
+// ReloadWithAdmission validates the staged processes before calling admit.
+// If admit fails, the current plugins and discovery policy remain installed.
+// The callback must not call the plugin manager.
+func (p *PreparedReload) ReloadWithAdmission(ctx context.Context, name string, admit func() error) error {
+	m := p.manager
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if m.shimClosed {
+		return errors.New("plugin manager is shut down")
+	}
+
+	changedConfig := make(map[string]bool)
+	for pluginName := range m.plugins {
+		var oldConfig, nextConfig json.RawMessage
+		if current := m.plugins[pluginName]; current.configCaptured {
+			oldConfig = current.configSnapshot
+		} else if m.settings != nil {
+			oldConfig = m.settings.Plugins[pluginName]
+		}
+		if p.candidates.settings != nil {
+			nextConfig = p.candidates.settings.Plugins[pluginName]
+		}
+		changedConfig[pluginName] = !bytes.Equal(oldConfig, nextConfig)
+	}
+	for _, path := range slices.Sorted(maps.Keys(p.candidates.binaries)) {
+		pluginName := filepath.Base(path)
+		if name != "" && name != pluginName {
+			continue
+		}
+		if current := m.plugins[pluginName]; current != nil && !current.deregistered && name == "" && current.Path == path && current.Hash == p.candidates.binaries[path] && !changedConfig[pluginName] {
+			continue
+		}
+		manifestPath := p.candidates.manifestPaths[path]
+		if manifestPath == "" {
+			continue
+		}
+		manifest, err := p.candidates.packageManifest(manifestPath)
+		if err != nil {
+			return fmt.Errorf("prepare plugin manifest: %w", err)
+		}
+		if err := m.waitForShimReady(ctx, manifest); err != nil {
+			return err
+		}
+	}
+	previousSettings := m.settings
+	previousBinaries := m.binaries
+	previousPaths := m.manifestPaths
+	previousManifests := m.packageManifests
+	previousPackages := m.packageBinaries
+	m.settings = p.candidates.settings
+	m.binaries = p.candidates.binaries
+	m.manifestPaths = p.candidates.manifestPaths
+	m.packageManifests = p.candidates.packageManifests
+	m.packageBinaries = p.candidates.packageBinaries
+	admitted, reloadErr := m.reloadCandidates(ctx, name, changedConfig, admit)
+	if !admitted {
+		m.settings = previousSettings
+		m.binaries = previousBinaries
+		m.manifestPaths = previousPaths
+		m.packageManifests = previousManifests
+		m.packageBinaries = previousPackages
+	}
+	return reloadErr
 }

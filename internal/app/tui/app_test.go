@@ -1143,3 +1143,18 @@ func TestChatRenderUpdateKeepsFixedViewOnWindowGrowth(t *testing.T) {
 		t.Fatalf("scroll pos after 2 rows dropped above = %d, want 6", got)
 	}
 }
+
+func TestPausedEventShowsPauseUntilResponseStarts(t *testing.T) {
+	a := newTestApp(t)
+	a.footer = NewFooter(&footerData{})
+
+	a.handleEvent(sdk.Event{Type: "paused", Payload: map[string]any{"target": "nightly"}})
+	if got := a.workingMessage(); !strings.HasPrefix(got, `paused by flag "nightly" since `) {
+		t.Fatalf("workingMessage = %q, want pause notice", got)
+	}
+
+	a.handleEvent(sdk.Event{Type: "message_start", Payload: map[string]any{"role": "assistant"}})
+	if got := a.workingMessage(); got != defaultWorkingMessage {
+		t.Fatalf("workingMessage after resume = %q, want %q", got, defaultWorkingMessage)
+	}
+}

@@ -1207,3 +1207,140 @@ func TestSettingsWritesPreserveCancellationCause(t *testing.T) {
 		})
 	}
 }
+
+func TestSettingsRetainUnknownNestedFieldsWhenSaved(t *testing.T) {
+	for _, group := range []string{"compaction", "retry", "thinkingBudgets", "terminal", "images", "markdown", "bash", "read", "branchSummary"} {
+		t.Run(group, func(t *testing.T) {
+			data := []byte(fmt.Sprintf(`{"%s":{"future":{"count":9007199254740993,"enabled":false,"items":[]}}}`, group))
+			settings, err := parseSettings(data)
+			require.NoError(t, err)
+			path := filepath.Join(t.TempDir(), "settings.json")
+			require.NoError(t, SaveSettings(path, settings))
+			saved, err := os.ReadFile(path)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(saved, &fields))
+			var nested map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(fields[group], &nested))
+			require.JSONEq(t, `{"count":9007199254740993,"enabled":false,"items":[]}`, string(nested["future"]))
+			require.Contains(t, string(nested["future"]), "9007199254740993")
+		})
+	}
+}
+
+func TestSettingsUnknownTopLevelEditsReplaceOriginalJSON(t *testing.T) {
+	settings, err := parseSettings([]byte(`{"custom":{"value":"old"}}`))
+	require.NoError(t, err)
+	settings.Plugins["custom"] = json.RawMessage(`{"value":"new"}`)
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, SaveSettings(path, settings))
+	saved, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(saved, &fields))
+	require.JSONEq(t, `{"value":"new"}`, string(fields["custom"]))
+}
+
+func TestMergeSettingsOwnsUnknownNestedFieldBytes(t *testing.T) {
+	user, err := parseSettings([]byte(`{"bash":{"future":{"value":"user"}},"read":{"future":{"value":"user"}}}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"bash":{"future":{"value":"project"}}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	project.Bash.present["future"][0] = '!'
+	user.Read.present["future"][0] = '!'
+	data, err := json.Marshal(merged)
+	require.NoError(t, err)
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &fields))
+	require.JSONEq(t, `{"future":{"value":"project"}}`, string(fields["bash"]))
+	require.JSONEq(t, `{"future":{"value":"user"}}`, string(fields["read"]))
+}
+
+func TestSettingsRetainUnknownProviderAndModelFields(t *testing.T) {
+	data := []byte(`{"retry":{"provider":{"timeoutMs":0,"future":{"n":9007199254740993}}},"compaction":{"modelOverrides":{"p/m":{"reserveTokens":0,"future":[false,null]}}},"models":{"p/m":{"thinkingLevel":"low","future":{"enabled":false}}}}`)
+	settings, err := parseSettings(data)
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, SaveSettings(path, settings))
+	saved, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(saved), "9007199254740993")
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(saved, &fields))
+	var retry map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(fields["retry"], &retry))
+	require.JSONEq(t, `{"timeoutMs":0,"future":{"n":9007199254740993}}`, string(retry["provider"]))
+	var compaction map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(fields["compaction"], &compaction))
+	require.JSONEq(t, `{"p/m":{"reserveTokens":0,"future":[false,null]}}`, string(compaction["modelOverrides"]))
+	require.JSONEq(t, `{"p/m":{"thinkingLevel":"low","future":{"enabled":false}}}`, string(fields["models"]))
+}
+
+func TestMergeSettingsOwnsProviderAndModelMetadata(t *testing.T) {
+	user, err := parseSettings([]byte(`{"retry":{"provider":{"timeoutMs":7,"future":"user"}},"compaction":{"modelOverrides":{"p/m":{"reserveTokens":5,"future":"user"}}},"models":{"p/m":{"thinkingLevel":"high","future":"user"}}}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"retry":{"provider":{"maxRetries":0,"future":"project"}},"compaction":{"modelOverrides":{"p/m":{"keepRecentTokens":0,"future":"project"}}},"models":{"p/m":{"thinkingLevel":"","future":"project"}}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	project.Retry.Provider.present["future"][0] = '!'
+	project.Compaction.ModelOverrides["p/m"].present["future"][0] = '!'
+	project.Models["p/m"].present["future"][0] = '!'
+	require.Empty(t, merged.Models["p/m"].ThinkingLevel)
+	require.Equal(t, 7, *merged.Retry.Provider.TimeoutMs)
+	require.Zero(t, *merged.Retry.Provider.MaxRetries)
+	require.Equal(t, 5, *merged.Compaction.ModelOverrides["p/m"].ReserveTokens)
+	require.Zero(t, *merged.Compaction.ModelOverrides["p/m"].KeepRecentTokens)
+	for _, raw := range []json.RawMessage{merged.Retry.Provider.present["future"], merged.Compaction.ModelOverrides["p/m"].present["future"], merged.Models["p/m"].present["future"]} {
+		require.Equal(t, `"project"`, string(raw))
+	}
+	_, err = json.Marshal(merged)
+	require.NoError(t, err)
+}
+
+func TestMergedResourceScopesOwnTheirEntrySlices(t *testing.T) {
+	user, err := parseSettings([]byte(`{"skills":["user"]}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"skills":["project"]}`))
+	require.NoError(t, err)
+	first := MergeSettings(user, project)
+	next := MergeSettings(first, nil)
+	scopes := first.resourceScopes["skills"]
+	scopes[0].entries[0] = "changed-user"
+	scopes[1].entries[0] = "changed-project"
+	u, p := next.ResourcePathsByScope("skills")
+	require.Equal(t, []string{"user"}, u)
+	require.Equal(t, []string{"project"}, p)
+}
+
+func TestSettingsRejectNonObjectRootBeforeRewrite(t *testing.T) {
+	for _, data := range []string{"null", "[]", "true", "42", `"settings"`} {
+		t.Run(data, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.json")
+			require.NoError(t, os.WriteFile(path, []byte(data), 0o600))
+			_, err := LoadSettings(path)
+			require.Error(t, err)
+			require.Error(t, UpdateSettings(t.Context(), path, map[string]any{"theme": "dark"}))
+			unchanged, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, data, string(unchanged))
+		})
+	}
+}
+
+func TestMergeSettingsMergesBashEnvironmentPerKey(t *testing.T) {
+	user, err := parseSettings([]byte(`{"bash":{"envExtra":{"KEEP":"user","REPLACE":"user"},"envAllowlist":["HOME"]}}`))
+	require.NoError(t, err)
+	project, err := parseSettings([]byte(`{"bash":{"envExtra":{"REPLACE":"project","ADD":"project"},"envAllowlist":[]}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	require.Equal(t, map[string]string{"KEEP": "user", "REPLACE": "project", "ADD": "project"}, merged.Bash.EnvExtra)
+	require.NotNil(t, merged.Bash.EnvAllowlist)
+	require.Empty(t, merged.Bash.EnvAllowlist)
+	merged.Bash.EnvExtra["KEEP"] = "changed"
+	require.Equal(t, "user", user.Bash.EnvExtra["KEEP"])
+	require.Equal(t, "project", project.Bash.EnvExtra["REPLACE"])
+	empty, err := parseSettings([]byte(`{"bash":{"envExtra":{}}}`))
+	require.NoError(t, err)
+	require.Empty(t, MergeSettings(user, empty).Bash.EnvExtra)
+}

@@ -11,6 +11,7 @@ import (
 	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/packages"
 	"github.com/losinggeneration/tau/paths"
+	"github.com/pelletier/go-toml/v2"
 )
 
 // packageDirs returns the package search paths (project-local first, then global).
@@ -70,18 +71,22 @@ func (m *Manager) scanPackagesDir(dir string) error {
 				if !scopedEntry.IsDir() && scopedEntry.Type()&os.ModeSymlink == 0 {
 					continue
 				}
-				m.scanPackageDir(filepath.Join(pkgDir, scopedEntry.Name()))
+				if err := m.scanPackageDir(filepath.Join(pkgDir, scopedEntry.Name())); err != nil {
+					return err
+				}
 			}
 			continue
 		}
 
-		m.scanPackageDir(pkgDir)
+		if err := m.scanPackageDir(pkgDir); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (m *Manager) scanPackageDir(pkgDir string) {
+func (m *Manager) scanPackageDir(pkgDir string) error {
 	resolved, err := filepath.EvalSymlinks(pkgDir)
 	if err == nil {
 		pkgDir = resolved
@@ -90,55 +95,41 @@ func (m *Manager) scanPackageDir(pkgDir string) {
 
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read plugin manifest: %w", err)
 	}
 
-	// Check if the manifest has a [plugin] section.
-	if !hasPluginSection(data) {
-		return
+	var manifest Manifest
+	if err := toml.Unmarshal(data, &manifest); err != nil {
+		return fmt.Errorf("parse plugin package manifest: %w", err)
 	}
-
-	manifest, err := parseManifest(manifestPath)
-	if err != nil {
-		m.logger.Warn("plugin package manifest parse failed", "dir", pkgDir, "error", err)
-		return
+	if manifest.Plugin == nil {
+		return nil
 	}
 
 	binaryPath := pkgDir
 	if !manifest.HasRunCommand() {
 		// Find the plugin binary in the package directory.
 		var err error
-		binaryPath, err = findPluginBinary(pkgDir, manifest)
+		binaryPath, err = findPluginBinary(pkgDir, &manifest)
 		if err != nil {
-			m.logger.Warn("plugin package binary not found", "dir", pkgDir, "error", err)
-			return
+			return fmt.Errorf("find plugin package binary: %w", err)
 		}
 	}
 
 	// Compute hash and register.
-	hash, err := pluginDiscoveryHash(pkgDir, manifestPath, manifest, binaryPath, m.computeHash)
+	hash, err := pluginDiscoveryHash(pkgDir, manifestPath, &manifest, binaryPath, m.computeHash)
 	if err != nil {
-		return
+		return fmt.Errorf("hash plugin package: %w", err)
 	}
 
 	m.mu.Lock()
 	m.binaries[binaryPath] = hash
 	m.manifestPaths[binaryPath] = manifestPath
 	m.mu.Unlock()
-}
-
-// hasPluginSection checks if the tau-package.toml content has a [plugin] section.
-func hasPluginSection(data []byte) bool {
-	// Simple check: look for "[plugin]" as a section header.
-	// TOML section headers are [section_name] on its own line.
-	content := string(data)
-	for _, line := range splitLines(content) {
-		line = trimSpace(line)
-		if line == "[plugin]" {
-			return true
-		}
-	}
-	return false
+	return nil
 }
 
 // findPluginBinary looks for an executable in the package directory.
@@ -160,11 +151,14 @@ func findPluginBinary(pkgDir string, manifest *Manifest) (string, error) {
 		if entry.IsDir() {
 			continue
 		}
-		info, err := entry.Info()
+		info, err := os.Stat(filepath.Join(pkgDir, entry.Name()))
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", fmt.Errorf("stat plugin executable: %w", err)
 		}
-		if info.Mode()&0o111 != 0 {
+		if info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
 			executables = append(executables, filepath.Join(pkgDir, entry.Name()))
 		}
 	}
@@ -206,7 +200,9 @@ func (m *Manager) scanConfiguredPackages() error {
 		} else if err != nil {
 			return fmt.Errorf("stat package manifest: %w", err)
 		}
-		m.scanPackageDir(pkg.Root)
+		if err := m.scanPackageDir(pkg.Root); err != nil {
+			return err
+		}
 		m.mu.Lock()
 		manifestPath := filepath.Join(pkg.Root, "tau-package.toml")
 		manifest, manifestErr := parseManifest(manifestPath)

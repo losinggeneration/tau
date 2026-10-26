@@ -621,3 +621,73 @@ func TestAuthMutationLockWaitRetainsCancellationCause(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "original", got.APIKey)
 }
+
+func TestFileBackendObservesCredentialEditsWithUnchangedMetadata(t *testing.T) {
+	for _, operation := range []string{"overwrite", "replace", "invalid", "delete provider"} {
+		t.Run(operation, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.json")
+			original := []byte(`{"api":{"type":"api_key","key":"old"}}`)
+			require.NoError(t, os.WriteFile(path, original, 0o600))
+			backend := NewFileBackend(path, Options{})
+			credential, err := backend.Get(t.Context(), "api")
+			require.NoError(t, err)
+			require.Equal(t, "old", credential.APIKey)
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			replacement := []byte(`{"api":{"type":"api_key","key":"new"}}`)
+			switch operation {
+			case "invalid":
+				replacement = bytes.Repeat([]byte("!"), len(original))
+			case "delete provider":
+				replacement = append([]byte(`{}`), bytes.Repeat([]byte(" "), len(original)-2)...)
+			}
+			require.Len(t, replacement, len(original))
+			if operation == "replace" {
+				temporary := filepath.Join(filepath.Dir(path), "replacement")
+				require.NoError(t, os.WriteFile(temporary, replacement, 0o600))
+				require.NoError(t, os.Chtimes(temporary, info.ModTime(), info.ModTime()))
+				require.NoError(t, os.Rename(temporary, path))
+			} else {
+				require.NoError(t, os.WriteFile(path, replacement, 0o600))
+				require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
+			}
+			credential, err = backend.Get(t.Context(), "api")
+			switch operation {
+			case "invalid":
+				require.ErrorContains(t, err, "parse auth.json")
+			case "delete provider":
+				require.ErrorContains(t, err, "credential not found")
+				require.Empty(t, credential.APIKey)
+			default:
+				require.NoError(t, err)
+				require.Equal(t, "new", credential.APIKey)
+			}
+		})
+	}
+}
+
+func TestFileRefreshRetainsCancellationAndProviderFailure(t *testing.T) {
+	for _, method := range []string{"Get", "RefreshOAuth"} {
+		t.Run(method, func(t *testing.T) {
+			cause := errors.New("refresh withdrawn")
+			failure := errors.New("provider disconnected")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			refresh := func(context.Context) error { cancel(cause); return failure }
+			backend := NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), Options{RefreshFuncs: map[string]RefreshFunc{"provider": func(ctx context.Context, _ ai.Credential) (ai.Credential, error) {
+				return ai.Credential{}, refresh(ctx)
+			}}})
+			require.NoError(t, backend.Set(t.Context(), "provider", ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")))
+			var err error
+			if method == "Get" {
+				_, err = backend.Get(ctx, "provider")
+			} else {
+				_, err = backend.RefreshOAuth(ctx, "provider", terminalRefreshProvider{refresh: refresh})
+			}
+			require.ErrorIs(t, err, cause)
+			require.ErrorIs(t, err, failure)
+			stored, err := backend.readCredential("provider")
+			require.NoError(t, err)
+			require.Equal(t, "old", stored.AccessToken)
+		})
+	}
+}

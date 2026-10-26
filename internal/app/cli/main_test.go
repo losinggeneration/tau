@@ -2058,6 +2058,20 @@ type reloadSettingsSession struct {
 	settings *ai.Settings
 }
 
+func (s *reloadSettingsSession) ReloadResources(ctx context.Context, settings *ai.Settings, prepared *artifacts.PreparedReload, preparedPlugins *plugins.PreparedReload, name string) error {
+	if preparedPlugins != nil {
+		if err := preparedPlugins.ReloadWithAdmission(ctx, name, func() error { return s.ReloadSettings(ctx, settings) }); err != nil {
+			return err
+		}
+	} else if err := s.ReloadSettings(ctx, settings); err != nil {
+		return err
+	}
+	if prepared != nil {
+		prepared.Commit()
+	}
+	return nil
+}
+
 func (s *reloadSettingsSession) ReloadSettings(_ context.Context, settings *ai.Settings) error {
 	s.settings = settings
 	return nil
@@ -2352,6 +2366,10 @@ func TestModelScopePatternsPreferFlagsOverEnabledModels(t *testing.T) {
 type failingReloadSession struct {
 	commands.CommandSession
 	err error
+}
+
+func (s *failingReloadSession) ReloadResources(context.Context, *ai.Settings, *artifacts.PreparedReload, *plugins.PreparedReload, string) error {
+	return s.err
 }
 
 func (s *failingReloadSession) ReloadSettings(context.Context, *ai.Settings) error { return s.err }
@@ -3030,4 +3048,121 @@ func TestReloadSessionRejectsCancellationBeforeAdmission(t *testing.T) {
 	require.ErrorIs(t, err, cause)
 	require.Nil(t, sess.settings)
 	require.Equal(t, commands.Result{}, result)
+}
+
+func TestReloadSessionRejectsPluginDiscoveryBeforeSettings(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	bad := filepath.Join(cfg, "bad-extensions", "broken")
+	require.NoError(t, os.MkdirAll(bad, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(bad, "package.json"), []byte(`{"pi":`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{"extensions":["bad-extensions"]}`), 0o600))
+	oldLoader, oldManager := sdk.GlobalArtifactLoader, GlobalPluginManager
+	promptDir := filepath.Join(cfg, "prompts")
+	require.NoError(t, os.MkdirAll(promptDir, 0o700))
+	promptPath := filepath.Join(promptDir, "old.md")
+	require.NoError(t, os.WriteFile(promptPath, []byte("old prompt"), 0o600))
+	registry := commands.NewInMemoryRegistry()
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), UserDirs: map[artifacts.ArtifactKind]string{artifacts.KindPrompt: promptDir}, DisableSkills: true, DisableThemes: true, CommandsRegistry: registry})
+	require.NoError(t, err)
+	before := loader.PromptRegistry()
+	require.NoError(t, os.Remove(promptPath))
+	sdk.GlobalArtifactLoader = loader
+	GlobalPluginManager = plugins.NewManager(cfg, nil, nil)
+	t.Cleanup(func() { sdk.GlobalArtifactLoader = oldLoader; GlobalPluginManager = oldManager })
+	sess := &reloadSettingsSession{}
+	_, err = reloadSession(t.Context(), "", sess)
+	require.ErrorContains(t, err, "parse Pi manifest")
+	require.Nil(t, sess.settings)
+	require.Same(t, before, loader.PromptRegistry())
+	_, _, ok := registry.Lookup("old")
+	require.True(t, ok)
+}
+
+type failingResourceReloadSession struct {
+	commands.CommandSession
+	settings       *ai.Settings
+	toolErr        error
+	promptErr      error
+	promptReloaded bool
+}
+
+func (s *failingResourceReloadSession) ReloadSettings(_ context.Context, settings *ai.Settings) error {
+	s.settings = settings
+	return nil
+}
+
+func (s *failingResourceReloadSession) ReloadToolRegistry(context.Context) error { return s.toolErr }
+
+func (s *failingResourceReloadSession) ReloadSystemPrompt(context.Context) error {
+	s.promptReloaded = true
+	return s.promptErr
+}
+
+func TestReloadSessionRejectsUnsupportedSessionWithoutMutation(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{"read":{"lineCap":7}}`), 0o600))
+	oldLoader, oldManager := sdk.GlobalArtifactLoader, GlobalPluginManager
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisablePrompts: true, DisableThemes: true})
+	require.NoError(t, err)
+	before := loader.SkillRegistry()
+	sdk.GlobalArtifactLoader, GlobalPluginManager = loader, nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader, GlobalPluginManager = oldLoader, oldManager })
+	sess := &failingResourceReloadSession{toolErr: errors.New("tool refresh failed"), promptErr: errors.New("prompt refresh failed")}
+	result, err := reloadSession(t.Context(), "", sess)
+	require.ErrorContains(t, err, "coordinated resource reload")
+	require.Equal(t, commands.Result{}, result)
+	require.False(t, sess.promptReloaded)
+	require.Nil(t, sess.settings)
+	require.Same(t, before, loader.SkillRegistry())
+}
+
+type coordinatedReloadSession struct {
+	reloadSettingsSession
+	called bool
+	cause  error
+}
+
+func (s *coordinatedReloadSession) ReloadResources(_ context.Context, settings *ai.Settings, prepared *artifacts.PreparedReload, preparedPlugins *plugins.PreparedReload, name string) error {
+	s.called = settings != nil && prepared != nil && preparedPlugins != nil && name == "selected"
+	return s.cause
+}
+
+func TestReloadSessionUsesCoordinatedAdmission(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	oldLoader, oldManager := sdk.GlobalArtifactLoader, GlobalPluginManager
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisablePrompts: true, DisableThemes: true})
+	require.NoError(t, err)
+	before := loader.SkillRegistry()
+	sdk.GlobalArtifactLoader = loader
+	GlobalPluginManager = plugins.NewManager(cfg, nil, nil)
+	t.Cleanup(func() { sdk.GlobalArtifactLoader = oldLoader; GlobalPluginManager = oldManager })
+	cause := errors.New("coordinated rejection")
+	sess := &coordinatedReloadSession{cause: cause}
+	_, err = reloadSession(t.Context(), "selected", sess)
+	require.ErrorIs(t, err, cause)
+	require.True(t, sess.called)
+	require.Nil(t, sess.settings)
+	require.Same(t, before, loader.SkillRegistry())
+}
+
+type unpreparedArtifactLoader struct{ sdk.ArtifactLoader }
+
+func TestReloadSessionRejectsUnpreparedArtifactLoader(t *testing.T) {
+	isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisablePrompts: true, DisableThemes: true})
+	require.NoError(t, err)
+	oldLoader, oldManager := sdk.GlobalArtifactLoader, GlobalPluginManager
+	sdk.GlobalArtifactLoader, GlobalPluginManager = &unpreparedArtifactLoader{ArtifactLoader: loader}, nil
+	t.Cleanup(func() { sdk.GlobalArtifactLoader, GlobalPluginManager = oldLoader, oldManager })
+	before := loader.SkillRegistry()
+	sess := &reloadSettingsSession{}
+	result, err := reloadSession(t.Context(), "", sess)
+	require.ErrorContains(t, err, "artifact loader does not support prepared reload")
+	require.Equal(t, commands.Result{}, result)
+	require.Nil(t, sess.settings)
+	require.Same(t, before, loader.SkillRegistry())
 }

@@ -164,17 +164,20 @@ type Config struct {
 	InitialState          *InitialState
 	PrepareNextTurn       PrepareNextTurnFunc
 	OnProviderStreamEvent func(context.Context, ai.StreamEvent)
-	FinishTurn            FinishTurnFunc
-	PrepareRequest        PrepareRequestFunc
-	Model                 *ai.Model
-	SystemPrompt          string
-	InitialMessages       []*Message
-	Tools                 []Tool
-	ThinkingLevel         ThinkingLevel
-	StreamHandler         StreamHandler
-	APIKeyProvider        APIKeyProvider
-	ClientFactory         ClientFactory
-	StreamFn              StreamFunc
+	// PausedBy reports the pause flag holding provider requests, or "" when
+	// requests may proceed. The loop polls it before every provider request.
+	PausedBy        func() string
+	FinishTurn      FinishTurnFunc
+	PrepareRequest  PrepareRequestFunc
+	Model           *ai.Model
+	SystemPrompt    string
+	InitialMessages []*Message
+	Tools           []Tool
+	ThinkingLevel   ThinkingLevel
+	StreamHandler   StreamHandler
+	APIKeyProvider  APIKeyProvider
+	ClientFactory   ClientFactory
+	StreamFn        StreamFunc
 
 	// SystemAddendum is additional context appended to the system prompt.
 	// Used for skill content injection.
@@ -547,6 +550,14 @@ type UsageLimitWait struct {
 
 func (UsageLimitWait) isEvent() {}
 
+// Paused indicates provider requests are held by the pause flag named Target
+// until it is removed.
+type Paused struct {
+	Target string
+}
+
+func (Paused) isEvent() {}
+
 // ToolStart indicates a tool is starting execution.
 type ToolStart struct {
 	ToolCallID string
@@ -628,8 +639,11 @@ type AgentLoopConfig struct {
 	FlushContextMessages  func()
 	PrepareNextTurn       PrepareNextTurnFunc
 	OnProviderStreamEvent func(context.Context, ai.StreamEvent)
-	FinishTurn            FinishTurnFunc
-	PrepareRequest        PrepareRequestFunc
+	// PausedBy reports the pause flag holding provider requests, or "" when
+	// requests may proceed. The loop polls it before every provider request.
+	PausedBy       func() string
+	FinishTurn     FinishTurnFunc
+	PrepareRequest PrepareRequestFunc
 	// Required configuration
 	Model        *ai.Model
 	ConvertToLlm ConvertToLlmFunc

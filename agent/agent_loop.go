@@ -1045,6 +1045,35 @@ func getFollowUpMessages(ctx context.Context, config AgentLoopConfig) ([]*Messag
 // so a request landing exactly at the reset doesn't bounce off a stale quota.
 var usageLimitRetryBuffer = 5 * time.Second
 
+// pausePollInterval is how often a paused loop rechecks its pause flag.
+var pausePollInterval = 15 * time.Second
+
+// waitWhilePaused holds the next provider request while config.PausedBy
+// reports a pause flag.
+func waitWhilePaused(ctx context.Context, config AgentLoopConfig, emit EventSink) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if config.PausedBy == nil {
+		return nil
+	}
+	target := config.PausedBy()
+	if target == "" {
+		return nil
+	}
+	emit(Paused{Target: target})
+	ticker := time.NewTicker(pausePollInterval)
+	defer ticker.Stop()
+	for config.PausedBy() != "" {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return nil
+}
+
 func sleepUntil(ctx context.Context, until time.Time) error {
 	timer := time.NewTimer(time.Until(until))
 	defer timer.Stop()
@@ -1076,7 +1105,7 @@ func streamAssistantResponse(
 	opts []ai.Option,
 	emit EventSink,
 ) (*Message, error) {
-	if err := ctx.Err(); err != nil {
+	if err := waitWhilePaused(ctx, config, emit); err != nil {
 		return nil, err
 	}
 	// Apply context transform if configured

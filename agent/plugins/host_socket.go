@@ -1,24 +1,40 @@
 package plugins
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync/atomic"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/losinggeneration/tau/agent/plugins/proto"
+	"github.com/losinggeneration/tau/ai"
 	"google.golang.org/grpc"
 )
+
+var hostSocketSequence atomic.Uint64
+
+type stagedHostContextKey struct{}
 
 // hostSocket pairs the per-plugin Host service gRPC server with its unix
 // socket listener. The socket is created BEFORE the plugin process launches
 // so its path can be injected via the TAU_HOST_SOCKET environment variable.
 type hostSocket struct {
-	path   string
-	server *grpc.Server
-	ln     net.Listener
+	path    string
+	server  *grpc.Server
+	ln      net.Listener
+	staging *atomic.Bool
+	retired *atomic.Bool
 }
 
 // close stops the server and removes the socket file. Stopping the server
@@ -54,6 +70,10 @@ func hostSocketDir() string {
 //
 // NOTE: takes hostMu, not m.mu — loadLocked runs while the caller holds m.mu.
 func (m *Manager) prepareHostSocketLocked(pluginName string) (string, error) {
+	return m.prepareHostSocket(context.Background(), pluginName)
+}
+
+func (m *Manager) prepareHostSocket(ctx context.Context, pluginName string) (string, error) {
 	m.hostMu.Lock()
 	defer m.hostMu.Unlock()
 
@@ -69,7 +89,7 @@ func (m *Manager) prepareHostSocketLocked(pluginName string) (string, error) {
 		return "", fmt.Errorf("create host socket dir %s: %w", dir, err)
 	}
 
-	socketPath := filepath.Join(dir, fmt.Sprintf("tau-host-%s-%d.sock", pluginName, os.Getpid()))
+	socketPath := filepath.Join(dir, fmt.Sprintf("tau-host-%s-%d-%d.sock", pluginName, os.Getpid(), hostSocketSequence.Add(1)))
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return "", fmt.Errorf("remove stale host socket %s: %w", socketPath, err)
 	}
@@ -91,10 +111,41 @@ func (m *Manager) prepareHostSocketLocked(pluginName string) (string, error) {
 		return "", err
 	}
 
-	server := grpc.NewServer()
+	var staging atomic.Bool
+	var retired atomic.Bool
+	staging.Store(ctx.Value(stagedHostContextKey{}) != nil)
+	var snapshot *HostService
+	if staging.Load() {
+		snapshotSettings := &ai.Settings{}
+		if m.settings != nil {
+			snapshotSettings.Plugins = map[string]json.RawMessage{pluginName: slices.Clone(m.settings.Plugins[pluginName])}
+		}
+		snapshot = NewHostService(&Manager{settings: snapshotSettings, cliFlags: map[string]map[string]string{pluginName: maps.Clone(m.cliFlags[pluginName])}, cliFlagOverrides: map[string]map[string]string{pluginName: maps.Clone(m.cliFlagOverrides[pluginName])}})
+	}
+	server := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		identity, _ := metadata.FromIncomingContext(ctx)
+		names := identity.Get("tau-plugin-name")
+		if len(names) != 1 || names[0] != pluginName {
+			return nil, status.Error(codes.PermissionDenied, "plugin identity does not match Host endpoint")
+		}
+		if retired.Load() {
+			return nil, status.Error(codes.FailedPrecondition, "plugin Host endpoint is retired")
+		}
+		if !staging.Load() {
+			return handler(ctx, req)
+		}
+		switch info.FullMethod {
+		case proto.Host_GetConfig_FullMethodName:
+			return snapshot.GetConfig(ctx, req.(*proto.GetConfigRequest))
+		case proto.Host_Log_FullMethodName:
+			return handler(ctx, req)
+		default:
+			return nil, status.Error(codes.FailedPrecondition, "plugin reload is not admitted")
+		}
+	}))
 	proto.RegisterHostServer(server, m.host)
 
-	hs := &hostSocket{path: socketPath, server: server, ln: ln}
+	hs := &hostSocket{path: socketPath, server: server, ln: ln, staging: &staging, retired: &retired}
 	m.hostSockets[pluginName] = hs
 
 	go func() {

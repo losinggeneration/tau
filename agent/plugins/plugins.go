@@ -117,14 +117,16 @@ type VirtualModelRegistration struct {
 
 // PluginInfo holds information about a loaded plugin.
 type PluginInfo struct {
-	Name          string
-	Path          string
-	ManifestPath  string
-	Manifest      *Manifest // parsed tau-package.toml, if found
-	Hash          string
-	APIVersion    string
-	Registrations Registrations
-	Cleanup       func()
+	configSnapshot json.RawMessage
+	configCaptured bool
+	Name           string
+	Path           string
+	ManifestPath   string
+	Manifest       *Manifest // parsed tau-package.toml, if found
+	Hash           string
+	APIVersion     string
+	Registrations  Registrations
+	Cleanup        func()
 
 	// grpcClient is the gRPC client for calling Shutdown.
 	grpcClient proto.PluginClient
@@ -205,7 +207,8 @@ type Manager struct {
 
 	// CLI flags holds resolved CLI flag values per plugin.
 	// These are injected into the config namespace so Host.GetConfig returns them.
-	cliFlags map[string]map[string]string // pluginName -> key -> value
+	cliFlags         map[string]map[string]string // pluginName -> key -> value
+	cliFlagOverrides map[string]map[string]string
 
 	progressMu          sync.RWMutex
 	progressSubscribers map[string][]chan<- ToolProgressEvent
@@ -217,6 +220,8 @@ type Manager struct {
 	hostSockets map[string]*hostSocket
 
 	// cleanups tracks plugin cleanup hooks so Shutdown can join them.
+	cleanupMu    sync.Mutex
+	cleanupErr   error
 	cleanups     sync.WaitGroup
 	cleanupGrace time.Duration
 
@@ -505,25 +510,24 @@ func (m *Manager) connectPluginProcess(ctx context.Context, path string, manifes
 }
 
 func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manifest, manifestPath string, timeouts DefaultRPCConfig) (*pluginStartup, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	pluginName := filepath.Base(path)
-	hostSocket, err := m.prepareHostSocketLocked(pluginName)
+	hostSocket, err := m.prepareHostSocket(ctx, pluginName)
 	if err != nil {
 		return nil, fmt.Errorf("prepare host socket: %w", err)
 	}
 
 	grpcClient, closeConnection, err := m.connectPlugin(ctx, path, manifest, manifestPath, hostSocket)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("connect plugin: %w", err), m.closeHostSocketLocked(pluginName))
+		return nil, errors.Join(fmt.Errorf("connect plugin: %w", err), context.Cause(ctx), m.runCleanup(ctx, pluginName, closeConnection), m.closeHostSocketLocked(pluginName))
 	}
 	if grpcClient == nil || closeConnection == nil {
-		if closeConnection != nil {
-			closeConnection()
-		}
-		return nil, errors.Join(errors.New("plugin connector requires a client and cleanup"), m.closeHostSocketLocked(pluginName))
+		return nil, errors.Join(errors.New("plugin connector requires a client and cleanup"), m.runCleanup(ctx, pluginName, closeConnection), m.closeHostSocketLocked(pluginName))
 	}
 	fail := func(err error) error {
-		closeConnection()
-		return errors.Join(err, m.closeHostSocketLocked(pluginName))
+		return errors.Join(err, m.runCleanup(ctx, pluginName, closeConnection), m.closeHostSocketLocked(pluginName))
 	}
 
 	cwd := ""
@@ -553,7 +557,13 @@ func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manife
 		ManifestPath: manifestPath,
 	})
 	if err != nil {
-		return nil, fail(fmt.Errorf("initialize: %w", err))
+		return nil, fail(errors.Join(fmt.Errorf("initialize: %w", err), context.Cause(initCtx)))
+	}
+	if err := context.Cause(initCtx); err != nil {
+		return nil, fail(err)
+	}
+	if resp == nil {
+		return nil, fail(errors.New("initialize returned no response"))
 	}
 	if resp.Error != "" {
 		return nil, fail(fmt.Errorf("plugin init error: %s", resp.Error))
@@ -567,9 +577,37 @@ func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manife
 
 	regs, err := grpcClient.ListRegistrations(regCtx, &proto.ListRegistrationsRequest{})
 	if err != nil {
-		return nil, fail(fmt.Errorf("list registrations: %w", err))
+		return nil, fail(errors.Join(fmt.Errorf("list registrations: %w", err), context.Cause(regCtx)))
 	}
 
+	if err := context.Cause(regCtx); err != nil {
+		return nil, fail(err)
+	}
+
+	if regs == nil {
+		return nil, fail(errors.New("registrations returned no response"))
+	}
+
+	for _, entry := range regs.Tools {
+		if entry == nil {
+			return nil, fail(errors.New("nil tool registration"))
+		}
+	}
+	for _, entry := range regs.Commands {
+		if entry == nil {
+			return nil, fail(errors.New("nil command registration"))
+		}
+	}
+	for _, entry := range regs.CliFlags {
+		if entry == nil {
+			return nil, fail(errors.New("nil CLI flag registration"))
+		}
+	}
+	for _, entry := range regs.VirtualModels {
+		if entry == nil {
+			return nil, fail(errors.New("nil virtual model registration"))
+		}
+	}
 	return &pluginStartup{
 		grpcClient: grpcClient,
 		apiVersion: resp.ApiVersion,
@@ -587,27 +625,50 @@ func (m *Manager) startPlugin(ctx context.Context, path string, manifest *Manife
 
 // Handshake runs the plugin handshake protocol: starts the plugin subprocess,
 // performs gRPC handshake, initializes, and lists registrations.
-// It does not register the plugin into the Manager — use LoadPlugin for that.
+// It does not register the plugin into the Manager; use Load for that.
 func (m *Manager) Handshake(ctx context.Context, path string) (*HandshakeResult, error) {
 	hash, manifest, manifestPath, err := m.handshakeMetadata(path)
 	if err != nil {
 		return nil, fmt.Errorf("load plugin metadata: %w", err)
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shimClosed {
+		return nil, errors.New("plugin manager is shut down")
+	}
+
+	if _, exists := m.plugins[filepath.Base(path)]; exists {
+		return nil, fmt.Errorf("plugin %s: %w", filepath.Base(path), errPluginAlreadyLoaded)
+	}
 	timeouts := DefaultRPCTimeouts
 	if manifest != nil {
-		m.mu.Lock()
 		shimErr := m.waitForShimReady(ctx, manifest)
-		m.mu.Unlock()
 		if shimErr != nil {
 			return nil, shimErr
 		}
 		timeouts = manifestTimeouts(manifest)
 	}
-	started, err := m.startPlugin(ctx, path, manifest, manifestPath, timeouts)
+	started, err := m.startPlugin(context.WithValue(ctx, stagedHostContextKey{}, true), path, manifest, manifestPath, timeouts)
 	if err != nil {
 		return nil, err
 	}
+
+	m.hostMu.Lock()
+	probeSocket := m.hostSockets[filepath.Base(path)]
+	m.hostMu.Unlock()
+	closeHandshake := sync.OnceValue(func() error {
+		cleanupErr := m.runCleanup(context.WithoutCancel(ctx), filepath.Base(path), started.cleanup)
+		m.hostMu.Lock()
+		defer m.hostMu.Unlock()
+		if m.hostSockets[filepath.Base(path)] == probeSocket {
+			delete(m.hostSockets, filepath.Base(path))
+		}
+		if probeSocket != nil {
+			cleanupErr = errors.Join(cleanupErr, probeSocket.close())
+		}
+		return cleanupErr
+	})
 
 	return &HandshakeResult{
 		Name:          filepath.Base(path),
@@ -616,10 +677,7 @@ func (m *Manager) Handshake(ctx context.Context, path string) (*HandshakeResult,
 		ManifestPath:  manifestPath,
 		Manifest:      manifest,
 		Hash:          hash,
-		Close: func() error {
-			started.cleanup()
-			return m.closeHostSocketLocked(filepath.Base(path))
-		},
+		Close:         closeHandshake,
 	}, nil
 }
 
@@ -650,35 +708,14 @@ func (m *Manager) handshakeMetadata(path string) (hash string, manifest *Manifes
 			manifest, parseErr = m.packageManifest(manifestPath)
 			m.mu.RUnlock()
 			if parseErr != nil {
-				// Log but continue without manifest.
-				m.logger.Warn("plugin manifest parse failed", "path", manifestPath, "error", parseErr)
+				return "", nil, "", fmt.Errorf("parse plugin manifest: %w", parseErr)
 			}
 		}
 	}
 
-	if manifest != nil && manifest.HasRunCommand() {
-		if manifestNeedsManagedShim(manifest) {
-			if hash, err := computeManagedShimHash(manifestPath, manifest); err == nil {
-				return hash, manifest, manifestPath, nil
-			}
-		}
-		// Run-command plugins: hash the package directory so extension-file
-		// changes are detected on reload. Falls back to the resolved command
-		// binary when the dir can't be read.
-		if dirHash, dirErr := computeDirHash(filepath.Dir(manifestPath)); dirErr == nil {
-			return dirHash, manifest, manifestPath, nil
-		}
-		if resolved := resolveRunCommandPath(filepath.Dir(manifestPath), manifest.Run.Command); resolved != "" {
-			hash, err = m.computeHash(resolved)
-			if err != nil {
-				return "", nil, "", fmt.Errorf("compute hash: %w", err)
-			}
-			return hash, manifest, manifestPath, nil
-		}
-	}
-	hash, err = m.computeHash(path)
+	hash, err = m.pluginHash(path, manifest, manifestPath)
 	if err != nil {
-		return "", nil, "", fmt.Errorf("compute hash: %w", err)
+		return "", nil, "", err
 	}
 	return hash, manifest, manifestPath, nil
 }
@@ -934,6 +971,10 @@ func (m *Manager) Discover(ctx context.Context) error {
 func (m *Manager) AutoLoad(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.shimClosed {
+		return errors.New("plugin manager is shut down")
+	}
+
 	return m.autoLoadLocked(ctx)
 }
 
@@ -993,14 +1034,42 @@ func (p *PluginInfo) getTimeouts() DefaultRPCConfig {
 	}
 }
 
+var errPluginAlreadyLoaded = errors.New("plugin is already loaded; use reload to replace it")
+
 // loadLocked loads a single plugin. Caller must hold m.mu.
 func (m *Manager) loadLocked(ctx context.Context, path string, manifestPath string) (*PluginInfo, error) {
+	if _, exists := m.plugins[filepath.Base(path)]; exists {
+		return nil, fmt.Errorf("plugin %s: %w", filepath.Base(path), errPluginAlreadyLoaded)
+	}
+
+	info, err := m.startCandidateLocked(context.WithValue(ctx, stagedHostContextKey{}, true), path, manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	m.plugins[info.Name] = info
+	m.binaries[path] = info.Hash
+	if info.Manifest != nil {
+		m.failureConfig[path] = info.Manifest.getFailureConfig()
+	}
+	m.registerPlugin(info)
+	m.hostMu.Lock()
+	if socket := m.hostSockets[info.Name]; socket != nil && socket.staging != nil {
+		socket.staging.Store(false)
+	}
+	m.hostMu.Unlock()
+	return info, nil
+}
+
+func (m *Manager) startCandidateLocked(ctx context.Context, path string, manifestPath string) (*PluginInfo, error) {
+	if m.shimClosed {
+		return nil, errors.New("plugin manager is shut down")
+	}
 	var manifest *Manifest
 	var err error
 	if manifestPath != "" {
 		manifest, err = m.packageManifest(manifestPath)
 		if err != nil {
-			m.logger.Warn("plugin manifest parse failed", "path", manifestPath, "error", err)
+			return nil, fmt.Errorf("parse plugin manifest: %w", err)
 		}
 	}
 
@@ -1016,7 +1085,7 @@ func (m *Manager) loadLocked(ctx context.Context, path string, manifestPath stri
 	}
 
 	if manifest != nil && manifest.ConfigSchema != nil && manifest.ConfigSchema.Schema != "" {
-		if err := m.validatePluginConfig(filepath.Base(path), manifest.ConfigSchema.Schema); err != nil {
+		if err := validatePluginSettings(m.settings, filepath.Base(path), manifest.ConfigSchema.Schema); err != nil {
 			return nil, fmt.Errorf("config validation: %w", err)
 		}
 	}
@@ -1030,7 +1099,12 @@ func (m *Manager) loadLocked(ctx context.Context, path string, manifestPath stri
 		return nil, err
 	}
 
+	var config json.RawMessage
+	if m.settings != nil {
+		config = slices.Clone(m.settings.Plugins[filepath.Base(path)])
+	}
 	info := &PluginInfo{
+		configSnapshot: config, configCaptured: true,
 		Name:          filepath.Base(path),
 		Path:          path,
 		ManifestPath:  manifestPath,
@@ -1041,13 +1115,6 @@ func (m *Manager) loadLocked(ctx context.Context, path string, manifestPath stri
 		grpcClient:    started.grpcClient,
 		Cleanup:       started.cleanup,
 	}
-
-	m.plugins[info.Name] = info
-	m.binaries[path] = hash
-	if manifest != nil {
-		m.failureConfig[path] = manifest.getFailureConfig()
-	}
-	m.registerPlugin(info)
 
 	return info, nil
 }
@@ -1062,31 +1129,13 @@ func manifestTimeouts(manifest *Manifest) DefaultRPCConfig {
 }
 
 func (m *Manager) pluginHash(path string, manifest *Manifest, manifestPath string) (string, error) {
-	if manifest != nil && manifest.HasRunCommand() {
-		if manifestNeedsManagedShim(manifest) {
-			if hash, err := computeManagedShimHash(manifestPath, manifest); err == nil {
-				return hash, nil
-			}
-		}
-		manifestDir := filepath.Dir(manifestPath)
-		if manifestPath == "" {
-			manifestDir = filepath.Dir(path)
-		}
-		if dirHash, err := computeDirHash(manifestDir); err == nil {
-			return dirHash, nil
-		}
-		if resolved := resolveRunCommandPath(manifestDir, manifest.Run.Command); resolved != "" {
-			hash, err := m.computeHash(resolved)
-			if err != nil {
-				return "", fmt.Errorf("compute hash: %w", err)
-			}
-			return hash, nil
-		}
+	root := filepath.Dir(manifestPath)
+	if manifestPath == "" {
+		root = filepath.Dir(path)
 	}
-
-	hash, err := m.computeHash(path)
+	hash, err := pluginDiscoveryHash(root, manifestPath, manifest, path, m.computeHash)
 	if err != nil {
-		return "", fmt.Errorf("compute hash: %w", err)
+		return "", fmt.Errorf("compute plugin hash: %w", err)
 	}
 	return hash, nil
 }
@@ -1117,21 +1166,42 @@ func isAPIVersionSupported(version string) bool {
 }
 
 // AttemptLoadWithRetry attempts to load a plugin with bounded retry and backoff.
-// Returns an error only after all attempts are exhausted.
+// Returns an error after all attempts are exhausted or the caller cancels.
 func (m *Manager) AttemptLoadWithRetry(ctx context.Context, path string, manifestPath string) (*PluginInfo, error) {
+	m.mu.RLock()
+	if m.shimClosed {
+		m.mu.RUnlock()
+		return nil, errors.New("plugin manager is shut down")
+	}
+
+	existing := m.plugins[filepath.Base(path)]
 	config := m.failureConfig[path]
+	m.mu.RUnlock()
+	if existing != nil {
+		return nil, fmt.Errorf("plugin %s: %w", filepath.Base(path), errPluginAlreadyLoaded)
+	}
 	if config.MaxAttempts == 0 {
 		config = DefaultFailureConfig
 	}
 
 	var lastErr error
 	for attempt := 0; attempt < config.MaxAttempts; attempt++ {
+		if err := context.Cause(ctx); err != nil {
+			return nil, fmt.Errorf("plugin load retry canceled: %w", errors.Join(lastErr, err))
+		}
+		m.mu.RLock()
+		closed := m.shimClosed
+		m.mu.RUnlock()
+		if closed {
+			return nil, errors.Join(lastErr, errors.New("plugin manager is shut down"))
+		}
+
 		if attempt > 0 {
 			// Calculate backoff: base * factor^attempt
 			backoff := float64(config.BackoffBase) * pow(config.BackoffFactor, float64(attempt-1))
 			select {
 			case <-ctx.Done():
-				return nil, fmt.Errorf("plugin load retry canceled: %w", ctx.Err())
+				return nil, fmt.Errorf("plugin load retry canceled: %w", errors.Join(lastErr, context.Cause(ctx)))
 			case <-time.After(time.Duration(backoff)):
 			}
 			m.logger.Debug("plugin load retrying after backoff", "attempt", attempt+1, "max_attempts", config.MaxAttempts)
@@ -1149,13 +1219,18 @@ func (m *Manager) AttemptLoadWithRetry(ctx context.Context, path string, manifes
 			return info, nil
 		}
 
-		lastErr = err
+		if errors.Is(err, errPluginAlreadyLoaded) {
+			return nil, errors.Join(lastErr, err)
+		}
+
+		lastErr = errors.Join(lastErr, err)
 		m.logger.Warn("plugin load attempt failed", "attempt", attempt+1, "max_attempts", config.MaxAttempts, "error", err)
 
 		// Clean up failed load attempt resources.
 		m.mu.Lock()
 		if info := m.plugins[filepath.Base(path)]; info != nil && info.Cleanup != nil {
 			if err := m.releasePluginLocked(ctx, info.Name, info); err != nil {
+				lastErr = errors.Join(lastErr, err)
 				m.logger.Warn("plugin cleanup failed", "plugin", info.Name, "error", err)
 			}
 			delete(m.plugins, filepath.Base(path))
@@ -1188,50 +1263,48 @@ func (m *Manager) deregister(name string, reason string) {
 	}
 }
 
-// ReattemptDeregistered re-attempts loading of plugins that were deregistered.
-// Called by /reload to bring back plugins that previously exhausted retries.
-func (m *Manager) ReattemptDeregistered(ctx context.Context) {
+// ReattemptDeregistered stages retries before replacing deregistered entries.
+func (m *Manager) ReattemptDeregistered(ctx context.Context) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 	m.mu.Lock()
-	var toReattempt []struct {
-		name         string
-		path         string
-		manifestPath string
+	defer m.mu.Unlock()
+	if m.shimClosed {
+		return errors.New("plugin manager is shut down")
 	}
-	for name, info := range m.plugins {
-		if info.deregistered {
-			toReattempt = append(toReattempt, struct {
-				name         string
-				path         string
-				manifestPath string
-			}{name, info.Path, info.ManifestPath})
-			delete(m.plugins, name)
-		}
-	}
-	m.mu.Unlock()
 
-	for _, item := range toReattempt {
-		m.logger.Info("plugin re-attempting deregistered plugin", "plugin", item.name)
-		info, err := m.AttemptLoadWithRetry(ctx, item.path, item.manifestPath)
-		if err != nil {
-			m.logger.Warn("plugin re-attempt failed", "plugin", item.name, "error", err)
-			m.mu.Lock()
-			// Mark as deregistered again.
-			if p, ok := m.plugins[item.name]; ok {
-				p.deregistered = true
-			} else {
-				// Re-register with deregistered flag.
-				m.plugins[item.name] = &PluginInfo{
-					Name:         item.name,
-					Path:         item.path,
-					ManifestPath: item.manifestPath,
-					deregistered: true,
-				}
-			}
-			m.mu.Unlock()
-		} else {
-			_ = info // already registered via Load
+	var retryErr error
+	for _, name := range slices.Sorted(maps.Keys(m.plugins)) {
+		previous := m.plugins[name]
+		if !previous.deregistered {
+			continue
 		}
+		if previous.ManifestPath != "" {
+			manifest, err := m.packageManifest(previous.ManifestPath)
+			if err != nil {
+				retryErr = errors.Join(retryErr, err)
+				continue
+			}
+			if err := m.waitForShimReady(ctx, manifest); err != nil {
+				retryErr = errors.Join(retryErr, err)
+				continue
+			}
+			if m.plugins[name] != previous {
+				continue
+			}
+		}
+		candidate, err := m.stageReloadPluginLocked(ctx, previous)
+		if err != nil {
+			retryErr = errors.Join(retryErr, fmt.Errorf("retry plugin %s: %w", name, err))
+			continue
+		}
+		if err := context.Cause(ctx); err != nil {
+			return errors.Join(retryErr, err, m.discardStagedPlugin(ctx, name, candidate))
+		}
+		retryErr = errors.Join(retryErr, m.replacePluginLocked(ctx, name, previous, candidate))
 	}
+	return retryErr
 }
 
 // convertToolRegistrations converts proto registrations to internal type.
@@ -1406,6 +1479,9 @@ func (m *Manager) registerPlugin(info *PluginInfo) {
 	for _, flag := range info.Registrations.CLIFlags {
 		flags[flag.Name] = flag.DefaultValue
 	}
+	for key, value := range m.cliFlagOverrides[pluginName] {
+		flags[key] = value
+	}
 	m.cliFlags[pluginName] = flags
 }
 
@@ -1536,6 +1612,9 @@ func (m *Manager) handleEvent(ctx context.Context, pluginName, eventName string,
 // unregisterPluginLocked removes a plugin's registrations from the manager.
 // Caller must hold m.mu.
 func (m *Manager) unregisterPluginLocked(info *PluginInfo) {
+	if m.commandRegistry != nil && info.Path != "" {
+		m.commandRegistry.ClearSource(info.Path)
+	}
 	toolPrefix := info.Registrations.ToolPrefix
 
 	// Remove tools.
@@ -1573,46 +1652,125 @@ func (m *Manager) unregisterPluginLocked(info *PluginInfo) {
 // Reload re-hashes all plugins and restarts those whose hash changed,
 // and re-attempts loading of any plugins that were previously deregistered.
 func (m *Manager) Reload(ctx context.Context) error {
-	// Re-attempt loading any plugins that were previously deregistered.
-	m.ReattemptDeregistered(ctx)
 	return m.ReloadNamed(ctx, "")
 }
 
-// ReloadNamed rehashes plugins and restarts those matching name (or all if name is empty).
-// If name is non-empty, the matching plugin is force-reloaded even if its hash unchanged.
+// ReloadNamed rehashes plugins and restarts those matching name, or all when empty.
+// A named plugin is restarted even when its hash is unchanged.
 func (m *Manager) ReloadNamed(ctx context.Context, name string) error {
-	if err := context.Cause(ctx); err != nil {
+	prepared, err := m.PrepareReload(ctx, m.getSettings())
+	if err != nil {
 		return err
 	}
-	// Scan directories to discover current binaries and hashes.
-	if err := m.scanExtensionCandidates(); err != nil {
-		return err
+	return prepared.Reload(ctx, name)
+}
+
+// reloadCandidates requires m.mu to be held throughout staging and admission.
+func (m *Manager) reloadCandidates(ctx context.Context, name string, changedConfig map[string]bool, admit func() error) (bool, error) {
+	var reloadErr error
+	names := slices.Sorted(maps.Keys(m.plugins))
+	staged := make(map[string]*stagedPlugin)
+	replacements := make(map[string]string)
+	for _, path := range slices.Sorted(maps.Keys(m.binaries)) {
+		pluginName := filepath.Base(path)
+		if _, exists := replacements[pluginName]; !exists {
+			replacements[pluginName] = path
+		}
 	}
-	if err := m.scanConfiguredPackages(); err != nil {
-		return fmt.Errorf("discover configured packages: %w", err)
+	for _, pluginName := range names {
+		info := m.plugins[pluginName]
+		if name != "" && pluginName != name {
+			continue
+		}
+		hash, exists := m.binaries[info.Path]
+		candidateInfo := info
+		if !exists {
+			if replacementPath := replacements[pluginName]; replacementPath != "" {
+				moved := *info
+				moved.Path = replacementPath
+				moved.ManifestPath = m.manifestPaths[replacementPath]
+				candidateInfo = &moved
+				hash, exists = m.binaries[replacementPath]
+			}
+		}
+		if !exists || (!info.deregistered && hash == info.Hash && candidateInfo.Path == info.Path && name == "" && !changedConfig[pluginName]) {
+			continue
+		}
+		candidate, err := m.stageReloadPluginLocked(ctx, candidateInfo)
+		if err != nil {
+			for candidateName, item := range staged {
+				err = errors.Join(err, m.discardStagedPlugin(ctx, candidateName, item))
+			}
+			return false, fmt.Errorf("stage plugin %s: %w", pluginName, err)
+		}
+		staged[pluginName] = candidate
 	}
 
-	m.filterConfiguredExtensions()
-	if err := context.Cause(ctx); err != nil {
-		return err
+	newPlugins := make(map[string]*stagedPlugin)
+	for _, path := range slices.Sorted(maps.Keys(m.binaries)) {
+		pluginName := filepath.Base(path)
+		if name != "" && name != pluginName {
+			continue
+		}
+		if _, exists := m.plugins[pluginName]; exists {
+			continue
+		}
+		if _, exists := newPlugins[pluginName]; exists {
+			continue
+		}
+		candidate, err := m.stagePluginLocked(ctx, &PluginInfo{Name: pluginName, Path: path})
+		if err != nil {
+			for candidateName, item := range staged {
+				err = errors.Join(err, m.discardStagedPlugin(ctx, candidateName, item))
+			}
+			for candidateName, item := range newPlugins {
+				err = errors.Join(err, m.discardStagedPlugin(ctx, candidateName, item))
+			}
+			return false, fmt.Errorf("stage new plugin %s: %w", pluginName, err)
+		}
+		newPlugins[pluginName] = candidate
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.prepareShimIfNeeded(ctx)
+	if err := context.Cause(ctx); err != nil {
+		for candidateName, item := range staged {
+			err = errors.Join(err, m.discardStagedPlugin(ctx, candidateName, item))
+		}
+		for candidateName, item := range newPlugins {
+			err = errors.Join(err, m.discardStagedPlugin(ctx, candidateName, item))
+		}
+		return false, err
+	}
+
+	if admit != nil {
+		if err := admit(); err != nil {
+			for candidateName, item := range staged {
+				err = errors.Join(err, m.discardStagedPlugin(ctx, candidateName, item))
+			}
+			for candidateName, item := range newPlugins {
+				err = errors.Join(err, m.discardStagedPlugin(ctx, candidateName, item))
+			}
+			return false, err
+		}
+	}
 
 	// Check each loaded plugin for hash changes or force restart.
-	for pluginName, info := range m.plugins {
+	for _, pluginName := range names {
+		info := m.plugins[pluginName]
 		// If name is specified and doesn't match, skip.
 		if name != "" && pluginName != name {
 			continue
 		}
 
-		newHash, exists := m.binaries[info.Path]
+		if candidate := staged[pluginName]; candidate != nil {
+			reloadErr = errors.Join(reloadErr, m.replacePluginLocked(ctx, pluginName, info, candidate))
+			continue
+		}
+		_, exists := m.binaries[info.Path]
 		if !exists {
 			// Binary no longer exists, shut down and remove.
 			m.logger.Info("plugin binary no longer found; shutting down", "plugin", pluginName)
 			if err := m.shutdownPluginLocked(ctx, pluginName, info, DefaultDrainTimeout); err != nil {
+				reloadErr = errors.Join(reloadErr, err)
 				m.logger.Warn("plugin shutdown failed", "plugin", pluginName, "error", err)
 			}
 			m.unregisterPluginLocked(info)
@@ -1620,28 +1778,12 @@ func (m *Manager) ReloadNamed(ctx context.Context, name string) error {
 			continue
 		}
 
-		if newHash != info.Hash || name != "" {
-			// Hash changed, or this is a named (forced) reload — restart this plugin.
-			if name != "" {
-				m.logger.Info("plugin force-reloading", "plugin", pluginName)
-			} else {
-				m.logger.Info("plugin hash changed; reloading", "plugin", pluginName)
-			}
-			if err := m.shutdownPluginLocked(ctx, pluginName, info, DefaultDrainTimeout); err != nil {
-				m.logger.Warn("plugin shutdown failed", "plugin", pluginName, "error", err)
-			}
-			m.unregisterPluginLocked(info)
-			delete(m.plugins, pluginName)
-
-			// Reload the plugin.
-			if _, err := m.loadLocked(ctx, info.Path, m.manifestPaths[info.Path]); err != nil {
-				m.logger.Warn("plugin reload failed", "plugin", pluginName, "error", err)
-			}
-		}
 	}
 
-	// Load any new plugins discovered during scanning.
-	return m.autoLoadLocked(ctx)
+	for pluginName, candidate := range newPlugins {
+		m.installStagedPluginLocked(pluginName, candidate)
+	}
+	return true, reloadErr
 }
 
 // PluginShutdowner allows a plugin to be shut down gracefully.
@@ -1654,8 +1796,11 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	err := m.stopShimSetupLocked(ctx)
-	for name, info := range m.plugins {
+	for _, name := range slices.Sorted(maps.Keys(m.plugins)) {
+		info := m.plugins[name]
 		err = errors.Join(err, m.shutdownPluginLocked(ctx, name, info, DefaultDrainTimeout))
+		m.unregisterPluginLocked(info)
+		delete(m.plugins, name)
 	}
 	return errors.Join(err, m.waitCleanups(ctx))
 }
@@ -1666,6 +1811,11 @@ const GracePeriod = 2 * time.Second
 // shutdownPluginLocked calls the Shutdown RPC on a plugin.
 // Caller must hold m.mu.
 func (m *Manager) shutdownPluginLocked(ctx context.Context, name string, info *PluginInfo, drainTimeout time.Duration) error {
+	m.hostMu.Lock()
+	if socket := m.hostSockets[name]; socket != nil && socket.retired != nil {
+		socket.retired.Store(true)
+	}
+	m.hostMu.Unlock()
 	if info.grpcClient == nil {
 		return m.releasePluginLocked(ctx, name, info)
 	}
@@ -1677,14 +1827,17 @@ func (m *Manager) shutdownPluginLocked(ctx context.Context, name string, info *P
 	resp, err := info.grpcClient.Shutdown(drainCtx, &proto.ShutdownRequest{
 		DrainTimeoutSeconds: int32(drainTimeout.Seconds()),
 	})
-
+	err = shutdownResponseError(name, resp, err)
+	if err != nil {
+		err = errors.Join(err, context.Cause(drainCtx))
+	}
 	// Cancel the drain context to stop waiting.
 	cancel()
 
 	if releaseErr := m.releasePluginLocked(ctx, name, info); releaseErr != nil {
-		return errors.Join(shutdownResponseError(name, resp, err), releaseErr)
+		return errors.Join(err, releaseErr)
 	}
-	if err := shutdownResponseError(name, resp, err); err != nil {
+	if err != nil {
 		return err
 	}
 	m.logger.Debug("plugin shut down gracefully", "plugin", name)
@@ -1722,7 +1875,10 @@ func (m *Manager) ShutdownPlugin(ctx context.Context, name string, drainTimeout 
 		return fmt.Errorf("plugin not found: %s", name)
 	}
 
-	return m.shutdownPluginLocked(ctx, name, info, drainTimeout)
+	err := m.shutdownPluginLocked(ctx, name, info, drainTimeout)
+	m.unregisterPluginLocked(info)
+	delete(m.plugins, name)
+	return err
 }
 
 // CancellableEvents is the set of event names whose handlers may return
@@ -2062,4 +2218,100 @@ func (m *Manager) ReachPluginTools(ctx context.Context, name string, args map[st
 		return nil, errors.New("plugin returned no reach result")
 	}
 	return result.Names, nil
+}
+
+type stagedPlugin struct {
+	info   *PluginInfo
+	socket *hostSocket
+}
+
+func (m *Manager) discardStagedPlugin(ctx context.Context, name string, candidate *stagedPlugin) error {
+	err := m.runCleanup(ctx, name, candidate.info.Cleanup)
+	if candidate.socket != nil {
+		err = errors.Join(err, candidate.socket.close())
+	}
+	return err
+}
+
+func (m *Manager) stagePluginLocked(ctx context.Context, previous *PluginInfo) (*stagedPlugin, error) {
+	name := previous.Name
+	m.hostMu.Lock()
+	oldSocket := m.hostSockets[name]
+	delete(m.hostSockets, name)
+	m.hostMu.Unlock()
+	manifestPath, discovered := m.manifestPaths[previous.Path]
+	if !discovered {
+		manifestPath = previous.ManifestPath
+	}
+	replacement, err := m.startCandidateLocked(context.WithValue(ctx, stagedHostContextKey{}, true), previous.Path, manifestPath)
+	m.hostMu.Lock()
+	newSocket := m.hostSockets[name]
+	if oldSocket != nil {
+		m.hostSockets[name] = oldSocket
+	} else {
+		delete(m.hostSockets, name)
+	}
+	m.hostMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return &stagedPlugin{info: replacement, socket: newSocket}, nil
+}
+
+func (m *Manager) replacePluginLocked(ctx context.Context, name string, previous *PluginInfo, candidate *stagedPlugin) error {
+	shutdownErr := m.shutdownPluginLocked(ctx, name, previous, DefaultDrainTimeout)
+	m.unregisterPluginLocked(previous)
+	m.installStagedPluginLocked(name, candidate)
+	return shutdownErr
+}
+
+func (m *Manager) installStagedPluginLocked(name string, candidate *stagedPlugin) {
+	replacement := candidate.info
+	newSocket := candidate.socket
+	m.hostMu.Lock()
+	if newSocket != nil {
+		m.hostSockets[name] = newSocket
+	}
+	m.hostMu.Unlock()
+	m.plugins[name] = replacement
+	m.binaries[replacement.Path] = replacement.Hash
+	if replacement.Manifest != nil {
+		m.failureConfig[replacement.Path] = replacement.Manifest.getFailureConfig()
+	}
+	m.registerPlugin(replacement)
+	if newSocket != nil && newSocket.staging != nil {
+		newSocket.staging.Store(false)
+	}
+}
+
+func (m *Manager) stageReloadPluginLocked(ctx context.Context, previous *PluginInfo) (*stagedPlugin, error) {
+	if !previous.deregistered {
+		return m.stagePluginLocked(ctx, previous)
+	}
+	config := m.failureConfig[previous.Path]
+	if config.MaxAttempts == 0 {
+		config = DefaultFailureConfig
+	}
+	var lastErr error
+	for attempt := range config.MaxAttempts {
+		if err := context.Cause(ctx); err != nil {
+			return nil, errors.Join(lastErr, err)
+		}
+		if attempt > 0 {
+			backoff := time.Duration(float64(config.BackoffBase) * pow(config.BackoffFactor, float64(attempt-1)))
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, errors.Join(lastErr, context.Cause(ctx))
+			case <-timer.C:
+			}
+		}
+		candidate, err := m.stagePluginLocked(ctx, previous)
+		if err == nil {
+			return candidate, nil
+		}
+		lastErr = errors.Join(lastErr, err)
+	}
+	return nil, fmt.Errorf("plugin load failed after %d attempts: %w", config.MaxAttempts, lastErr)
 }
