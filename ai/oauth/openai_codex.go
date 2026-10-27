@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	airoot "github.com/losinggeneration/tau/ai"
 	"golang.org/x/oauth2"
 )
@@ -21,19 +23,32 @@ type openaiCodexProvider struct {
 	tokenURL     string
 	callbackPort int
 	originator   string
+	deviceID     func(context.Context) (string, error)
 }
 
-func NewOpenAICodexProvider(originator string) Provider {
+// OpenAICodexOption configures OpenAI sign-in.
+type OpenAICodexOption func(*openaiCodexProvider)
+
+// WithOpenAIDeviceID resolves the installation ID only when sign-in needs it.
+func WithOpenAIDeviceID(resolve func(context.Context) (string, error)) OpenAICodexOption {
+	return func(p *openaiCodexProvider) { p.deviceID = resolve }
+}
+
+func NewOpenAICodexProvider(originator string, opts ...OpenAICodexOption) Provider {
 	if originator == "" {
 		originator = "pi"
 	}
-	return &openaiCodexProvider{
+	provider := &openaiCodexProvider{
 		clientID:     "app_EMoamEEZ73f0CkXaXp7hrann",
 		authURL:      "https://auth.openai.com/oauth/authorize",
 		tokenURL:     "https://auth.openai.com/oauth/token",
 		callbackPort: 1455,
 		originator:   originator,
 	}
+	for _, opt := range opts {
+		opt(provider)
+	}
+	return provider
 }
 
 func (p *openaiCodexProvider) ID() ProviderID {
@@ -170,8 +185,26 @@ func (p *openaiCodexProvider) Login(ctx context.Context, callbacks LoginCallback
 	verifier := oauth2.GenerateVerifier()
 	state := oauth2.GenerateVerifier()
 
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return nil, err
+	}
+	var hostID string
+	if p.deviceID != nil {
+		id, err := p.deviceID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("resolve device ID: %w", err)
+		}
+		parsed, err := uuid.Parse(id)
+		if err != nil {
+			return nil, fmt.Errorf("invalid device ID: %w", err)
+		}
+		if len(id) != 36 {
+			return nil, fmt.Errorf("invalid device ID: expected canonical UUID")
+		}
+		hostID = "urn:uuid:" + parsed.String()
+		if err := context.Cause(ctx); err != nil {
+			return nil, err
+		}
 	}
 	server := newCallbackServer(state, p.callbackPort)
 	listenErr := server.startFixed(ctx)
@@ -179,13 +212,16 @@ func (p *openaiCodexProvider) Login(ctx context.Context, callbacks LoginCallback
 
 	redirectURI := server.AuthCallbackURL()
 	config := p.oauthConfig(redirectURI)
-	authURL := config.AuthCodeURL(
-		state,
+	authOptions := []oauth2.AuthCodeOption{
 		oauth2.S256ChallengeOption(verifier),
 		oauth2.SetAuthURLParam("id_token_add_organizations", "true"),
 		oauth2.SetAuthURLParam("codex_cli_simplified_flow", "true"),
 		oauth2.SetAuthURLParam("originator", p.originator),
-	)
+	}
+	if hostID != "" {
+		authOptions = append(authOptions, oauth2.SetAuthURLParam("ext_agent_host_id", hostID))
+	}
+	authURL := config.AuthCodeURL(state, authOptions...)
 
 	callbacks.OnAuth(authURL, "A browser window should open. Complete login to finish.")
 	if err := ctx.Err(); err != nil {

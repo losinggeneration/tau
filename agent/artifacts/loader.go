@@ -41,6 +41,8 @@ type Loader struct {
 
 // LoaderOptions configures a Loader.
 type LoaderOptions struct {
+	// ProjectTrusted gates automatic project resources.
+	ProjectTrusted *bool
 	ThemeValidator func([]byte) error
 	// Log is used for warnings during discovery and reload. May be nil.
 	Log *slog.Logger
@@ -80,6 +82,7 @@ type LoaderOptions struct {
 func NewLoader(opts LoaderOptions) (*Loader, error) {
 	cfg := &DiscoveryConfig{
 		CWD:            opts.CWD,
+		ProjectTrusted: cloneTrustDecision(opts.ProjectTrusted),
 		SettingsPaths:  opts.SettingsPaths,
 		SettingsScopes: opts.SettingsScopes,
 		UserDirs:       opts.UserDirs,
@@ -168,6 +171,8 @@ func (l *Loader) Reload(ctx context.Context) error {
 
 // ReloadOptions carries the settings-derived discovery inputs for a reload.
 type ReloadOptions struct {
+	// ProjectTrusted replaces the project resource policy when nonnil.
+	ProjectTrusted *bool
 	// PackagePaths replaces installed-package search directories when nonnil.
 	// An explicit empty slice disables installed-package discovery.
 	PackagePaths []string
@@ -198,6 +203,9 @@ func (l *Loader) Prepare(opts ReloadOptions) (*PreparedReload, error) {
 	l.mu.RLock()
 	cfg := *l.cfg
 	l.mu.RUnlock()
+	if opts.ProjectTrusted != nil {
+		cfg.ProjectTrusted = cloneTrustDecision(opts.ProjectTrusted)
+	}
 	cfg.SettingsPaths = opts.SettingsPaths
 	cfg.SettingsScopes = opts.SettingsScopes
 	cfg.UserDirs = opts.UserDirs
@@ -325,3 +333,10 @@ func (l *Loader) registerCommands() {
 
 // SkillRegistry returns the uncommitted skills for prompt preparation.
 func (p *PreparedReload) SkillRegistry() *SkillRegistry { return p.skills }
+
+func cloneTrustDecision(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	return new(*value)
+}

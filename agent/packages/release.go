@@ -59,6 +59,10 @@ func downloadAndExtract(ctx context.Context, release *ReleaseSection, destDir st
 		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
 
+	if resp.ContentLength > maxArchiveDownload {
+		return errors.New("archive download size limit exceeded")
+	}
+
 	archive, err := os.CreateTemp("", "tau-release-*.tar.gz")
 	if err != nil {
 		return fmt.Errorf("create release archive: %w", err)
@@ -70,7 +74,7 @@ func downloadAndExtract(ctx context.Context, release *ReleaseSection, destDir st
 		}
 	}()
 	hash := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(archive, hash), archiveContextReader{ctx: ctx, reader: resp.Body}); err != nil {
+	if _, err := io.Copy(io.MultiWriter(archive, hash), archiveContextReader{ctx: ctx, reader: &archiveLimitReader{reader: resp.Body, remaining: maxArchiveDownload}}); err != nil {
 		return fmt.Errorf("read release archive: %w", errors.Join(err, context.Cause(ctx)))
 	}
 	if err := context.Cause(ctx); err != nil {
@@ -135,7 +139,9 @@ func extractTarGzContext(ctx context.Context, r io.Reader, destDir string) (err 
 		}
 	}()
 
-	tr := tar.NewReader(gzR)
+	expanded := archiveContextReader{ctx: ctx, reader: &archiveLimitReader{reader: gzR, remaining: maxArchiveExpanded + maxArchiveMetadata}}
+	tr := tar.NewReader(expanded)
+	var budget archiveBudget
 	for {
 		if err := context.Cause(ctx); err != nil {
 			return err
@@ -146,6 +152,10 @@ func extractTarGzContext(ctx context.Context, r io.Reader, destDir string) (err 
 		}
 		if err != nil {
 			return fmt.Errorf("read tar header: %w", err)
+		}
+
+		if err := budget.admit(header); err != nil {
+			return err
 		}
 
 		target := filepath.FromSlash(strings.TrimPrefix(header.Name, "/"))
@@ -186,6 +196,10 @@ func extractTarGzContext(ctx context.Context, r io.Reader, destDir string) (err 
 		}
 	}
 
+	if _, err := io.Copy(io.Discard, expanded); err != nil {
+		return fmt.Errorf("validate archive trailer: %w", err)
+	}
+
 	return nil
 }
 
@@ -210,5 +224,54 @@ func (r archiveContextReader) Read(data []byte) (int, error) {
 	if cause := context.Cause(r.ctx); cause != nil {
 		return n, errors.Join(err, cause)
 	}
+	return n, err
+}
+
+const (
+	maxArchiveDownload int64 = 256 * 1024 * 1024
+	maxArchiveExpanded int64 = 1024 * 1024 * 1024
+	maxArchiveMetadata int64 = 64 * 1024 * 1024
+	maxArchiveEntries        = 100000
+)
+
+type archiveBudget struct {
+	entries  int
+	expanded int64
+}
+
+func (b *archiveBudget) admit(header *tar.Header) error {
+	if b.entries >= maxArchiveEntries {
+		return errors.New("archive entry limit exceeded")
+	}
+	b.entries++
+	if header.Size < 0 || header.Size > maxArchiveExpanded-b.expanded {
+		return errors.New("archive expanded size limit exceeded")
+	}
+	b.expanded += header.Size
+	return nil
+}
+
+type archiveLimitReader struct {
+	reader    io.Reader
+	remaining int64
+}
+
+func (r *archiveLimitReader) Read(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if r.remaining == 0 {
+		var probe [1]byte
+		n, err := r.reader.Read(probe[:])
+		if n > 0 {
+			return 0, errors.Join(errors.New("archive stream size limit exceeded"), err)
+		}
+		return 0, err
+	}
+	if int64(len(data)) > r.remaining {
+		data = data[:r.remaining]
+	}
+	n, err := r.reader.Read(data)
+	r.remaining -= int64(n)
 	return n, err
 }

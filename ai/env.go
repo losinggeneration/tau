@@ -338,7 +338,7 @@ func getEnvHeaders(provider string, lookup func(string) string) map[string]strin
 // HasEnvCredentials reports environment authentication without resolving stored
 // credentials or performing network calls.
 func HasEnvCredentials(provider string) bool {
-	return len(GetEnvHeaders(provider)) != 0 || GetEnvAPIKey(provider) != ""
+	return ProviderEnvHasCredentials(provider, nil)
 }
 
 // ProviderEnvAPIKey resolves a key from scoped variables before process values.
@@ -349,4 +349,10 @@ func ProviderEnvAPIKey(provider string, env map[string]string) string {
 // ProviderEnvHeaders resolves header-owned authentication from scoped variables.
 func ProviderEnvHeaders(provider string, env map[string]string) map[string]string {
 	return (&options{providerEnv: env}).envHeaders(provider)
+}
+
+// ProviderEnvHasCredentials reports scoped authentication without exchanging tokens.
+func ProviderEnvHasCredentials(provider string, env map[string]string) bool {
+	o := &options{providerEnv: env}
+	return len(o.envHeaders(provider)) != 0 || o.envAPIKey(provider) != "" || (provider == ProviderAnthropic && o.providerEnvValue("ANTHROPIC_FEDERATION_RULE_ID") != "" && o.providerEnvValue("ANTHROPIC_ORGANIZATION_ID") != "" && o.providerEnvValue("ANTHROPIC_IDENTITY_TOKEN_FILE") != "")
 }

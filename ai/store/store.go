@@ -363,6 +363,7 @@ func refreshedOAuthCredential(creds *oauth.Credentials, previous ai.Credential) 
 	}
 	cred := CredentialFromOAuth(creds)
 	cred.Scope = previous.Scope
+	cred.Env = maps.Clone(previous.Env)
 	if previous.Extra != nil {
 		extra := cloneAuthJSON(previous.Extra).(map[string]any)
 		for key, value := range cred.Extra {

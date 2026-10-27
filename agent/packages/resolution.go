@@ -176,6 +176,9 @@ func recoverInstalledEntries(base string, entries []os.DirEntry) ([]os.DirEntry,
 // ResolvePackageSources resolves configured local sources and already installed
 // npm/git sources. Discovery never installs or executes an unapproved package.
 func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([]ResolvedPackage, error) {
+	if !settings.ProjectResourcesTrusted() {
+		projectDir = ""
+	}
 	for _, dir := range []*string{&userDir, &projectDir} {
 		if *dir == "" {
 			continue

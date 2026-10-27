@@ -137,6 +137,8 @@ type Entry struct {
 
 // DiscoveryConfig holds configuration for the discovery walker.
 type DiscoveryConfig struct {
+	// ProjectTrusted gates automatic project resources; nil preserves caller-controlled discovery.
+	ProjectTrusted *bool
 	// HomeDir is the user's home directory.
 	HomeDir string
 	// CWD is the current working directory (for project-local discovery).
@@ -226,7 +228,7 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 
 	// 2. Project-local paths (TierProject)
 	tauDir := filepath.Join(cfg.CWD, ".tau")
-	if cfg.CWD != "" {
+	if cfg.CWD != "" && (cfg.ProjectTrusted == nil || *cfg.ProjectTrusted) {
 		if !cfg.DisableSkills {
 			skillsDir := filepath.Join(tauDir, "skills")
 			e, _ := discoverDir(skillsDir, KindSkill, TierProject, false, cfg.CWD)
@@ -290,6 +292,9 @@ func Walk(cfg DiscoveryConfig) ([]Entry, error) {
 	// Packages retain their own filtering policy, separate from scoped local paths.
 	entries = append(entries, discoverPackageArtifacts(cfg)...)
 	for _, tier := range []SourceTier{TierProject, TierUser} {
+		if tier == TierProject && cfg.ProjectTrusted != nil && !*cfg.ProjectTrusted {
+			continue
+		}
 		for kind, configured := range cfg.SettingsScopes[tier] {
 			entries = discoverSettingsEntries(entries, configured, kind, tier, cfg)
 		}
@@ -389,6 +394,12 @@ func discoverPackageArtifacts(cfg DiscoveryConfig) []Entry {
 
 	for order, basePath := range cfg.PackagePaths {
 		basePath = paths.ResourcePath(basePath, cfg.CWD, cfg.HomeDir)
+		if cfg.ProjectTrusted != nil && !*cfg.ProjectTrusted {
+			rel, err := filepath.Rel(filepath.Join(cfg.CWD, ".tau"), basePath)
+			if err == nil && (rel == "." || filepath.IsLocal(rel)) {
+				continue
+			}
+		}
 		for _, pkgRoot := range packageRoots(basePath, cfg.Log) {
 			found := discoverPackageRoot(pkgRoot, cfg)
 			for i := range found {

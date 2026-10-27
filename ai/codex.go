@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -486,9 +487,21 @@ func streamCodexWebSocket(ctx context.Context, websocketURL string, headers http
 		builder.WriteString("\n")
 
 		var event struct {
-			Type string `json:"type"`
+			Type       string `json:"type"`
+			Status     int    `json:"status"`
+			StatusCode int    `json:"status_code"`
 		}
 		if jsonErr := json.Unmarshal(message, &event); jsonErr == nil {
+			// Over WebSocket, Codex reports a usage limit as an error event in
+			// the stream instead of an HTTP 429. Returning the typed error keeps
+			// the wait-and-retry working here too. Pi treats this as a plain
+			// terminal error, and we intentionally don't.
+			if event.Type == "error" {
+				status := cmp.Or(event.Status, event.StatusCode, http.StatusTooManyRequests)
+				if usageErr := parseCodexUsageLimitError(status, message); usageErr != nil {
+					return builder.String(), started, usageErr
+				}
+			}
 			switch event.Type {
 			case "response.completed", "response.done", "response.incomplete", "response.failed", "error":
 				sawCompletion = true

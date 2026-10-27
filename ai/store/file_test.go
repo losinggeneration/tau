@@ -691,3 +691,47 @@ func TestFileRefreshRetainsCancellationAndProviderFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestFileOAuthEnvironmentRoundTrip(t *testing.T) {
+	backend := NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), Options{})
+	credential := ai.NewOAuthCredential("access", "refresh", time.Now().Add(time.Hour), "scope")
+	credential.Env = map[string]string{"ENDPOINT": "scoped"}
+	require.NoError(t, backend.Set(t.Context(), "provider", credential))
+	got, err := backend.Get(t.Context(), "provider")
+	require.NoError(t, err)
+	require.Equal(t, credential.Env, got.Env)
+}
+
+func TestFileUnauthenticatedEnvironmentRoundTrip(t *testing.T) {
+	backend := NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), Options{})
+	credential := ai.NewNoneCredential()
+	credential.Env = map[string]string{"AWS_REGION": "scoped-region"}
+	require.NoError(t, backend.Set(t.Context(), "provider", credential))
+	got, err := backend.Get(t.Context(), "provider")
+	require.NoError(t, err)
+	require.Equal(t, credential.Env, got.Env)
+}
+
+func TestFileOAuthRefreshPreservesScopedEnvironment(t *testing.T) {
+	for _, method := range []string{"Get", "RefreshOAuth"} {
+		t.Run(method, func(t *testing.T) {
+			backend := NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), Options{RefreshFuncs: OAuthProviderRefreshFuncs(scopedRefreshProvider{})})
+			credential := ai.NewOAuthCredential("old", "refresh", time.Now().Add(-time.Hour), "scope")
+			credential.Env = map[string]string{"ENDPOINT": "scoped"}
+			require.NoError(t, backend.Set(t.Context(), "provider", credential))
+			var got ai.Credential
+			var err error
+			if method == "Get" {
+				got, err = backend.Get(t.Context(), "provider")
+			} else {
+				got, err = backend.RefreshOAuth(t.Context(), "provider", scopedRefreshProvider{})
+			}
+			require.NoError(t, err)
+			require.Equal(t, credential.Env, got.Env)
+			got.Env["ENDPOINT"] = "caller-change"
+			persisted, err := NewFileBackend(backend.path, Options{}).Get(t.Context(), "provider")
+			require.NoError(t, err)
+			require.Equal(t, "scoped", persisted.Env["ENDPOINT"])
+		})
+	}
+}

@@ -286,6 +286,13 @@ type Settings struct {
 	packageBase    string
 	packageScopes  *[2]PackageScope
 
+	// DefaultProjectTrust is global-only. Project settings cannot change it.
+	DefaultProjectTrust string `json:"defaultProjectTrust,omitempty"`
+	HTTPProxy           string `json:"httpProxy,omitempty"`
+	DeviceID            string `json:"deviceId,omitempty"`
+	projectTrusted      *bool
+	projectTrustPath    string
+
 	// === Top-level scalars ===
 
 	LastChangelogVersion string `json:"lastChangelogVersion,omitempty"`
@@ -842,6 +849,10 @@ func MergeSettings(user, project *Settings) *Settings {
 		project = &Settings{}
 	}
 	out := *user // shallow copy
+	out.projectTrusted = nil
+	if user.projectTrusted != nil {
+		out.projectTrusted = new(*user.projectTrusted)
+	}
 	userPackages, projectPackages := user.PackageSourcesByScope()
 	if project.Packages != nil {
 		projectPackages = clonePackageScope(PackageScope{project.packageBase, project.Packages})
@@ -923,7 +934,7 @@ func MergeSettings(user, project *Settings) *Settings {
 	for i := range source.NumField() {
 		field := source.Type().Field(i)
 		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
-		if project.present[name] == nil {
+		if (name == "defaultProjectTrust" || name == "httpProxy" || name == "deviceId") || project.present[name] == nil {
 			continue
 		}
 		switch source.Field(i).Kind() {
@@ -932,6 +943,12 @@ func MergeSettings(user, project *Settings) *Settings {
 		}
 	}
 	out.present = mergeSettingsPresence(user.present, project.present)
+	for _, name := range []string{"defaultProjectTrust", "httpProxy", "deviceId"} {
+		delete(out.present, name)
+		if raw := user.present[name]; raw != nil {
+			out.present[name] = slices.Clone(raw)
+		}
+	}
 
 	// Lists: project overrides entirely.
 	if project.Packages != nil {

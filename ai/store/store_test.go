@@ -1265,3 +1265,13 @@ func TestAPIKeyFromCredentialScopesEnvironment(t *testing.T) {
 		require.Equal(t, "scoped-secret", key)
 	}
 }
+
+func TestRefreshedOAuthRetainsEnvironment(t *testing.T) {
+	previous := ai.NewOAuthCredential("access", "refresh", time.Now().Add(-time.Hour), "scope")
+	previous.Env = map[string]string{"ENDPOINT": "scoped"}
+	got, err := refreshedOAuthCredential(&oauth.Credentials{Access: "new", Expires: time.Now().Add(time.Hour).UnixMilli()}, previous)
+	require.NoError(t, err)
+	require.Equal(t, previous.Env, got.Env)
+	got.Env["ENDPOINT"] = "changed"
+	require.Equal(t, "scoped", previous.Env["ENDPOINT"])
+}

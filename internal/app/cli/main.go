@@ -203,22 +203,40 @@ func sessionDirForCmd(cmd *cli.Command) (string, error) {
 	return dir, nil
 }
 
-// loadSettings loads and merges user + project settings.
-func loadSettings() (*ai.Settings, error) {
-	cfgDir := configDir()
-	userPath := filepath.Join(cfgDir, "settings.json")
-	userSettings, err := ai.LoadSettings(userPath)
-	if err != nil {
-		return nil, fmt.Errorf("load user settings %s: %w", userPath, err)
-	}
+// loadSettings admits project settings only after resolving directory trust.
+func loadSettings() (*ai.Settings, error) { return loadSettingsForTrust(context.Background(), nil) }
 
-	projectPath := ".tau/settings.json"
-	projectSettings, err := ai.LoadSettings(projectPath)
-	if err != nil {
-		return nil, fmt.Errorf("load project settings %s: %w", projectPath, err)
-	}
+func loadSettingsForTrust(ctx context.Context, cmd *cli.Command) (*ai.Settings, error) {
+	return loadSettingsWithUI(ctx, cmd, nil)
+}
 
-	return ai.MergeSettings(userSettings, projectSettings), nil
+func loadSettingsWithUI(ctx context.Context, cmd *cli.Command, u ui.UI) (*ai.Settings, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("resolve settings directory: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve home directory: %w", err)
+	}
+	if cmd == nil {
+		cmd, _ = ctx.Value(rootCmdKey{}).(*cli.Command)
+	}
+	var override *bool
+	if cmd != nil {
+		if cmd.Bool("no-approve") {
+			override = new(false)
+		} else if cmd.Bool("approve") {
+			override = new(true)
+		}
+	}
+	opts := ai.ProjectTrustOptions{Override: override}
+	if u != nil {
+		opts.Prompt = func(ctx context.Context, cwd string) (*bool, error) {
+			return ai.PromptProjectTrust(ctx, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}, cwd, u.Select)
+		}
+	}
+	return ai.LoadTrustedSettings(ctx, configDir(), cwd, home, opts)
 }
 
 // openStore creates a FileBackend credential store at the standard path.
@@ -241,7 +259,7 @@ func reloadSession(ctx context.Context, plugin string, sess commands.CommandSess
 	if err := context.Cause(ctx); err != nil {
 		return commands.Result{}, err
 	}
-	settings, err := loadSettings()
+	settings, err := loadSettingsForTrust(ctx, nil)
 	if err != nil {
 		return commands.Result{}, fmt.Errorf("reload settings: %w", err)
 	}
@@ -256,6 +274,7 @@ func reloadSession(ctx context.Context, plugin string, sess commands.CommandSess
 			PackagePaths:   []string{projectDir, userDir},
 			Packages:       resolved,
 			SettingsScopes: getSettingsArtifactScopes(settings),
+			ProjectTrusted: new(settings.ProjectResourcesTrusted()),
 			UserDirs:       artifactUserDirs(settings),
 		})
 		if err != nil {
@@ -446,8 +465,12 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		opt(&cfg)
 	}
 
-	settings, err := loadSettings()
+	settings, err := loadSettingsWithUI(ctx, cmd, uiImpl)
 	if err != nil {
+		return sdk.RuntimeOptions{}, nil, nil, nil, err
+	}
+
+	if err := settings.ApplyHTTPProxySettings(); err != nil {
 		return sdk.RuntimeOptions{}, nil, nil, nil, err
 	}
 
@@ -524,6 +547,7 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		Log:              nil,
 		CWD:              cwd,
 		SettingsScopes:   getSettingsArtifactScopes(settings),
+		ProjectTrusted:   new(settings.ProjectResourcesTrusted()),
 		CLIPaths:         cliPaths,
 		PackagePaths:     []string{projectDir, userDir},
 		Packages:         resolved,
@@ -736,8 +760,19 @@ func runLogin(ctx context.Context, cmd *cli.Command) error {
 	if providerAllowsNoCredential(provider) && apiKey == "" && !useOAuth {
 		cred = ai.NewNoneCredential()
 	} else if isOAuth && (apiKey == "" || useOAuth) {
+		if oauthProvider.ID() == oauth.ProviderOpenAICodex {
+			oauthProvider = oauth.NewOpenAICodexProvider("tau", oauth.WithOpenAIDeviceID(func(ctx context.Context) (string, error) {
+				return ai.GetOrCreateDeviceID(ctx, filepath.Join(configDir(), "settings.json"))
+			}))
+		}
+		globalSettings, err := ai.LoadSettings(filepath.Join(configDir(), "settings.json"))
+		if err != nil {
+			return cli.Exit(fmt.Sprintf("load authentication settings: %v", err), ExitSubsystemError)
+		}
+		if err := globalSettings.ApplyHTTPProxySettings(); err != nil {
+			return cli.Exit(err.Error(), ExitSubsystemError)
+		}
 		callbacks := &loginCallbacks{interactive: interactive}
-		var err error
 		cred, err = loginOAuthCredential(ctx, oauthProvider, callbacks)
 		if err != nil {
 			return cli.Exit(fmt.Sprintf("OAuth login failed: %v", err), ExitAuthError)
@@ -4450,8 +4485,32 @@ func discoverPluginCLIFlags(ctx context.Context, args []string) (owners map[stri
 	if err := context.Cause(ctx); err != nil {
 		return nil, err
 	}
-	settings, err := loadSettings()
+	var override *bool
+	for _, arg := range args[1:] {
+		if arg == "--" {
+			break
+		}
+		if arg == "--no-approve" || arg == "-na" {
+			override = new(false)
+			break
+		}
+		if arg == "--approve" || arg == "-a" {
+			override = new(true)
+		}
+	}
+	cwd, err := os.Getwd()
 	if err != nil {
+		return nil, err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	settings, err := ai.LoadTrustedSettings(ctx, configDir(), cwd, home, ai.ProjectTrustOptions{Override: override})
+	if err != nil {
+		return nil, err
+	}
+	if err := settings.ApplyHTTPProxySettings(); err != nil {
 		return nil, err
 	}
 	cfgDir := configDir()

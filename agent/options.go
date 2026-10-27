@@ -189,3 +189,8 @@ func WithRequestOptions(opts ...ai.Option) Option {
 func WithProviderEnvironment(resolve func(context.Context, string) (map[string]string, error)) Option {
 	return func(c *Config) { c.ProviderEnv = resolve }
 }
+
+// WithRequestCredentials resolves the key and environment together for each request.
+func WithRequestCredentials(resolve RequestCredentialsProvider) Option {
+	return func(c *Config) { c.RequestCredentials = resolve }
+}

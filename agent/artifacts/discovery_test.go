@@ -244,3 +244,46 @@ func TestPiManifestResourcesDoNotLeakConventions(t *testing.T) {
 		assert.Empty(t, discoverPackageRoot(root, DiscoveryConfig{}), "Pi manifest absence/empty declarations must not load undeclared conventions")
 	}
 }
+
+func TestWalkDeniedProjectKeepsGlobalAndExplicitResources(t *testing.T) {
+	home, cwd := t.TempDir(), t.TempDir()
+	for _, base := range []string{filepath.Join(home, ".tau", "agent", "prompts"), filepath.Join(cwd, ".tau", "prompts"), filepath.Join(cwd, "extra")} {
+		require.NoError(t, os.MkdirAll(base, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(base, "example.md"), []byte("prompt"), 0o600))
+	}
+	entries, err := Walk(DiscoveryConfig{HomeDir: home, CWD: cwd, ProjectTrusted: new(false), CLIPaths: map[ArtifactKind][]string{KindPrompt: {filepath.Join(cwd, "extra")}}})
+	require.NoError(t, err)
+	var tiers []SourceTier
+	for _, entry := range entries {
+		if entry.Kind == KindPrompt {
+			tiers = append(tiers, entry.Tier)
+		}
+	}
+	require.ElementsMatch(t, []SourceTier{TierCLI, TierUser}, tiers)
+}
+
+func TestWalkDeniedProjectSkipsAncestorSkillsAndImplicitPackages(t *testing.T) {
+	home, root := t.TempDir(), t.TempDir()
+	cwd := filepath.Join(root, "nested")
+	require.NoError(t, os.Mkdir(cwd, 0o700))
+	for _, base := range []string{filepath.Join(root, ".agents", "skills", "unsafe"), filepath.Join(home, ".agents", "skills", "safe")} {
+		require.NoError(t, os.MkdirAll(base, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(base, "SKILL.md"), []byte("---\nname: test\ndescription: test\n---\nbody"), 0o600))
+	}
+	pkg := filepath.Join(cwd, ".tau", "packages", "unsafe")
+	require.NoError(t, os.MkdirAll(filepath.Join(pkg, "prompts"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(pkg, "prompts", "unsafe.md"), []byte("prompt"), 0o600))
+	entries, err := Walk(DiscoveryConfig{HomeDir: home, CWD: cwd, ProjectTrusted: new(false), PackagePaths: []string{filepath.Dir(pkg)}})
+	require.NoError(t, err)
+	for _, entry := range entries {
+		require.NotContains(t, entry.SourcePath, root)
+	}
+	var skills []Entry
+	for _, entry := range entries {
+		if entry.Kind == KindSkill {
+			skills = append(skills, entry)
+		}
+	}
+	require.Len(t, skills, 1)
+	require.Equal(t, TierUser, skills[0].Tier)
+}

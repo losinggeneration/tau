@@ -555,3 +555,66 @@ func TestNpmExtractionRejectsCancelledAdmission(t *testing.T) {
 	require.ErrorIs(t, err, cause)
 	require.NoDirExists(t, destination)
 }
+
+func TestNPMRejectsOversizedEntryBeforeCreatingFile(t *testing.T) {
+	var raw bytes.Buffer
+	tw := tar.NewWriter(&raw)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "package/oversized", Mode: 0o600, Size: 1024*1024*1024 + 1}))
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	_, err := gz.Write(raw.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, gz.Close())
+	archive := filepath.Join(t.TempDir(), "package.tgz")
+	require.NoError(t, os.WriteFile(archive, compressed.Bytes(), 0o600))
+	destination := t.TempDir()
+	err = extractNpmPackage(archive, destination)
+	require.ErrorContains(t, err, "archive expanded size limit")
+	require.NoFileExists(t, filepath.Join(destination, "oversized"))
+}
+
+func TestNPMRejectsOversizedCompressedArchive(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "oversized.tgz")
+	file, err := os.Create(archive)
+	require.NoError(t, err)
+	require.NoError(t, file.Truncate(maxArchiveDownload+1))
+	require.NoError(t, file.Close())
+	destination := t.TempDir()
+	err = extractNpmPackage(archive, destination)
+	require.ErrorContains(t, err, "archive download size limit")
+	entries, err := os.ReadDir(destination)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func TestNPMRejectsEntryFlood(t *testing.T) {
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gz)
+	for range maxArchiveEntries + 1 {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: "package/directory", Typeflag: tar.TypeDir, Mode: 0o700}))
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	archive := filepath.Join(t.TempDir(), "package.tgz")
+	require.NoError(t, os.WriteFile(archive, compressed.Bytes(), 0o600))
+	err := extractNpmPackage(archive, t.TempDir())
+	require.ErrorContains(t, err, "archive entry limit")
+}
+
+func TestNPMRejectsCorruptGzipTrailer(t *testing.T) {
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gz)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "package/file", Mode: 0o600, Size: 2}))
+	_, err := tw.Write([]byte("ok"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	data := compressed.Bytes()
+	data[len(data)-8] ^= 0xff
+	archive := filepath.Join(t.TempDir(), "package.tgz")
+	require.NoError(t, os.WriteFile(archive, data, 0o600))
+	err = extractNpmPackage(archive, t.TempDir())
+	require.ErrorIs(t, err, gzip.ErrChecksum)
+}

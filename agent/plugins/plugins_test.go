@@ -168,6 +168,11 @@ func TestBuildPluginCmd_ManifestRunCommand(t *testing.T) {
 	if !strings.Contains(strings.Join(cmd.Env, " "), "TAU_HOST_SOCKET=/tmp/sock") {
 		t.Errorf("TAU_HOST_SOCKET env missing: %v", cmd.Env)
 	}
+	// The Host endpoint only admits calls tagged with the name startPlugin
+	// derives from path, so the plugin must be told that exact name.
+	if !slices.Contains(cmd.Env, "TAU_PLUGIN_NAME=extension") {
+		t.Errorf("TAU_PLUGIN_NAME env missing: %v", cmd.Env)
+	}
 }
 
 // TestBuildPluginCmd_ComplexRunCommandUsesShell: commands with shell
@@ -222,6 +227,9 @@ func TestBuildPluginCmd_NoManifest(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(cmd.Env, " "), "TAU_HOST_SOCKET=/tmp/sock2") {
 		t.Errorf("TAU_HOST_SOCKET env missing: %v", cmd.Env)
+	}
+	if !slices.Contains(cmd.Env, "TAU_PLUGIN_NAME=plugin-binary") {
+		t.Errorf("TAU_PLUGIN_NAME env missing: %v", cmd.Env)
 	}
 }
 

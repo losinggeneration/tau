@@ -3802,3 +3802,72 @@ func TestProviderEnvironmentFailureRejectsRequest(t *testing.T) {
 	require.ErrorIs(t, err, cause)
 	require.Zero(t, requests)
 }
+
+func TestRequestCredentialsOverrideSeparateLookups(t *testing.T) {
+	for _, fails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failure=%t", fails), func(t *testing.T) {
+			cause := errors.New("snapshot unavailable")
+			calls, requests := 0, 0
+			a, err := New(Config{
+				Model:          &ai.Model{ID: "test", Provider: "test"},
+				APIKeyProvider: func(context.Context, string) (string, error) { t.Error("separate key lookup"); return "", cause },
+				ProviderEnv: func(context.Context, string) (map[string]string, error) {
+					t.Error("separate environment lookup")
+					return nil, cause
+				},
+				RequestCredentials: func(ctx context.Context, provider string) (string, map[string]string, error) {
+					calls++
+					require.Equal(t, "test", provider)
+					if fails {
+						return "", nil, cause
+					}
+					return "snapshot", map[string]string{"VERSION": "snapshot"}, nil
+				},
+				ClientFactory: func(*ai.Model) (ai.Client, error) {
+					return stubClient{stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+						requests++
+						actual := ai.ExtractSimpleStreamOptions(opts)
+						require.Equal(t, "snapshot", actual.APIKey)
+						require.Equal(t, "snapshot", actual.Env["VERSION"])
+						handler(ctx, ai.Done{Message: ai.AssistantMessage{Role: "assistant", StopReason: ai.StopReasonStop}})
+						return nil
+					}}, nil
+				},
+			})
+			require.NoError(t, err)
+			err = a.Prompt(t.Context(), NewUserMessage("hello"))
+			require.Equal(t, 1, calls)
+			if fails {
+				require.ErrorIs(t, err, cause)
+				require.Zero(t, requests)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 1, requests)
+			}
+		})
+	}
+}
+
+func TestRequestCredentialsRetainCancellationCause(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	cause := errors.New("credential resolution cancelled")
+	calls := 0
+	a, err := New(Config{
+		Model: &ai.Model{ID: "test", Provider: "test"},
+		RequestCredentials: func(context.Context, string) (string, map[string]string, error) {
+			cancel(cause)
+			return "key", nil, nil
+		},
+		ClientFactory: func(*ai.Model) (ai.Client, error) {
+			return stubClient{stream: func(context.Context, *ai.Model, *ai.Context, ai.EventHandler, ...ai.Option) error {
+				calls++
+				return nil
+			}}, nil
+		},
+	})
+	require.NoError(t, err)
+	err = a.Prompt(ctx, NewUserMessage("hello"))
+	require.ErrorIs(t, err, cause)
+	require.Zero(t, calls)
+}

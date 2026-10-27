@@ -6,6 +6,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -704,4 +707,202 @@ func TestBedrockEnvOptOutUsesExplicitBearerWithoutAmbientConfig(t *testing.T) {
 		require.ErrorContains(t, err, "synthetic rejection")
 	}
 	require.Equal(t, 2, requests)
+}
+
+func TestBedrockScopedStaticCredentials(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "ambient-access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
+	t.Setenv("AWS_SESSION_TOKEN", "ambient-session")
+	o := applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_ACCESS_KEY_ID": "scoped-access", "AWS_SECRET_ACCESS_KEY": "scoped-secret", "AWS_SESSION_TOKEN": "scoped-session"})})
+	client, err := newBedrockRuntimeClient(t.Context(), o)
+	require.NoError(t, err)
+	cred, err := client.Options().Credentials.Retrieve(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "scoped-access", cred.AccessKeyID)
+	require.Equal(t, "scoped-secret", cred.SecretAccessKey)
+	require.Equal(t, "scoped-session", cred.SessionToken)
+	require.Equal(t, "ambient-access", os.Getenv("AWS_ACCESS_KEY_ID"))
+}
+
+func TestBedrockScopedProfile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "credentials")
+	require.NoError(t, os.WriteFile(file, []byte("[scoped]\naws_access_key_id = profile-access\naws_secret_access_key = profile-secret\naws_session_token = profile-session\n"), 0o600))
+	t.Setenv("AWS_ACCESS_KEY_ID", "ambient-access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
+	o := applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_PROFILE": "scoped", "AWS_SHARED_CREDENTIALS_FILE": file})})
+	client, err := newBedrockRuntimeClient(t.Context(), o)
+	require.NoError(t, err)
+	cred, err := client.Options().Credentials.Retrieve(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "profile-access", cred.AccessKeyID)
+	require.Equal(t, "profile-session", cred.SessionToken)
+}
+
+func TestBedrockScopedStaticCredentialFallbackAndValidation(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "ambient-access")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
+	t.Setenv("AWS_SESSION_TOKEN", "ambient-session")
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"empty override", map[string]string{"AWS_ACCESS_KEY_ID": ""}, "ambient-access"},
+		{"partial scoped key", map[string]string{"AWS_ACCESS_KEY_ID": "scoped-access"}, "scoped-access"},
+		{"scoped session", map[string]string{"AWS_SESSION_TOKEN": "scoped-session"}, "ambient-access"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := newBedrockRuntimeClient(t.Context(), applyOptions([]Option{WithProviderEnv(tc.env)}))
+			require.NoError(t, err)
+			cred, err := client.Options().Credentials.Retrieve(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, tc.want, cred.AccessKeyID)
+			require.Equal(t, "ambient-secret", cred.SecretAccessKey)
+			if tc.env["AWS_SESSION_TOKEN"] != "" {
+				require.Equal(t, "scoped-session", cred.SessionToken)
+			} else {
+				require.Equal(t, "ambient-session", cred.SessionToken)
+			}
+		})
+	}
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	_, err := newBedrockRuntimeClient(t.Context(), applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_ACCESS_KEY_ID": "scoped-access"})}))
+	require.ErrorContains(t, err, "require an access key and secret key")
+}
+
+func TestBedrockScopedProfileRespectsExplicitProfile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "credentials")
+	require.NoError(t, os.WriteFile(file, []byte("[scoped]\naws_access_key_id = scoped\naws_secret_access_key = scoped-secret\n[explicit]\naws_access_key_id = explicit\naws_secret_access_key = explicit-secret\n"), 0o600))
+	o := applyOptions([]Option{WithBedrockProfile("explicit"), WithProviderEnv(map[string]string{"AWS_PROFILE": "scoped", "AWS_SHARED_CREDENTIALS_FILE": file, "AWS_ACCESS_KEY_ID": "scoped-key", "AWS_SECRET_ACCESS_KEY": "scoped-secret"})})
+	client, err := newBedrockRuntimeClient(t.Context(), o)
+	require.NoError(t, err)
+	cred, err := client.Options().Credentials.Retrieve(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "explicit", cred.AccessKeyID)
+}
+
+func TestBedrockScopedWebIdentityReadsScopedFile(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "ambient-token"))
+	file := filepath.Join(t.TempDir(), "scoped-token")
+	client, err := newBedrockRuntimeClient(t.Context(), applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_WEB_IDENTITY_TOKEN_FILE": file, "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/scoped", "AWS_ROLE_SESSION_NAME": "scoped-session"})}))
+	require.NoError(t, err)
+	_, err = client.Options().Credentials.Retrieve(t.Context())
+	require.ErrorContains(t, err, file)
+	require.NotContains(t, err.Error(), os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE"))
+}
+
+func TestBedrockScopedWebIdentityRejectsIncompleteConfiguration(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_ROLE_ARN", "")
+	_, err := newBedrockRuntimeClient(t.Context(), applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_WEB_IDENTITY_TOKEN_FILE": "token"})}))
+	require.ErrorContains(t, err, "requires a token file and role ARN")
+	cause := errors.New("cancel credentials")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(cause)
+	_, err = newBedrockRuntimeClient(ctx, applyOptions(nil))
+	require.ErrorIs(t, err, cause)
+}
+
+func TestBedrockScopedConfigFileAndMissingProfile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "config")
+	require.NoError(t, os.WriteFile(file, []byte("[profile scoped]\naws_access_key_id = config-access\naws_secret_access_key = config-secret\n"), 0o600))
+	for _, profile := range []string{"scoped", "missing"} {
+		t.Run(profile, func(t *testing.T) {
+			o := applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_PROFILE": profile, "AWS_CONFIG_FILE": file, "AWS_SHARED_CREDENTIALS_FILE": filepath.Join(t.TempDir(), "absent")})})
+			client, err := newBedrockRuntimeClient(t.Context(), o)
+			if profile == "missing" {
+				require.Error(t, err)
+				require.Nil(t, client)
+				return
+			}
+			require.NoError(t, err)
+			cred, err := client.Options().Credentials.Retrieve(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, "config-access", cred.AccessKeyID)
+		})
+	}
+}
+
+func TestBedrockScopedContainerCredentials(t *testing.T) {
+	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_PROFILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"} {
+		t.Setenv(name, "")
+	}
+	file := filepath.Join(t.TempDir(), "authorization")
+	require.NoError(t, os.WriteFile(file, []byte("first-token"), 0o600))
+	var tokens []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, err := io.WriteString(w, `{"AccessKeyId":"container-access","SecretAccessKey":"container-secret","Token":"container-session","Expiration":"2099-01-01T00:00:00Z"}`)
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+	o := applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_CONTAINER_CREDENTIALS_FULL_URI": server.URL, "AWS_CONTAINER_AUTHORIZATION_TOKEN": "ignored-token", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": file})})
+	client, err := newBedrockRuntimeClient(t.Context(), o)
+	require.NoError(t, err)
+	cache := client.Options().Credentials.(*aws.CredentialsCache)
+	for _, token := range []string{"first-token", "rotated-token"} {
+		require.NoError(t, os.WriteFile(file, []byte(token), 0o600))
+		cache.Invalidate()
+		cred, err := cache.Retrieve(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, "container-access", cred.AccessKeyID)
+		require.Equal(t, "container-session", cred.SessionToken)
+	}
+	require.Equal(t, []string{"first-token", "rotated-token"}, tokens)
+}
+
+func TestBedrockScopedContainerEndpointValidation(t *testing.T) {
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+	for _, tc := range []struct {
+		endpoint string
+		valid    bool
+	}{
+		{"https://credentials.example.com/path", true},
+		{"http://127.0.0.1/path", true},
+		{"http://[::1]/path", true},
+		{"http://169.254.170.2/role", true},
+		{"http://outside.example.com/role", false},
+		{"http://169.254.169.254/role", false},
+		{"https://user:password@credentials.example.com", false},
+		{"file:///tmp/token", false},
+	} {
+		_, err := bedrockContainerEndpoint(applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_CONTAINER_CREDENTIALS_FULL_URI": tc.endpoint})}))
+		if tc.valid {
+			require.NoError(t, err)
+		} else {
+			require.Error(t, err)
+		}
+	}
+	endpoint, err := bedrockContainerEndpoint(applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/role", "AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://ignored.example.com"})}))
+	require.NoError(t, err)
+	require.Equal(t, "http://169.254.170.2/role", endpoint)
+	_, err = bedrockContainerEndpoint(applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "//outside"})}))
+	require.Error(t, err)
+}
+
+func TestBedrockScopedContainerTokenFileFailure(t *testing.T) {
+	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_PROFILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"} {
+		t.Setenv(name, "")
+	}
+	file := filepath.Join(t.TempDir(), "token")
+	cause := errors.New("unexpected credentials request")
+	previous := http.DefaultTransport
+	requests := 0
+	http.DefaultTransport = roundTripperFunc(func(*http.Request) (*http.Response, error) { requests++; return nil, cause })
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	client, err := newBedrockRuntimeClient(t.Context(), applyOptions([]Option{WithProviderEnv(map[string]string{"AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1/role", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": file})}))
+	require.NoError(t, err)
+	_, err = client.Options().Credentials.Retrieve(t.Context())
+	require.ErrorContains(t, err, "open container authorization token")
+	require.ErrorContains(t, err, file)
+	require.Zero(t, requests)
+	require.NoError(t, os.WriteFile(file, []byte(strings.Repeat("x", 16*1024+1)), 0o600))
+	_, err = client.Options().Credentials.Retrieve(t.Context())
+	require.ErrorContains(t, err, "exceeds 16 KiB")
+	require.Zero(t, requests)
 }

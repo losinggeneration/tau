@@ -2108,6 +2108,7 @@ func TestLoadSettingsRejectsMalformedProjectSettings(t *testing.T) {
 	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
 	dir := t.TempDir()
 	t.Chdir(dir)
+	require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}.Set(t.Context(), dir, new(true)))
 	if err := os.Mkdir(filepath.Join(dir, ".tau"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -2269,6 +2270,7 @@ func TestSettingsArtifactPathsRetainScopeThroughStartupAndReload(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("TAU_CONFIG_DIR", cfgDir)
 	t.Chdir(project)
+	require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(cfgDir, "trust.json")}.Set(t.Context(), project, new(true)))
 	for _, path := range []string{filepath.Join(cfgDir, "extra", "user.md"), filepath.Join(project, ".tau", "extra", "project.md")} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
@@ -2876,6 +2878,7 @@ func TestRuntimeCommandsRejectInvalidSettingsBeforeDiscovery(t *testing.T) {
 				cfg := isolateBuildEnv(t)
 				root := t.TempDir()
 				t.Chdir(root)
+				require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}.Set(t.Context(), root, new(true)))
 				path := filepath.Join(cfg, "settings.json")
 				if scope == "project" {
 					require.NoError(t, os.Mkdir(filepath.Join(root, ".tau"), 0o700))
@@ -2898,6 +2901,7 @@ func TestBuildRuntimeOptionsRejectsSettingsWithoutPartialState(t *testing.T) {
 				cfg := isolateBuildEnv(t)
 				root := t.TempDir()
 				t.Chdir(root)
+				require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}.Set(t.Context(), root, new(true)))
 				path := filepath.Join(cfg, "settings.json")
 				if scope == "project" {
 					require.NoError(t, os.Mkdir(filepath.Join(root, ".tau"), 0o700))
@@ -2979,6 +2983,7 @@ func TestSessionCommandsRejectMalformedSettings(t *testing.T) {
 			t.Setenv("TAU_SESSION_DIR", "")
 			root := t.TempDir()
 			t.Chdir(root)
+			require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}.Set(t.Context(), root, new(true)))
 			path := filepath.Join(cfg, "settings.json")
 			if scope == "project" {
 				require.NoError(t, os.Mkdir(filepath.Join(root, ".tau"), 0o700))
@@ -3183,6 +3188,7 @@ func TestPackageCommandsRejectInvalidSettings(t *testing.T) {
 				config := isolateBuildEnv(t)
 				root := t.TempDir()
 				t.Chdir(root)
+				require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}.Set(t.Context(), root, new(true)))
 				path := filepath.Join(config, "settings.json")
 				if scope == "project" {
 					require.NoError(t, os.MkdirAll(filepath.Join(root, ".tau"), 0o700))
@@ -3203,4 +3209,41 @@ func TestPackageUpdateReportsFailuresInsteadOfSuccessfulExit(t *testing.T) {
 	err := command.Run(t.Context(), []string{"update", "missing-one", "missing-two"})
 	require.ErrorContains(t, err, "missing-one")
 	require.ErrorContains(t, err, "missing-two")
+}
+
+func TestDeniedProjectBootstrapAndExplicitOverride(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{"defaultProjectTrust":"never","theme":"global"}`), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(cwd, ".tau", "prompts"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "prompts", "unsafe.md"), []byte("unsafe prompt"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "settings.json"), []byte("malformed"), 0o600))
+	opts, mgr, loader, _, err := buildRuntimeOptions(t.Context(), ui.NewNoOpUI(), nil)
+	require.NoError(t, err)
+	require.False(t, opts.Settings.ProjectResourcesTrusted())
+	require.Equal(t, "global", opts.Settings.Theme)
+	require.NotNil(t, mgr)
+	require.NotNil(t, loader)
+	require.Empty(t, loader.PromptRegistry().List())
+	require.NoError(t, mgr.Shutdown(t.Context()))
+	cmd := &cli.Command{Name: "test", Flags: []cli.Flag{&cli.BoolFlag{Name: "approve"}, &cli.BoolFlag{Name: "no-approve"}}, Action: func(ctx context.Context, cmd *cli.Command) error {
+		_, err := loadSettingsForTrust(ctx, cmd)
+		return err
+	}, ExitErrHandler: func(context.Context, *cli.Command, error) {}}
+	require.ErrorContains(t, cmd.Run(t.Context(), []string{"test", "--approve"}), "load project settings")
+	require.NoError(t, cmd.Run(t.Context(), []string{"test", "--approve", "--no-approve"}))
+}
+
+func TestBuildRuntimeOptionsRejectsInvalidGlobalProxyBeforeDiscovery(t *testing.T) {
+	cfg := isolateBuildEnv(t)
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "settings.json"), []byte(`{"httpProxy":"ftp://proxy.invalid"}`), 0o600))
+	opts, manager, loader, registry, err := buildRuntimeOptions(t.Context(), ui.NewNoOpUI(), nil)
+	require.ErrorContains(t, err, "httpProxy")
+	require.Equal(t, sdk.RuntimeOptions{}, opts)
+	require.Nil(t, manager)
+	require.Nil(t, loader)
+	require.Nil(t, registry)
+	require.NoFileExists(t, filepath.Join(cfg, "auth.json"))
 }

@@ -136,6 +136,7 @@ func isOAuthToken(apiKey string) bool {
 }
 
 type anthropicClient struct {
+	federation    *anthropicFederation
 	model         *Model
 	transport     *HTTPTransport
 	isOAuth       bool
@@ -158,7 +159,8 @@ func newAnthropicClient(model *Model) (*anthropicClient, error) {
 	}
 
 	return &anthropicClient{
-		model: model,
+		model:      model,
+		federation: &anthropicFederation{},
 		transport: NewTransport(baseURL, "", map[string][]string{
 			"Content-Type":      {"application/json"},
 			"anthropic-version": {"2023-06-01"},
@@ -233,12 +235,33 @@ func (c *anthropicClient) stream(ctx context.Context, model *Model, prompt *Cont
 			hasAuth = true
 		}
 	}
+	var federationToken string
+	if !hasAuth && model.Provider == ProviderAnthropic && !o.noEnvCredentials {
+		cache := c.federation
+		if cache == nil {
+			cache = &anthropicFederation{}
+		}
+		federationToken, err = cache.accessToken(ctx, c.transport.baseURL, c.transport.httpClient, &o)
+		if err != nil {
+			return err
+		}
+		if federationToken != "" {
+			if o.headers == nil {
+				o.headers = make(map[string]string)
+			}
+			o.headers["Authorization"] = "Bearer " + federationToken
+			hasAuth = true
+		}
+	}
 	if !hasAuth {
 		return fmt.Errorf("%s: missing API key", model.Provider)
 	}
 
 	// Build headers based on auth type
 	var betas []string
+	if federationToken != "" {
+		betas = append(betas, "oauth-2025-04-20")
+	}
 	if anthropicManagedEffort(model) {
 		betas = append(betas, anthropicMidConversationOutputConfigBeta, anthropicThinkingBindingBeta)
 	}

@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"slices"
@@ -16,9 +18,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	bedrockdocument "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 type bedrockClientImpl struct {
@@ -235,7 +241,12 @@ func streamBedrockEvents(ctx context.Context, model *Model, events <-chan bedroc
 }
 
 func newBedrockRuntimeClient(ctx context.Context, o *options) (*bedrockruntime.Client, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	var cfg aws.Config
+	var scopedWebIdentity bool
+	var scopedContainerURL string
 	if o != nil && o.noEnvCredentials {
 		if resolveBedrockBearerToken(o) == "" {
 			return nil, errors.New("bedrock: ambient credentials disabled; supply an explicit bearer token")
@@ -246,14 +257,76 @@ func newBedrockRuntimeClient(ctx context.Context, o *options) (*bedrockruntime.C
 		if region := resolveBedrockRegion(o); region != "" {
 			loadOptions = append(loadOptions, awsconfig.WithRegion(region))
 		}
-		if o != nil && o.bedrockProfile != "" {
-			loadOptions = append(loadOptions, awsconfig.WithSharedConfigProfile(o.bedrockProfile))
+		if o != nil {
+			profile := o.bedrockProfile
+			if profile == "" {
+				profile = o.providerEnv["AWS_PROFILE"]
+			}
+			if profile != "" {
+				loadOptions = append(loadOptions, awsconfig.WithSharedConfigProfile(profile))
+			} else if o.providerEnv["AWS_ACCESS_KEY_ID"] != "" || o.providerEnv["AWS_SECRET_ACCESS_KEY"] != "" || o.providerEnv["AWS_SESSION_TOKEN"] != "" {
+				access, secret := o.providerEnvValue("AWS_ACCESS_KEY_ID"), o.providerEnvValue("AWS_SECRET_ACCESS_KEY")
+				if access == "" || secret == "" {
+					return nil, errors.New("bedrock: scoped static credentials require an access key and secret key")
+				}
+				loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(access, secret, o.providerEnvValue("AWS_SESSION_TOKEN"))))
+			}
+			if profile == "" && o.providerEnvValue("AWS_ACCESS_KEY_ID") == "" && (o.providerEnv["AWS_WEB_IDENTITY_TOKEN_FILE"] != "" || o.providerEnv["AWS_ROLE_ARN"] != "" || o.providerEnv["AWS_ROLE_SESSION_NAME"] != "") {
+				if o.providerEnvValue("AWS_WEB_IDENTITY_TOKEN_FILE") == "" || o.providerEnvValue("AWS_ROLE_ARN") == "" {
+					return nil, errors.New("bedrock: scoped web identity requires a token file and role ARN")
+				}
+				scopedWebIdentity = true
+				loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(aws.AnonymousCredentials{}))
+			}
+			if profile == "" && o.providerEnvValue("AWS_ACCESS_KEY_ID") == "" && o.providerEnvValue("AWS_WEB_IDENTITY_TOKEN_FILE") == "" && (o.providerEnv["AWS_CONTAINER_CREDENTIALS_FULL_URI"] != "" || o.providerEnv["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] != "" || o.providerEnv["AWS_CONTAINER_AUTHORIZATION_TOKEN"] != "" || o.providerEnv["AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"] != "") {
+				var endpointErr error
+				scopedContainerURL, endpointErr = bedrockContainerEndpoint(o)
+				if endpointErr != nil {
+					return nil, endpointErr
+				}
+				loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(aws.AnonymousCredentials{}))
+			}
+			if file := o.providerEnv["AWS_SHARED_CREDENTIALS_FILE"]; file != "" {
+				loadOptions = append(loadOptions, awsconfig.WithSharedCredentialsFiles([]string{file}))
+			}
+			if file := o.providerEnv["AWS_CONFIG_FILE"]; file != "" {
+				loadOptions = append(loadOptions, awsconfig.WithSharedConfigFiles([]string{file}))
+			}
 		}
 		var err error
 		cfg, err = awsconfig.LoadDefaultConfig(ctx, loadOptions...)
 		if err != nil {
 			return nil, fmt.Errorf("bedrock: load config: %w", err)
 		}
+	}
+
+	if scopedWebIdentity {
+		cfg.Credentials = aws.NewCredentialsCache(stscreds.NewWebIdentityRoleProvider(sts.NewFromConfig(cfg), o.providerEnvValue("AWS_ROLE_ARN"), stscreds.IdentityTokenFile(o.providerEnvValue("AWS_WEB_IDENTITY_TOKEN_FILE")), func(opts *stscreds.WebIdentityRoleOptions) {
+			opts.RoleSessionName = o.providerEnvValue("AWS_ROLE_SESSION_NAME")
+		}))
+	}
+
+	if scopedContainerURL != "" {
+		cfg.Credentials = aws.NewCredentialsCache(endpointcreds.New(scopedContainerURL, func(opts *endpointcreds.Options) {
+			opts.HTTPClient = &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+			opts.AuthorizationToken = o.providerEnvValue("AWS_CONTAINER_AUTHORIZATION_TOKEN")
+			if file := o.providerEnvValue("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"); file != "" {
+				opts.AuthorizationTokenProvider = endpointcreds.TokenProviderFunc(func() (string, error) {
+					f, err := os.Open(file)
+					if err != nil {
+						return "", fmt.Errorf("bedrock: open container authorization token: %w", err)
+					}
+					data, readErr := io.ReadAll(io.LimitReader(f, 16*1024+1))
+					if err := errors.Join(readErr, f.Close()); err != nil {
+						return "", fmt.Errorf("bedrock: read container authorization token: %w", err)
+					}
+					if len(data) > 16*1024 {
+						return "", errors.New("bedrock: container authorization token exceeds 16 KiB")
+					}
+					return string(data), nil
+				})
+			}
+		}))
 	}
 
 	client := bedrockruntime.NewFromConfig(cfg, func(options *bedrockruntime.Options) {
@@ -264,7 +337,9 @@ func newBedrockRuntimeClient(ctx context.Context, o *options) (*bedrockruntime.C
 			options.RetryMaxAttempts = *o.maxRetries + 1
 		}
 		transport := http.DefaultTransport
+		customTransport := false
 		if len(o.headers) > 0 || resolveBedrockBearerToken(o) != "" {
+			customTransport = true
 			transport = &bedrockHeaderRoundTripper{
 				base:        transport,
 				headers:     cloneStringMap(o.headers),
@@ -272,9 +347,10 @@ func newBedrockRuntimeClient(ctx context.Context, o *options) (*bedrockruntime.C
 			}
 		}
 		if o.timeout > 0 {
+			customTransport = true
 			transport = &headerTimeoutTransport{base: transport, timeout: o.timeout, label: "bedrock"}
 		}
-		if transport != http.DefaultTransport {
+		if customTransport {
 			options.HTTPClient = &http.Client{Transport: transport}
 		}
 	})
@@ -978,4 +1054,24 @@ func (rt *bedrockHeaderRoundTripper) RoundTrip(req *http.Request) (*http.Respons
 		base = http.DefaultTransport
 	}
 	return base.RoundTrip(clone)
+}
+
+func bedrockContainerEndpoint(o *options) (string, error) {
+	endpoint := o.providerEnvValue("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+	if relative := o.providerEnvValue("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"); relative != "" {
+		if !strings.HasPrefix(relative, "/") || strings.HasPrefix(relative, "//") {
+			return "", errors.New("bedrock: invalid container credential relative URI")
+		}
+		endpoint = "http://169.254.170.2" + relative
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
+		return "", errors.New("bedrock: invalid container credential endpoint")
+	}
+	host := parsed.Hostname()
+	allowedHTTP := host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "169.254.170.2" || host == "169.254.170.23" || host == "fd00:ec2::23"
+	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !allowedHTTP) {
+		return "", errors.New("bedrock: insecure container credential endpoint")
+	}
+	return endpoint, nil
 }

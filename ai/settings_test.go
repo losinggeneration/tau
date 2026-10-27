@@ -1381,3 +1381,20 @@ func TestMergeSettingsRecursivelyMergesUnknownNestedObjects(t *testing.T) {
 		})
 	}
 }
+
+func TestMergeSettingsKeepsProxyGlobal(t *testing.T) {
+	user, err := ParseSettings([]byte(`{"httpProxy":"http://global:8080"}`))
+	require.NoError(t, err)
+	project, err := ParseSettings([]byte(`{"httpProxy":"http://project:8080"}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	data, err := merged.MarshalJSON()
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(data, &got))
+	require.Equal(t, "http://global:8080", got["httpProxy"])
+	merged = MergeSettings(nil, project)
+	data, err = merged.MarshalJSON()
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "httpProxy")
+}

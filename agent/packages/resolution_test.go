@@ -225,3 +225,18 @@ func TestInstalledRootsRecoversInterruptedPackages(t *testing.T) {
 		})
 	}
 }
+
+func TestDeniedProjectPackagesAreNotInspected(t *testing.T) {
+	global, project := t.TempDir(), t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"defaultProjectTrust":"never"}`), 0600))
+	require.NoError(t, os.Mkdir(filepath.Join(project, ".tau"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte("malformed"), 0600))
+	settings, err := ai.LoadTrustedSettings(t.Context(), global, project, t.TempDir(), ai.ProjectTrustOptions{})
+	require.NoError(t, err)
+	base := filepath.Join(project, ".tau", "packages")
+	require.NoError(t, os.MkdirAll(filepath.Join(base, "broken"), 0700))
+	require.NoError(t, os.WriteFile(sidecarPath(filepath.Join(base, "broken")), []byte("malformed"), 0600))
+	resolved, err := ResolvePackageSources(settings, t.TempDir(), base)
+	require.NoError(t, err)
+	require.Empty(t, resolved)
+}

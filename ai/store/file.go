@@ -128,11 +128,10 @@ func (c authCredential) MarshalJSON() ([]byte, error) {
 }
 
 func credentialToAuthCredential(cred ai.Credential) authCredential {
-	out := authCredential{Type: cred.Type, NeedsReauth: cred.NeedsReauth}
+	out := authCredential{Type: cred.Type, NeedsReauth: cred.NeedsReauth, Env: maps.Clone(cred.Env)}
 	switch cred.Type {
 	case ai.CredentialTypeAPIKey:
 		out.Key = cred.APIKey
-		out.Env = cred.Env
 	case ai.CredentialTypeOAuth:
 		out.Access = cred.AccessToken
 		out.Refresh = cred.RefreshToken
@@ -165,10 +164,12 @@ func authCredentialToCredential(wire authCredential) ai.Credential {
 		cred.Email = wire.Email
 		cred.AccountID = wire.AccountID
 		cred.Extra = wire.Extra
+		cred.Env = maps.Clone(wire.Env)
 		cred.NeedsReauth = wire.NeedsReauth
 		return cred
 	case ai.CredentialTypeNone:
 		cred := ai.NewNoneCredential()
+		cred.Env = maps.Clone(wire.Env)
 		cred.NeedsReauth = wire.NeedsReauth
 		return cred
 	default:

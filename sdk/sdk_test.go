@@ -11725,3 +11725,227 @@ func TestStoredProviderEnvironmentReachesRequestsAndSummaries(t *testing.T) {
 		require.Equal(t, secret, ai.ExtractSimpleStreamOptions(summary).Env["REQUEST_SECRET"])
 	}
 }
+
+func TestRestoredModelAcceptsScopedFederation(t *testing.T) {
+	for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE"} {
+		t.Setenv(name, "")
+	}
+	credentials := &mockCredStore{getCred: ai.Credential{Type: ai.CredentialTypeAPIKey, Env: map[string]string{"ANTHROPIC_FEDERATION_RULE_ID": "rule", "ANTHROPIC_ORGANIZATION_ID": "organization", "ANTHROPIC_IDENTITY_TOKEN_FILE": "token"}}}
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, CredentialStore: credentials})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	r := rt.(*runtime)
+	require.True(t, r.restoredModelCredentialAvailable(t.Context(), ai.ProviderAnthropic, credentials))
+	delete(credentials.getCred.Env, "ANTHROPIC_ORGANIZATION_ID")
+	require.False(t, r.restoredModelCredentialAvailable(t.Context(), ai.ProviderAnthropic, credentials))
+}
+
+type rotatingRequestCredentialStore struct {
+	*mockCredStore
+	reads int
+}
+
+func (s *rotatingRequestCredentialStore) Get(context.Context, string) (ai.Credential, error) {
+	s.reads++
+	value := fmt.Sprintf("rotation-%d", s.reads)
+	return ai.Credential{Type: ai.CredentialTypeAPIKey, APIKey: value, Env: map[string]string{"ROTATION": value}}, nil
+}
+
+func TestRequestCredentialsUseOneStoreSnapshot(t *testing.T) {
+	provider, model := registerRecordingProvider(t, "reply")
+	credentials := &rotatingRequestCredentialStore{mockCredStore: &mockCredStore{}}
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ExplicitModel: model, CredentialStore: credentials})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	session, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	before := credentials.reads
+	events, err := session.Send(t.Context(), Message{Text: "hello"})
+	require.NoError(t, err)
+	for range events {
+	}
+	actual := provider.CompleteOptions()
+	require.Equal(t, actual.APIKey, actual.Env["ROTATION"])
+	require.Equal(t, before+1, credentials.reads)
+	before = credentials.reads
+	s := session.(*agentSession)
+	opts, err := s.compactionCompletionOptions(t.Context(), s.model, agent.ThinkingOff)
+	require.NoError(t, err)
+	actual = ai.ExtractSimpleStreamOptions(opts)
+	require.Equal(t, actual.APIKey, actual.Env["ROTATION"])
+	require.Equal(t, before+1, credentials.reads)
+}
+
+type cancelledSnapshotCredentialStore struct {
+	*mockCredStore
+	cancel context.CancelCauseFunc
+	cause  error
+}
+
+func (s *cancelledSnapshotCredentialStore) Get(context.Context, string) (ai.Credential, error) {
+	s.cancel(s.cause)
+	return ai.Credential{Type: ai.CredentialTypeAPIKey, APIKey: "must-not-use", Env: map[string]string{"VERSION": "cancelled"}}, nil
+}
+
+func TestSummaryRejectsCancelledCredentialSnapshot(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	credentials := &cancelledSnapshotCredentialStore{mockCredStore: &mockCredStore{}}
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ExplicitModel: model, CredentialStore: credentials})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	session, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	credentials.cancel = cancel
+	credentials.cause = errors.New("credential snapshot cancelled")
+	s := session.(*agentSession)
+	options, err := s.compactionCompletionOptions(ctx, s.model, agent.ThinkingOff)
+	require.ErrorIs(t, err, credentials.cause)
+	require.Nil(t, options)
+}
+
+func TestFileOAuthSnapshotReachesSummaryOptions(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	credentials := store.NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), store.Options{})
+	credential := ai.NewOAuthCredential("oauth-access", "refresh", time.Now().Add(time.Hour), "")
+	credential.Env = map[string]string{"ANTHROPIC_BASE_URL": "https://scoped.invalid"}
+	require.NoError(t, credentials.Set(t.Context(), ai.ProviderAnthropic, credential))
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ExplicitModel: model, CredentialStore: credentials})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	session, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	s := session.(*agentSession)
+	summaryModel := *s.model
+	summaryModel.Provider = ai.ProviderAnthropic
+	opts, err := s.compactionCompletionOptions(t.Context(), &summaryModel, agent.ThinkingOff)
+	require.NoError(t, err)
+	actual := ai.ExtractSimpleStreamOptions(opts)
+	require.Equal(t, "oauth-access", actual.APIKey)
+	require.Equal(t, credential.Env, actual.Env)
+	actual.Env["ANTHROPIC_BASE_URL"] = "caller-change"
+	opts, err = s.compactionCompletionOptions(t.Context(), &summaryModel, agent.ThinkingOff)
+	require.NoError(t, err)
+	require.Equal(t, credential.Env, ai.ExtractSimpleStreamOptions(opts).Env)
+}
+
+func TestRuntimeDeniedProjectKeepsGlobalPromptAndProjectContext(t *testing.T) {
+	global, cwd, home := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", global)
+	t.Setenv("HOME", home)
+	t.Chdir(cwd)
+	require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"defaultProjectTrust":"never"}`), 0o600))
+	require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "settings.json"), []byte("malformed"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "SYSTEM.md"), []byte("PROJECT SECRET PROMPT"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "APPEND_SYSTEM.md"), []byte("PROJECT SECRET APPEND"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, "AGENTS.md"), []byte("retained project context"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(global, "SYSTEM.md"), []byte("global system"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(global, "APPEND_SYSTEM.md"), []byte("global append"), 0o600))
+	rt, err := NewRuntime(RuntimeOptions{IgnoreEnv: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	impl := rt.(*runtime)
+	require.False(t, impl.settings.ProjectResourcesTrusted())
+	prompt, err := impl.buildSystemPrompt(cwd, nil, "", nil)
+	require.NoError(t, err)
+	require.Contains(t, prompt, "global system")
+	require.Contains(t, prompt, "global append")
+	require.Contains(t, prompt, "retained project context")
+	require.NotContains(t, prompt, "PROJECT SECRET")
+	_, err = NewRuntime(RuntimeOptions{ProjectTrust: ai.ProjectTrustOptions{Override: new(true)}})
+	require.ErrorContains(t, err, "load project settings")
+}
+
+func TestCoordinatedReloadUsesProposedProjectTrust(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	cwd, global, home := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", global)
+	t.Setenv("HOME", home)
+	require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(global, "SYSTEM.md"), []byte("GLOBAL TRUST PROMPT"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "SYSTEM.md"), []byte("PROJECT TRUST PROMPT"), 0o600))
+	denied, err := ai.LoadTrustedSettings(t.Context(), global, cwd, home, ai.ProjectTrustOptions{Override: new(false)})
+	require.NoError(t, err)
+	allowed, err := ai.LoadTrustedSettings(t.Context(), global, cwd, home, ai.ProjectTrustOptions{Override: new(true)})
+	require.NoError(t, err)
+	rt, err := NewRuntime(RuntimeOptions{Settings: denied, ExplicitModel: model, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true})
+	require.NoError(t, err)
+	concrete := sess.(*agentSession)
+	require.Contains(t, agentMessageText(concrete.agent.Messages()[0]), "GLOBAL TRUST PROMPT")
+	require.NoError(t, concrete.ReloadResources(t.Context(), allowed, nil, nil, ""))
+	require.Contains(t, agentMessageText(concrete.agent.Messages()[0]), "PROJECT TRUST PROMPT")
+	require.NoError(t, concrete.ReloadResources(t.Context(), denied, nil, nil, ""))
+	prompt := agentMessageText(concrete.agent.Messages()[0])
+	require.Contains(t, prompt, "GLOBAL TRUST PROMPT")
+	require.NotContains(t, prompt, "PROJECT TRUST PROMPT")
+}
+
+type projectTrustTestUI struct {
+	ui.NoOpUI
+	selectTrust func(context.Context, string, []string) (int, error)
+}
+
+func (u *projectTrustTestUI) Select(ctx context.Context, title string, choices []string) (int, error) {
+	return u.selectTrust(ctx, title, choices)
+}
+
+func TestRuntimeTrustPromptPrecedesProjectSettings(t *testing.T) {
+	global, cwd, home := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", global)
+	t.Setenv("HOME", home)
+	t.Chdir(cwd)
+	require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "settings.json"), []byte(`{"theme":"trusted-project"}`), 0o600))
+	calls := 0
+	userInterface := &projectTrustTestUI{selectTrust: func(context.Context, string, []string) (int, error) { calls++; return 1, nil }}
+	rt, err := NewRuntime(RuntimeOptions{UI: userInterface})
+	require.NoError(t, err)
+	require.True(t, rt.(*runtime).settings.ProjectResourcesTrusted())
+	require.Equal(t, "trusted-project", rt.(*runtime).settings.Theme)
+	require.Equal(t, 1, calls)
+	require.NoFileExists(t, filepath.Join(global, "trust.json"))
+	require.NoError(t, rt.Close(t.Context()))
+	require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(global, "trust.json")}.Set(t.Context(), cwd, new(false)))
+	rt, err = NewRuntime(RuntimeOptions{UI: userInterface})
+	require.NoError(t, err)
+	require.False(t, rt.(*runtime).settings.ProjectResourcesTrusted())
+	require.Empty(t, rt.(*runtime).settings.Theme)
+	require.Equal(t, 1, calls)
+	require.NoError(t, rt.Close(t.Context()))
+}
+
+func TestRuntimeAppliesOnlyGlobalProxyBeforeCredentialSetup(t *testing.T) {
+	global, cwd, home := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", global)
+	t.Setenv("HOME", home)
+	t.Chdir(cwd)
+	t.Setenv("HTTP_PROXY", "")
+	t.Setenv("HTTPS_PROXY", "")
+	require.NoError(t, os.Unsetenv("HTTP_PROXY"))
+	require.NoError(t, os.Unsetenv("HTTPS_PROXY"))
+	require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"httpProxy":"http://global.invalid:8080"}`), 0o600))
+	require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "settings.json"), []byte(`{"httpProxy":"http://project.invalid:8080"}`), 0o600))
+	rt, err := NewRuntime(RuntimeOptions{ProjectTrust: ai.ProjectTrustOptions{Override: new(true)}})
+	require.NoError(t, err)
+	require.Equal(t, "http://global.invalid:8080", os.Getenv("HTTP_PROXY"))
+	require.Equal(t, "http://global.invalid:8080", os.Getenv("HTTPS_PROXY"))
+	require.NoError(t, rt.Close(t.Context()))
+	settings, err := ai.LoadSettings(filepath.Join(global, "settings.json"))
+	require.NoError(t, err)
+	require.Empty(t, settings.DeviceID)
+}
+
+func TestRuntimeRejectsInvalidProxyBeforeCredentialSetup(t *testing.T) {
+	global := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", global)
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{HTTPProxy: "ftp://proxy.invalid"}})
+	require.ErrorContains(t, err, "httpProxy")
+	require.Nil(t, rt)
+	require.NoDirExists(t, filepath.Join(global, "credentials"))
+}

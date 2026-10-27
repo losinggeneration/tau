@@ -390,6 +390,43 @@ func TestStreamCodexWebSocketReadsCompletionEvents(t *testing.T) {
 	}
 }
 
+func TestCodexWebSocketUsageLimitIsTyped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		var request map[string]any
+		if err := conn.ReadJSON(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1787198689,"resets_in_seconds":490120}}`)); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+
+	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"account"}}`))
+	var terminal *StreamError
+	err := (&codexClient{}).Stream(t.Context(), &Model{ID: "codex", BaseURL: server.URL}, &Context{}, func(_ context.Context, event StreamEvent) {
+		if event, ok := event.(StreamError); ok {
+			terminal = &event
+		}
+	}, WithAPIKey("header."+claims+".signature"), WithTransport(TransportAuto), WithTimeout(0))
+	require.NoError(t, err)
+	require.NotNil(t, terminal)
+
+	var usageErr *CodexUsageLimitError
+	require.ErrorAs(t, terminal.Err, &usageErr)
+	require.Equal(t, http.StatusTooManyRequests, usageErr.StatusCode)
+	resetAt, ok := UsageLimitResetAt(terminal.Err)
+	require.True(t, ok)
+	require.True(t, resetAt.Equal(time.Unix(1787198689, 0)))
+}
+
 func TestCodexHeaderPrecedence(t *testing.T) {
 	for _, headers := range []http.Header{
 		buildCodexSSEHeaders(map[string]string{"originator": "model", "User-Agent": "model-agent"}, map[string]string{"Originator": "caller", "user-agent": "caller-agent", "Authorization": "wrong", "chatgpt-account-id": "wrong"}, "account", "key", ""),

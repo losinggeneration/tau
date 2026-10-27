@@ -2,6 +2,7 @@ package packages
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -1108,4 +1109,66 @@ func TestPackageRecoveryRejectsRedirectedDirectory(t *testing.T) {
 	require.ErrorContains(t, err, "real directory")
 	require.FileExists(t, filepath.Join(outside, "keep"))
 	require.NoDirExists(t, destination)
+}
+
+func TestNPMArchiveLimitRetainsInstalledPackage(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	t.Setenv("TAU_OFFLINE", "")
+	for _, pi := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pi=%t", pi), func(t *testing.T) {
+			base := t.TempDir()
+			destination := filepath.Join(base, "plugin")
+			require.NoError(t, os.MkdirAll(destination, 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(destination, "sentinel"), []byte("old"), 0o600))
+			previous := InstallSidecar{Source: "npm:plugin", Ref: "1.0.0"}
+			require.NoError(t, previous.Write(destination))
+			manager := NewInstallManager(base, t.TempDir())
+			manager.npmPack = func(ctx context.Context, spec, dir string) (string, error) {
+				var raw bytes.Buffer
+				tw := tar.NewWriter(&raw)
+				require.NoError(t, tw.WriteHeader(&tar.Header{Name: "package/oversized", Mode: 0o600, Size: maxArchiveExpanded + 1}))
+				var compressed bytes.Buffer
+				gz := gzip.NewWriter(&compressed)
+				_, err := gz.Write(raw.Bytes())
+				require.NoError(t, err)
+				require.NoError(t, gz.Close())
+				archive := filepath.Join(dir, "package.tgz")
+				require.NoError(t, os.WriteFile(archive, compressed.Bytes(), 0o600))
+				return archive, nil
+			}
+			err := manager.Install(t.Context(), Config{Source: "npm:plugin", Yes: true, Force: true, Pi: pi})
+			require.ErrorContains(t, err, "archive expanded size limit")
+			content, err := os.ReadFile(filepath.Join(destination, "sentinel"))
+			require.NoError(t, err)
+			require.Equal(t, "old", string(content))
+			sidecar, err := LoadSidecar(destination)
+			require.NoError(t, err)
+			require.Equal(t, previous, *sidecar)
+			entries, err := os.ReadDir(base)
+			require.NoError(t, err)
+			for _, entry := range entries {
+				require.False(t, strings.HasPrefix(entry.Name(), ".tau-install-stage-"))
+			}
+		})
+	}
+}
+
+func TestLinkRejectsAllRemoteSourcesBeforePreparation(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	t.Setenv("TAU_OFFLINE", "")
+	for _, source := range []string{"npm:plugin", "npm:@scope/plugin@1.0.0", "https://example.com/team/repo", "git@github.com:team/repo", "github.com/team/repo"} {
+		for _, pi := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/pi=%t", source, pi), func(t *testing.T) {
+				base := filepath.Join(t.TempDir(), "packages")
+				manager := NewInstallManager(base, t.TempDir())
+				manager.npmPack = func(context.Context, string, string) (string, error) {
+					t.Error("remote link attempted packing")
+					return "", errors.New("unexpected packing")
+				}
+				err := manager.Install(t.Context(), Config{Source: source, Link: true, Pi: pi, Yes: true})
+				require.ErrorContains(t, err, "--link is only supported for local paths")
+				require.NoDirExists(t, base)
+			})
+		}
+	}
 }

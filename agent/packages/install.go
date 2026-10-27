@@ -192,8 +192,8 @@ func (m *InstallManager) Install(ctx context.Context, cfg Config) error {
 	}
 
 	// --link is only supported for local paths
-	if cfg.Link && isGitURL(cfg.Source) {
-		return fmt.Errorf("--link is only supported for local paths, not git URLs")
+	if cfg.Link && (isGitURL(cfg.Source) || strings.HasPrefix(cfg.Source, "npm:")) {
+		return fmt.Errorf("--link is only supported for local paths, not remote packages")
 	}
 
 	if strings.HasPrefix(cfg.Source, "npm:") {

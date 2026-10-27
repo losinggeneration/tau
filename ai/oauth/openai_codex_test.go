@@ -155,3 +155,46 @@ func TestOpenAICodexLoginUsesConfiguredOriginatorAndCallbackHost(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAICodexDeviceIDReachesAuthorization(t *testing.T) {
+	id := "8DFB4786-146F-4C98-9846-CF1B6DD94AAC"
+	calls := 0
+	provider := NewOpenAICodexProvider("tau", WithOpenAIDeviceID(func(context.Context) (string, error) { calls++; return id, nil })).(*openaiCodexProvider)
+	provider.callbackPort = 0
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	cause := errors.New("stop after authorization")
+	_, err := provider.Login(ctx, &DefaultLoginCallbacks{FnAuth: func(raw, _ string) {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parsed.Query().Get("ext_agent_host_id"); got != "urn:uuid:"+strings.ToLower(id) {
+			t.Errorf("host ID=%q", got)
+		}
+		cancel(cause)
+	}})
+	if err == nil {
+		t.Fatal("expected cancellation")
+	}
+	if calls != 1 {
+		t.Errorf("identity reads=%d", calls)
+	}
+}
+
+func TestOpenAICodexDeviceIDFailurePreventsAuthorization(t *testing.T) {
+	cause := errors.New("settings unavailable")
+	for _, test := range []struct {
+		id  string
+		err error
+	}{{"", cause}, {"invalid", nil}} {
+		provider := NewOpenAICodexProvider("tau", WithOpenAIDeviceID(func(context.Context) (string, error) { return test.id, test.err })).(*openaiCodexProvider)
+		_, err := provider.Login(t.Context(), &DefaultLoginCallbacks{FnAuth: func(string, string) { t.Error("authorization after identity failure") }})
+		if err == nil {
+			t.Fatal("expected identity error")
+		}
+		if test.err != nil && !errors.Is(err, cause) {
+			t.Errorf("error lost cause: %v", err)
+		}
+	}
+}

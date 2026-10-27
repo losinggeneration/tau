@@ -559,6 +559,8 @@ type BranchSummarizer interface {
 
 // RuntimeOptions configures a new Runtime.
 type RuntimeOptions struct {
+	// ProjectTrust controls automatic project configuration when settings are loaded.
+	ProjectTrust ai.ProjectTrustOptions
 	// UI is the user interface for the runtime.
 	UI ui.UI
 	// SessionsDir is the directory for session storage.
@@ -787,8 +789,8 @@ type agentSession struct {
 	clientFactory func(*ai.Model) (ai.Client, error)
 	// credentialProvider resolves the active provider credential for direct SDK
 	// model calls outside the agent loop, such as compaction summarization.
-	credentialProvider  func(context.Context, string) (string, error)
-	providerEnvironment func(context.Context, string) (map[string]string, error)
+	credentialProvider func(context.Context, string) (string, error)
+	requestCredentials agent.RequestCredentialsProvider
 	// credStore holds the session's stored credentials, whose metadata can
 	// limit the models an account offers.
 	credStore        store.CredentialStore
@@ -2321,7 +2323,7 @@ func (s *agentSession) compactionCompletionOptions(ctx context.Context, model *a
 	if budgets := s.settingsSnapshot().ResolveThinkingBudgets(); budgets != nil {
 		opts = append(opts, ai.WithThinkingBudgets(budgets))
 	}
-	if model == nil || s.credentialProvider == nil {
+	if model == nil || (s.credentialProvider == nil && s.requestCredentials == nil) {
 		return opts, nil
 	}
 	providerKey := model.Provider
@@ -2331,15 +2333,21 @@ func (s *agentSession) compactionCompletionOptions(ctx context.Context, model *a
 	if providerKey == "" {
 		return opts, nil
 	}
-	if s.providerEnvironment != nil {
-		env, err := s.providerEnvironment(ctx, providerKey)
+
+	if s.requestCredentials != nil {
+		key, env, err := s.requestCredentials(ctx, providerKey)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("summary credentials for %s: %w", providerKey, err)
 		}
 		if env != nil {
 			opts = append(opts, ai.WithProviderEnv(env))
 		}
+		if key != "" {
+			opts = append(opts, ai.WithAPIKey(key))
+		}
+		return opts, nil
 	}
+
 	apiKey, err := s.credentialProvider(ctx, providerKey)
 	if err != nil {
 		return nil, fmt.Errorf("summary credentials for %s: %w", providerKey, err)
@@ -5005,20 +5013,31 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 	sessionsDir := opts.SessionsDir
 
 	// Load settings with sensible defaults if not provided.
-	// This matches the CLI behavior: load user settings (<configDir>/settings.json),
-	// merge project settings (.tau/settings.json) with project taking precedence.
+	// Global settings and directory trust precede protected project settings.
 	settings := opts.Settings
 	if settings == nil {
-		userSettingsPath := filepath.Join(paths.ConfigDir(), "settings.json")
-		userSettings, err := ai.LoadSettings(userSettingsPath)
+		cwd, err := os.Getwd()
 		if err != nil {
-			return nil, fmt.Errorf("load user settings: %w", err)
+			return nil, fmt.Errorf("resolve runtime working directory: %w", err)
 		}
-		projectSettings, err := ai.LoadSettings(".tau/settings.json")
+		home, err := os.UserHomeDir()
 		if err != nil {
-			return nil, fmt.Errorf("load project settings: %w", err)
+			return nil, fmt.Errorf("resolve runtime home: %w", err)
 		}
-		settings = ai.MergeSettings(userSettings, projectSettings)
+		trustOptions := opts.ProjectTrust
+		if trustOptions.Prompt == nil {
+			trustOptions.Prompt = func(ctx context.Context, cwd string) (*bool, error) {
+				return ai.PromptProjectTrust(ctx, ai.ProjectTrustStore{Path: filepath.Join(paths.ConfigDir(), "trust.json")}, cwd, u.Select)
+			}
+		}
+		settings, err = ai.LoadTrustedSettings(context.Background(), paths.ConfigDir(), cwd, home, trustOptions)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err := settings.ApplyHTTPProxySettings(); err != nil {
+		return nil, err
 	}
 
 	// Sessions default: TAU_SESSION_DIR, then sessionDir from settings, then
@@ -5417,8 +5436,8 @@ func (r *runtime) restoredModelCredentialAvailable(ctx context.Context, provider
 	if credStore != nil {
 		cred, err := credStore.Get(ctx, providerKey)
 		if err == nil && !cred.NeedsReauth {
-			if cred.Type == ai.CredentialTypeAPIKey {
-				return cred.APIKey != ""
+			if cred.Type == ai.CredentialTypeAPIKey && (cred.APIKey != "" || (!r.noEnvCredentials && ai.ProviderEnvHasCredentials(providerKey, cred.Env))) {
+				return true
 			}
 			apiKey, keyErr := store.APIKeyFromCredential(ctx, providerKey, cred)
 			if keyErr == nil && apiKey != "" {
@@ -5545,86 +5564,71 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		sessionProviderKey = r.provider
 	}
 
-	credentialProvider := func(ctx context.Context, provider string) (string, error) {
+	requestCredentials := func(ctx context.Context, provider string) (key string, scopedEnv map[string]string, err error) {
 		if err := context.Cause(ctx); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		providerKey := provider
 		if providerKey == "" {
 			providerKey = sessionProviderKey
 		}
 		if providerKey == "" {
-			return "", nil
+			return "", nil, nil
 		}
 
 		// Precedence: explicit key > stored API key or OAuth > models.json > environment.
 		if r.apiKey != "" {
-			return r.apiKey, nil
+			return r.apiKey, nil, nil
 		}
 
-		var scopedEnv map[string]string
 		if credStore != nil {
 			cred, err := credStore.Get(ctx, providerKey)
+			if cause := context.Cause(ctx); cause != nil {
+				return "", nil, errors.Join(cause, err)
+			}
 			if err != nil && !errors.Is(err, ai.ErrCredentialNotFound) {
-				return "", fmt.Errorf("get credentials for %s: %w", providerKey, err)
+				return "", nil, fmt.Errorf("get credentials for %s: %w", providerKey, err)
 			}
 			if err == nil {
+				cred.Env = maps.Clone(cred.Env)
 				scopedEnv = cred.Env
 				if cred.NeedsReauth {
-					return "", ai.ErrCredentialNeedsReauth{Provider: providerKey}
+					return "", nil, ai.ErrCredentialNeedsReauth{Provider: providerKey}
 				}
 				apiKey, err := store.APIKeyFromCredential(ctx, providerKey, cred)
 				if err != nil {
-					return "", err
+					return "", nil, err
 				}
 				if apiKey != "" {
-					return apiKey, nil
+					return apiKey, scopedEnv, nil
 				}
 			}
 		}
 
 		if key, err := r.modelRegistry.ResolveAPIKeyWithEnv(ctx, providerKey, scopedEnv); err != nil {
-			return "", err
+			return "", nil, err
 		} else if key != "" {
-			return key, nil
+			return key, scopedEnv, nil
 		}
 
 		if !r.noEnvCredentials {
 			if len(ai.ProviderEnvHeaders(providerKey, scopedEnv)) != 0 {
-				return "", nil
+				return "", scopedEnv, nil
 			}
 			if envAPIKey := ai.ProviderEnvAPIKey(providerKey, scopedEnv); envAPIKey != "" {
 				envOverrideLoggedOncePtr.Do(func() {
 					sessionLogger.Info("NOTICE: using API key from environment", "provider", providerKey)
 				})
-				return envAPIKey, nil
+				return envAPIKey, scopedEnv, nil
 			}
 		}
 
-		return "", nil
+		return "", scopedEnv, nil
 	}
 
-	providerEnvironment := func(ctx context.Context, provider string) (map[string]string, error) {
-		if err := context.Cause(ctx); err != nil {
-			return nil, err
-		}
-		if r.apiKey != "" || credStore == nil {
-			return nil, nil
-		}
-		if provider == "" {
-			provider = sessionProviderKey
-		}
-		cred, err := credStore.Get(ctx, provider)
-		if errors.Is(err, ai.ErrCredentialNotFound) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, fmt.Errorf("get provider environment for %s: %w", provider, err)
-		}
-		if cred.NeedsReauth {
-			return nil, ai.ErrCredentialNeedsReauth{Provider: provider}
-		}
-		return maps.Clone(cred.Env), nil
+	credentialProvider := func(ctx context.Context, provider string) (string, error) {
+		key, _, err := requestCredentials(ctx, provider)
+		return key, err
 	}
 
 	clientFactory := func(m *ai.Model) (ai.Client, error) {
@@ -5639,9 +5643,6 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 			return nil, err
 		}
 
-		// Some legacy clients accept a key only at construction time. Most calls now
-		// receive ai.WithAPIKey from agent.WithAPIKeyProvider below, but keep this
-		// setter path for clients that still consult local client state.
 		providerKey := m.Provider
 		if providerKey == "" {
 			providerKey = sessionProviderKey
@@ -5677,7 +5678,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		agent.WithTransport(transport),
 		agent.WithClientFactory(clientFactory),
 		agent.WithAPIKeyProvider(credentialProvider),
-		agent.WithProviderEnvironment(providerEnvironment),
+		agent.WithRequestCredentials(requestCredentials),
 	)
 
 	// Honor the thinking level from SessionOptions or RuntimeOptions if set.
@@ -6188,7 +6189,7 @@ agentCreation:
 		runtime:                     r,
 		clientFactory:               clientFactory,
 		credentialProvider:          credentialProvider,
-		providerEnvironment:         providerEnvironment,
+		requestCredentials:          requestCredentials,
 		credStore:                   credStore,
 		artifactLoader:              loader,
 		sessionStartReason:          sessionStartReason,
@@ -6607,6 +6608,10 @@ func (r *runtime) buildSystemPrompt(cwd string, loader ArtifactLoader, override 
 }
 
 func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.SkillRegistry, override string, appends []string) (string, error) {
+	return r.buildSystemPromptWithPolicy(cwd, skills, override, appends, r.settings)
+}
+
+func (r *runtime) buildSystemPromptWithPolicy(cwd string, skills *artifacts.SkillRegistry, override string, appends []string, settings *ai.Settings) (string, error) {
 	addendumParts := []string{fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd)}
 	if !r.noContextFiles {
 		contextAddendum, err := buildContextFileAddendum(paths.ConfigDir(), cwd)
@@ -6627,7 +6632,11 @@ func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.Skil
 			}
 		}
 	}
-	appendSys, err := loadAppendSystemPrompt(paths.ConfigDir(), cwd)
+	promptCWD := cwd
+	if !settings.ProjectResourcesTrustedAt(cwd) {
+		promptCWD = ""
+	}
+	appendSys, err := loadPromptFile(paths.ConfigDir(), promptCWD, "APPEND_SYSTEM.md")
 	if err != nil {
 		return "", err
 	}
@@ -6641,7 +6650,7 @@ func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.Skil
 	}
 
 	var prompt string
-	sys, err := loadSystemPrompt(paths.ConfigDir(), cwd)
+	sys, err := loadPromptFile(paths.ConfigDir(), promptCWD, "SYSTEM.md")
 	if err != nil {
 		return "", err
 	}
@@ -6664,9 +6673,13 @@ func loadSystemPrompt(homeDir, cwd string) (body string, err error) {
 	if cwd == "" {
 		cwd = "."
 	}
-	candidates := []string{
-		filepath.Join(cwd, ".tau", "SYSTEM.md"),
-		filepath.Join(homeDir, "SYSTEM.md"),
+	return loadPromptFile(homeDir, cwd, "SYSTEM.md")
+}
+
+func loadPromptFile(homeDir, cwd, name string) (string, error) {
+	candidates := []string{filepath.Join(homeDir, name)}
+	if cwd != "" {
+		candidates = append([]string{filepath.Join(cwd, ".tau", name)}, candidates...)
 	}
 	for _, path := range candidates {
 		data, readErr := os.ReadFile(path)
@@ -6686,20 +6699,7 @@ func loadAppendSystemPrompt(homeDir, cwd string) (string, error) {
 	if cwd == "" {
 		cwd = "."
 	}
-	candidates := []string{
-		filepath.Join(cwd, ".tau", "APPEND_SYSTEM.md"),
-		filepath.Join(homeDir, "APPEND_SYSTEM.md"),
-	}
-	for _, path := range candidates {
-		data, readErr := os.ReadFile(path)
-		if readErr == nil {
-			return strings.TrimPrefix(string(data), "\ufeff"), nil
-		}
-		if !os.IsNotExist(readErr) {
-			return "", fmt.Errorf("read %s: %w", path, readErr)
-		}
-	}
-	return "", nil
+	return loadPromptFile(homeDir, cwd, "APPEND_SYSTEM.md")
 }
 
 // loadSessionHistory loads messages from a session file for re-injection into the agent.
@@ -7128,7 +7128,7 @@ func (s *agentSession) ReloadResources(ctx context.Context, settings *ai.Setting
 	} else if s.artifactLoader != nil {
 		skills = s.artifactLoader.SkillRegistry()
 	}
-	prompt, err := s.runtime.buildSystemPromptWithSkills(s.cwd, skills, s.systemPromptOverride, s.appendSystemPrompts)
+	prompt, err := s.runtime.buildSystemPromptWithPolicy(s.cwd, skills, s.systemPromptOverride, s.appendSystemPrompts, settings)
 	if err != nil {
 		return err
 	}

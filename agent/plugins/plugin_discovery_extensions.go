@@ -146,6 +146,9 @@ func (m *Manager) projectPluginDir() string {
 	if err != nil {
 		return ""
 	}
+	if !m.settings.ProjectResourcesTrustedAt(cwd) {
+		return ""
+	}
 	return filepath.Join(cwd, ".tau", "extensions")
 }
 

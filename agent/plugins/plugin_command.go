@@ -125,7 +125,10 @@ func buildPluginCmd(path string, manifest *Manifest, manifestPath, hostSocket st
 	withEnv := func(cmd *exec.Cmd) *exec.Cmd {
 		cmd.Dir = dir
 		if hostSocket != "" {
-			cmd.Env = append(cmd.Env, "TAU_HOST_SOCKET="+hostSocket)
+			// The Host endpoint rejects calls whose tau-plugin-name metadata
+			// differs from the name startPlugin derives from path, so hand the
+			// plugin that name rather than letting it guess from argv[0].
+			cmd.Env = append(cmd.Env, "TAU_HOST_SOCKET="+hostSocket, "TAU_PLUGIN_NAME="+filepath.Base(path))
 		}
 		return cmd
 	}

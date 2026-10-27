@@ -166,19 +166,20 @@ type Config struct {
 	OnProviderStreamEvent func(context.Context, ai.StreamEvent)
 	// PausedBy reports the pause flag holding provider requests, or "" when
 	// requests may proceed. The loop polls it before every provider request.
-	PausedBy        func() string
-	FinishTurn      FinishTurnFunc
-	PrepareRequest  PrepareRequestFunc
-	Model           *ai.Model
-	SystemPrompt    string
-	InitialMessages []*Message
-	Tools           []Tool
-	ThinkingLevel   ThinkingLevel
-	StreamHandler   StreamHandler
-	APIKeyProvider  APIKeyProvider
-	ProviderEnv     func(context.Context, string) (map[string]string, error)
-	ClientFactory   ClientFactory
-	StreamFn        StreamFunc
+	PausedBy           func() string
+	FinishTurn         FinishTurnFunc
+	PrepareRequest     PrepareRequestFunc
+	Model              *ai.Model
+	SystemPrompt       string
+	InitialMessages    []*Message
+	Tools              []Tool
+	ThinkingLevel      ThinkingLevel
+	StreamHandler      StreamHandler
+	APIKeyProvider     APIKeyProvider
+	ProviderEnv        func(context.Context, string) (map[string]string, error)
+	RequestCredentials RequestCredentialsProvider
+	ClientFactory      ClientFactory
+	StreamFn           StreamFunc
 
 	// SystemAddendum is additional context appended to the system prompt.
 	// Used for skill content injection.
@@ -264,6 +265,9 @@ type StreamHandler func(event Event)
 
 // APIKeyProvider returns an API key for a provider.
 type APIKeyProvider func(ctx context.Context, provider string) (string, error)
+
+// RequestCredentialsProvider resolves a key and its environment from one snapshot.
+type RequestCredentialsProvider func(context.Context, string) (string, map[string]string, error)
 
 // ClientFactory builds an AI client for a model.
 type ClientFactory func(model *ai.Model) (ai.Client, error)
@@ -660,8 +664,9 @@ type AgentLoopConfig struct {
 	// Resolves API key dynamically for each LLM call.
 	// Important for short-lived OAuth tokens that may expire during tool execution.
 	// Return nil when no key is available.
-	GetAPIKey   func(ctx context.Context, provider string) (string, error)
-	ProviderEnv func(context.Context, string) (map[string]string, error)
+	GetAPIKey          func(ctx context.Context, provider string) (string, error)
+	ProviderEnv        func(context.Context, string) (map[string]string, error)
+	RequestCredentials RequestCredentialsProvider
 
 	// Optional custom client factory. When nil, ai.GetClient is used.
 	ClientFactory ClientFactory

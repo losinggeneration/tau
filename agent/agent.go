@@ -820,6 +820,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform Transfo
 		SystemAddendum:        mergedAddendum,
 		GetAPIKey:             a.config.APIKeyProvider,
 		ProviderEnv:           a.config.ProviderEnv,
+		RequestCredentials:    a.config.RequestCredentials,
 		TransformContext:      composeTransforms(transform, a.config.TransformContext),
 		OnPayload:             a.config.OnPayload,
 		OnResponse:            a.config.OnResponse,

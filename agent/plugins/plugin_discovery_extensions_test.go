@@ -555,3 +555,18 @@ func TestPreparedReloadRestartsPluginWhenItsConfigurationChanges(t *testing.T) {
 	require.NoError(t, unchanged.Reload(t.Context(), ""))
 	require.Equal(t, 2, calls)
 }
+
+func TestDeniedProjectExtensionsAreNotInspected(t *testing.T) {
+	cwd, global := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"defaultProjectTrust":"never"}`), 0600))
+	require.NoError(t, os.MkdirAll(filepath.Join(cwd, ".tau", "extensions", "broken"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "extensions", "broken", "tau-package.toml"), []byte("malformed TOML"), 0600))
+	settings, err := ai.LoadTrustedSettings(t.Context(), global, cwd, t.TempDir(), ai.ProjectTrustOptions{})
+	require.NoError(t, err)
+	manager := NewManager(global, nil, nil)
+	manager.SetSettings(settings)
+	require.Empty(t, manager.projectPluginDir())
+	require.NoError(t, manager.Discover(t.Context()))
+	require.Empty(t, manager.binaries)
+}

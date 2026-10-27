@@ -310,3 +310,27 @@ func TestLoaderPiManifestPoliciesSurvivePreparedReload(t *testing.T) {
 	_, ok = loader.PromptRegistry().Get("keep")
 	require.False(t, ok, "reload restored a resource disabled by the Pi manifest")
 }
+
+func TestPreparedReloadOwnsAndAdmitsTrustPolicy(t *testing.T) {
+	cwd, home := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	prompts := filepath.Join(cwd, ".tau", "prompts")
+	require.NoError(t, os.MkdirAll(prompts, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(prompts, "project.md"), []byte("project prompt"), 0o600))
+	decision := new(false)
+	loader, err := NewLoader(LoaderOptions{CWD: cwd, ProjectTrusted: decision})
+	require.NoError(t, err)
+	*decision = true
+	require.Empty(t, loader.PromptRegistry().List())
+	prepared, err := loader.Prepare(ReloadOptions{ProjectTrusted: new(true)})
+	require.NoError(t, err)
+	require.Empty(t, loader.PromptRegistry().List())
+	require.Len(t, prepared.prompts.List(), 1)
+	prepared.Commit()
+	require.Len(t, loader.PromptRegistry().List(), 1)
+	prepared, err = loader.Prepare(ReloadOptions{ProjectTrusted: new(false)})
+	require.NoError(t, err)
+	require.Len(t, loader.PromptRegistry().List(), 1)
+	prepared.Commit()
+	require.Empty(t, loader.PromptRegistry().List())
+}

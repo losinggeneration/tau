@@ -754,7 +754,8 @@ func runLoop(
 
 			// Stream assistant response. A usage-limit failure (429 carrying a
 			// reset time) is surfaced in the transcript and retried once the
-			// window passes instead of ending the run.
+			// window passes instead of ending the run like Pi does. That's
+			// intentional, so keep it when porting upstream agent-loop changes.
 			message, err := streamAssistantResponse(ctx, currentCtx, config, client, model, systemPrompt, opts, emit)
 			for err != nil {
 				resetAt, ok := ai.UsageLimitResetAt(err)
@@ -1402,6 +1403,8 @@ func streamAssistantResponse(
 
 		case ai.StreamError:
 			settled = true
+			// Usage limits go back to the caller's wait-and-retry instead of
+			// becoming a terminal error.
 			if _, ok := ai.UsageLimitResetAt(e.Err); ok {
 				err = e.Err
 				return
@@ -1449,34 +1452,44 @@ func streamAssistantResponse(
 	// tokens that may expire while tools are running between turns.
 	streamOpts := opts
 	apiKey := config.APIKey
-	if config.GetAPIKey != nil {
-		provider := ""
-		if model != nil {
-			provider = model.Provider
-		}
-		key, err := config.GetAPIKey(ctx, provider)
+
+	var env map[string]string
+	provider := ""
+	if model != nil {
+		provider = model.Provider
+	}
+	if config.RequestCredentials != nil {
+		key, variables, err := config.RequestCredentials(ctx, provider)
 		if err != nil {
-			return nil, fmt.Errorf("get api key: %w", err)
+			return nil, fmt.Errorf("get request credentials: %w", err)
 		}
 		if key != "" {
 			apiKey = key
 		}
+		env = variables
+	} else {
+		if config.GetAPIKey != nil {
+			key, err := config.GetAPIKey(ctx, provider)
+			if err != nil {
+				return nil, fmt.Errorf("get api key: %w", err)
+			}
+			if key != "" {
+				apiKey = key
+			}
+		}
+		if config.ProviderEnv != nil {
+			variables, err := config.ProviderEnv(ctx, provider)
+			if err != nil {
+				return nil, fmt.Errorf("get provider environment: %w", err)
+			}
+			env = variables
+		}
 	}
 	if apiKey != "" {
-		streamOpts = append(append([]ai.Option(nil), opts...), ai.WithAPIKey(apiKey))
+		streamOpts = append(slices.Clone(streamOpts), ai.WithAPIKey(apiKey))
 	}
-	if config.ProviderEnv != nil {
-		provider := ""
-		if model != nil {
-			provider = model.Provider
-		}
-		env, err := config.ProviderEnv(ctx, provider)
-		if err != nil {
-			return nil, fmt.Errorf("get provider environment: %w", err)
-		}
-		if env != nil {
-			streamOpts = append(slices.Clone(streamOpts), ai.WithProviderEnv(env))
-		}
+	if env != nil {
+		streamOpts = append(slices.Clone(streamOpts), ai.WithProviderEnv(env))
 	}
 
 	// Like upstream streamSimple, the response budget defaults to the model cap

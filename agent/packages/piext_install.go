@@ -139,11 +139,7 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 				return err
 			}
 		}
-		if cfg.Link && sourceDir == cfg.Source {
-			if err := os.Symlink(cfg.Source, staged); err != nil {
-				return fmt.Errorf("create symlink: %w", err)
-			}
-		} else if err := copyDirContext(ctx, sourceDir, staged); err != nil {
+		if err := copyDirContext(ctx, sourceDir, staged); err != nil {
 			return fmt.Errorf("copy package: %w", err)
 		}
 
@@ -189,6 +185,9 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 		if loadErr != nil {
 			return fmt.Errorf("load generated manifest: %w", loadErr)
 		}
+		if cfg.Link {
+			return linkPiSource(ctx, sourceDir, staged)
+		}
 		return nil
 	})
 	if err != nil {
@@ -196,6 +195,33 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 	}
 
 	m.notifyReloaders(ctx, pkg.Name, loaded)
+	return nil
+}
+
+// linkPiSource keeps generated metadata and dependencies in the installation.
+// Setup runs on copies before source entries become live links.
+// ponytail: top-level entries are captured at install; reinstall to link newly added roots.
+func linkPiSource(ctx context.Context, source, staged string) error {
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return fmt.Errorf("read linked pi source: %w", err)
+	}
+	for _, entry := range entries {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		switch entry.Name() {
+		case "package-lock.json", "npm-shrinkwrap.json", "node_modules", "tau-package.toml", ".tau-install.json":
+			continue
+		}
+		path := filepath.Join(staged, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove staged source entry: %w", err)
+		}
+		if err := os.Symlink(filepath.Join(source, entry.Name()), path); err != nil {
+			return fmt.Errorf("link pi source entry: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -276,13 +302,22 @@ func extractNpmPackageContext(ctx context.Context, tarball, dst string) (err err
 	}
 	defer func() { err = errors.Join(err, file.Close()) }()
 
-	gz, err := gzip.NewReader(file)
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat npm archive: %w", err)
+	}
+	if info.Size() > maxArchiveDownload {
+		return errors.New("archive download size limit exceeded")
+	}
+	gz, err := gzip.NewReader(&archiveLimitReader{reader: file, remaining: maxArchiveDownload})
 	if err != nil {
 		return fmt.Errorf("read gzip: %w", err)
 	}
 	defer func() { err = errors.Join(err, gz.Close()) }()
 
-	tr := tar.NewReader(gz)
+	expanded := archiveContextReader{ctx: ctx, reader: &archiveLimitReader{reader: gz, remaining: maxArchiveExpanded + maxArchiveMetadata}}
+	tr := tar.NewReader(expanded)
+	var budget archiveBudget
 	for {
 		if err := context.Cause(ctx); err != nil {
 			return err
@@ -293,6 +328,9 @@ func extractNpmPackageContext(ctx context.Context, tarball, dst string) (err err
 		}
 		if err != nil {
 			return fmt.Errorf("read tar: %w", err)
+		}
+		if err := budget.admit(hdr); err != nil {
+			return err
 		}
 		rel := strings.TrimPrefix(filepath.Clean(filepath.FromSlash(hdr.Name)), "package"+string(os.PathSeparator))
 		if !filepath.IsLocal(rel) {
@@ -327,6 +365,10 @@ func extractNpmPackageContext(ctx context.Context, tarball, dst string) (err err
 			}
 		}
 	}
+	if _, err := io.Copy(io.Discard, expanded); err != nil {
+		return fmt.Errorf("validate archive trailer: %w", err)
+	}
+
 	return nil
 }
 

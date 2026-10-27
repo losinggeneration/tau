@@ -9117,3 +9117,86 @@ func TestAnthropicEnvironmentBearerDoesNotRefreshAnAPIKey(t *testing.T) {
 	assert.Equal(t, 1, requests)
 	assert.Zero(t, refreshes)
 }
+
+func TestAnthropicFederationRequestsAvoidOAuthShapingAndRespectKeys(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	env := federationOptions(t).providerEnv
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprint(explicit), func(t *testing.T) {
+			exchanges, messages := 0, 0
+			previous := http.DefaultClient
+			t.Cleanup(func() { http.DefaultClient = previous })
+			http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path == "/v1/oauth/token" {
+					exchanges++
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"federation-access","expires_in":3600}`))}, nil
+				}
+				messages++
+				if explicit {
+					require.Equal(t, "explicit-key", req.Header.Get("x-api-key"))
+					require.Empty(t, req.Header.Get("Authorization"))
+				} else {
+					require.Equal(t, "Bearer federation-access", req.Header.Get("Authorization"))
+					require.Empty(t, req.Header.Get("x-api-key"))
+					require.Contains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
+				}
+				require.NotContains(t, req.Header.Get("anthropic-beta"), "claude-code")
+				require.NotContains(t, req.Header.Get("anthropic-beta"), "oidc-federation")
+				return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"synthetic rejection"}}`))}, nil
+			})}
+			model := &Model{ID: "claude-test", Provider: ProviderAnthropic, API: APIAnthropicMessages, BaseURL: "https://api.anthropic.invalid"}
+			client, err := newAnthropicClient(model)
+			require.NoError(t, err)
+			opts := []Option{WithProviderEnv(env), WithMaxRetries(0)}
+			if explicit {
+				opts = append(opts, WithAPIKey("explicit-key"))
+			}
+			for range 2 {
+				err = client.Stream(t.Context(), model, &Context{}, func(context.Context, StreamEvent) {}, opts...)
+				require.ErrorContains(t, err, "synthetic rejection")
+			}
+			require.Equal(t, 2, messages)
+			if explicit {
+				require.Zero(t, exchanges)
+			} else {
+				require.Equal(t, 1, exchanges)
+			}
+		})
+	}
+}
+
+func TestAnthropicFederationAdmissionAndHeaderPrecedence(t *testing.T) {
+	for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"} {
+		t.Setenv(name, "")
+	}
+	env := federationOptions(t).providerEnv
+	for _, tc := range []struct {
+		name, provider string
+		option         Option
+		wantRequests   int
+	}{
+		{"header", ProviderAnthropic, WithHeaders(map[string]string{"Authorization": "Bearer explicit"}), 1},
+		{"disabled", ProviderAnthropic, WithoutEnvCredentials(), 0},
+		{"other provider", "other-anthropic-compatible", WithMaxRetries(0), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			previous := http.DefaultClient
+			t.Cleanup(func() { http.DefaultClient = previous })
+			requests := 0
+			http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				require.Equal(t, "/v1/messages", req.URL.Path)
+				require.Equal(t, "Bearer explicit", req.Header.Get("Authorization"))
+				return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"synthetic rejection"}}`))}, nil
+			})}
+			model := &Model{ID: "claude-test", Provider: tc.provider, API: APIAnthropicMessages, BaseURL: "https://api.anthropic.invalid"}
+			client, err := newAnthropicClient(model)
+			require.NoError(t, err)
+			err = client.Stream(t.Context(), model, &Context{}, func(context.Context, StreamEvent) {}, WithProviderEnv(env), tc.option, WithMaxRetries(0))
+			require.Error(t, err)
+			require.Equal(t, tc.wantRequests, requests)
+		})
+	}
+}

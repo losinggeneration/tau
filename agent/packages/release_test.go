@@ -652,3 +652,104 @@ func TestReleaseExtractionStopsWhenArchiveReadCancels(t *testing.T) {
 	require.ErrorIs(t, err, cause)
 	require.NoFileExists(t, filepath.Join(destination, "binary"))
 }
+
+func TestReleaseRejectsOversizedEntryBeforeCreatingFile(t *testing.T) {
+	var raw bytes.Buffer
+	tw := tar.NewWriter(&raw)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "oversized", Mode: 0o600, Size: 1024*1024*1024 + 1}))
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	_, err := gz.Write(raw.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, gz.Close())
+	destination := t.TempDir()
+	err = extractTarGz(bytes.NewReader(compressed.Bytes()), destination)
+	require.ErrorContains(t, err, "archive expanded size limit")
+	require.NoFileExists(t, filepath.Join(destination, "oversized"))
+}
+
+func TestArchiveBudgetBoundaries(t *testing.T) {
+	budget := archiveBudget{expanded: maxArchiveExpanded - 4, entries: maxArchiveEntries - 2}
+	require.NoError(t, budget.admit(&tar.Header{Size: 4}))
+	require.ErrorContains(t, budget.admit(&tar.Header{Size: 1}), "expanded size limit")
+	require.Equal(t, maxArchiveExpanded, budget.expanded)
+	require.ErrorContains(t, budget.admit(&tar.Header{}), "entry limit")
+	budget = archiveBudget{}
+	require.ErrorContains(t, budget.admit(&tar.Header{Size: -1}), "expanded size limit")
+	budget = archiveBudget{entries: maxArchiveEntries - 1}
+	require.NoError(t, budget.admit(&tar.Header{Typeflag: tar.TypeDir}))
+	require.ErrorContains(t, budget.admit(&tar.Header{Typeflag: tar.TypeDir}), "entry limit")
+}
+
+func TestArchiveStreamLimitBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name, input string
+		limit       int64
+		fails       bool
+	}{
+		{"below", "abc", 4, false}, {"exact", "abcd", 4, false}, {"above", "abcde", 4, true}, {"empty", "", 0, false}, {"zero", "a", 0, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reader := &archiveLimitReader{reader: strings.NewReader(test.input), remaining: test.limit}
+			n, err := reader.Read(nil)
+			require.Zero(t, n)
+			require.NoError(t, err)
+			data, err := io.ReadAll(reader)
+			if test.fails {
+				require.ErrorContains(t, err, "archive stream size limit")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, test.input, string(data))
+			}
+			require.LessOrEqual(t, int64(len(data)), test.limit)
+		})
+	}
+	cause := errors.New("stream failed")
+	reader := &archiveLimitReader{reader: releaseFailingReader{err: cause}}
+	_, err := io.ReadAll(reader)
+	require.ErrorIs(t, err, cause)
+}
+
+func TestReleaseRejectsEntryFlood(t *testing.T) {
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gz)
+	for range maxArchiveEntries + 1 {
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: "directory", Typeflag: tar.TypeDir, Mode: 0o700}))
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	err := extractTarGz(bytes.NewReader(compressed.Bytes()), t.TempDir())
+	require.ErrorContains(t, err, "archive entry limit")
+}
+
+func TestReleaseRejectsCorruptGzipTrailer(t *testing.T) {
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gz)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "file", Mode: 0o600, Size: 2}))
+	_, err := tw.Write([]byte("ok"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	data := compressed.Bytes()
+	data[len(data)-8] ^= 0xff
+	err = extractTarGz(bytes.NewReader(data), t.TempDir())
+	require.ErrorIs(t, err, gzip.ErrChecksum)
+}
+
+func TestDownloadRejectsDeclaredArchiveSizeBeforeReading(t *testing.T) {
+	original := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = original })
+	readFailure := errors.New("oversized response was read")
+	closeFailure := errors.New("oversized response close failed")
+	http.DefaultClient = &http.Client{Transport: releaseTestTransport(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, ContentLength: maxArchiveDownload + 1, Body: releaseTestBody{Reader: releaseFailingReader{err: readFailure}, closeErr: closeFailure}, Header: make(http.Header), Request: req}, nil
+	})}
+	destination := filepath.Join(t.TempDir(), "rejected")
+	err := downloadAndExtract(t.Context(), &ReleaseSection{URL: "https://release.invalid/archive"}, destination)
+	require.ErrorContains(t, err, "archive download size limit")
+	require.ErrorIs(t, err, closeFailure)
+	require.NotErrorIs(t, err, readFailure)
+	require.NoDirExists(t, destination)
+}
