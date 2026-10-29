@@ -11,7 +11,6 @@ package commands // import "github.com/losinggeneration/tau/commands"
 // Commands that are implemented in Go (via CLI subcommands or runtime):
 // - login/logout: Available via CLI subcommands and handled at the runtime level
 // - export: Available via sessions export subcommand
-// - share: Available via sessions share subcommand
 // - compact: Available via sessions compact subcommand
 // - fork: Available via SDK and sessions fork subcommand
 // - resume: Available via sessions resume subcommand
@@ -27,7 +26,6 @@ package commands // import "github.com/losinggeneration/tau/commands"
 // - /model: Interactive TUI model selector - Go uses CLI flags (--model) or settings
 // - /scoped-models: TUI feature for Ctrl+P cycling - Go doesn't have this TUI model
 // - /session: TUI session info - Available via 'sessions show' subcommand
-// - /changelog: TUI changelog display - Available via 'tau --version' or changelog file
 // - /hotkeys: TUI keybindings display - Not applicable to Go's execution model
 // - /tree: TUI tree navigation - Available via 'sessions' subcommands
 // - /import: TUI import feature - Available via 'sessions restore' subcommand
@@ -93,12 +91,6 @@ var BUILTIN_SLASH_COMMANDS = []BuiltinSlashCommand{
 		Note:        "Available via 'tau sessions restore' subcommand.",
 	},
 	{
-		Name:        "share",
-		Description: "Share session as a secret GitHub gist",
-		Implemented: true,
-		Note:        "Available via 'tau sessions share' subcommand.",
-	},
-	{
 		Name:        "copy",
 		Description: "Copy last agent message to clipboard",
 		Implemented: false,
@@ -115,12 +107,6 @@ var BUILTIN_SLASH_COMMANDS = []BuiltinSlashCommand{
 		Description: "Show session info and stats",
 		Implemented: true,
 		Note:        "Available via 'tau sessions show' subcommand.",
-	},
-	{
-		Name:        "changelog",
-		Description: "Show changelog entries",
-		Implemented: false,
-		Note:        "Available via 'tau --version' or reading CHANGELOG.md directly.",
 	},
 	{
 		Name:        "hotkeys",

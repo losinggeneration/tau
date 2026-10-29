@@ -786,3 +786,28 @@ func systemEntriesBefore(branch []string, entries []Entry, firstKeptID string) [
 	}
 	return result
 }
+
+// BranchJSONL serializes the session header and the active branch as JSONL,
+// with parent links rewritten so the branch forms a single chain.
+func (r *Reader) BranchJSONL() ([]byte, error) {
+	header := r.header
+	header.Timestamp = NewTimestamp()
+	header.ParentSession, header.ParentEntry = nil, nil
+	line, err := MarshalEntry(header)
+	if err != nil {
+		return nil, err
+	}
+	out := append(line, '\n')
+	var parent *string
+	for _, id := range r.ActiveBranch() {
+		entry := *r.FindByID(id)
+		entry.ParentID = parent
+		line, err := MarshalEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		out = append(append(out, line...), '\n')
+		parent = &id
+	}
+	return out, nil
+}

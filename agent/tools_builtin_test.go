@@ -2,8 +2,10 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -160,6 +162,39 @@ func TestGenerateDiffStringSingleLineChangeKeepsFollowingContextUnchanged(t *tes
 		if strings.Contains(diff, unexpected) {
 			t.Fatalf("diff marked unchanged following line as added %q:\n%s", unexpected, diff)
 		}
+	}
+}
+
+// A diff of a large file must not cost memory quadratic in its line count:
+// a full LCS table for a 30k-line file is several gigabytes.
+func TestGenerateDiffStringLargeFileStaysLinear(t *testing.T) {
+	lines := make([]string, 5000)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line %d", i)
+	}
+	oldContent := strings.Join(lines, "\n")
+	lines[10] = "changed near top"
+	lines[4990] = "changed near bottom"
+	newContent := strings.Join(lines, "\n")
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	diff, first := generateDiffString(oldContent, newContent)
+	runtime.ReadMemStats(&after)
+
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 20<<20 {
+		t.Fatalf("diff allocated %d MiB for a 5000-line file", alloc>>20)
+	}
+	if first != 11 {
+		t.Fatalf("first changed line = %d, want 11", first)
+	}
+	for _, want := range []string{"-  11 line 10", "+  11 changed near top", "-4991 line 4990", "+4991 changed near bottom", "  12 line 11"} {
+		if !strings.Contains(diff, want) {
+			t.Fatalf("diff missing %q", want)
+		}
+	}
+	if n := strings.Count(diff, "\n") + 1; n != 5002 {
+		t.Fatalf("diff has %d lines, want 5002", n)
 	}
 }
 

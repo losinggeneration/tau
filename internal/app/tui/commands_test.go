@@ -34,8 +34,8 @@ func TestCommandsBuiltins(t *testing.T) {
 	// we list every entry.
 	want := []string{
 		"help", "model", "show-model", "quit",
-		"settings", "scoped-models", "export", "import", "share",
-		"copy", "name", "session", "sessions", "changelog", "hotkeys", "layout", "fork", "forget",
+		"settings", "scoped-models", "export", "import",
+		"copy", "name", "session", "sessions", "hotkeys", "layout", "fork", "forget",
 		"tree", "login", "logout", "new", "compact", "retry", "resume", "history",
 	}
 	got := make([]string, 0, len(c.All()))
@@ -81,16 +81,16 @@ func TestCommandsFilter(t *testing.T) {
 		// (this is the canonical command list for the TUI).
 		{"", []string{
 			"help", "model", "show-model", "quit",
-			"settings", "scoped-models", "export", "import", "share",
-			"copy", "name", "session", "sessions", "changelog", "hotkeys", "layout", "fork", "forget",
+			"settings", "scoped-models", "export", "import",
+			"copy", "name", "session", "sessions", "hotkeys", "layout", "fork", "forget",
 			"tree", "login", "logout", "new", "compact", "retry", "resume", "history",
 		}},
 		{"h", []string{"help", "history", "hotkeys"}},
-		{"c", []string{"changelog", "compact", "copy"}},
+		{"c", []string{"compact", "copy"}},
 		{"q", []string{"quit"}},
 		{"m", []string{"model"}},
-		// Several s-prefix commands: scoped-models, session, sessions, settings, share, show-model.
-		{"s", []string{"scoped-models", "session", "sessions", "settings", "share", "show-model"}},
+		// Several s-prefix commands: scoped-models, session, sessions, settings, show-model.
+		{"s", []string{"scoped-models", "session", "sessions", "settings", "show-model"}},
 		{"HE", []string{"help"}}, // case-insensitive
 		{"zz", nil},
 	}
@@ -408,7 +408,7 @@ func TestTrySubmitSessionsOpensWorkspace(t *testing.T) {
 	fs.mu.Lock()
 	// The runtime command registry advertises a shell-oriented "sessions"
 	// builtin; the TUI must shadow it locally rather than forward.
-	fs.slashInfos = []sdkSlashInfo{{Name: "sessions", Description: "List, fork, export, and share sessions", Source: "builtin"}}
+	fs.slashInfos = []sdkSlashInfo{{Name: "sessions", Description: "List, fork, and export sessions", Source: "builtin"}}
 	fs.mu.Unlock()
 	app.sessionLister = func(context.Context) ([]sdkpkg.SessionInfo, error) {
 		return []sdkpkg.SessionInfo{{ID: "abc12345", Name: "demo", Created: "2026-01-01T00:00:00Z"}}, nil
@@ -521,13 +521,13 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 	fs.mu.Unlock()
 
 	items := app.completionItems("")
-	// The local registry has 26 entries; the two same-named session
+	// The local registry has 24 entries; the two same-named session
 	// commands are shadowed by the local registry, leaving one external
 	// entry. We don't assert the exact list ordering beyond the first
 	// five (the originals) so future stub additions don't break this
 	// test.
-	if len(items) != 27 {
-		t.Fatalf("completionItems = %d items, want 27 (26 local + 1 external)", len(items))
+	if len(items) != 25 {
+		t.Fatalf("completionItems = %d items, want 25 (24 local + 1 external)", len(items))
 	}
 	wantLocal := []string{"help", "model", "show-model", "quit", "settings"}
 	for i, name := range wantLocal {
@@ -570,13 +570,13 @@ func TestRegisterUnregisterAtRuntime(t *testing.T) {
 	}
 	// NewCommands seeds the builtins: 4 originals (help, model,
 	// show-model, quit) plus the interactive stubs/commands (settings,
-	// scoped-models, export, import, share, copy, name, session,
-	// sessions, changelog, hotkeys, fork, tree, login, logout, new,
+	// scoped-models, export, import, copy, name, session,
+	// sessions, hotkeys, fork, tree, login, logout, new,
 	// compact, resume, history, layout, forget). /reload is not a TUI
 	// local — the session owns it. With 1 plugin registered, All()
-	// returns 27.
-	if got := len(c.All()); got != 27 {
-		t.Errorf("All() length = %d, want 27 (26 builtins + 1 plugin)", got)
+	// returns 25.
+	if got := len(c.All()); got != 25 {
+		t.Errorf("All() length = %d, want 25 (24 builtins + 1 plugin)", got)
 	}
 	if !c.Unregister("plugin-cmd") {
 		t.Error("Unregister(plugin-cmd) returned false")
@@ -627,57 +627,6 @@ func TestCmdCopyCopiesLastReplyByDefault(t *testing.T) {
 	}
 }
 
-// TestStubCommandsSurfaceComingSoon verifies each not-yet-wired interactive
-// command surfaces a "coming soon" notice in the chat log when invoked,
-//
-// /hotkeys and /compact are tested separately because they have real
-// implementations.
-func TestStubCommandsSurfaceComingSoon(t *testing.T) {
-	stubs := []struct {
-		name   string
-		notice string
-	}{
-		{"export", "Export the session to a file (coming soon)"},
-		{"import", "Import a session from a file (coming soon)"},
-		{"share", "Share the session (coming soon)"},
-		{"changelog", "Show the changelog (coming soon)"},
-	}
-	for _, tc := range stubs {
-		t.Run(tc.name, func(t *testing.T) {
-			app := newTestApp(t)
-			// Build the closure from the same factory the
-			// NewCommands registrations use so the assertions
-			// stay in sync.
-			_ = cmdStub(tc.name, tc.notice) // sanity: factory is callable
-			cmd, ok := app.cmds.Lookup(tc.name)
-			if !ok {
-				t.Fatalf("command %q not registered", tc.name)
-			}
-			if cmd.Handler == nil {
-				t.Fatalf("command %q has nil handler; should be a stub", tc.name)
-			}
-			// Invoke through the registry so we exercise the
-			// same path the production code does.
-			app.conv.Clear()
-			cmd.Handler(app, "")
-			got := app.conv.Messages()
-			if len(got) != 1 {
-				t.Fatalf("/%s produced %d messages, want 1", tc.name, len(got))
-			}
-			if got[0].Role != RoleSystem {
-				t.Errorf("/%s role = %q, want %q", tc.name, got[0].Role, RoleSystem)
-			}
-			wantPrefix := "/" + tc.name + ": " + tc.notice
-			if got[0].Text != wantPrefix {
-				t.Errorf("/%s notice = %q, want %q", tc.name, got[0].Text, wantPrefix)
-			}
-		})
-	}
-}
-
-// TestCmdHotkeysShowsKeybindingHints covers /hotkeys as a standalone
-// command (separate from /help). The output should mention the
-// standard actions plus the queue dequeue binding.
 func TestCmdHotkeysShowsKeybindingHints(t *testing.T) {
 	app := newTestApp(t)
 	app.conv.Clear()
@@ -730,15 +679,15 @@ func TestCmdLoginStoresNoCredentialProvider(t *testing.T) {
 	}
 }
 
-func TestCmdLoginRequiresAPIKeyForKeyProvider(t *testing.T) {
+func TestCmdLoginWithoutDialogPointsAtKeySyntax(t *testing.T) {
 	app := newTestApp(t)
 	app.authStore = appCredentialStore(t)
 
 	cmdLogin(app, ai.ProviderOpenAI)
 
 	msgs := app.conv.Messages()
-	if len(msgs) != 1 || msgs[0].Role != RoleError || !strings.Contains(msgs[0].Text, "usage: /login "+ai.ProviderOpenAI+" <api-key>") {
-		t.Fatalf("messages = %+v, want usage error", msgs)
+	if len(msgs) != 1 || msgs[0].Role != RoleError || !strings.Contains(msgs[0].Text, "/login <provider> <api-key>") {
+		t.Fatalf("messages = %+v, want key syntax hint", msgs)
 	}
 }
 

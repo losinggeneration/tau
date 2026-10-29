@@ -314,12 +314,6 @@ func getEnvAPIKey(provider string, lookup func(string) string) string {
 }
 
 // getEnv is exported for internal use by providers.
-// ShareViewerURL returns the share viewer URL override from TAU_SHARE_VIEWER_URL.
-// Returns empty string if not set (defaults to https://pi.dev/session/).
-func ShareViewerURL() string {
-	return os.Getenv("TAU_SHARE_VIEWER_URL")
-}
-
 // GetEnvHeaders returns provider-owned authentication headers. Bearer tokens
 // are kept separate from API keys to avoid activating OAuth request shaping.
 func GetEnvHeaders(provider string) map[string]string {

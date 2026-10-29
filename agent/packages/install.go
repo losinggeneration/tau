@@ -347,8 +347,11 @@ func (m *InstallManager) installFromLocal(ctx context.Context, cfg Config) error
 			return err
 		}
 		if cfg.Link {
-			if err := os.Symlink(cfg.Source, staged); err != nil {
-				return fmt.Errorf("create symlink: %w", err)
+			if err := os.Mkdir(staged, 0o700); err != nil {
+				return fmt.Errorf("create linked package: %w", err)
+			}
+			if err := linkSourceEntries(ctx, cfg.Source, staged, ".tau-install.json"); err != nil {
+				return err
 			}
 		} else if err := copyDirContext(ctx, cfg.Source, staged); err != nil {
 			return fmt.Errorf("copy package: %w", err)

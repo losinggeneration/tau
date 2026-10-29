@@ -347,6 +347,58 @@ func TestEventResponse_MarshalsResponseData(t *testing.T) {
 	}
 }
 
+func TestProjectTrustDecisionFirstAnswerWins(t *testing.T) {
+	answer := func(data string, calls *[]string, name string) EventHandler {
+		return EventHandler{PluginName: name, Handler: func(_ context.Context, event string, payload json.RawMessage, _ string) EventResponse {
+			*calls = append(*calls, name+":"+event+":"+string(payload))
+			return EventResponse{ResponseData: []byte(data)}
+		}}
+	}
+	for _, tc := range []struct {
+		name     string
+		answers  []string
+		want     *bool
+		remember bool
+		calls    int
+	}{
+		{name: "none"},
+		{name: "undecided falls through", answers: []string{`{"trusted":"undecided"}`, ``, `not json`, `{"trusted":"maybe"}`}, calls: 4},
+		{name: "yes remembered", answers: []string{`{"trusted":"undecided"}`, `{"trusted":"yes","remember":true}`, `{"trusted":"no"}`}, want: new(true), remember: true, calls: 2},
+		{name: "no", answers: []string{`{"trusted":"no"}`, `{"trusted":"yes"}`}, want: new(false), calls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := NewManager(t.TempDir(), nil, nil)
+			var calls []string
+			for i, data := range tc.answers {
+				mgr.RegisterEventHandler("project_trust", answer(data, &calls, fmt.Sprint(i)))
+			}
+			got, remember, err := mgr.ProjectTrustDecision(t.Context(), "/work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (got == nil) != (tc.want == nil) || got != nil && *got != *tc.want || remember != tc.remember {
+				t.Fatalf("decision = %v remember %v, want %v %v", got, remember, tc.want, tc.remember)
+			}
+			if len(calls) != tc.calls {
+				t.Fatalf("calls = %q, want %d", calls, tc.calls)
+			}
+			if len(calls) > 0 && calls[0] != `0:project_trust:{"cwd":"/work"}` {
+				t.Fatalf("first call = %q", calls[0])
+			}
+		})
+	}
+
+	mgr := NewManager(t.TempDir(), nil, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	mgr.RegisterEventHandler("project_trust", EventHandler{Handler: func(context.Context, string, json.RawMessage, string) EventResponse {
+		cancel()
+		return EventResponse{ResponseData: []byte(`{"trusted":"yes"}`)}
+	}})
+	if got, _, err := mgr.ProjectTrustDecision(ctx, "/work"); !errors.Is(err, context.Canceled) || got != nil {
+		t.Fatalf("cancelled decision = %v, %v", got, err)
+	}
+}
+
 // TestPrepareHostSocket_DistinctPath leaves unrelated prior socket paths untouched.
 func TestPrepareHostSocket_DistinctPath(t *testing.T) {
 	dir := t.TempDir()

@@ -49,3 +49,36 @@ func TestMarkdownThemedQuotesWrapWithStyledBorders(t *testing.T) {
 		}
 	}
 }
+
+func TestMarkdownThemedCodeBlocksHighlightKnownLanguages(t *testing.T) {
+	syntax := SyntaxTheme{
+		Keyword: Style{FG: ColorRed}, Function: Style{FG: ColorBlue}, Number: Style{FG: ColorGreen},
+		Comment: Style{FG: ColorYellow}, String: Style{FG: ColorMagenta},
+	}
+	theme := MarkdownTheme{CodeBlock: Style{FG: ColorCyan}, Syntax: &syntax}
+	colors := func(src string) map[string]Color {
+		md := NewMarkdown(src)
+		md.SetTheme(theme)
+		got := map[string]Color{}
+		for _, row := range md.Render(80) {
+			d := &ansiRecordingDrawer{}
+			DrawANSIText(d, Point{}, row, Style{})
+			for _, op := range d.ops {
+				if word := strings.TrimSpace(op.text); word != "" {
+					got[word] = op.st.FG
+				}
+			}
+		}
+		return got
+	}
+	got := colors("```go\nfunc main() { return 42 } // hi\n```")
+	for word, want := range map[string]Color{"func": ColorRed, "main": ColorBlue, "42": ColorGreen, "// hi": ColorYellow} {
+		if got[word] != want {
+			t.Errorf("%q color = %v, want %v (all %v)", word, got[word], want, got)
+		}
+	}
+	got = colors("```nosuchlang\nfunc main()\n```")
+	if got["func main()"] != ColorCyan {
+		t.Errorf("unknown language should keep the code block color, got %v", got)
+	}
+}

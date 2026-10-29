@@ -622,5 +622,23 @@ func (t *themeTokens) markdownTheme() tauui.MarkdownTheme {
 		QuoteBorder:     t.foreground("mdQuoteBorder", t.MdQuoteBorder, tauui.Style{}),
 		HR:              t.foreground("mdHr", t.MdHr, tauui.Style{}),
 		ListBullet:      t.foreground("mdListBullet", t.MdListBullet, tauui.Style{}),
+		Syntax:          new(t.syntaxTheme()),
+	}
+}
+
+// syntaxTheme maps the syntax tokens onto highlighted code. Text keeps the
+// code block color so unclassified tokens read like unhighlighted code.
+func (t *themeTokens) syntaxTheme() tauui.SyntaxTheme {
+	return tauui.SyntaxTheme{
+		Text:        t.foreground("mdCodeBlock", t.MdCodeBlock, tauui.Style{}),
+		Comment:     t.foreground("syntaxComment", t.SyntaxComment, tauui.Style{}),
+		Keyword:     t.foreground("syntaxKeyword", t.SyntaxKeyword, tauui.Style{}),
+		Function:    t.foreground("syntaxFunction", t.SyntaxFunction, tauui.Style{}),
+		Variable:    t.foreground("syntaxVariable", t.SyntaxVariable, tauui.Style{}),
+		String:      t.foreground("syntaxString", t.SyntaxString, tauui.Style{}),
+		Number:      t.foreground("syntaxNumber", t.SyntaxNumber, tauui.Style{}),
+		Type:        t.foreground("syntaxType", t.SyntaxType, tauui.Style{}),
+		Operator:    t.foreground("syntaxOperator", t.SyntaxOperator, tauui.Style{}),
+		Punctuation: t.foreground("syntaxPunctuation", t.SyntaxPunctuation, tauui.Style{}),
 	}
 }

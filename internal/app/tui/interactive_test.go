@@ -1,12 +1,15 @@
 package tui
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestInteractiveCommands_HelpContainsAllCommands verifies /help
@@ -230,19 +233,41 @@ func TestInteractiveCommands_Compact(t *testing.T) {
 	}
 }
 
-// TestInteractiveCommands_ExportStub verifies /export without args
-// surfaces the coming-soon notice.
-func TestInteractiveCommands_ExportStub(t *testing.T) {
+type exportingSession struct {
+	*fakeSession
+	calls []string
+}
+
+func (e *exportingSession) ExportHTML(_ context.Context, path string) (string, error) {
+	e.calls = append(e.calls, "html:"+path)
+	return cmp.Or(path, "tau-session-x.html"), nil
+}
+
+func (e *exportingSession) ExportJSONL(_ context.Context, path string) (string, error) {
+	e.calls = append(e.calls, "jsonl:"+path)
+	return path, errors.New("disk full")
+}
+
+// TestInteractiveCommands_ExportPicksFormatFromPath checks upstream's rule:
+// .jsonl exports the branch, anything else (or nothing) exports HTML.
+func TestInteractiveCommands_ExportPicksFormatFromPath(t *testing.T) {
 	app := newTestApp(t)
+	sess := &exportingSession{fakeSession: &fakeSession{}}
+	app.sess = sess
 	app.conv.Clear()
-	cmdExportOrStub(app, "")
-	msgs := app.conv.Messages()
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(msgs))
+	for _, args := range []string{"", `"my notes.md" extra`, "out.jsonl"} {
+		cmdExport(app, args)
 	}
-	if !strings.Contains(msgs[0].Text, "export") {
-		t.Errorf("export stub should mention 'export': %q", msgs[0].Text)
+	assert.Equal(t, []string{"html:", "html:my notes.md", "jsonl:out.jsonl"}, sess.calls)
+	var texts []string
+	for _, msg := range app.conv.Messages() {
+		texts = append(texts, msg.Text)
 	}
+	assert.Equal(t, []string{
+		"Session exported to: tau-session-x.html",
+		"Session exported to: my notes.md",
+		"Failed to export session: disk full",
+	}, texts)
 }
 
 // TestInteractiveCommands_ExportWithArgs verifies /export with a

@@ -3,6 +3,8 @@ package clipboard
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -114,4 +116,51 @@ func TestWriteTextCancellationStopsFallback(t *testing.T) {
 	defer cancel()
 	w := textWriter{platform: "linux", getenv: func(string) string { return "1" }, run: func(context.Context, string, string, ...string) error { cancel(); return context.Canceled }, emit: func(string) error { t.Fatal("emitted after cancellation"); return nil }}
 	require.ErrorIs(t, w.write(ctx, "text"), context.Canceled)
+}
+
+func TestWriteTextWSLUsesWindowsClipboard(t *testing.T) {
+	boom := errors.New("powershell failed")
+	for _, tc := range []struct {
+		name       string
+		env        map[string]string
+		powershell error
+		want       []string
+	}{
+		{"interop", nil, nil, []string{"wslpath", "powershell.exe"}},
+		{"windows terminal prefers OSC 52", map[string]string{"WT_SESSION": "1"}, nil, []string{"osc52"}},
+		{"interop failure falls back to OSC 52", nil, boom, []string{"wslpath", "powershell.exe", "osc52"}},
+		{"remote still emits OSC 52", map[string]string{"SSH_CONNECTION": "1"}, nil, []string{"wslpath", "powershell.exe", "osc52"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			var tmpFile string
+			dir := t.TempDir()
+			w := textWriter{platform: "linux", wsl: true, tempDir: dir, getenv: func(k string) string { return tc.env[k] }, output: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				require.NoError(t, ctx.Err())
+				calls = append(calls, name)
+				require.Equal(t, []string{"-w"}, args[:1])
+				tmpFile = args[1]
+				data, err := os.ReadFile(tmpFile)
+				require.NoError(t, err)
+				assert.Equal(t, "héllo", string(data))
+				return []byte("C:\\Temp\\it's.txt\r\n"), nil
+			}, run: func(_ context.Context, name, text string, args ...string) error {
+				calls = append(calls, name)
+				assert.Empty(t, text)
+				assert.Equal(t, []string{"-NoProfile", "-Command", "Set-Clipboard -Value ([System.IO.File]::ReadAllText('C:\\Temp\\it''s.txt', [System.Text.Encoding]::UTF8))"}, args)
+				return tc.powershell
+			}, emit: func(string) error { calls = append(calls, "osc52"); return nil }}
+			require.NoError(t, w.write(context.Background(), "héllo"))
+			assert.Equal(t, tc.want, calls)
+			if tmpFile != "" {
+				assert.Equal(t, dir, filepath.Dir(tmpFile))
+				assert.NoFileExists(t, tmpFile)
+			}
+		})
+	}
+}
+
+func TestIsWSLFromEnvironment(t *testing.T) {
+	assert.True(t, isWSL(func(k string) string { return map[string]string{"WSL_DISTRO_NAME": "Ubuntu"}[k] }))
+	assert.True(t, isWSL(func(k string) string { return map[string]string{"WSLENV": "PATH/l"}[k] }))
 }

@@ -207,10 +207,71 @@ func sessionDirForCmd(cmd *cli.Command) (string, error) {
 func loadSettings() (*ai.Settings, error) { return loadSettingsForTrust(context.Background(), nil) }
 
 func loadSettingsForTrust(ctx context.Context, cmd *cli.Command) (*ai.Settings, error) {
-	return loadSettingsWithUI(ctx, cmd, nil)
+	return loadSettingsWithUI(ctx, cmd, nil, nil)
 }
 
-func loadSettingsWithUI(ctx context.Context, cmd *cli.Command, u ui.UI) (*ai.Settings, error) {
+// pluginTrustPass loads global and CLI plugins with the project untrusted so
+// they can answer project_trust before project settings or plugins are read.
+type pluginTrustPass struct {
+	mgr         *plugins.Manager
+	ran         bool
+	discoverErr error
+	// installed is set when packages were installed after the pass ran
+	// discovery, so finish has to reload.
+	installed bool
+}
+
+func (p *pluginTrustPass) decide(ctx context.Context, cwd string) (*bool, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve home directory: %w", err)
+	}
+	untrusted, err := ai.LoadTrustedSettings(ctx, configDir(), cwd, home, ai.ProjectTrustOptions{Override: new(false)})
+	if err != nil {
+		return nil, err
+	}
+	if err := untrusted.ApplyHTTPProxySettings(); err != nil {
+		return nil, err
+	}
+	p.mgr.SetSettings(untrusted)
+	p.ran = true
+	p.discoverErr = p.mgr.Discover(ctx)
+	decision, remember, err := p.mgr.ProjectTrustDecision(ctx, cwd)
+	if err != nil || decision == nil || !remember {
+		return decision, err
+	}
+	return decision, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}.Set(ctx, cwd, decision)
+}
+
+// finish admits the resolved settings. A trusted project reloads the
+// pre-trust plugin set so project plugins, filters and config take effect.
+func (p *pluginTrustPass) finish(ctx context.Context, settings *ai.Settings) error {
+	p.mgr.SetSettings(settings)
+	if !p.ran {
+		return p.mgr.Discover(ctx)
+	}
+	if !settings.ProjectResourcesTrusted() && !p.installed {
+		return p.discoverErr
+	}
+	return errors.Join(p.discoverErr, p.mgr.Reload(ctx))
+}
+
+// installConfiguredSources installs configured npm and git sources that
+// aren't installed yet, as upstream does on startup and reload.
+func installConfiguredSources(ctx context.Context, settings *ai.Settings) ([]string, error) {
+	userDir, projectDir := packageDirsFromSettings(settings)
+	mgr := packages.NewInstallManager(userDir, projectDir)
+	mgr.NPMCommand = settings.NPMCommand
+	return mgr.InstallMissingSources(ctx, settings, nil)
+}
+
+// projectTrustDecisions holds each directory's resolved trust for the process,
+// as upstream does, so session-only answers survive reloads and external
+// trust.json edits. Headless fallthrough and unprotected directories aren't
+// cached, so a later interactive prompt or new protected resources still ask.
+var projectTrustDecisions sync.Map
+
+func loadSettingsWithUI(ctx context.Context, cmd *cli.Command, u ui.UI, decide func(context.Context, string) (*bool, error)) (*ai.Settings, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("resolve settings directory: %w", err)
@@ -230,13 +291,57 @@ func loadSettingsWithUI(ctx context.Context, cmd *cli.Command, u ui.UI) (*ai.Set
 			override = new(true)
 		}
 	}
-	opts := ai.ProjectTrustOptions{Override: override}
-	if u != nil {
-		opts.Prompt = func(ctx context.Context, cwd string) (*bool, error) {
-			return ai.PromptProjectTrust(ctx, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}, cwd, u.Select)
+	return loadTrustedSettingsCached(ctx, cwd, home, override, u, decide)
+}
+
+func loadTrustedSettingsCached(ctx context.Context, cwd, home string, override *bool, u ui.UI, decide func(context.Context, string) (*bool, error)) (*ai.Settings, error) {
+	if override == nil {
+		if cached, ok := projectTrustDecisions.Load(cwd); ok {
+			return ai.LoadTrustedSettings(ctx, configDir(), cwd, home, ai.ProjectTrustOptions{Override: new(cached.(bool))})
 		}
 	}
-	return ai.LoadTrustedSettings(ctx, configDir(), cwd, home, opts)
+	var protected, undecided bool
+	opts := ai.ProjectTrustOptions{
+		Override: override,
+		Decide: func(ctx context.Context, cwd string) (*bool, error) {
+			protected = true
+			if decide == nil {
+				return nil, nil
+			}
+			return decide(ctx, cwd)
+		},
+		Prompt: func(ctx context.Context, cwd string) (*bool, error) {
+			if u == nil {
+				undecided = true
+				return nil, nil
+			}
+			return ai.PromptProjectTrust(ctx, ai.ProjectTrustStore{Path: filepath.Join(configDir(), "trust.json")}, cwd, u.Select)
+		},
+	}
+	settings, err := ai.LoadTrustedSettings(ctx, configDir(), cwd, home, opts)
+	if err == nil && protected && !undecided {
+		projectTrustDecisions.Store(cwd, settings.ProjectResourcesTrusted())
+	}
+	return settings, err
+}
+
+// errProjectUntrusted refuses project-scope writes in an untrusted directory.
+var errProjectUntrusted = cli.Exit("Project is not trusted. Use --approve to modify project config.", ExitUserError)
+
+func projectTrusted(ctx context.Context, cmd *cli.Command) (bool, error) {
+	settings, err := loadSettingsForTrust(ctx, cmd)
+	if err != nil {
+		return false, cli.Exit(err.Error(), ExitUserError)
+	}
+	return settings.ProjectResourcesTrusted(), nil
+}
+
+func requireTrustedProject(ctx context.Context, cmd *cli.Command) error {
+	trusted, err := projectTrusted(ctx, cmd)
+	if err != nil || trusted {
+		return err
+	}
+	return errProjectUntrusted
 }
 
 // openStore creates a FileBackend credential store at the standard path.
@@ -262,6 +367,9 @@ func reloadSession(ctx context.Context, plugin string, sess commands.CommandSess
 	settings, err := loadSettingsForTrust(ctx, nil)
 	if err != nil {
 		return commands.Result{}, fmt.Errorf("reload settings: %w", err)
+	}
+	if _, err := installConfiguredSources(ctx, settings); err != nil {
+		return commands.Result{}, fmt.Errorf("reload package sources: %w", err)
 	}
 	var prepared *artifacts.PreparedReload
 	if loader, ok := sdk.GlobalArtifactLoader.(*artifacts.Loader); ok {
@@ -356,7 +464,7 @@ func registerBuiltInCommands(reg *commands.InMemoryRegistry) {
 
 	mustRegisterBuiltin(reg, commands.Info{
 		Name:        "sessions",
-		Description: "List, fork, export, and share sessions (run `tau sessions --help` for subcommands)",
+		Description: "List, fork and export sessions (run `tau sessions --help` for subcommands)",
 		Source:      commands.Builtin,
 	}, func(ctx context.Context, args string, ui commands.CommandUI, sess commands.CommandSession) (commands.Result, error) {
 		return commands.Result{Output: "use `tau sessions <subcommand>` from the shell"}, nil
@@ -444,6 +552,7 @@ var GlobalPluginManager *plugins.Manager
 
 // runtimeBuildConfig carries optional buildRuntimeOptions behavior.
 type runtimeBuildConfig struct {
+	trustPrompt ui.UI
 	skipPlugins bool
 }
 
@@ -457,15 +566,55 @@ func withoutPlugins() runtimeBuildOption {
 	return func(c *runtimeBuildConfig) { c.skipPlugins = true }
 }
 
+// withTrustPrompt asks about project trust with u before bootstrap. Like
+// upstream, only interactive startup prompts; other modes stay headless.
+func withTrustPrompt(u ui.UI) runtimeBuildOption {
+	return func(c *runtimeBuildConfig) { c.trustPrompt = u }
+}
+
 // buildRuntimeOptions creates RuntimeOptions with all shared state initialized.
 // cmd may be nil for commands that don't have conversation flags.
-func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, buildOpts ...runtimeBuildOption) (sdk.RuntimeOptions, *plugins.Manager, *artifacts.Loader, *commands.InMemoryRegistry, error) {
+func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, buildOpts ...runtimeBuildOption) (_ sdk.RuntimeOptions, _ *plugins.Manager, _ *artifacts.Loader, _ *commands.InMemoryRegistry, err error) {
+	var started *plugins.Manager
+	defer func() {
+		if err == nil || started == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), plugins.DefaultDrainTimeout)
+		defer cancel()
+		err = errors.Join(err, started.Shutdown(cleanupCtx))
+	}()
 	var cfg runtimeBuildConfig
 	for _, opt := range buildOpts {
 		opt(&cfg)
 	}
 
-	settings, err := loadSettingsWithUI(ctx, cmd, uiImpl)
+	reg := commands.NewInMemoryRegistry()
+	registerBuiltInCommands(reg)
+
+	cfgDir := configDir()
+	var (
+		pluginMgr *plugins.Manager
+		trustPass *pluginTrustPass
+		decide    func(context.Context, string) (*bool, error)
+	)
+	if !cfg.skipPlugins {
+		pluginMgr = plugins.NewManager(cfgDir, uiImpl, reg)
+		started = pluginMgr
+		if cmd != nil {
+			for _, extPath := range cmd.StringSlice("extension") {
+				if extPath != "" {
+					pluginMgr.AddExtensionPath(extPath)
+				}
+			}
+		}
+		if cmd == nil || !cmd.Bool("no-extensions") {
+			trustPass = &pluginTrustPass{mgr: pluginMgr}
+			decide = trustPass.decide
+		}
+	}
+
+	settings, err := loadSettingsWithUI(ctx, cmd, cfg.trustPrompt, decide)
 	if err != nil {
 		return sdk.RuntimeOptions{}, nil, nil, nil, err
 	}
@@ -473,13 +622,15 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 	if err := settings.ApplyHTTPProxySettings(); err != nil {
 		return sdk.RuntimeOptions{}, nil, nil, nil, err
 	}
-
-	reg := commands.NewInMemoryRegistry()
-	registerBuiltInCommands(reg)
+	installed, err := installConfiguredSources(ctx, settings)
+	if err != nil {
+		recordStartupDiagnostic(ctx, "package install error: %v", err)
+	}
+	if trustPass != nil {
+		trustPass.installed = len(installed) > 0
+	}
 
 	opts := sdk.RuntimeOptions{UI: uiImpl, CommandRegistry: reg}
-
-	cfgDir := configDir()
 	fb, err := openStore()
 	if err != nil {
 		return sdk.RuntimeOptions{}, nil, nil, nil, err
@@ -501,26 +652,11 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 		return sdk.RuntimeOptions{}, nil, nil, nil, fmt.Errorf("clean stale session owners: %w", err)
 	}
 
-	var pluginMgr *plugins.Manager
-	if !cfg.skipPlugins {
-		pluginMgr = plugins.NewManager(cfgDir, uiImpl, reg)
+	if pluginMgr != nil {
 		pluginMgr.SetSessionAccessor(session.NewSessionStoreAccessor(sessionStorage))
-		if settings != nil {
-			pluginMgr.SetSettings(settings)
-		}
-
-		if cmd != nil {
-			for _, extPath := range cmd.StringSlice("extension") {
-				if extPath != "" {
-					pluginMgr.AddExtensionPath(extPath)
-				}
-			}
-		}
-
-		// Honor --no-extensions: skip plugin discovery if the flag is set.
-		// Honor --extension: add additional paths to the plugin manager.
-		if cmd == nil || !cmd.Bool("no-extensions") {
-			if err := pluginMgr.Discover(ctx); err != nil {
+		pluginMgr.SetSettings(settings)
+		if trustPass != nil {
+			if err := trustPass.finish(ctx, settings); err != nil {
 				recordStartupDiagnostic(ctx, "plugin discovery error: %v", err)
 			}
 		}
@@ -582,9 +718,9 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 	return opts, pluginMgr, loader, reg, nil
 }
 
-func buildConversationRuntimeOptions(ctx context.Context, uiImpl ui.UI) (sdk.RuntimeOptions, *plugins.Manager, *artifacts.Loader, *commands.InMemoryRegistry, SessionFlags, error) {
+func buildConversationRuntimeOptions(ctx context.Context, uiImpl ui.UI, buildOpts ...runtimeBuildOption) (sdk.RuntimeOptions, *plugins.Manager, *artifacts.Loader, *commands.InMemoryRegistry, SessionFlags, error) {
 	cmd := rootCmdFromContext(ctx)
-	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, cmd)
+	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, cmd, buildOpts...)
 	if err != nil {
 		return sdk.RuntimeOptions{}, nil, nil, nil, SessionFlags{}, err
 	}
@@ -1233,6 +1369,11 @@ func runSetModel(ctx context.Context, cmd *cli.Command) error {
 
 	modelSpec := cmd.Args().First()
 	project := cmd.Bool("project")
+	if project {
+		if err := requireTrustedProject(ctx, cmd); err != nil {
+			return err
+		}
+	}
 
 	spec, err := ai.ParseModelSpec(modelSpec)
 	if err != nil {
@@ -1312,6 +1453,11 @@ func runInstall(ctx context.Context, cmd *cli.Command) error {
 	cfg.Yes = cmd.Bool("yes")
 	cfg.Force = cmd.Bool("force")
 	cfg.Pi = cmd.Bool("pi")
+	if cfg.Project {
+		if err := requireTrustedProject(ctx, cmd); err != nil {
+			return err
+		}
+	}
 
 	userDir, projectDir, err := packagesDirs()
 	if err != nil {
@@ -1367,11 +1513,20 @@ func runUninstall(ctx context.Context, cmd *cli.Command) error {
 	}
 	mgr := packages.NewManager(userDir, projectDir)
 
+	trusted, err := projectTrusted(ctx, cmd)
+	if err != nil {
+		return err
+	}
 	var scopesToCheck []packages.Scope
-	if scopeFlag != "" {
+	switch {
+	case scopeFlag == packages.ScopeProject && !trusted:
+		return errProjectUntrusted
+	case scopeFlag != "":
 		scopesToCheck = []packages.Scope{scopeFlag}
-	} else {
+	case trusted:
 		scopesToCheck = []packages.Scope{packages.ScopeProject, packages.ScopeUser}
+	default:
+		scopesToCheck = []packages.Scope{packages.ScopeUser}
 	}
 
 	// Check for existence and scope conflict before uninstalling
@@ -1445,6 +1600,9 @@ func runUninstall(ctx context.Context, cmd *cli.Command) error {
 func runUpdate(ctx context.Context, cmd *cli.Command) error {
 	scope := packages.ScopeUser
 	if cmd.Bool("project") {
+		if err := requireTrustedProject(ctx, cmd); err != nil {
+			return err
+		}
 		scope = packages.ScopeProject
 	}
 
@@ -2350,36 +2508,6 @@ func runSessionsExport(ctx context.Context, cmd *cli.Command) error {
 
 	if opts.Output != "" {
 		fmt.Fprintf(os.Stderr, "Exported session %.8s to %s\n", id, opts.Output)
-	}
-	return nil
-}
-
-// runSessionsShare handles the `tau sessions share` subcommand.
-func runSessionsShare(ctx context.Context, cmd *cli.Command) error {
-	if !cmd.Args().Present() {
-		return cli.Exit("usage: tau sessions share <id> [--public]", ExitUserError)
-	}
-	id := cmd.Args().First()
-
-	isPublic := cmd.Bool("public")
-
-	dir, err := sessionDirForCmd(cmd)
-	if err != nil {
-		return cli.Exit(err.Error(), ExitUserError)
-	}
-	sessCLI, err := session.NewCLI(dir)
-	if err != nil {
-		return cli.Exit(fmt.Sprintf("create sessions CLI: %v", err), ExitSubsystemError)
-	}
-
-	url, err := sessCLI.Share(ctx, id, isPublic)
-	if err != nil {
-		return cli.Exit(fmt.Sprintf("share session: %v", err), ExitSubsystemError)
-	}
-
-	fmt.Fprintf(os.Stderr, "Shared session %.8s: %s\n", id, url)
-	if isTTY() && copyToClipboard(url) {
-		fmt.Fprintln(os.Stderr, "(URL copied to clipboard)")
 	}
 	return nil
 }
@@ -3553,8 +3681,12 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 	}()
 
 	uiImpl := ui.NewNoOpUI()
+	var buildOpts []runtimeBuildOption
+	if isTTY() {
+		buildOpts = append(buildOpts, withTrustPrompt(ui.NewStdinUI()))
+	}
 
-	rtOpts, pluginMgr, loader, reg, sessionFlags, err := buildConversationRuntimeOptions(ctx, uiImpl)
+	rtOpts, pluginMgr, loader, reg, sessionFlags, err := buildConversationRuntimeOptions(ctx, uiImpl, buildOpts...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return ExitUserError
@@ -3672,6 +3804,13 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 				return fmt.Errorf("session storage unavailable")
 			}
 			return storage.Delete(id)
+		},
+		ImportSession: func(ctx context.Context, src, cwd string) (string, error) {
+			storage := rt.GetSessionStorage()
+			if storage == nil {
+				return "", fmt.Errorf("session storage unavailable")
+			}
+			return storage.Import(src, cwd)
 		},
 	})
 	if err != nil {
@@ -4506,16 +4645,7 @@ func discoverPluginCLIFlags(ctx context.Context, args []string) (owners map[stri
 	if err != nil {
 		return nil, err
 	}
-	settings, err := ai.LoadTrustedSettings(ctx, configDir(), cwd, home, ai.ProjectTrustOptions{Override: override})
-	if err != nil {
-		return nil, err
-	}
-	if err := settings.ApplyHTTPProxySettings(); err != nil {
-		return nil, err
-	}
-	cfgDir := configDir()
-	reg := commands.NewInMemoryRegistry()
-	mgr := plugins.NewManager(cfgDir, ui.NewNoOpUI(), reg)
+	mgr := plugins.NewManager(configDir(), ui.NewNoOpUI(), commands.NewInMemoryRegistry())
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), plugins.DefaultDrainTimeout)
 		defer cancel()
@@ -4524,13 +4654,18 @@ func discoverPluginCLIFlags(ctx context.Context, args []string) (owners map[stri
 			owners = nil
 		}
 	}()
-	if settings != nil {
-		mgr.SetSettings(settings)
-	}
 	for _, extPath := range extractExtensionPaths(args) {
 		mgr.AddExtensionPath(extPath)
 	}
-	if err := mgr.Discover(ctx); err != nil {
+	pass := &pluginTrustPass{mgr: mgr}
+	settings, err := loadTrustedSettingsCached(ctx, cwd, home, override, nil, pass.decide)
+	if err != nil {
+		return nil, err
+	}
+	if err := settings.ApplyHTTPProxySettings(); err != nil {
+		return nil, err
+	}
+	if err := pass.finish(ctx, settings); err != nil {
 		return nil, err
 	}
 

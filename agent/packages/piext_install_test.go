@@ -138,9 +138,9 @@ func TestPiLinkedResourcesKeepInstallationMetadataPrivate(t *testing.T) {
 	}
 }
 
-func TestLinkPiSourceRejectsFailedPreparation(t *testing.T) {
+func TestLinkSourceEntriesRejectsFailedPreparation(t *testing.T) {
 	t.Run("missing source", func(t *testing.T) {
-		require.ErrorContains(t, linkPiSource(t.Context(), filepath.Join(t.TempDir(), "missing"), t.TempDir()), "read linked pi source")
+		require.ErrorContains(t, linkSourceEntries(t.Context(), filepath.Join(t.TempDir(), "missing"), t.TempDir()), "read linked source")
 	})
 	t.Run("cancelled", func(t *testing.T) {
 		source := t.TempDir()
@@ -149,7 +149,7 @@ func TestLinkPiSourceRejectsFailedPreparation(t *testing.T) {
 		cause := errors.New("stop linking")
 		cancel(cause)
 		staged := t.TempDir()
-		require.ErrorIs(t, linkPiSource(ctx, source, staged), cause)
+		require.ErrorIs(t, linkSourceEntries(ctx, source, staged), cause)
 		require.NoFileExists(t, filepath.Join(staged, "entry"))
 	})
 	t.Run("invalid destination", func(t *testing.T) {
@@ -157,7 +157,7 @@ func TestLinkPiSourceRejectsFailedPreparation(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(source, "entry"), []byte("source"), 0o600))
 		staged := filepath.Join(t.TempDir(), "file")
 		require.NoError(t, os.WriteFile(staged, []byte("keep"), 0o600))
-		require.Error(t, linkPiSource(t.Context(), source, staged))
+		require.Error(t, linkSourceEntries(t.Context(), source, staged))
 		data, err := os.ReadFile(staged)
 		require.NoError(t, err)
 		require.Equal(t, "keep", string(data))

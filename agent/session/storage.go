@@ -136,6 +136,63 @@ func (s *Storage) latestResumableFrom(list func() ([]SessionSummary, error)) (st
 	return "", nil
 }
 
+// Import copies the session file at src into cwd's session directory and
+// returns its session ID. An existing file is never overwritten: the copy
+// takes the first free "<name>-N" suffix. A file already in storage is
+// returned as-is. Because sessions are addressed by ID, a file whose ID
+// already belongs to another stored session is refused.
+func (s *Storage) Import(src, cwd string) (id string, err error) {
+	src, err = filepath.Abs(src)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", src, err)
+	}
+	header, err := ReadHeader(src)
+	if err != nil {
+		return "", fmt.Errorf("read session %s: %w", src, err)
+	}
+	files, err := s.findSessionFiles("*.jsonl")
+	if err != nil {
+		return "", fmt.Errorf("search sessions: %w", err)
+	}
+	for _, path := range files {
+		if stored, err := ReadHeader(path); err == nil && stored.ID == header.ID {
+			if path == src {
+				return header.ID, nil
+			}
+			return "", fmt.Errorf("session %s is already stored at %s", header.ID, path)
+		}
+	}
+	dir := s.DirForCWD(cwd)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create session dir: %w", err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return "", fmt.Errorf("read session %s: %w", src, err)
+	}
+	dst := filepath.Join(dir, filepath.Base(src))
+	ext := filepath.Ext(dst)
+	name := strings.TrimSuffix(dst, ext)
+	for i := 1; ; i++ {
+		f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			dst = fmt.Sprintf("%s-%d%s", name, i, ext)
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("create %s: %w", dst, err)
+		}
+		_, err = f.Write(data)
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return "", fmt.Errorf("write %s: %w", dst, err)
+		}
+		return header.ID, nil
+	}
+}
+
 // Open opens an existing session for reading.
 func (s *Storage) Open(id string) (*Reader, error) {
 	path, err := s.resolveID(id)

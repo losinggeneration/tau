@@ -240,6 +240,15 @@ func (d *DialogPicker) SetOnChange(fn func(filter string)) {
 // the picker (Esc).
 func (d *DialogPicker) SetOnCancel(fn func()) { d.onCancel = fn }
 
+// Cancel runs the cancel handler as Esc does and reports whether one is set.
+func (d *DialogPicker) Cancel() bool {
+	if d.onCancel == nil {
+		return false
+	}
+	d.onCancel()
+	return true
+}
+
 // SetComponent installs a custom component to host inside the
 // picker. When non-nil, the picker delegates body rendering and
 // input forwarding to the component instead of using its default

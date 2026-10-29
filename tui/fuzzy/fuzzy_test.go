@@ -130,3 +130,14 @@ func assertStrings(t *testing.T, got, want []string) {
 		}
 	}
 }
+
+func TestFilterRanksExactMatchFirstAndSplitsSlashTokens(t *testing.T) {
+	id := func(s string) string { return s }
+	if got := Filter([]string{"clone", "cl"}, "cl", id); len(got) != 2 || got[0] != "cl" {
+		t.Fatalf("exact match not first: %v", got)
+	}
+	models := []string{"openai/gpt-5.2", "anthropic/claude-opus-4-6"}
+	if got := Filter(models, "opus/anthropic", id); len(got) != 1 || got[0] != "anthropic/claude-opus-4-6" {
+		t.Fatalf("reordered provider/model query: %v", got)
+	}
+}

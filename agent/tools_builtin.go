@@ -17,6 +17,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/pmezard/go-difflib/difflib"
+
 	"github.com/losinggeneration/tau/agent/fmqueue"
 	"github.com/losinggeneration/tau/ai"
 )
@@ -1906,44 +1908,28 @@ func generateDiffString(oldContent, newContent string) (string, int) {
 	}
 	lineNumWidth := len(fmt.Sprintf("%d", maxLineNum))
 
-	lcs := make([][]int, len(oldLines)+1)
-	for i := range lcs {
-		lcs[i] = make([]int, len(newLines)+1)
-	}
-	for i := len(oldLines) - 1; i >= 0; i-- {
-		for j := len(newLines) - 1; j >= 0; j-- {
-			if oldLines[i] == newLines[j] {
-				lcs[i][j] = lcs[i+1][j+1] + 1
-				continue
-			}
-			lcs[i][j] = max(lcs[i+1][j], lcs[i][j+1])
-		}
-	}
-
+	// difflib's matcher works in memory linear in the line counts; a full LCS
+	// table is quadratic and runs to gigabytes on a large source file.
 	var output []string
 	firstChangedLine := -1
-	i, j := 0, 0
-	for i < len(oldLines) || j < len(newLines) {
-		switch {
-		case i < len(oldLines) && j < len(newLines) && oldLines[i] == newLines[j]:
-			lineNum := fmt.Sprintf("%*d", lineNumWidth, j+1)
-			output = append(output, fmt.Sprintf(" %s %s", lineNum, oldLines[i]))
-			i++
-			j++
-		case j < len(newLines) && (i == len(oldLines) || lcs[i][j+1] >= lcs[i+1][j]):
-			if firstChangedLine == -1 {
-				firstChangedLine = j + 1
+	line := func(sign byte, num int, text string) {
+		output = append(output, fmt.Sprintf("%c%*d %s", sign, lineNumWidth, num, text))
+	}
+	for _, op := range difflib.NewMatcher(oldLines, newLines).GetOpCodes() {
+		if op.Tag == 'e' {
+			for k := range op.J2 - op.J1 {
+				line(' ', op.J1+k+1, newLines[op.J1+k])
 			}
-			lineNum := fmt.Sprintf("%*d", lineNumWidth, j+1)
-			output = append(output, fmt.Sprintf("+%s %s", lineNum, newLines[j]))
-			j++
-		case i < len(oldLines):
-			if firstChangedLine == -1 {
-				firstChangedLine = j + 1
-			}
-			lineNum := fmt.Sprintf("%*d", lineNumWidth, i+1)
-			output = append(output, fmt.Sprintf("-%s %s", lineNum, oldLines[i]))
-			i++
+			continue
+		}
+		if firstChangedLine == -1 {
+			firstChangedLine = op.J1 + 1
+		}
+		for i := op.I1; i < op.I2; i++ {
+			line('-', i+1, oldLines[i])
+		}
+		for j := op.J1; j < op.J2; j++ {
+			line('+', j+1, newLines[j])
 		}
 	}
 

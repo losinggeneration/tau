@@ -27,27 +27,37 @@ import (
 //   - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
 //   - Ollama: Some deployments truncate silently, others return errors like "prompt too long; exceeded max context length by X tokens"
 var overflowPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`prompt is too long`),                                  // Anthropic token overflow
-	regexp.MustCompile(`request_too_large`),                                   // Anthropic request byte-size overflow (HTTP 413)
-	regexp.MustCompile(`input is too long for requested model`),               // Amazon Bedrock
-	regexp.MustCompile(`exceeds the context window`),                          // OpenAI (Completions & Responses API)
-	regexp.MustCompile(`input token count.*exceeds the maximum`),              // Google (Gemini)
-	regexp.MustCompile(`maximum prompt length is \d+`),                        // xAI (Grok)
-	regexp.MustCompile(`reduce the length of the messages`),                   // Groq
-	regexp.MustCompile(`maximum context length is \d+ tokens`),                // OpenRouter (all backends)
-	regexp.MustCompile(`exceeds the limit of \d+`),                            // GitHub Copilot
-	regexp.MustCompile(`exceeds the available context size`),                  // llama.cpp server
-	regexp.MustCompile(`greater than the context length`),                     // LM Studio
-	regexp.MustCompile(`context window exceeds limit`),                        // MiniMax
-	regexp.MustCompile(`exceeded model token limit`),                          // Kimi For Coding
-	regexp.MustCompile(`too large for model with \d+ maximum context length`), // Mistral
-	regexp.MustCompile(`model_context_window_exceeded`),                       // z.ai non-standard finish_reason surfaced as error text
-	regexp.MustCompile(`prompt too long; exceeded (?:max )?context length`),   // Ollama explicit overflow error
-	regexp.MustCompile(`context[ _]length[ _]exceeded`),                       // Generic fallback
-	regexp.MustCompile(`too many tokens`),                                     // Generic fallback
-	regexp.MustCompile(`token limit exceeded`),                                // Generic fallback
-	regexp.MustCompile(`^4(?:00|13)\s*(?:status code)?\s*\(no body\)`),        // Cerebras: 400/413 with no body
+	regexp.MustCompile(`(?i)prompt (?:is )?too long`),                                                                   // Anthropic and z.ai token overflow
+	regexp.MustCompile(`(?i)prompt exceeds max length`),                                                                 // z.ai CN endpoint token overflow
+	regexp.MustCompile(`(?i)request_too_large`),                                                                         // Anthropic request byte-size overflow (HTTP 413)
+	regexp.MustCompile(`(?i)input is too long for requested model`),                                                     // Amazon Bedrock
+	regexp.MustCompile(`(?i)exceeds the context window`),                                                                // OpenAI (Completions & Responses API)
+	regexp.MustCompile(`(?i)exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))`), // OpenAI-compatible proxies (LiteLLM)
+	regexp.MustCompile(`(?i)input token count.*exceeds the maximum`),                                                    // Google (Gemini)
+	regexp.MustCompile(`(?i)maximum prompt length is \d+`),                                                              // xAI (Grok)
+	regexp.MustCompile(`(?i)reduce the length of the messages`),                                                         // Groq
+	regexp.MustCompile(`(?i)maximum context length is \d+ tokens`),                                                      // OpenRouter (most backends)
+	regexp.MustCompile(`(?i)exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?`),                           // OpenRouter/Poolside
+	regexp.MustCompile(`(?i)input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)`),            // Together AI
+	regexp.MustCompile(`(?i)exceeds the limit of \d+`),                                                                  // GitHub Copilot
+	regexp.MustCompile(`(?i)exceeds the available context size`),                                                        // llama.cpp server
+	regexp.MustCompile(`(?i)greater than the context length`),                                                           // LM Studio
+	regexp.MustCompile(`(?i)context window exceeds limit`),                                                              // MiniMax
+	regexp.MustCompile(`(?i)exceeded model token limit`),                                                                // Kimi For Coding
+	regexp.MustCompile(`(?i)too large for model with \d+ maximum context length`),                                       // Mistral
+	regexp.MustCompile(`(?i)prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?`),              // DS4 server
+	regexp.MustCompile(`(?i)model_context_window_exceeded`),                                                             // z.ai non-standard finish_reason surfaced as error text
+	regexp.MustCompile(`(?i)prompt too long; exceeded (?:max )?context length`),                                         // Ollama explicit overflow error
+	regexp.MustCompile(`(?i)range of input length should be`),                                                           // DashScope / Qwen Token Plan
+	regexp.MustCompile(`(?i)context[_ ]length[_ ]exceeded`),                                                             // Generic fallback
+	regexp.MustCompile(`(?i)too many tokens`),                                                                           // Generic fallback
+	regexp.MustCompile(`(?i)token limit exceeded`),                                                                      // Generic fallback
 }
+
+// cerebrasBodylessOverflow matches Cerebras's 400/413 with no body. Other
+// providers return bodyless 4xx for unrelated failures, so it only counts
+// for Cerebras.
+var cerebrasBodylessOverflow = regexp.MustCompile(`(?i)^4(?:00|13)\s*(?:status code)?\s*\(no body\)`)
 
 // Non-overflow patterns - error messages matching these are excluded
 // from overflow detection even if they also match an overflow pattern.
@@ -56,9 +66,9 @@ var overflowPatterns = []*regexp.Regexp{
 // please wait before trying again." which would match the "too many tokens" overflow
 // pattern without this exclusion.
 var nonOverflowPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`^(Throttling error|Service unavailable):`), // AWS Bedrock non-overflow errors
-	regexp.MustCompile(`rate limit`),                               // Generic rate limiting
-	regexp.MustCompile(`too many requests`),                        // Generic HTTP 429 style
+	regexp.MustCompile(`(?i)^(Throttling error|Service unavailable):`), // AWS Bedrock non-overflow errors
+	regexp.MustCompile(`(?i)rate limit`),                               // Generic rate limiting
+	regexp.MustCompile(`(?i)too many requests`),                        // Generic HTTP 429 style
 }
 
 // OverflowUsage represents token usage information for overflow detection.
@@ -97,7 +107,7 @@ type OverflowUsage struct {
 //   - Ollama: May truncate input silently for some setups, but may also return explicit
 //     overflow errors that match the patterns above. Silent truncation still cannot be
 //     detected here because we do not know the expected token count.
-func IsContextOverflow(stopReason, errorMessage string, usage OverflowUsage, contextWindow int) bool {
+func IsContextOverflow(provider, stopReason, errorMessage string, usage OverflowUsage, contextWindow int) bool {
 	// Case 1: Check error message patterns
 	if stopReason == "error" && errorMessage != "" {
 		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
@@ -116,6 +126,9 @@ func IsContextOverflow(stopReason, errorMessage string, usage OverflowUsage, con
 				if pattern.MatchString(errorMessage) {
 					return true
 				}
+			}
+			if provider == ProviderCerebras && cerebrasBodylessOverflow.MatchString(errorMessage) {
+				return true
 			}
 		}
 	}

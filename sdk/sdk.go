@@ -441,9 +441,10 @@ type Forgetter interface {
 	Forget(entryID string) error
 }
 
-// HTMLExporter exports a session as an HTML file.
-type HTMLExporter interface {
+// Exporter writes a session to an HTML or JSONL file and returns its path.
+type Exporter interface {
 	ExportHTML(ctx context.Context, path string) (string, error)
+	ExportJSONL(ctx context.Context, path string) (string, error)
 }
 
 // Namer exposes the current session display name.
@@ -711,9 +712,6 @@ type Runtime interface {
 	// TelemetryEnabled returns whether telemetry reporting is enabled.
 	// Uses RuntimeOptions.Telemetry if set, otherwise falls back to TAU_TELEMETRY env var.
 	TelemetryEnabled() bool
-	// ShareViewerURL returns the share viewer URL override from TAU_SHARE_VIEWER_URL.
-	// Returns empty string if not set (defaults to https://pi.dev/session/).
-	ShareViewerURL() string
 	// PluginManager returns the plugin manager, or nil if not configured.
 	PluginManager() *plugins.Manager
 	// GetSessionStorage returns the session storage for direct access.
@@ -736,7 +734,7 @@ var (
 	_ ForkMessageLister             = (*agentSession)(nil)
 	_ ForkEntryLister               = (*agentSession)(nil)
 	_ Forgetter                     = (*agentSession)(nil)
-	_ HTMLExporter                  = (*agentSession)(nil)
+	_ Exporter                      = (*agentSession)(nil)
 	_ Namer                         = (*agentSession)(nil)
 	_ LastAssistantTexter           = (*agentSession)(nil)
 	_ Statser                       = (*agentSession)(nil)
@@ -1502,7 +1500,7 @@ func (s *agentSession) recoverFromOverflow(ctx context.Context, message *agent.M
 	}
 	stop := string(message.StopReason)
 	usage := ai.OverflowUsage{Input: message.Usage.Input, Output: message.Usage.Output, CacheHit: message.Usage.CacheRead}
-	overflow := ai.IsContextOverflow(stop, message.ErrorMessage, usage, model.ContextWindow)
+	overflow := ai.IsContextOverflow(message.Provider, stop, message.ErrorMessage, usage, model.ContextWindow)
 	if !overflow && !ai.IsRecoverableLength(stop, message.Usage.Output, model.MaxTokens) {
 		return false
 	}
@@ -3804,14 +3802,7 @@ func forkEntryText(blocks []ai.ContentBlock) string {
 }
 
 func (s *agentSession) ExportHTML(_ context.Context, path string) (string, error) {
-	s.mu.Lock()
-	writer := s.sessionWriter
-	s.mu.Unlock()
-	if writer == nil {
-		return "", fmt.Errorf("session is not persisted")
-	}
-	writerPath := writer.Path()
-	reader, err := sessionpkg.ReadFile(writerPath)
+	reader, err := s.exportReader()
 	if err != nil {
 		return "", err
 	}
@@ -3820,12 +3811,48 @@ func (s *agentSession) ExportHTML(_ context.Context, path string) (string, error
 		return "", err
 	}
 	if path == "" {
-		path = strings.TrimSuffix(writerPath, filepath.Ext(writerPath)) + ".html"
+		path = "tau-session-" + strings.TrimSuffix(filepath.Base(reader.Path()), ".jsonl") + ".html"
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+// ExportJSONL writes the header and active branch to path, defaulting to a
+// timestamped file in the working directory.
+func (s *agentSession) ExportJSONL(_ context.Context, path string) (string, error) {
+	reader, err := s.exportReader()
+	if err != nil {
+		return "", err
+	}
+	data, err := reader.BranchJSONL()
+	if err != nil {
+		return "", err
+	}
+	if path == "" {
+		path = "session-" + strings.NewReplacer(":", "-", ".", "-").Replace(time.Now().UTC().Format("2006-01-02T15:04:05.000Z")) + ".jsonl"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (s *agentSession) exportReader() (*sessionpkg.Reader, error) {
+	s.mu.Lock()
+	writer, pending := s.sessionWriter, s.pendingHeader != nil
+	s.mu.Unlock()
+	if pending && writer == nil {
+		return nil, errors.New("nothing to export yet - start a conversation first")
+	}
+	if writer == nil {
+		return nil, errors.New("cannot export an in-memory session")
+	}
+	return sessionpkg.ReadFile(writer.Path())
 }
 
 func (s *agentSession) GetLastAssistantText() string { return s.getLastAssistantText() }
@@ -6928,12 +6955,6 @@ func (r *runtime) TelemetryEnabled() bool {
 		return *r.telemetry
 	}
 	return ai.TelemetryEnabled()
-}
-
-// ShareViewerURL returns the share viewer URL override from TAU_SHARE_VIEWER_URL.
-// Returns empty string if not set (defaults to https://pi.dev/session/).
-func (r *runtime) ShareViewerURL() string {
-	return ai.ShareViewerURL()
 }
 
 // PluginManager returns the plugin manager.

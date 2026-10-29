@@ -285,13 +285,6 @@ var sessionsCmd = &cli.Command{
 			Flags:     SessionsExportFlags,
 			Action:    runSessionsExport,
 		},
-		{
-			Name:      "share",
-			Usage:     "Share a session",
-			ArgsUsage: "<id>",
-			Flags:     SessionsShareFlags,
-			Action:    runSessionsShare,
-		},
 	},
 }
 

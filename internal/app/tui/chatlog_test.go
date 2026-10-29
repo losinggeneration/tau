@@ -15,6 +15,7 @@ import (
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/widgets"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2235,7 +2236,7 @@ func chatLogJoinedRows(t *testing.T, log *ChatLog) string {
 	t.Helper()
 	log.mu.Lock()
 	defer log.mu.Unlock()
-	return strings.Join(renderLineTexts(log.lines), "\n")
+	return tauui.StripANSI(strings.Join(renderLineTexts(log.lines), "\n"))
 }
 
 // TestChatLogUserMessageClickTogglesExpansion verifies that clicking a
@@ -2981,6 +2982,52 @@ func TestChatMarkdownThemeReachesAssistantUserAndStreamingFences(t *testing.T) {
 					require.True(t, found)
 				})
 			}
+		})
+	}
+}
+
+func TestChatSyntaxTokensColorFencesAndWritePreview(t *testing.T) {
+	for _, kind := range []string{"fence", "streaming", "write"} {
+		t.Run(kind, func(t *testing.T) {
+			conv := NewConversationModel()
+			switch kind {
+			case "fence":
+				conv.AddAssistantMessage("```go\nfunc main() { return 42 }\n```")
+			case "streaming":
+				conv.BeginAssistantMessage()
+				conv.AppendAssistantText("```go\nfunc main() { return 42 }")
+			case "write":
+				conv.AddToolCallWithID("call-1", "write", `{"path":"main.go","content":"func main() { return 42 }"}`)
+				conv.AddToolResultWithName("call-1", "write", "ok", false)
+			}
+			log := newTestChatLog(t, conv)
+			log.Layout(tauui.Rect{W: 60, H: 12})
+			log.setThemeDefinition("custom", ThemeDefinition{Values: map[string]string{"syntaxKeyword": "#112233", "syntaxNumber": "#445566", "syntaxFunction": "#778899"}})
+			waitForChatLog(t, log)
+			buf := tauui.NewBuffer(60, 12)
+			base := tauui.Style{}
+			log.Paint(tauui.NewDrawer(tauui.NewPainter(tauui.NewRenderPainter(buf, tauui.Rect{W: 60, H: 12}, base), base)), &tauui.Ctx{Theme: appTheme()})
+			var screen strings.Builder
+			want := map[string]string{"func": "#112233", "main": "#778899", "42": "#445566"}
+			found := map[string]bool{}
+			for y := range 12 {
+				var row strings.Builder
+				for x := range 60 {
+					row.WriteRune(buf.At(x, y).R)
+				}
+				screen.WriteString(row.String() + "\n")
+				for word, color := range want {
+					x := strings.Index(row.String(), word+map[string]string{"func": " ", "main": "(", "42": " }"}[word])
+					if x < 0 || found[word] {
+						continue
+					}
+					expected, ok := parseThemeColor(color)
+					require.True(t, ok)
+					assert.Equal(t, expected, buf.At(x, y).Style.FG, "%s color", word)
+					found[word] = true
+				}
+			}
+			assert.Len(t, found, len(want), "words found: %v\n%s", found, screen.String())
 		})
 	}
 }

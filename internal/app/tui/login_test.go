@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,4 +363,254 @@ func TestNativeLoginCredentialCommandsCancelPendingAuthentication(t *testing.T) 
 			}
 		})
 	}
+}
+
+// onFocusedDialog waits until the dialog is shown and focused, so keys sent
+// from fn reach the picker rather than the editor.
+func onFocusedDialog(t *testing.T, a *App, title string, fn func(*tauui.UpdateCtx)) {
+	t.Helper()
+	var check func(*tauui.UpdateCtx)
+	check = func(u *tauui.UpdateCtx) {
+		if a.dialogPicker.Shown() && a.dialogPicker.Header() == title && a.app.FocusedID() == a.dialogPicker.ID() {
+			fn(u)
+			return
+		}
+		if err := a.app.Post(check); err != nil {
+			t.Errorf("wait for dialog: %v", err)
+		}
+	}
+	require.NoError(t, a.app.Post(check))
+}
+
+func TestLoginSelectsMethodProviderAndSavesAPIKey(t *testing.T) {
+	a, be := nativeDialogApp(t)
+	credentials := appCredentialStore(t)
+	a.authStore = credentials
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	typeText := func(text string) {
+		for _, r := range text {
+			be.SendEvent(tauui.KeyEvent{Key: tauui.KeyRune, Rune: r})
+		}
+	}
+	names := func() []string {
+		var out []string
+		for _, item := range a.dialogPicker.Items() {
+			out = append(out, item.Name)
+		}
+		return out
+	}
+	require.NoError(t, a.app.Post(func(*tauui.UpdateCtx) { cmdLogin(a, "") }))
+	onFocusedDialog(t, a, "Select authentication method:", func(*tauui.UpdateCtx) {
+		assert.Equal(t, []string{loginAccountLabel, loginAPIKeyLabel}, names())
+		typeText("api")
+		be.SendEvent(tauui.KeyEvent{Key: tauui.KeyEnter})
+		onFocusedDialog(t, a, "Select provider:", func(*tauui.UpdateCtx) {
+			assert.Contains(t, names(), ai.ProviderMistral)
+			assert.NotContains(t, names(), "GitHub Copilot", "account providers listed for API-key sign-in")
+			assert.NotContains(t, names(), ai.ProviderClaudeAgent, "no-credential provider listed")
+			typeText("mistral")
+			be.SendEvent(tauui.KeyEvent{Key: tauui.KeyEnter})
+			onFocusedDialog(t, a, "Enter API key for mistral", func(*tauui.UpdateCtx) {
+				assert.Equal(t, "auth", a.programStatus.current().Kind)
+				typeText("sk-mistral")
+				be.SendEvent(tauui.KeyEvent{Key: tauui.KeyEnter})
+				var finished func(*tauui.UpdateCtx)
+				finished = func(*tauui.UpdateCtx) {
+					if a.dialogPicker.Shown() {
+						require.NoError(t, a.app.Post(finished))
+						return
+					}
+					a.app.Quit()
+				}
+				require.NoError(t, a.app.Post(finished))
+			})
+		})
+	})
+	require.NoError(t, a.Run(ctx))
+	cred, err := credentials.Get(t.Context(), ai.ProviderMistral)
+	require.NoError(t, err)
+	assert.Equal(t, "sk-mistral", cred.APIKey)
+	assert.Contains(t, a.conv.Messages()[len(a.conv.Messages())-1].Text, "Saved API key for mistral")
+}
+
+func TestLoginReferenceMatchesLikeUpstream(t *testing.T) {
+	for _, tc := range []struct{ ref, header, filter string }{
+		{ref: "ANTHROPIC", header: "Select authentication method for Anthropic (Claude Pro/Max):"},
+		{ref: "openai", header: "Enter API key for openai"},
+		{ref: "nonexistent", header: "Select provider:", filter: "nonexistent"},
+	} {
+		t.Run(tc.ref, func(t *testing.T) {
+			a, _ := nativeDialogApp(t)
+			a.authStore = appCredentialStore(t)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			require.NoError(t, a.app.Post(func(*tauui.UpdateCtx) { cmdLogin(a, tc.ref) }))
+			onFocusedDialog(t, a, tc.header, func(*tauui.UpdateCtx) {
+				assert.Equal(t, tc.filter, a.dialogPicker.Filter())
+				a.app.Quit()
+			})
+			require.NoError(t, a.Run(ctx))
+		})
+	}
+}
+
+func TestLoginCancelReturnsToPreviousStep(t *testing.T) {
+	a, be := nativeDialogApp(t)
+	a.authStore = appCredentialStore(t)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	require.NoError(t, a.app.Post(func(*tauui.UpdateCtx) { cmdLogin(a, "") }))
+	onFocusedDialog(t, a, "Select authentication method:", func(*tauui.UpdateCtx) {
+		be.SendEvent(tauui.KeyEvent{Key: tauui.KeyEnter})
+		onFocusedDialog(t, a, "Select provider:", func(*tauui.UpdateCtx) {
+			be.SendEvent(tauui.KeyEvent{Key: tauui.KeyEsc})
+			onFocusedDialog(t, a, "Select authentication method:", func(*tauui.UpdateCtx) {
+				be.SendEvent(tauui.KeyEvent{Key: tauui.KeyEsc})
+				var closed func(*tauui.UpdateCtx)
+				closed = func(*tauui.UpdateCtx) {
+					if a.dialogPicker.Shown() {
+						require.NoError(t, a.app.Post(closed))
+						return
+					}
+					a.app.Quit()
+				}
+				require.NoError(t, a.app.Post(closed))
+			})
+		})
+	})
+	require.NoError(t, a.Run(ctx))
+}
+
+func TestOAuthDialogOpensBrowserAndCopiesURL(t *testing.T) {
+	a, be := nativeDialogApp(t)
+	a.authStore = appCredentialStore(t)
+	const url = "https://example.com/auth?state=copy"
+	var opened, copied []string
+	a.openURL = func(u string) error { opened = append(opened, u); return nil }
+	a.clipboardWrite = func(text string, done func(error)) { copied = append(copied, text); done(nil) }
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	p := nativeLoginProvider{login: func(ctx context.Context, c oauth.LoginCallbacks) (*oauth.Credentials, error) {
+		c.OnAuth(url, "")
+		_, err := c.OnPrompt(ctx, "Paste the code", "")
+		return nil, err
+	}}
+	require.NoError(t, a.app.Post(func(*tauui.UpdateCtx) { a.startOAuthLogin(p) }))
+	var ready func(*tauui.UpdateCtx)
+	ready = func(*tauui.UpdateCtx) {
+		if a.loginDialog == nil || a.loginDialog.input == nil {
+			require.NoError(t, a.app.Post(ready))
+			return
+		}
+		assert.Equal(t, []string{url}, opened)
+		assert.Contains(t, a.loginDialog.Render(80), "Ctrl+click to open • ctrl+x to copy")
+		be.SendEvent(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'x', Mod: tauui.ModCtrl})
+		var check func(*tauui.UpdateCtx)
+		check = func(*tauui.UpdateCtx) {
+			if len(copied) == 0 {
+				require.NoError(t, a.app.Post(check))
+				return
+			}
+			assert.Equal(t, []string{url}, copied)
+			assert.Contains(t, a.loginDialog.Render(80), "Ctrl+click to open • Copied URL to clipboard")
+			assert.Empty(t, a.loginDialog.input.Value, "copy key must not reach the prompt input")
+			a.app.Quit()
+		}
+		require.NoError(t, a.app.Post(check))
+	}
+	require.NoError(t, a.app.Post(ready))
+	require.NoError(t, a.Run(ctx))
+}
+
+func TestMessageCopyKeyCopiesLastReply(t *testing.T) {
+	app := newTestApp(t)
+	app.conv.AddUserMessage("question")
+	app.conv.AddAssistantMessage("the answer")
+	var copied string
+	app.loopMu.Lock()
+	app.loopCtx = &tauui.Ctx{ClipboardWrite: func(s string) { copied = s }}
+	app.loopMu.Unlock()
+	act, ok := appKeymap{app: app, manager: app.keybindings}.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyRune, Rune: 'x', Mod: tauui.ModCtrl})
+	require.True(t, ok)
+	require.Equal(t, AppActionMessageCopy, act)
+	assert.True(t, (&Root{app: app}).HandleAction(act, app.loopContext()))
+	assert.Equal(t, "the answer", copied)
+}
+
+func TestLoginSelectsProviderDefaultWhenModelUnknown(t *testing.T) {
+	const label = "Saved API key for mistral"
+	use := " Use /model to select a model."
+	for _, tc := range []struct {
+		name, current, provider string
+		refs                    []string
+		defaultID               string
+		setErr                  error
+		wantSet                 []string
+		wantSystem, wantError   string
+	}{
+		{name: "selects default", provider: ai.ProviderMistral, refs: []string{ai.ProviderMistral}, wantSet: []string{"mistral/devstral-medium-latest"}, wantSystem: label + ". Selected devstral-medium-latest"},
+		{name: "known model kept", current: "openai/gpt-5.5", provider: ai.ProviderMistral, refs: []string{ai.ProviderMistral}, wantSystem: label},
+		{name: "no default", provider: "tau-test", wantSystem: label, wantError: label + `, but no default model is configured for provider "tau-test".` + use},
+		{name: "no models", provider: ai.ProviderMistral, wantSystem: label, wantError: label + ", but no models are available for that provider." + use},
+		{name: "default missing", provider: ai.ProviderMistral, refs: []string{ai.ProviderMistral}, defaultID: "gone", wantSystem: label, wantError: label + `, but its default model "gone" is not available.` + use},
+		{name: "radius falls back to its first model", provider: "radius", refs: []string{"radius"}, defaultID: "gone", wantSet: []string{firstModel(t, "radius")}, wantSystem: label + ". Selected " + strings.TrimPrefix(firstModel(t, "radius"), "radius/")},
+		{name: "set fails", provider: ai.ProviderMistral, refs: []string{ai.ProviderMistral}, setErr: errors.New("boom"), wantSystem: label, wantError: label + ", but selecting its default model failed: boom." + use},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.defaultID != "" {
+				old := ai.DefaultModelPerProvider[tc.provider]
+				ai.DefaultModelPerProvider[tc.provider] = tc.defaultID
+				t.Cleanup(func() { ai.DefaultModelPerProvider[tc.provider] = old })
+			}
+			a := newTestApp(t)
+			sess := &fakeSession{setModelErr: tc.setErr}
+			a.sess = sess
+			a.currentModel = tc.current
+			a.settingsPath = filepath.Join(t.TempDir(), "settings.json")
+			var refs []ai.CredentialRef
+			for _, p := range tc.refs {
+				refs = append(refs, ai.CredentialRef{Provider: p, Type: ai.CredentialTypeAPIKey})
+			}
+			a.credentialStore = fakeCredentialLister{refs: refs}
+
+			a.completeProviderLogin(tc.provider, label)
+
+			assert.Equal(t, tc.wantSet, sess.setModels)
+			var system, errs []string
+			for _, m := range a.conv.Messages() {
+				switch m.Role {
+				case RoleSystem:
+					system = append(system, m.Text)
+				case RoleError:
+					errs = append(errs, m.Text)
+				}
+			}
+			assert.Equal(t, []string{tc.wantSystem}, system)
+			if tc.wantError == "" {
+				assert.Empty(t, errs)
+			} else {
+				assert.Equal(t, []string{tc.wantError}, errs)
+			}
+			if tc.wantSet != nil {
+				assert.Equal(t, tc.wantSet[0], a.currentModel)
+				data, err := os.ReadFile(a.settingsPath)
+				require.NoError(t, err)
+				assert.Contains(t, string(data), `"defaultModel": "`+strings.TrimPrefix(tc.wantSet[0], tc.provider+"/")+`"`)
+			}
+		})
+	}
+}
+
+func firstModel(t *testing.T, provider string) string {
+	t.Helper()
+	a := newTestApp(t)
+	a.credentialStore = fakeCredentialLister{refs: []ai.CredentialRef{{Provider: provider, Type: ai.CredentialTypeAPIKey}}}
+	for _, m := range a.availableModels() {
+		if m.Provider == provider {
+			return m.Provider + "/" + m.ID
+		}
+	}
+	t.Fatalf("no %s models", provider)
+	return ""
 }

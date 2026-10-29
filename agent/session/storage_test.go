@@ -656,3 +656,47 @@ func TestRecursiveSessionDiscoveryReportsMissingRoot(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 	require.ErrorIs(t, storage.CleanupStaleOwners(), os.ErrNotExist)
 }
+
+func TestStorageImportCopiesWithoutOverwriting(t *testing.T) {
+	storage, err := NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	writeSession := func(dir, name string) (Header, string) {
+		header := NewHeader("/work", nil, nil)
+		data, err := json.Marshal(header)
+		require.NoError(t, err)
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, append(data, '\n'), 0o600))
+		return header, path
+	}
+	first, firstSrc := writeSession(t.TempDir(), "shared.jsonl")
+	second, secondSrc := writeSession(t.TempDir(), "shared.jsonl")
+	dir := storage.DirForCWD("/work")
+
+	id, err := storage.Import(firstSrc, "/work")
+	require.NoError(t, err)
+	require.Equal(t, first.ID, id)
+	id, err = storage.Import(secondSrc, "/work")
+	require.NoError(t, err)
+	require.Equal(t, second.ID, id)
+	require.FileExists(t, filepath.Join(dir, "shared.jsonl"))
+	require.FileExists(t, filepath.Join(dir, "shared-1.jsonl"), "a same-named file must not be overwritten")
+	reader, err := storage.Open(second.ID)
+	require.NoError(t, err)
+	require.Equal(t, second.ID, reader.Header().ID)
+
+	id, err = storage.Import(filepath.Join(dir, "shared.jsonl"), "/work")
+	require.NoError(t, err)
+	require.Equal(t, first.ID, id, "a stored file is reused, not copied")
+	_, err = storage.Import(firstSrc, "/work")
+	require.ErrorContains(t, err, "already stored", "a duplicate ID would make both copies unreachable")
+
+	_, err = storage.Import(filepath.Join(t.TempDir(), "missing.jsonl"), "/work")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	bad := filepath.Join(t.TempDir(), "bad.jsonl")
+	require.NoError(t, os.WriteFile(bad, []byte("not json\n"), 0o600))
+	_, err = storage.Import(bad, "/work")
+	require.Error(t, err)
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+}

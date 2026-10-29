@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -712,7 +713,7 @@ func chatLogRenderRow(row string, width int) string {
 		return ""
 	}
 	row = expandChatLogTabs(row)
-	row = tauui.TextTruncate(row, width, false)
+	row = tauui.Truncate(row, width, false)
 	rowWidth := tauui.TextWidth(row)
 	if rowWidth >= width {
 		return row
@@ -2499,20 +2500,20 @@ func (c *ChatLog) renderAssistantText(ctx context.Context, body string, streamin
 
 	lines := []renderLine{{text: " ", st: c.pal().spacer}}
 	blocks := groupAssistantMarkdownBlocks(strings.Split(body, "\n"))
-	inFence := false
+	var fence chatFence
 	tailByte := 0
 	// Every block but the last is committed; the last block is the streaming
 	// tail later deltas re-render in place.
 	for _, block := range blocks[:len(blocks)-1] {
-		lines = c.appendAssistantMarkdownBlock(ctx, lines, block, width, c.pal().assistant, &inFence)
+		lines = c.appendAssistantMarkdownBlock(ctx, lines, block, width, c.pal().assistant, &fence)
 		tailByte += len(block) + 1 // include the newline separator
 	}
 	tailStart := len(lines)
-	lines = c.appendAssistantMarkdownBlock(ctx, lines, blocks[len(blocks)-1], width, c.pal().assistant, &inFence)
+	lines = c.appendAssistantMarkdownBlock(ctx, lines, blocks[len(blocks)-1], width, c.pal().assistant, &fence)
 	return lines, tailStart, tailByte
 }
 
-func (c *ChatLog) renderAssistantTextTail(ctx context.Context, body string, streaming bool, width int, initialInFence bool) ([]renderLine, int, int) {
+func (c *ChatLog) renderAssistantTextTail(ctx context.Context, body string, streaming bool, width int, fence chatFence) ([]renderLine, int, int) {
 	body = strings.TrimRight(body, "\n")
 	if body == "" {
 		if streaming {
@@ -2524,32 +2525,46 @@ func (c *ChatLog) renderAssistantTextTail(ctx context.Context, body string, stre
 
 	blocks := groupAssistantMarkdownBlocks(strings.Split(body, "\n"))
 	var lines []renderLine
-	inFence := initialInFence
 	tailByte := 0
 	for _, block := range blocks[:len(blocks)-1] {
-		lines = c.appendAssistantMarkdownBlock(ctx, lines, block, width, c.pal().assistant, &inFence)
+		lines = c.appendAssistantMarkdownBlock(ctx, lines, block, width, c.pal().assistant, &fence)
 		tailByte += len(block) + 1
 	}
 	tailStart := len(lines)
-	lines = c.appendAssistantMarkdownBlock(ctx, lines, blocks[len(blocks)-1], width, c.pal().assistant, &inFence)
+	lines = c.appendAssistantMarkdownBlock(ctx, lines, blocks[len(blocks)-1], width, c.pal().assistant, &fence)
 	return lines, tailStart, tailByte
 }
 
-func chatLogFenceStateBefore(body string, byteOffset int) bool {
+// chatFence tracks whether assistant lines are inside a code fence, and the
+// fence's language.
+type chatFence struct {
+	open bool
+	lang string
+}
+
+func (f *chatFence) toggle(line string) {
+	f.open = !f.open
+	f.lang = ""
+	if f.open {
+		f.lang, _, _ = strings.Cut(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "```")), " ")
+	}
+}
+
+func chatLogFenceStateBefore(body string, byteOffset int) chatFence {
+	var fence chatFence
 	if byteOffset <= 0 || body == "" {
-		return false
+		return fence
 	}
 	if byteOffset > len(body) {
 		byteOffset = len(body)
 	}
-	inFence := false
 	prefix := body[:byteOffset]
 	for line := range strings.SplitSeq(prefix, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "```") {
-			inFence = !inFence
+			fence.toggle(line)
 		}
 	}
-	return inFence
+	return fence
 }
 
 func (c *ChatLog) appendToolExecution(ctx context.Context, out []renderLine, component ChatComponent, width int) []renderLine {
@@ -2928,6 +2943,7 @@ func (c *ChatLog) appendWriteToolExecution(ctx context.Context, out []renderLine
 	}
 	if preview := writeContentPreviewFromArgs(tool.Args, limit); len(preview) > 0 {
 		out = append(out, renderLine{text: " ", st: st})
+		preview = c.highlightWritePreview(preview, editPathFromArgs(tool.Args))
 		for _, line := range preview {
 			if ctx.Err() != nil {
 				return out
@@ -2948,6 +2964,24 @@ func (c *ChatLog) appendWriteToolExecution(ctx context.Context, out []renderLine
 		}
 	}
 	return out
+}
+
+// highlightWritePreview colors the file lines of a write preview by the
+// language of path, leaving the header and the "more lines" footer alone.
+func (c *ChatLog) highlightWritePreview(preview []string, path string) []string {
+	end := len(preview)
+	if end > 1 && strings.HasPrefix(preview[end-1], "... (") {
+		end--
+	}
+	code := make([]string, 0, end-1)
+	for _, line := range preview[1:end] {
+		code = append(code, expandChatLogTabs(line))
+	}
+	lines := tauui.HighlightCode(strings.Join(code, "\n"), filepath.Base(path), c.pal().tokens.syntaxTheme())
+	if len(lines) != end-1 {
+		return preview
+	}
+	return slices.Concat(preview[:1], lines, preview[end:])
 }
 
 func renderEditToolCall(tool ToolExecutionComponent, fallback string) string {
@@ -3270,25 +3304,29 @@ func renderToolCallComponent(tool ToolExecutionComponent, fallback string) strin
 // single-line block keeps the historic per-line path (including fence
 // toggling); a multi-line block is a grouped markdown construct — currently a
 // table — that must be parsed as one unit to render at all.
-func (c *ChatLog) appendAssistantMarkdownBlock(ctx context.Context, out []renderLine, body string, width int, st tauui.Style, inFence *bool) []renderLine {
+func (c *ChatLog) appendAssistantMarkdownBlock(ctx context.Context, out []renderLine, body string, width int, st tauui.Style, fence *chatFence) []renderLine {
 	if strings.Contains(body, "\n") {
 		return c.appendMarkdown(ctx, out, body, width, st)
 	}
-	return c.appendAssistantMarkdownLine(ctx, out, body, width, st, inFence)
+	return c.appendAssistantMarkdownLine(ctx, out, body, width, st, fence)
 }
 
-func (c *ChatLog) appendAssistantMarkdownLine(ctx context.Context, out []renderLine, body string, width int, st tauui.Style, inFence *bool) []renderLine {
+func (c *ChatLog) appendAssistantMarkdownLine(ctx context.Context, out []renderLine, body string, width int, st tauui.Style, fence *chatFence) []renderLine {
 	if strings.HasPrefix(strings.TrimSpace(body), "```") {
 		tokens := c.pal().tokens
 		out = c.appendWrapped(ctx, out, body, width, tokens.foreground("mdCodeBlockBorder", tokens.MdCodeBlockBorder, st))
-		if inFence != nil {
-			*inFence = !*inFence
+		if fence != nil {
+			fence.toggle(body)
 		}
 		return out
 	}
-	if inFence != nil && *inFence {
+	if fence != nil && fence.open {
 		tokens := c.pal().tokens
-		return c.appendWrapped(ctx, out, body, width, tokens.foreground("mdCodeBlock", tokens.MdCodeBlock, st))
+		codeStyle := tokens.foreground("mdCodeBlock", tokens.MdCodeBlock, st)
+		if lines := tauui.HighlightCode(expandChatLogTabs(body), fence.lang, tokens.syntaxTheme()); len(lines) == 1 {
+			return c.appendCodeRows(ctx, out, lines[0], width, codeStyle)
+		}
+		return c.appendWrapped(ctx, out, body, width, codeStyle)
 	}
 	return c.appendMarkdown(ctx, out, body, width, st)
 }
@@ -3515,6 +3553,27 @@ func (c *ChatLog) appendPaddedTextBox(ctx context.Context, out []renderLine, bod
 		}
 	}
 	out = append(out, renderLine{text: strings.Repeat(" ", width), st: st})
+	return out
+}
+
+// appendCodeRows hard-wraps one ANSI-styled code line inside the output
+// padding, the way appendWrapped places plain code.
+func (c *ChatLog) appendCodeRows(ctx context.Context, out []renderLine, line string, width int, st tauui.Style) []renderLine {
+	pad := c.outputPadding(width)
+	inset := strings.Repeat(" ", pad)
+	if tauui.StripANSI(line) == "" {
+		return append(out, renderLine{text: " ", st: st})
+	}
+	for i, row := range tauui.ANSIWrap(line, max(1, width-2*pad)) {
+		if ctx.Err() != nil {
+			return out
+		}
+		r := renderLine{text: inset + row, st: st}
+		if i > 0 {
+			r.join = joinNone
+		}
+		out = append(out, r)
+	}
 	return out
 }
 

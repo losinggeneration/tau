@@ -1523,7 +1523,7 @@ func (s *Server) handleExportHTML(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	if agentSess, ok := sess.(sdk.HTMLExporter); ok {
+	if agentSess, ok := sess.(sdk.Exporter); ok {
 		path, err := agentSess.ExportHTML(ctx, args.OutputPath)
 		if err != nil {
 			return s.sendErrorResult(cmd.ID, err)

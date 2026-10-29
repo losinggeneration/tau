@@ -35,6 +35,7 @@ const (
 	actionIDHistorySearchBackward = "tau.input.historySearchBackward"
 	actionIDHistorySearchForward  = "tau.input.historySearchForward"
 	actionIDPaste                 = "app.clipboard.pasteImage"
+	actionIDMessageCopy           = "app.message.copy"
 
 	// Scoped-model dialog actions. Not spec ids — the dialog is tau's — but
 	// they go through the same registry so they are configurable too.
@@ -78,6 +79,7 @@ func appKeybindingDefinitions() map[string]keybindings.Definition {
 		actionIDHistorySearchBackward: {DefaultKeys: []string{"ctrl+r"}, Description: "Search prompt history backward"},
 		actionIDHistorySearchForward:  {DefaultKeys: []string{"ctrl+s"}, Description: "Search prompt history forward"},
 		actionIDPaste:                 {DefaultKeys: []string{"ctrl+v"}, Description: "Paste from clipboard"},
+		actionIDMessageCopy:           {DefaultKeys: []string{"ctrl+x"}, Description: "Copy the last reply or the sign-in URL"},
 
 		actionIDScopedModelsAll:      {DefaultKeys: []string{"ctrl+a"}, Description: "Scoped models: enable all"},
 		actionIDScopedModelsClear:    {DefaultKeys: []string{"ctrl+x"}, Description: "Scoped models: clear"},
@@ -105,6 +107,7 @@ func appActions() map[string]tauui.Action {
 		actionIDHistorySearchBackward: AppActionHistorySearchBackward,
 		actionIDHistorySearchForward:  AppActionHistorySearchForward,
 		actionIDPaste:                 AppActionPaste,
+		actionIDMessageCopy:           AppActionMessageCopy,
 
 		actionIDScopedModelsAll:      AppActionScopedModelsAll,
 		actionIDScopedModelsClear:    AppActionScopedModelsClear,

@@ -245,16 +245,18 @@ api_version = "1"
 	err = mgr.Install(context.Background(), cfg)
 	require.NoError(t, err)
 
-	// Verify installation is a symlink
+	// Source entries stay live through links; the sidecar stays in the install.
 	installPath := filepath.Join(tmpDir, "user", "test-pkg")
-	link, err := os.Readlink(installPath)
-	require.NoError(t, err)
-	assert.Equal(t, srcDir, link)
-
-	// Verify sidecar has null commit SHA for linked install
+	require.NoFileExists(t, filepath.Join(srcDir, ".tau-install.json"), "linked install wrote into its source")
+	for _, name := range []string{"tau-package.toml", "skills"} {
+		link, err := os.Readlink(filepath.Join(installPath, name))
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(srcDir, name), link)
+	}
 	sidecar, err := LoadSidecar(installPath)
 	require.NoError(t, err)
 	assert.Empty(t, sidecar.CommitSHA)
+	assert.Equal(t, RefTypeLink, ClassifyRef(sidecar))
 }
 
 // TestInstallManager_InstallFromGit_ArtifactReload tests that artifact reload hooks

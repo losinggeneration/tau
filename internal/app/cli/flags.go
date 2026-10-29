@@ -426,14 +426,6 @@ var SessionsExportFlags = []cli.Flag{
 	},
 }
 
-// SessionsShareFlags defines flags for the sessions share subcommand.
-var SessionsShareFlags = []cli.Flag{
-	&cli.BoolFlag{
-		Name:  "public",
-		Usage: "Make the share public",
-	},
-}
-
 // Prompt flags that should trigger TTY behavior.
 var PromptFlags = []cli.Flag{
 	&cli.BoolFlag{

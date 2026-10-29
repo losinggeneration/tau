@@ -41,6 +41,7 @@ const HANDLED_EVENTS = new Set<string>([
 	"tool_result",
 	"user_bash",
 	"input",
+	"project_trust",
 ]);
 
 const CANCELLABLE = new Set<string>([
@@ -168,6 +169,8 @@ interface Collected {
 	isError?: boolean;
 	text?: string;
 	block?: boolean;
+	trusted?: "yes" | "no";
+	remember?: boolean;
 }
 
 function serializeResponseData(name: string, collected: Collected[]): string {
@@ -182,6 +185,8 @@ function serializeResponseData(name: string, collected: Collected[]): string {
 			return JSON.stringify({ content: last.content, is_error: Boolean(last.isError) });
 		case "input":
 			return JSON.stringify({ text: last.text, block: Boolean(last.block) });
+		case "project_trust":
+			return JSON.stringify({ trusted: last.trusted, remember: Boolean(last.remember) });
 		default:
 			return "";
 	}
@@ -310,6 +315,11 @@ export class EventRouter {
 				}
 				if (name === "input" && (result["text"] !== undefined || result["block"] === true)) {
 					collected.push({ text: asString(result["text"]), block: result["block"] === true });
+				}
+				// The first project_trust handler answering yes/no wins; undecided falls through.
+				if (name === "project_trust" && (result["trusted"] === "yes" || result["trusted"] === "no")) {
+					collected.push({ trusted: result["trusted"], remember: result["remember"] === true });
+					break;
 				}
 			}
 			if (name === "tool_call") {

@@ -164,9 +164,6 @@ func (c *claudeAgentClient) handleMessage(ctx context.Context, msg claude.Messag
 		output.StopReason = claudeAgentStopReason(m.StopReason, isError)
 		output.Usage = claudeAgentUsage(m.Usage)
 		output.ResponseID = m.UUID
-		if isError && output.ErrorMessage == "" {
-			output.ErrorMessage = strings.Join(m.Errors, "; ")
-		}
 		if isError {
 			message := strings.Join(m.Errors, "; ") + "\n" + m.Result
 			for _, block := range output.Content {
@@ -177,6 +174,16 @@ func (c *claudeAgentClient) handleMessage(ctx context.Context, msg claude.Messag
 			if err := parseClaudeAgentUsageLimitError(message, time.Now()); err != nil {
 				emitTerminalStreamError(ctx, handler, *output, err, StopReasonError)
 				return true
+			}
+			output.ErrorMessage = strings.TrimSpace(strings.Join(m.Errors, "; "))
+			if output.ErrorMessage == "" {
+				output.ErrorMessage = strings.TrimSpace(message)
+			}
+			if output.ErrorMessage == "" {
+				output.ErrorMessage = m.Subtype
+			}
+			if output.ErrorMessage == "" {
+				output.ErrorMessage = "Claude Code returned an error without a message"
 			}
 		}
 		handler(ctx, Done{Reason: output.StopReason, Message: *output})
@@ -653,7 +660,7 @@ func (e *ClaudeAgentUsageLimitError) Error() string {
 	return fmt.Sprintf("%s: %s. Available again at %s", ProviderClaudeAgent, e.Message, e.ResetsAt.Format(time.DateTime))
 }
 
-var claudeAgentResetPattern = regexp.MustCompile(`(?i)You've hit your session limit\s*·\s*resets (\d{1,2}(?::\d{2})?[ap]m) \(([^()]+)\)`)
+var claudeAgentResetPattern = regexp.MustCompile(`(?i)You've hit your (?:session|5-hour) limit\s*·\s*resets (\d{1,2}(?::\d{2})?[ap]m) \(([^()]+)\)`)
 
 func parseClaudeAgentUsageLimitError(message string, now time.Time) *ClaudeAgentUsageLimitError {
 	match := claudeAgentResetPattern.FindStringSubmatch(message)

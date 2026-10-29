@@ -162,6 +162,11 @@ const (
 	// status line shown while the user is scrolled away. External id
 	// "app.chat.scrollBottom".
 	AppActionChatScrollBottom
+
+	// AppActionMessageCopy copies the login dialog's sign-in URL while that
+	// dialog is open and the last reply otherwise. External id
+	// "app.message.copy".
+	AppActionMessageCopy
 )
 
 // selectorMode enumerates the modes the inline Selector can be in. The
@@ -335,6 +340,10 @@ type App struct {
 	extensionDialog   *extensionDialog
 	loginDialog       *loginDialog
 	loginWorkers      sync.WaitGroup
+	// openURL and clipboardWrite default to the system browser and the
+	// toolkit clipboard; tests replace them so no helper process starts.
+	openURL        func(string) error
+	clipboardWrite func(string, func(error))
 	// currentModel is the key (provider/id) of the session's active
 	// model. Cached so model items can be sorted with the active model
 	// at the top of the list and marked with the active marker (the
@@ -488,6 +497,7 @@ type App struct {
 	// deleteSession moves a persisted session to the trash from the
 	// workspace UI.
 	deleteSession SessionActionFunc
+	importSession func(ctx context.Context, src, cwd string) (string, error)
 
 	// loopCtx is the most recent *tauui.Ctx observed during a paint pass. The
 	// toolkit's Invalidate closure is stable for the app's lifetime, so it is
@@ -592,6 +602,9 @@ type Options struct {
 	// DeleteSession moves a persisted session to the trash from the
 	// workspace UI.
 	DeleteSession SessionActionFunc
+	// ImportSession copies a session file into storage for cwd and returns
+	// the session ID, which /import then resumes.
+	ImportSession func(ctx context.Context, src, cwd string) (string, error)
 	// ThemeColors resolves a theme name to its colour tokens, so themes
 	// discovered as resources actually repaint the UI. Nil restricts the app to
 	// its built-in token sets.
@@ -669,6 +682,7 @@ func New(opts Options) (*App, error) {
 		pinSession:      opts.PinSession,
 		unpinSession:    opts.UnpinSession,
 		deleteSession:   opts.DeleteSession,
+		importSession:   opts.ImportSession,
 		authStore:       opts.CredentialStore,
 		credentialStore: opts.CredentialStore,
 		settingsPath:    opts.SettingsPath,
@@ -1528,6 +1542,13 @@ func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
 		return true
 	case AppActionPaste:
 		return r.app.requestClipboardPaste(ctx)
+	case AppActionMessageCopy:
+		if d := r.app.loginDialog; d != nil {
+			d.copyURL()
+			return true
+		}
+		cmdCopy(r.app, "")
+		return true
 	case AppActionQuitNow:
 		r.app.quit()
 		return true
@@ -1661,6 +1682,11 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 			}
 			if ks.Mod == tauui.ModCtrl && ks.Key == tauui.KeyRune && (ks.Rune == 'v' || ks.Rune == 'V') {
 				return AppActionPaste, true
+			}
+			if k.app.loginDialog != nil {
+				if act, ok := k.resolveAppAction(ks, func(id string) bool { return id == actionIDMessageCopy }); ok {
+					return act, true
+				}
 			}
 			return tauui.ActionNone, false
 		}
@@ -3707,10 +3733,29 @@ func (a *App) selectModel(key, thinkingLevel string) {
 		a.refreshChat()
 		return
 	}
-	if err := a.sess.SetModel(key); err != nil {
+	if err := a.commitModel(key); err != nil {
 		a.conv.AddError("model: " + err.Error())
 		a.refreshChat()
 		return
+	}
+	a.conv.AddSystem("model: " + key)
+	// A saved per-model thinking level follows the model switch; without this
+	// the session keeps the previous model's level. Runs after the model system
+	// row so the transcript reads model-first, and after refreshFooterStats so
+	// its footer/editor-chrome update is the last word on the displayed level.
+	if thinkingLevel != "" {
+		a.applyThinkingLevel(thinkingLevel)
+	} else {
+		a.applySavedThinkingLevel(key)
+	}
+	a.refreshChat()
+}
+
+// commitModel switches the session to key and saves it as the default model.
+func (a *App) commitModel(key string) error {
+	provider, _, _ := strings.Cut(key, "/")
+	if err := a.sess.SetModel(key); err != nil {
+		return err
 	}
 	a.currentModel = key
 	// Sync the footer's model display. The footer reads from its
@@ -3724,22 +3769,10 @@ func (a *App) selectModel(key, thinkingLevel string) {
 	a.refreshFooterStats(a.loopContext())
 	if a.settingsPath != "" {
 		if err := ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{"defaultProvider": provider, "defaultModel": strings.TrimPrefix(key, provider+"/")}); err != nil {
-			a.conv.AddError("model: selected " + key + " but failed to save default: " + err.Error())
-			a.refreshChat()
-			return
+			return fmt.Errorf("selected %s but failed to save default: %w", key, err)
 		}
 	}
-	a.conv.AddSystem("model: " + key)
-	// A saved per-model thinking level follows the model switch; without this
-	// the session keeps the previous model's level. Runs after the model system
-	// row so the transcript reads model-first, and after refreshFooterStats so
-	// its footer/editor-chrome update is the last word on the displayed level.
-	if thinkingLevel != "" {
-		a.applyThinkingLevel(thinkingLevel)
-	} else {
-		a.applySavedThinkingLevel(key)
-	}
-	a.refreshChat()
+	return nil
 }
 
 // sessionSettings returns the merged settings a session applies, or nil when
@@ -4467,7 +4500,10 @@ func (a *App) dismissSelectorIfVisible() bool {
 // stop Esc processing before it becomes a streaming interrupt.
 func (a *App) dismissSelectorIfVisibleCtx(ctx *tauui.Ctx) bool {
 	if a.dialogPicker != nil && a.dialogPicker.Shown() {
-		a.dismissDialogCtx(ctx)
+		// The picker's own cancel handler may step back instead of closing.
+		if !a.dialogPicker.Cancel() {
+			a.dismissDialogCtx(ctx)
+		}
 		return true
 	}
 	if a.selector != nil && a.selector.Shown() {

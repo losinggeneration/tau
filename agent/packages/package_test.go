@@ -156,16 +156,11 @@ path = "prompts/"
 	err = mgr.Install(context.Background(), cfg)
 	require.NoError(t, err)
 
-	// Verify symlink was created
+	// Verify source entries are linked into the installation
 	linkPath := filepath.Join(packagesDir, "linked-pkg")
-	info, err := os.Lstat(linkPath)
+	realPath, err := filepath.EvalSymlinks(filepath.Join(linkPath, "skills"))
 	require.NoError(t, err)
-	assert.True(t, info.Mode()&os.ModeSymlink != 0, "install should create symlink for --link")
-
-	// Verify symlink points to source directory
-	realPath, err := filepath.EvalSymlinks(linkPath)
-	require.NoError(t, err)
-	assert.Equal(t, srcDir, realPath, "symlink should point to source directory")
+	assert.Equal(t, filepath.Join(srcDir, "skills"), realPath, "skills should link to the source directory")
 
 	// Verify sidecar was written
 	sidecar, err := LoadSidecar(linkPath)

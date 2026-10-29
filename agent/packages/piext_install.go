@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -186,7 +187,7 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 			return fmt.Errorf("load generated manifest: %w", loadErr)
 		}
 		if cfg.Link {
-			return linkPiSource(ctx, sourceDir, staged)
+			return linkSourceEntries(ctx, sourceDir, staged, "package-lock.json", "npm-shrinkwrap.json", "node_modules", "tau-package.toml", ".tau-install.json")
 		}
 		return nil
 	})
@@ -198,20 +199,20 @@ func (m *InstallManager) installPiFromDir(ctx context.Context, cfg Config, sourc
 	return nil
 }
 
-// linkPiSource keeps generated metadata and dependencies in the installation.
-// Setup runs on copies before source entries become live links.
+// linkSourceEntries replaces each top-level entry of staged with a link into
+// source, except the private entries, so install metadata and prepared
+// dependencies never land in the source directory.
 // ponytail: top-level entries are captured at install; reinstall to link newly added roots.
-func linkPiSource(ctx context.Context, source, staged string) error {
+func linkSourceEntries(ctx context.Context, source, staged string, private ...string) error {
 	entries, err := os.ReadDir(source)
 	if err != nil {
-		return fmt.Errorf("read linked pi source: %w", err)
+		return fmt.Errorf("read linked source: %w", err)
 	}
 	for _, entry := range entries {
 		if err := context.Cause(ctx); err != nil {
 			return err
 		}
-		switch entry.Name() {
-		case "package-lock.json", "npm-shrinkwrap.json", "node_modules", "tau-package.toml", ".tau-install.json":
+		if slices.Contains(private, entry.Name()) {
 			continue
 		}
 		path := filepath.Join(staged, entry.Name())
@@ -219,7 +220,7 @@ func linkPiSource(ctx context.Context, source, staged string) error {
 			return fmt.Errorf("remove staged source entry: %w", err)
 		}
 		if err := os.Symlink(filepath.Join(source, entry.Name()), path); err != nil {
-			return fmt.Errorf("link pi source entry: %w", err)
+			return fmt.Errorf("link source entry: %w", err)
 		}
 	}
 	return nil

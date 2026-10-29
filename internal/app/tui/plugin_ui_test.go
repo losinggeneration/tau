@@ -140,6 +140,7 @@ func nativeDialogApp(t *testing.T) (*App, *headless.Backend) {
 	a, err := New(Options{Session: &fakeSession{}})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, a.chat.Close()) })
+	a.openURL = func(string) error { return nil }
 	be := headless.New(geom.Size{W: 60, H: 20})
 	t.Cleanup(be.Close)
 	a.app, err = tauui.New(tauui.Opts{Root: a.root, Backend: be, Theme: appTheme(), Keymap: appKeymap{app: a, manager: a.keybindings}})

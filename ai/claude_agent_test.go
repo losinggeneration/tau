@@ -677,63 +677,66 @@ func eventTypeNames(events []StreamEvent) []string {
 }
 
 func TestClaudeAgentStreamUsageLimit(t *testing.T) {
-	const message = "You've hit your session limit · resets 6:10am (America/Los_Angeles)"
-	for _, source := range []string{"text", "assistant", "errors", "result", "runner"} {
-		t.Run(source, func(t *testing.T) {
-			client := &claudeAgentClient{runner: func(context.Context, any, claude.Options) (<-chan claude.Message, <-chan error) {
-				messages := make(chan claude.Message, 2)
-				errs := make(chan error, 1)
-				result := claude.ResultMessage{IsError: true, StopReason: "error"}
-				switch source {
-				case "assistant":
-					messages <- claude.AssistantMessage{Error: "rate_limit", Content: []claude.ContentBlock{claude.TextBlock{Text: message}}}
-				case "text":
-					messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.TextBlock{Text: message}}}
-				case "errors":
-					result.Errors = []string{message}
-				case "result":
-					result.Result = message
-				case "runner":
-					errs <- errors.New(message)
+	for _, limit := range []string{"session", "5-hour"} {
+		message := "You've hit your " + limit + " limit · resets 4:30pm (America/Los_Angeles)"
+		for _, source := range []string{"text", "assistant", "errors", "result", "runner"} {
+			t.Run(limit+"/"+source, func(t *testing.T) {
+				client := &claudeAgentClient{runner: func(context.Context, any, claude.Options) (<-chan claude.Message, <-chan error) {
+					messages := make(chan claude.Message, 2)
+					errs := make(chan error, 1)
+					result := claude.ResultMessage{IsError: true, StopReason: "error"}
+					switch source {
+					case "assistant":
+						messages <- claude.AssistantMessage{Error: "rate_limit", Content: []claude.ContentBlock{claude.TextBlock{Text: message}}}
+					case "text":
+						messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.TextBlock{Text: message}}}
+					case "errors":
+						result.Errors = []string{message}
+					case "result":
+						result.Result = message
+					case "runner":
+						errs <- errors.New(message)
+					}
+					if source != "runner" {
+						messages <- result
+					}
+					close(messages)
+					close(errs)
+					return messages, errs
+				}}
+				var terminal StreamEvent
+				before := time.Now()
+				err := client.Stream(context.Background(), &Model{ID: "sonnet", API: APIClaudeAgent, Provider: ProviderClaudeAgent}, &Context{}, func(_ context.Context, event StreamEvent) { terminal = event })
+				if err != nil {
+					t.Fatal(err)
 				}
-				if source != "runner" {
-					messages <- result
+				streamErr, ok := terminal.(StreamError)
+				if !ok {
+					t.Fatalf("terminal = %T, want StreamError", terminal)
 				}
-				close(messages)
-				close(errs)
-				return messages, errs
-			}}
-			var terminal StreamEvent
-			before := time.Now()
-			err := client.Stream(context.Background(), &Model{ID: "sonnet", API: APIClaudeAgent, Provider: ProviderClaudeAgent}, &Context{}, func(_ context.Context, event StreamEvent) { terminal = event })
-			if err != nil {
-				t.Fatal(err)
-			}
-			streamErr, ok := terminal.(StreamError)
-			if !ok {
-				t.Fatalf("terminal = %T, want StreamError", terminal)
-			}
-			resetAt, ok := UsageLimitResetAt(fmt.Errorf("wrapped: %w", streamErr))
-			if !ok {
-				t.Fatalf("missing reset time: %v", streamErr)
-			}
-			loc, err := time.LoadLocation("America/Los_Angeles")
-			if err != nil {
-				t.Fatal(err)
-			}
-			local := resetAt.In(loc)
-			if local.Hour() != 6 || local.Minute() != 10 || !resetAt.After(before) || resetAt.Sub(before) > 25*time.Hour {
-				t.Fatalf("reset time = %v", resetAt)
-			}
-			if streamErr.Msg.StopReason != StopReasonError || !strings.Contains(streamErr.Msg.ErrorMessage, "session limit") {
-				t.Fatalf("message = %#v", streamErr.Msg)
-			}
-		})
+				resetAt, ok := UsageLimitResetAt(fmt.Errorf("wrapped: %w", streamErr))
+				if !ok {
+					t.Fatalf("missing reset time: %v", streamErr)
+				}
+				loc, err := time.LoadLocation("America/Los_Angeles")
+				if err != nil {
+					t.Fatal(err)
+				}
+				local := resetAt.In(loc)
+				if local.Hour() != 16 || local.Minute() != 30 || !resetAt.After(before) || resetAt.Sub(before) > 25*time.Hour {
+					t.Fatalf("reset time = %v", resetAt)
+				}
+				if streamErr.Msg.StopReason != StopReasonError || !strings.Contains(streamErr.Msg.ErrorMessage, limit+" limit") {
+					t.Fatalf("message = %#v", streamErr.Msg)
+				}
+			})
+		}
 	}
 }
 
 func TestParseClaudeAgentUsageLimitError(t *testing.T) {
 	for _, tt := range []struct{ name, message, now, want string }{
+		{"5-hour", "You've hit your 5-hour limit · resets 4:30pm (America/Los_Angeles)", "2026-10-11T22:00:00Z", "2026-10-11T23:30:00Z"},
 		{"recorded", "You've hit your session limit · resets 6:10am (America/Los_Angeles)", "2026-10-11T12:39:52Z", "2026-10-11T13:10:00Z"},
 		{"tomorrow", "You've hit your session limit · resets 6:10am (America/Los_Angeles)", "2026-10-11T14:00:00Z", "2026-10-12T13:10:00Z"},
 		{"no minutes", "You've hit your session limit · resets 12am (Asia/Tokyo)", "2026-10-11T12:00:00Z", "2026-10-11T15:00:00Z"},
@@ -761,6 +764,50 @@ func TestParseClaudeAgentUsageLimitError(t *testing.T) {
 			}
 			if actual := got.ResetsAt.UTC().Format(time.RFC3339); actual != tt.want {
 				t.Fatalf("reset = %s, want %s", actual, tt.want)
+			}
+		})
+	}
+}
+
+func TestClaudeAgentErrorDiagnostic(t *testing.T) {
+	const message = "You've hit your 5-hour limit · resets 4:30pm (Unknown/Zone)"
+	for _, tt := range []struct {
+		name   string
+		text   string
+		result claude.ResultMessage
+		want   string
+	}{
+		{name: "assistant text", text: message, want: message},
+		{name: "result text", result: claude.ResultMessage{Result: message}, want: message},
+		{name: "errors take precedence", text: "assistant detail", result: claude.ResultMessage{Errors: []string{"first", "second"}, Result: "result detail"}, want: "first; second"},
+		{name: "subtype", result: claude.ResultMessage{Subtype: "error_during_execution"}, want: "error_during_execution"},
+		{name: "no details", want: "Claude Code returned an error without a message"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &claudeAgentClient{runner: func(context.Context, any, claude.Options) (<-chan claude.Message, <-chan error) {
+				messages := make(chan claude.Message, 2)
+				messages <- claude.AssistantMessage{Content: []claude.ContentBlock{claude.TextBlock{Text: tt.text}}}
+				result := tt.result
+				result.IsError = true
+				messages <- result
+				close(messages)
+				return messages, nil
+			}}
+			model := &Model{ID: "sonnet", API: APIClaudeAgent, Provider: ProviderClaudeAgent}
+			var terminal StreamEvent
+			if err := client.Stream(t.Context(), model, &Context{}, func(_ context.Context, event StreamEvent) { terminal = event }); err != nil {
+				t.Fatal(err)
+			}
+			done, ok := terminal.(Done)
+			if !ok || done.Message.StopReason != StopReasonError || done.Message.ErrorMessage != tt.want {
+				t.Fatalf("terminal = %#v, want error with diagnostic %q", terminal, tt.want)
+			}
+			got, err := client.Complete(t.Context(), model, &Context{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.StopReason != StopReasonError || got.ErrorMessage != tt.want {
+				t.Fatalf("complete = %#v, want error with diagnostic %q", got, tt.want)
 			}
 		})
 	}

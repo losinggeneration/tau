@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"os"
 	"slices"
 	"testing"
 
@@ -238,4 +239,35 @@ func TestToolNamespaceSurvivesPersistedHistory(t *testing.T) {
 		require.NoError(t, err)
 		require.Contains(t, string(data), `"namespace":"dynamic_tools"`)
 	}
+}
+
+func TestBranchJSONLExportsActiveBranchAsChain(t *testing.T) {
+	header := NewHeader("/test", nil, nil)
+	w, err := CreateSessionFile(t.TempDir(), header)
+	require.NoError(t, err)
+	root := NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"root"}`), nil)
+	abandoned := NewMessageEntry(&root.ID, json.RawMessage(`{"role":"user","content":"abandoned"}`), nil)
+	move := NewPositionChangeEntry(root.ID)
+	active := NewMessageEntry(&root.ID, json.RawMessage(`{"role":"user","content":"active"}`), nil)
+	for _, e := range []Entry{root, abandoned, move, active} {
+		require.NoError(t, w.Append(e))
+	}
+	require.NoError(t, w.Close())
+	r, err := ReadFile(w.Path())
+	require.NoError(t, err)
+
+	data, err := r.BranchJSONL()
+	require.NoError(t, err)
+	path := t.TempDir() + "/export.jsonl"
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	exported, err := ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, header.ID, exported.Header().ID)
+	var ids []string
+	for _, e := range exported.Entries() {
+		ids = append(ids, e.ID)
+	}
+	require.Equal(t, []string{root.ID, active.ID}, ids)
+	require.Equal(t, root.ID, *exported.Entries()[1].ParentID)
+	require.Equal(t, []string{root.ID, active.ID}, exported.ActiveBranch())
 }

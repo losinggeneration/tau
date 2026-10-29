@@ -1937,6 +1937,47 @@ func (m *Manager) DispatchEventResponse(ctx context.Context, name string, payloa
 	return resp
 }
 
+// ProjectTrustDecision asks project_trust subscribers in dispatch order. The
+// first yes/no answer wins. Undecided, failed and malformed answers fall
+// through to the next handler, and remember asks the caller to save the answer.
+func (m *Manager) ProjectTrustDecision(ctx context.Context, cwd string) (decision *bool, remember bool, err error) {
+	payload, err := json.Marshal(map[string]string{"cwd": cwd})
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal project_trust payload: %w", err)
+	}
+	m.mu.RLock()
+	handlers := slices.Clone(m.eventHandlers["project_trust"])
+	m.mu.RUnlock()
+	for _, handler := range handlers {
+		if err := context.Cause(ctx); err != nil {
+			return nil, false, err
+		}
+		response := handler.Handler(ctx, "project_trust", payload, "")
+		if len(response.ResponseData) == 0 {
+			continue
+		}
+		var result struct {
+			Trusted  string `json:"trusted"`
+			Remember bool   `json:"remember"`
+		}
+		if err := json.Unmarshal(response.ResponseData, &result); err != nil {
+			m.logger.Warn("parse project_trust response", "plugin", handler.PluginName, "error", err)
+			continue
+		}
+		switch result.Trusted {
+		case "yes", "no":
+			if err := context.Cause(ctx); err != nil {
+				return nil, false, err
+			}
+			return new(result.Trusted == "yes"), result.Remember, nil
+		case "", "undecided":
+		default:
+			m.logger.Warn("invalid project_trust decision", "plugin", handler.PluginName, "trusted", result.Trusted)
+		}
+	}
+	return nil, false, context.Cause(ctx)
+}
+
 // DispatchEventCollect sends an event to all subscribed plugins and returns
 // every handler's response in dispatch (registration) order. Use this for
 // events whose per-plugin responses matter individually, e.g. chaining

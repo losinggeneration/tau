@@ -660,6 +660,8 @@ func TestVertexEndpointsAndAuthMatchUpstream(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(serviceAccount, data, 0o600))
+	externalAccount := filepath.Join(t.TempDir(), "external.json")
+	require.NoError(t, os.WriteFile(externalAccount, []byte(`{"type":"external_account","audience":"a","subject_token_type":"t","token_url":"https://token.invalid","credential_source":{"executable":{"command":"/bin/true"}}}`), 0o600))
 	const (
 		regional = "https://{location}-aiplatform.googleapis.com"
 		path     = "/publishers/google/models/gemini-test:streamGenerateContent?alt=sse"
@@ -678,6 +680,7 @@ func TestVertexEndpointsAndAuthMatchUpstream(t *testing.T) {
 		{name: "service account", baseURL: regional, project: "proj", location: "us-central1", credentials: serviceAccount, wantURL: "https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1" + path, wantBearer: "sa-token"},
 		{name: "missing project", baseURL: regional, location: "us-central1", accessToken: "token", wantErr: "missing project"},
 		{name: "missing location", baseURL: regional, project: "proj", accessToken: "token", wantErr: "missing location"},
+		{name: "external account credentials rejected", baseURL: regional, project: "proj", location: "us-central1", credentials: externalAccount, wantErr: `unsupported credential type "external_account"`},
 		{name: "unreadable credentials", baseURL: regional, project: "proj", location: "us-central1", credentials: filepath.Join(t.TempDir(), "missing.json"), wantErr: "get credentials"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

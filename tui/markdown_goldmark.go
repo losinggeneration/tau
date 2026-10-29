@@ -158,7 +158,7 @@ func (r markdownASTRenderer) renderBlockquote(n *ast.Blockquote, prefix string) 
 func (r markdownASTRenderer) renderFencedCodeBlock(n *ast.FencedCodeBlock, prefix string) []string {
 	raw := strings.TrimRight(blockLinesText(n, r.source), "\n")
 	if r.theme != nil {
-		return r.themedCodeBlock(raw, prefix)
+		return r.themedCodeBlock(raw, string(n.Language(r.source)), prefix)
 	}
 	if raw == "" {
 		return []string{prefix + ansiInlineCode + "```" + ansiReset, prefix + ansiInlineCode + "```" + ansiReset}
@@ -176,7 +176,7 @@ func (r markdownASTRenderer) renderFencedCodeBlock(n *ast.FencedCodeBlock, prefi
 func (r markdownASTRenderer) renderCodeBlock(n *ast.CodeBlock, prefix string) []string {
 	raw := strings.TrimRight(blockLinesText(n, r.source), "\n")
 	if r.theme != nil {
-		return r.themedCodeBlock(raw, prefix)
+		return r.themedCodeBlock(raw, "", prefix)
 	}
 	if raw == "" {
 		return []string{prefix + ansiInlineCode + "  " + ansiReset}
@@ -656,8 +656,16 @@ func (r markdownASTRenderer) leadingIndent(pos int) string {
 	return string(r.source[start:pos])
 }
 
-func (r markdownASTRenderer) themedCodeBlock(raw, prefix string) []string {
+func (r markdownASTRenderer) themedCodeBlock(raw, lang, prefix string) []string {
 	out := []string{prefix + r.themeStyle("```", "codeBlockBorder")}
+	if raw != "" && r.theme.Syntax != nil {
+		if lines := HighlightCode(strings.Join(normalizeRows(raw), "\n"), lang, *r.theme.Syntax); lines != nil {
+			for _, line := range lines {
+				out = append(out, prefix+r.codeIndent+line)
+			}
+			return append(out, prefix+r.themeStyle("```", "codeBlockBorder"))
+		}
+	}
 	if raw != "" {
 		for _, line := range normalizeRows(raw) {
 			out = append(out, prefix+r.codeIndent+r.themeStyle(line, "codeBlock"))

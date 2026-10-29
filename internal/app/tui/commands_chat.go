@@ -5,8 +5,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/losinggeneration/tau/sdk"
+	tauui "github.com/losinggeneration/tau/tui"
 )
 
 func cmdCopy(app *App, args string) {
@@ -62,18 +64,39 @@ func cmdCopy(app *App, args string) {
 	})
 }
 
-func cmdExportOrStub(app *App, args string) {
-	if strings.TrimSpace(args) == "" {
-		cmdStub("export", "Export the session to a file (coming soon)")(app, args)
-		return
-	}
-	cmdExport(app, args)
-}
-
+// cmdExport follows upstream: a .jsonl path exports the active branch, any
+// other path or none exports HTML. A leading markdown/md/json format keyword
+// writes the visible transcript instead.
 func cmdExport(app *App, args string) {
 	if app == nil || app.conv == nil {
 		return
 	}
+	switch strings.Fields(args + " x")[0] {
+	case "markdown", "md", "json":
+		cmdExportTranscript(app, args)
+		return
+	}
+	exporter, ok := app.sess.(sdk.Exporter)
+	if !ok {
+		app.conv.AddError("Failed to export session: export is unavailable")
+		app.refreshChat()
+		return
+	}
+	export := exporter.ExportHTML
+	path := pathCommandArgument(args)
+	if strings.HasSuffix(path, ".jsonl") {
+		export = exporter.ExportJSONL
+	}
+	path, err := export(app.ctxOrBackground(), path)
+	if err != nil {
+		app.conv.AddError("Failed to export session: " + err.Error())
+	} else {
+		app.conv.AddSystem("Session exported to: " + path)
+	}
+	app.refreshChat()
+}
+
+func cmdExportTranscript(app *App, args string) {
 	format, path, includeThinking, err := parseExportArgs(args)
 	if err != nil {
 		app.conv.AddError("export: " + err.Error())
@@ -110,13 +133,6 @@ func parseExportArgs(args string) (format string, path string, includeThinking b
 			}
 			path = field
 		}
-	}
-	if path == "" && len(fields) == 1 && (format == "markdown" || format == "md" || format == "json") {
-		return format, "", includeThinking, nil
-	}
-	if path == "" {
-		path = format
-		format = "markdown"
 	}
 	return format, path, includeThinking, nil
 }
@@ -314,4 +330,66 @@ func forkTo(app *App, entry string) {
 		app.editor.SetText(ctx, "")
 	}
 	app.refreshChat()
+}
+
+// cmdImport replaces the current session with a JSONL session file, after
+// confirmation. The file is copied into session storage, never overwriting a
+// stored session, and the copy is resumed.
+func cmdImport(app *App, args string) {
+	if app == nil || app.conv == nil {
+		return
+	}
+	path := pathCommandArgument(args)
+	if path == "" {
+		app.conv.AddError("Usage: /import <path.jsonl>")
+		app.refreshChat()
+		return
+	}
+	if app.importSession == nil || app.sessionFactory == nil {
+		app.conv.AddError("import: session storage is unavailable")
+		app.refreshChat()
+		return
+	}
+	ctx := app.ctxOrBackground()
+	cwd := app.sessionState().CWD()
+	go func() {
+		ok, err := app.Confirm(ctx, "Import session", "Replace current session with "+path+"?")
+		var id string
+		if ok && err == nil {
+			id, err = app.importSession(ctx, path, cwd)
+		}
+		app.post(func(*tauui.UpdateCtx) {
+			switch {
+			case err != nil:
+				app.conv.AddError("Failed to import session: " + err.Error())
+			case !ok:
+				app.conv.AddSystem("Import cancelled")
+			default:
+				cmdResume(app, id)
+				app.conv.AddSystem("Session imported from: " + path)
+			}
+			app.refreshChat()
+		})
+	}()
+}
+
+// pathCommandArgument returns the first argument, honoring one level of
+// single or double quotes so paths with spaces work. An unclosed quote yields
+// no path.
+func pathCommandArgument(args string) string {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return ""
+	}
+	if q := args[0]; q == '"' || q == '\'' {
+		end := strings.IndexByte(args[1:], q)
+		if end < 0 {
+			return ""
+		}
+		return args[1 : end+1]
+	}
+	if i := strings.IndexFunc(args, unicode.IsSpace); i >= 0 {
+		return args[:i]
+	}
+	return args
 }

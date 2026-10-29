@@ -29,10 +29,10 @@ func TestBuiltinSlashCommandStruct(t *testing.T) {
 }
 
 func TestBUILTIN_SLASH_COMMANDSContainsAllTSCommands(t *testing.T) {
-	// Verify we have all 20 commands from the TypeScript implementation
+	// Verify we have all 18 Pi commands Tau keeps from the TypeScript implementation
 	expectedCommands := []string{
 		"settings", "model", "scoped-models", "export", "import",
-		"share", "copy", "name", "session", "changelog",
+		"copy", "name", "session",
 		"hotkeys", "fork", "tree", "login", "logout",
 		"new", "compact", "resume", "reload", "quit",
 	}
@@ -114,9 +114,9 @@ func TestLookupBuiltinCommand(t *testing.T) {
 func TestListBuiltinCommands(t *testing.T) {
 	cmds := ListBuiltinCommands()
 
-	// Should return all 20 commands
-	if len(cmds) != 20 {
-		t.Errorf("expected 20 commands, got %d", len(cmds))
+	// Should return all 18 commands
+	if len(cmds) != 18 {
+		t.Errorf("expected 18 commands, got %d", len(cmds))
 	}
 
 	// Should be sorted by name (implemented commands first)
@@ -154,9 +154,9 @@ func TestListImplementedCommands(t *testing.T) {
 	}
 
 	// Verify we have the expected count of implemented commands
-	// Based on our implementation: export, import, share, name, session, fork, tree,
+	// Based on our implementation: export, import, name, session, fork, tree,
 	// login, logout, new, compact, resume, reload, quit
-	expectedCount := 14
+	expectedCount := 13
 	if len(cmds) != expectedCount {
 		t.Errorf("expected %d implemented commands, got %d", expectedCount, len(cmds))
 	}

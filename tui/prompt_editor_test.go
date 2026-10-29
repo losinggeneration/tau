@@ -93,6 +93,10 @@ func TestPromptEditorAnchorsPreviewAtMarkerColumn(t *testing.T) {
 func TestPromptEditorPreviewUsesCurrentWidth(t *testing.T) {
 	SetTerminalCapabilities(TerminalCapabilities{Images: ImageProtocolKitty, TrueColor: true})
 	t.Cleanup(ResetTerminalCapabilities)
+	// Image tests elsewhere in the package change the shared cell size.
+	cell := GetCellDimensions()
+	SetCellDimensions(CellDimensions{})
+	t.Cleanup(func() { SetCellDimensions(cell) })
 
 	ed := NewPromptEditor()
 	ed.SetText(nil, "@pasted-image.png")

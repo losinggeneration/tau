@@ -19,6 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
+
 	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/packages"
 	"github.com/losinggeneration/tau/agent/plugins"
@@ -3246,4 +3249,232 @@ func TestBuildRuntimeOptionsRejectsInvalidGlobalProxyBeforeDiscovery(t *testing.
 	require.Nil(t, loader)
 	require.Nil(t, registry)
 	require.NoFileExists(t, filepath.Join(cfg, "auth.json"))
+}
+
+func TestPluginTrustPassDecidesBeforeSavedPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		answer  string
+		trusted bool
+		saved   bool
+	}{
+		{name: "remembered yes overrides saved deny", answer: `{"trusted":"yes","remember":true}`, trusted: true, saved: true},
+		{name: "undecided keeps saved deny", answer: `{"trusted":"undecided"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			cfgDir := filepath.Join(home, "agent")
+			project := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("TAU_CONFIG_DIR", cfgDir)
+			t.Chdir(project)
+			store := ai.ProjectTrustStore{Path: filepath.Join(cfgDir, "trust.json")}
+			require.NoError(t, store.Set(t.Context(), project, new(false)))
+			require.NoError(t, os.MkdirAll(filepath.Join(project, ".tau"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte(`{"sessionDir":"project-sessions"}`), 0o600))
+
+			mgr := plugins.NewManager(cfgDir, nil, nil)
+			t.Cleanup(func() { require.NoError(t, mgr.Shutdown(context.Background())) })
+			var asked []string
+			mgr.RegisterEventHandler("project_trust", plugins.EventHandler{PluginName: "global", Handler: func(_ context.Context, _ string, payload json.RawMessage, _ string) plugins.EventResponse {
+				asked = append(asked, string(payload))
+				return plugins.EventResponse{ResponseData: []byte(tc.answer)}
+			}})
+			t.Cleanup(projectTrustDecisions.Clear)
+			pass := &pluginTrustPass{mgr: mgr}
+			settings, err := loadSettingsWithUI(t.Context(), nil, nil, pass.decide)
+			require.NoError(t, err)
+			require.NoError(t, pass.finish(t.Context(), settings))
+
+			want, err := json.Marshal(map[string]string{"cwd": project})
+			require.NoError(t, err)
+			require.Equal(t, []string{string(want)}, asked)
+			require.Equal(t, tc.trusted, settings.ProjectResourcesTrusted())
+			require.Equal(t, tc.trusted, settings.SessionDir == "project-sessions")
+			saved, err := store.Get(t.Context(), project)
+			require.NoError(t, err)
+			require.Equal(t, tc.saved, *saved)
+		})
+	}
+}
+
+func TestProjectTrustDecisionsPersistForProcess(t *testing.T) {
+	setup := func(t *testing.T) (string, ai.ProjectTrustStore) {
+		t.Helper()
+		home := t.TempDir()
+		cfgDir := filepath.Join(home, "agent")
+		project := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("TAU_CONFIG_DIR", cfgDir)
+		t.Chdir(project)
+		t.Cleanup(projectTrustDecisions.Clear)
+		require.NoError(t, os.MkdirAll(filepath.Join(project, ".tau"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte(`{"sessionDir":"project-sessions"}`), 0o600))
+		return project, ai.ProjectTrustStore{Path: filepath.Join(cfgDir, "trust.json")}
+	}
+
+	t.Run("session-only allow survives reload and external edits", func(t *testing.T) {
+		project, store := setup(t)
+		prompt := &ui.StdinUI{Reader: strings.NewReader("2\n"), Writer: io.Discard}
+		settings, err := loadSettingsWithUI(t.Context(), nil, prompt, nil)
+		require.NoError(t, err)
+		require.True(t, settings.ProjectResourcesTrusted())
+		saved, err := store.Get(t.Context(), project)
+		require.NoError(t, err)
+		require.Nil(t, saved)
+
+		require.NoError(t, store.Set(t.Context(), project, new(false)))
+		reloaded, err := loadSettingsForTrust(t.Context(), nil)
+		require.NoError(t, err)
+		require.True(t, reloaded.ProjectResourcesTrusted())
+		require.Equal(t, "project-sessions", reloaded.SessionDir)
+	})
+
+	t.Run("headless fallthrough does not suppress a later prompt", func(t *testing.T) {
+		setup(t)
+		headless, err := loadSettingsForTrust(t.Context(), nil)
+		require.NoError(t, err)
+		require.False(t, headless.ProjectResourcesTrusted())
+
+		prompt := &ui.StdinUI{Reader: strings.NewReader("2\n"), Writer: io.Discard}
+		settings, err := loadSettingsWithUI(t.Context(), nil, prompt, nil)
+		require.NoError(t, err)
+		require.True(t, settings.ProjectResourcesTrusted())
+	})
+
+	t.Run("unprotected directory is not cached", func(t *testing.T) {
+		project, store := setup(t)
+		require.NoError(t, os.RemoveAll(filepath.Join(project, ".tau")))
+		open, err := loadSettingsForTrust(t.Context(), nil)
+		require.NoError(t, err)
+		require.True(t, open.ProjectResourcesTrusted())
+
+		require.NoError(t, os.MkdirAll(filepath.Join(project, ".tau"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte(`{}`), 0o600))
+		require.NoError(t, store.Set(t.Context(), project, new(false)))
+		denied, err := loadSettingsForTrust(t.Context(), nil)
+		require.NoError(t, err)
+		require.False(t, denied.ProjectResourcesTrusted())
+	})
+}
+
+func TestBuildRuntimeOptionsPromptsOnlyWithTrustPrompt(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAU_CONFIG_DIR", filepath.Join(home, "agent"))
+	t.Setenv("TAU_SESSION_DIR", filepath.Join(home, "sessions"))
+	t.Chdir(project)
+	t.Cleanup(projectTrustDecisions.Clear)
+	require.NoError(t, os.MkdirAll(filepath.Join(project, ".tau"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte(`{}`), 0o600))
+
+	runtimeUI := &ui.StdinUI{Reader: strings.NewReader("1\n"), Writer: io.Discard}
+	opts, _, _, _, err := buildRuntimeOptions(t.Context(), runtimeUI, nil, withoutPlugins())
+	require.NoError(t, err)
+	require.False(t, opts.Settings.ProjectResourcesTrusted(), "runtime UI must not answer the trust prompt")
+
+	prompt := &ui.StdinUI{Reader: strings.NewReader("2\n"), Writer: io.Discard}
+	opts, _, _, _, err = buildRuntimeOptions(t.Context(), ui.NewNoOpUI(), nil, withoutPlugins(), withTrustPrompt(prompt))
+	require.NoError(t, err)
+	require.True(t, opts.Settings.ProjectResourcesTrusted())
+}
+
+func TestProjectScopedWritesRequireTrust(t *testing.T) {
+	setup := func(t *testing.T) (string, string) {
+		t.Helper()
+		home := t.TempDir()
+		cfgDir := filepath.Join(home, "agent")
+		project := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("TAU_CONFIG_DIR", cfgDir)
+		t.Chdir(project)
+		t.Cleanup(projectTrustDecisions.Clear)
+		settingsPath := filepath.Join(project, ".tau", "settings.json")
+		require.NoError(t, os.MkdirAll(filepath.Join(project, ".tau", "packages", "demo"), 0o755))
+		require.NoError(t, os.WriteFile(settingsPath, []byte(`{}`), 0o600))
+		require.NoError(t, ai.ProjectTrustStore{Path: filepath.Join(cfgDir, "trust.json")}.Set(t.Context(), project, new(false)))
+		return project, settingsPath
+	}
+	run := func(args ...string) error {
+		cmd := newRootCommand()
+		cmd.ExitErrHandler = func(context.Context, *cli.Command, error) {}
+		ctx := context.WithValue(t.Context(), rootCmdKey{}, cmd)
+		return cmd.Run(ctx, append([]string{"tau"}, args...))
+	}
+
+	for _, args := range [][]string{
+		{"set-model", "--project", "anthropic/example"},
+		{"install", "--project", "./missing-source"},
+		{"uninstall", "--project", "demo"},
+		{"update", "--project"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			project, settingsPath := setup(t)
+			require.ErrorContains(t, run(args...), "Project is not trusted")
+			data, err := os.ReadFile(settingsPath)
+			require.NoError(t, err)
+			require.Equal(t, `{}`, string(data))
+			require.DirExists(t, filepath.Join(project, ".tau", "packages", "demo"))
+		})
+	}
+
+	t.Run("unscoped uninstall skips untrusted project packages", func(t *testing.T) {
+		project, _ := setup(t)
+		require.ErrorContains(t, run("uninstall", "demo"), `package "demo" not found`)
+		require.DirExists(t, filepath.Join(project, ".tau", "packages", "demo"))
+	})
+
+	t.Run("approve allows project writes", func(t *testing.T) {
+		_, settingsPath := setup(t)
+		require.NoError(t, run("--approve", "set-model", "--project", "anthropic/example"))
+		data, err := os.ReadFile(settingsPath)
+		require.NoError(t, err)
+		require.JSONEq(t, `{"defaultProvider":"anthropic","defaultModel":"example"}`, string(data))
+	})
+}
+
+func TestBuildRuntimeOptionsInstallsMissingConfiguredSources(t *testing.T) {
+	repoDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, "tau-package.toml"), []byte("[package]\nname = \"configured\"\nversion = \"1\"\n[[skill]]\npath = \"skills\"\n"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(repoDir, "skills", "demo"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, "skills", "demo", "SKILL.md"), []byte("---\nname: demo\ndescription: Demo skill.\n---\nBody.\n"), 0o600))
+	repo, err := git.PlainInit(repoDir, false)
+	require.NoError(t, err)
+	tree, err := repo.Worktree()
+	require.NoError(t, err)
+	_, err = tree.Add(".")
+	require.NoError(t, err)
+	_, err = tree.Commit("package", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.invalid", When: time.Now()}})
+	require.NoError(t, err)
+
+	for _, offline := range []string{"", "1"} {
+		t.Run("offline="+offline, func(t *testing.T) {
+			t.Setenv("TAU_OFFLINE", offline)
+			t.Setenv("PI_OFFLINE", "")
+			home := t.TempDir()
+			cfgDir := filepath.Join(home, "agent")
+			t.Setenv("HOME", home)
+			t.Setenv("TAU_CONFIG_DIR", cfgDir)
+			t.Setenv("TAU_SESSION_DIR", filepath.Join(home, "sessions"))
+			t.Chdir(t.TempDir())
+			require.NoError(t, os.MkdirAll(cfgDir, 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(cfgDir, "settings.json"), []byte(`{"packages":["file://`+repoDir+`"]}`), 0o600))
+			ctx, diagnostics := withStartupDiagnostics(t.Context())
+			opts, _, _, _, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, withoutPlugins())
+			require.NoError(t, err)
+			require.Empty(t, diagnostics.Lines())
+			installed := filepath.Join(cfgDir, "packages", "configured", "tau-package.toml")
+			if offline == "" {
+				require.FileExists(t, installed)
+				userDir, projectDir := packageDirsFromSettings(opts.Settings)
+				resolved, err := packages.ResolvePackageSources(opts.Settings, userDir, projectDir)
+				require.NoError(t, err)
+				require.Len(t, resolved, 1)
+				assert.Equal(t, "file://"+repoDir, resolved[0].Source.Source)
+			} else {
+				require.NoFileExists(t, installed)
+			}
+		})
+	}
 }

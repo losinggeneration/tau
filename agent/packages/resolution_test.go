@@ -1,8 +1,10 @@
 package packages
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/losinggeneration/tau/ai"
@@ -228,15 +230,130 @@ func TestInstalledRootsRecoversInterruptedPackages(t *testing.T) {
 
 func TestDeniedProjectPackagesAreNotInspected(t *testing.T) {
 	global, project := t.TempDir(), t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"defaultProjectTrust":"never"}`), 0600))
-	require.NoError(t, os.Mkdir(filepath.Join(project, ".tau"), 0700))
-	require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte("malformed"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"defaultProjectTrust":"never"}`), 0o600))
+	require.NoError(t, os.Mkdir(filepath.Join(project, ".tau"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte("malformed"), 0o600))
 	settings, err := ai.LoadTrustedSettings(t.Context(), global, project, t.TempDir(), ai.ProjectTrustOptions{})
 	require.NoError(t, err)
 	base := filepath.Join(project, ".tau", "packages")
-	require.NoError(t, os.MkdirAll(filepath.Join(base, "broken"), 0700))
-	require.NoError(t, os.WriteFile(sidecarPath(filepath.Join(base, "broken")), []byte("malformed"), 0600))
+	require.NoError(t, os.MkdirAll(filepath.Join(base, "broken"), 0o700))
+	require.NoError(t, os.WriteFile(sidecarPath(filepath.Join(base, "broken")), []byte("malformed"), 0o600))
 	resolved, err := ResolvePackageSources(settings, t.TempDir(), base)
 	require.NoError(t, err)
 	require.Empty(t, resolved)
+}
+
+func TestInstallMissingSourcesFollowsScopeDecisionAndOffline(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	t.Setenv("TAU_OFFLINE", "")
+	setup := func(t *testing.T, trusted bool) (*InstallManager, *ai.Settings, string, string, *[]string) {
+		t.Helper()
+		global, project := t.TempDir(), t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"packages":["npm:user-pkg@1.0.0","./local-missing"]}`), 0o600))
+		require.NoError(t, os.Mkdir(filepath.Join(project, ".tau"), 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(project, ".tau", "settings.json"), []byte(`{"packages":["npm:project-pkg@2.0.0"]}`), 0o600))
+		settings, err := ai.LoadTrustedSettings(t.Context(), global, project, t.TempDir(), ai.ProjectTrustOptions{Override: new(trusted)})
+		require.NoError(t, err)
+		userDir, projectDir := filepath.Join(global, "packages"), filepath.Join(project, ".tau", "packages")
+		manager := NewInstallManager(userDir, projectDir)
+		var packed []string
+		manager.npmPack = func(_ context.Context, spec, dst string) (string, error) {
+			packed = append(packed, spec)
+			name, version, _ := strings.Cut(spec, "@")
+			return writePiTarball(t, dst, `{"name":"`+name+`","version":"`+version+`"}`), nil
+		}
+		return manager, settings, userDir, projectDir, &packed
+	}
+
+	t.Run("no decision installs each source into its scope", func(t *testing.T) {
+		manager, settings, userDir, projectDir, packed := setup(t, true)
+		installed, err := manager.InstallMissingSources(t.Context(), settings, nil)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []string{"npm:user-pkg@1.0.0", "npm:project-pkg@2.0.0"}, installed)
+		assert.ElementsMatch(t, []string{"user-pkg@1.0.0", "project-pkg@2.0.0"}, *packed)
+		require.FileExists(t, filepath.Join(userDir, "user-pkg", "package.json"))
+		require.FileExists(t, filepath.Join(projectDir, "project-pkg", "package.json"))
+		resolved, err := ResolvePackageSources(settings, userDir, projectDir)
+		require.NoError(t, err)
+		assert.Len(t, resolved, 2)
+		installed, err = manager.InstallMissingSources(t.Context(), settings, nil)
+		require.NoError(t, err)
+		assert.Empty(t, installed)
+		assert.Len(t, *packed, 2, "installed sources were installed again")
+	})
+	t.Run("skip and error decisions install nothing", func(t *testing.T) {
+		manager, settings, _, _, packed := setup(t, true)
+		var asked []string
+		installed, err := manager.InstallMissingSources(t.Context(), settings, func(_ context.Context, source string) (MissingSourceAction, error) {
+			asked = append(asked, source)
+			return MissingSourceSkip, nil
+		})
+		require.NoError(t, err)
+		assert.Empty(t, installed)
+		assert.ElementsMatch(t, []string{"npm:user-pkg@1.0.0", "npm:project-pkg@2.0.0"}, asked)
+		_, err = manager.InstallMissingSources(t.Context(), settings, func(context.Context, string) (MissingSourceAction, error) {
+			return MissingSourceError, nil
+		})
+		require.ErrorContains(t, err, "missing source")
+		assert.Empty(t, *packed)
+	})
+	t.Run("untrusted project installs only user sources", func(t *testing.T) {
+		manager, settings, _, projectDir, packed := setup(t, false)
+		_, err := manager.InstallMissingSources(t.Context(), settings, nil)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"user-pkg@1.0.0"}, *packed)
+		require.NoDirExists(t, projectDir)
+	})
+	t.Run("offline installs nothing", func(t *testing.T) {
+		t.Setenv("TAU_OFFLINE", "1")
+		manager, settings, _, _, packed := setup(t, true)
+		_, err := manager.InstallMissingSources(t.Context(), settings, func(context.Context, string) (MissingSourceAction, error) {
+			return MissingSourceError, nil
+		})
+		require.NoError(t, err)
+		assert.Empty(t, *packed)
+	})
+}
+
+func TestInstallMissingSourcesReinstallsVersionOutsideRange(t *testing.T) {
+	t.Setenv("PI_OFFLINE", "")
+	t.Setenv("TAU_OFFLINE", "")
+	for _, tc := range []struct {
+		name, source, installed, packs string
+		reinstall                      bool
+	}{
+		{name: "outside caret range", source: "npm:pkg@^1.2.0", installed: `{"name":"pkg","version":"1.0.0"}`, packs: "1.5.0", reinstall: true},
+		{name: "inside caret range", source: "npm:pkg@^1.2.0", installed: `{"name":"pkg","version":"1.4.1"}`},
+		{name: "pinned mismatch", source: "npm:pkg@2.0.0", installed: `{"name":"pkg","version":"1.0.0"}`, packs: "2.0.0", reinstall: true},
+		{name: "dist-tag always matches", source: "npm:pkg@latest", installed: `{"name":"pkg","version":"0.1.0"}`},
+		{name: "no version always matches", source: "npm:pkg", installed: `{"name":"pkg","version":"0.1.0"}`},
+		{name: "missing installed version", source: "npm:pkg@^1.0.0", installed: `{"name":"pkg"}`, packs: "1.5.0", reinstall: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			global := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(global, "settings.json"), []byte(`{"packages":["`+tc.source+`"]}`), 0o600))
+			settings, err := ai.LoadTrustedSettings(t.Context(), global, t.TempDir(), t.TempDir(), ai.ProjectTrustOptions{Override: new(false)})
+			require.NoError(t, err)
+			userDir := filepath.Join(global, "packages")
+			require.NoError(t, os.MkdirAll(filepath.Join(userDir, "pkg"), 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(userDir, "pkg", "package.json"), []byte(tc.installed), 0o600))
+			manager := NewInstallManager(userDir, "")
+			var packed []string
+			manager.npmPack = func(_ context.Context, spec, dst string) (string, error) {
+				packed = append(packed, spec)
+				return writePiTarball(t, dst, `{"name":"pkg","version":"`+tc.packs+`"}`), nil
+			}
+			installed, err := manager.InstallMissingSources(t.Context(), settings, nil)
+			require.NoError(t, err)
+			if !tc.reinstall {
+				assert.Empty(t, installed)
+				assert.Empty(t, packed)
+				return
+			}
+			assert.Equal(t, []string{tc.source}, installed)
+			data, err := os.ReadFile(filepath.Join(userDir, "pkg", "package.json"))
+			require.NoError(t, err)
+			assert.Contains(t, string(data), `"`+tc.packs+`"`)
+		})
+	}
 }

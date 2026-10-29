@@ -230,7 +230,6 @@ func (m *mockRuntime) ResolveModel() (*sdk.ResolvedModel, error) {
 }
 
 func (m *mockRuntime) TelemetryEnabled() bool { return false }
-func (m *mockRuntime) ShareViewerURL() string { return "" }
 func (m *mockRuntime) PluginManager() *plugins.Manager {
 	return nil
 }
@@ -303,11 +302,17 @@ func (s *mockSession) State() sdk.SessionState {
 	}
 	return state
 }
-func (s *mockSession) IsPersisted() bool                                               { return s.persist }
-func (s *mockSession) Close(ctx context.Context) error                                 { return s.closeErr }
-func (s *mockSession) Interrupt() error                                                { s.interrupts++; return nil }
+
+func (s *mockSession) IsPersisted() bool { return s.persist }
+
+func (s *mockSession) Close(ctx context.Context) error { return s.closeErr }
+
+func (s *mockSession) Interrupt() error { s.interrupts++; return nil }
+
 func (s *mockSession) Compact(ctx context.Context, customInstructions ...string) error { return nil }
-func (s *mockSession) SlashCommands() []sdk.SlashCommandInfo                           { return nil }
+
+func (s *mockSession) SlashCommands() []sdk.SlashCommandInfo { return nil }
+
 func (s *mockSession) SetModel(model string) error {
 	s.setModels = append(s.setModels, model)
 	s.state = sdk.NewSessionState(s.id, model, s.state.CWD())

@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 
+	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
 )
 
@@ -197,11 +199,19 @@ func getGoogleCloudCredentials(ctx context.Context, o *options) (googleCloudAuth
 		return googleCloudAuth{BearerToken: token}, nil
 	}
 	// ponytail: credentials are detected per request; cache them per client if token exchanges show up in latency.
-	creds, err := credentials.DetectDefault(&credentials.DetectOptions{
-		Scopes:          []string{"https://www.googleapis.com/auth/cloud-platform"},
-		CredentialsFile: o.providerEnvValue("GOOGLE_APPLICATION_CREDENTIALS"),
-		Client:          http.DefaultClient,
-	})
+	detect := &credentials.DetectOptions{
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Client: http.DefaultClient,
+	}
+	var (
+		creds *auth.Credentials
+		err   error
+	)
+	if path := o.providerEnvValue("GOOGLE_APPLICATION_CREDENTIALS"); path != "" {
+		creds, err = credentialsFromFile(path, detect)
+	} else {
+		creds, err = credentials.DetectDefault(detect)
+	}
 	if err != nil {
 		return googleCloudAuth{}, err
 	}
@@ -210,6 +220,29 @@ func getGoogleCloudCredentials(ctx context.Context, o *options) (googleCloudAuth
 		return googleCloudAuth{}, err
 	}
 	return googleCloudAuth{BearerToken: token.Value}, nil
+}
+
+// credentialsFromFile loads a GOOGLE_APPLICATION_CREDENTIALS file, accepting
+// only key-based credential types. External account configurations can run
+// arbitrary executables or reach arbitrary endpoints to fetch a token, so a
+// path that may come from scoped provider settings must not select one.
+func credentialsFromFile(path string, opts *credentials.DetectOptions) (*auth.Credentials, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var file struct {
+		Type credentials.CredType `json:"type"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	switch file.Type {
+	case credentials.ServiceAccount, credentials.AuthorizedUser:
+		return credentials.NewCredentialsFromJSON(file.Type, data, opts)
+	default:
+		return nil, fmt.Errorf("%s: unsupported credential type %q", path, file.Type)
+	}
 }
 
 // buildVertexRequestBody builds the Vertex AI request body.

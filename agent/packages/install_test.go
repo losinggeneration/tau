@@ -256,9 +256,9 @@ func TestInstallScopedNativePackageCreatesScopeParent(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(source, "tau-package.toml"), []byte("[package]\nname = \"@scope/plugin\"\nversion = \"1\"\n[plugin]\napi_version = \"1\"\n"), 0o600))
 	manager := NewInstallManager(base, t.TempDir())
 	require.NoError(t, manager.Install(t.Context(), Config{Source: source, Yes: true, Link: true}))
-	target, err := os.Readlink(filepath.Join(base, "@scope", "plugin"))
+	target, err := os.Readlink(filepath.Join(base, "@scope", "plugin", "tau-package.toml"))
 	require.NoError(t, err)
-	require.Equal(t, source, target)
+	require.Equal(t, filepath.Join(source, "tau-package.toml"), target)
 }
 
 func TestInstallLocalLinkResolvesRelativeSource(t *testing.T) {
@@ -269,9 +269,9 @@ func TestInstallLocalLinkResolvesRelativeSource(t *testing.T) {
 	base := filepath.Join(root, "packages")
 	manager := NewInstallManager(base, t.TempDir())
 	require.NoError(t, manager.Install(t.Context(), Config{Source: "./source", Yes: true, Link: true}))
-	target, err := filepath.EvalSymlinks(filepath.Join(base, "plugin"))
+	target, err := filepath.EvalSymlinks(filepath.Join(base, "plugin", "tau-package.toml"))
 	require.NoError(t, err)
-	require.Equal(t, filepath.Join(root, "source"), target)
+	require.Equal(t, filepath.Join(root, "source", "tau-package.toml"), target)
 }
 
 func TestCopyFileRetainsExecutablePermissions(t *testing.T) {

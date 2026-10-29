@@ -502,7 +502,7 @@ func TestChatLogStreamingFencedBlockKeepsLiteralStateAcrossDeltas(t *testing.T) 
 	defer log.mu.Unlock()
 	joined := strings.Join(renderLineTexts(log.lines), "\n")
 	for _, want := range []string{" ```markdown", " # Literal Header", " **literal bold**"} {
-		if !strings.Contains(joined, want) {
+		if !strings.Contains(tauui.StripANSI(joined), want) {
 			t.Fatalf("streaming fenced content missing %q from:\n%s", want, joined)
 		}
 	}
@@ -548,7 +548,7 @@ func TestChatLogFencedBlocksRenderLiteralContent(t *testing.T) {
 	defer log.mu.Unlock()
 	joined := strings.Join(renderLineTexts(log.lines), "\n")
 	for _, want := range []string{" ```markdown", " # Literal Header", " **literal bold**", " ```"} {
-		if !strings.Contains(joined, want) {
+		if !strings.Contains(tauui.StripANSI(joined), want) {
 			t.Fatalf("literal fenced content missing %q from:\n%s", want, joined)
 		}
 	}

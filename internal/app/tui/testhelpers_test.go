@@ -321,6 +321,7 @@ func newTestApp(t *testing.T) *App {
 	}
 	t.Cleanup(func() { _ = a.chat.Close() })
 	a.cancelRun = func() {}
+	a.openURL = func(string) error { return nil }
 	return a
 }
 

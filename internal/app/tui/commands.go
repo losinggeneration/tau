@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/losinggeneration/tau/ai"
-	"github.com/losinggeneration/tau/ai/oauth"
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
@@ -77,12 +76,11 @@ type Commands struct {
 // NewCommands returns a Commands registry seeded with the built-in
 // interactive commands:
 //
-//	/settings, /model, /scoped-models, /export, /import, /share,
-//	/copy, /name, /session, /changelog, /hotkeys, /fork, /tree,
+//	/settings, /model, /scoped-models, /export, /import,
+//	/copy, /name, /session, /hotkeys, /fork, /tree,
 //
 // plus the convenience /help (standard across interactive CLIs).
 //
-// Commands still stubbed: /import, /share, and /changelog.
 // /reload is owned by the session's command pipeline (it re-discovers
 // skills/prompts/themes and reloads plugins); the TUI forwards the line
 // when the session advertises it. /export, /copy, /fork, /tree, /login,
@@ -120,9 +118,8 @@ func NewCommands() *Commands {
 	// hooked up.
 	c.Register(Command{Name: "settings", Description: "Open settings", Handler: cmdSettingsOverlay})
 	c.Register(Command{Name: "scoped-models", Description: "Scope available models", Handler: cmdScopedModelsOverlay})
-	c.Register(Command{Name: "export", Description: "Export the current session", Handler: cmdExportOrStub})
-	c.Register(Command{Name: "import", Description: "Import a session", Handler: cmdStub("import", "Import a session from a file (coming soon)")})
-	c.Register(Command{Name: "share", Description: "Share the session", Handler: cmdStub("share", "Share the session (coming soon)")})
+	c.Register(Command{Name: "export", Description: "Export the current session", Handler: cmdExport})
+	c.Register(Command{Name: "import", Description: "Import a session", Handler: cmdImport})
 	c.Register(Command{Name: "copy", Description: "Copy the last reply", Handler: cmdCopy})
 	c.Register(Command{Name: "name", Description: "Name this session", Handler: cmdName})
 	c.Register(Command{Name: "session", Description: "Open the session workspace", Handler: cmdSessionWorkspace})
@@ -130,7 +127,6 @@ func NewCommands() *Commands {
 	// on the shell. Same workspace; the shell builtin's "run from the
 	// shell" reply is useless inside the TUI.
 	c.Register(Command{Name: "sessions", Description: "Browse saved sessions (resume, fork, rename, pin)", Handler: cmdSessionWorkspace})
-	c.Register(Command{Name: "changelog", Description: "Show the changelog", Handler: cmdStub("changelog", "Show the changelog (coming soon)")})
 	c.Register(Command{Name: "hotkeys", Description: "Show keybinding hints", Handler: cmdHotkeys})
 	c.Register(Command{Name: "layout", Description: "Switch layout: fixed or document", Handler: cmdLayout})
 	c.Register(Command{Name: "fork", Description: "Fork session (space: pick point)", Handler: cmdForkOrStub})
@@ -897,26 +893,6 @@ func (a *App) sessionState() sdk.SessionState {
 	return a.sess.State()
 }
 
-// cmdStub returns a handler that surfaces a "coming soon" notice in
-// the chat log. It's a placeholder for the interactive builtins that
-// don't have a real implementation yet. The notice is short on
-// purpose — the goal is to acknowledge the keystroke and tell the
-// user the command exists but isn't wired up, not to deliver a
-// full feature description. Each stub is paired with a Command
-// registration in NewCommands so the entry appears in /help and the
-// completion popup from the moment the TUI starts.
-//
-// The returned handler is safe to call from the app loop.
-func cmdStub(name, notice string) func(*App, string) {
-	return func(app *App, _ string) {
-		if app == nil {
-			return
-		}
-		app.conv.AddSystem("/" + name + ": " + notice)
-		app.refreshChat()
-	}
-}
-
 func cmdLogout(app *App, args string) {
 	if app == nil {
 		return
@@ -950,8 +926,7 @@ func cmdLogin(app *App, args string) {
 	}
 	fields := strings.Fields(args)
 	if len(fields) == 0 {
-		app.conv.AddError("usage: /login <provider> [api-key]")
-		app.refreshChat()
+		app.startLogin("")
 		return
 	}
 	provider := fields[0]
@@ -965,10 +940,8 @@ func cmdLogin(app *App, args string) {
 		return
 	}
 	if apiKey == "" && !ai.ProviderAllowsNoCredential(provider) {
-		if p, ok := oauth.GetProvider(oauth.ProviderID(provider)); ok {
-			app.startOAuthLogin(p)
-			return
-		}
+		app.startLogin(provider)
+		return
 	}
 	if app.loginDialog != nil {
 		app.dismissDialog()
@@ -989,7 +962,7 @@ func cmdLogin(app *App, args string) {
 		return
 	}
 	if apiKey != "" {
-		app.conv.AddSystem("Logged in to " + provider + " with API key")
+		app.completeProviderLogin(provider, "Logged in to "+provider+" with API key")
 	} else {
 		app.conv.AddSystem("Configured " + provider + " (no credential required)")
 	}
@@ -1037,6 +1010,7 @@ var hotkeyHintOrder = []string{
 	actionIDThinkingCycle,
 	actionIDThinkingToggle,
 	actionIDPaste,
+	actionIDMessageCopy,
 	actionIDMessageDequeue,
 	actionIDMessageFollowUp,
 	actionIDHistorySearchBackward,

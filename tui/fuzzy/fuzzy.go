@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -47,7 +48,7 @@ func MatchString(query, text string) Match {
 	return swappedMatch
 }
 
-// Filter returns the items whose text matches all space-separated tokens in
+// Filter returns the items whose text matches all space- or slash-separated tokens in
 // query, sorted by total fuzzy score. Empty or whitespace-only queries return a
 // shallow copy in the original order.
 func Filter[T any](items []T, query string, text func(T) string) []T {
@@ -58,7 +59,7 @@ func Filter[T any](items []T, query string, text func(T) string) []T {
 		return out
 	}
 
-	tokens := strings.Fields(query)
+	tokens := strings.FieldsFunc(query, func(r rune) bool { return r == '/' || unicode.IsSpace(r) })
 	if len(tokens) == 0 {
 		out := make([]T, len(items))
 		copy(out, items)
@@ -151,6 +152,10 @@ func matchNormalized(queryLower, textLower string) Match {
 
 	if queryIndex < len(query) {
 		return Match{Matches: false, Score: 0}
+	}
+
+	if queryLower == textLower {
+		score -= 100
 	}
 
 	return Match{Matches: true, Score: score}

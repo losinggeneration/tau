@@ -2,6 +2,7 @@ package packages
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/paths"
 )
@@ -174,8 +176,90 @@ func recoverInstalledEntries(base string, entries []os.DirEntry) ([]os.DirEntry,
 }
 
 // ResolvePackageSources resolves configured local sources and already installed
-// npm/git sources. Discovery never installs or executes an unapproved package.
+// npm/git sources. It never installs; see InstallManager.InstallMissingSources.
 func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([]ResolvedPackage, error) {
+	resolved, _, err := resolvePackages(settings, userDir, projectDir)
+	return resolved, err
+}
+
+// MissingSourceAction is a caller's decision for a configured source that
+// isn't installed.
+type MissingSourceAction int
+
+const (
+	MissingSourceInstall MissingSourceAction = iota
+	MissingSourceSkip
+	MissingSourceError
+)
+
+// InstallMissingSources installs configured npm and git sources that aren't
+// installed, each into the scope that configures it, and returns the installed
+// sources. The settings entry is the approval, so installs don't prompt. decide
+// picks an action per source and nil installs them all. Offline mode installs
+// nothing.
+func (m *InstallManager) InstallMissingSources(ctx context.Context, settings *ai.Settings, decide func(context.Context, string) (MissingSourceAction, error)) ([]string, error) {
+	if IsOfflineMode() {
+		return nil, nil
+	}
+	_, missing, err := resolvePackages(settings, m.userDir, m.projectDir)
+	if err != nil {
+		return nil, err
+	}
+	var installed []string
+	for _, source := range missing {
+		action := MissingSourceInstall
+		if decide != nil {
+			if action, err = decide(ctx, source.source); err != nil {
+				return installed, err
+			}
+		}
+		switch action {
+		case MissingSourceSkip:
+			continue
+		case MissingSourceError:
+			return installed, fmt.Errorf("missing source: %s", source.source)
+		}
+		if err := m.Install(ctx, Config{Source: source.source, Project: source.project, Yes: true, Force: source.stale}); err != nil {
+			return installed, fmt.Errorf("install %s: %w", source.source, err)
+		}
+		installed = append(installed, source.source)
+	}
+	return installed, nil
+}
+
+// missingSource is a configured npm or git source with no installed root, or
+// an installed npm package outside its configured version range (stale).
+type missingSource struct {
+	source  string
+	project bool
+	stale   bool
+}
+
+// npmVersionMatches reports whether the package installed at root satisfies
+// the version in an npm source. A version that isn't a range, such as a
+// dist-tag, always matches; an unreadable installed version never does.
+func npmVersionMatches(source, root string) bool {
+	version := parseNpmSpec(strings.TrimPrefix(strings.TrimSpace(source), "npm:")).Version
+	if version == "" {
+		return true
+	}
+	constraint, err := semver.NewConstraint(version)
+	if err != nil {
+		return true
+	}
+	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return false
+	}
+	var manifest struct{ Version string }
+	if json.Unmarshal(data, &manifest) != nil {
+		return false
+	}
+	installed, err := semver.NewVersion(manifest.Version)
+	return err == nil && constraint.Check(installed)
+}
+
+func resolvePackages(settings *ai.Settings, userDir, projectDir string) ([]ResolvedPackage, []missingSource, error) {
 	if !settings.ProjectResourcesTrusted() {
 		projectDir = ""
 	}
@@ -185,7 +269,7 @@ func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([
 		}
 		absolute, err := filepath.Abs(paths.ResourcePath(*dir, "", ""))
 		if err != nil {
-			return nil, fmt.Errorf("resolve packages directory: %w", err)
+			return nil, nil, fmt.Errorf("resolve packages directory: %w", err)
 		}
 		*dir = absolute
 	}
@@ -198,27 +282,27 @@ func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([
 	for scope, base := range []string{projectDir, userDir} {
 		roots, err := InstalledRoots(base)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, root := range roots {
 			sidecar, err := LoadSidecar(root)
 			var identity string
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) {
-					return nil, err
+					return nil, nil, err
 				}
 				name, relErr := filepath.Rel(base, root)
 				if relErr != nil {
-					return nil, fmt.Errorf("resolve installed name: %w", relErr)
+					return nil, nil, fmt.Errorf("resolve installed name: %w", relErr)
 				}
 				identity, err = packageIdentity("npm:"+filepath.ToSlash(name), base)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			} else {
 				identity, err = packageIdentity(sidecar.Source, base)
 				if err != nil {
-					return nil, fmt.Errorf("installed package %s: %w", root, err)
+					return nil, nil, fmt.Errorf("installed package %s: %w", root, err)
 				}
 			}
 			installs = append(installs, installed{root, identity, scope})
@@ -241,7 +325,7 @@ func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([
 		for _, source := range group.Sources {
 			identity, err := packageIdentity(source.Source, group.BaseDir)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			entries = append(entries, configured{source, identity, scope})
 		}
@@ -249,6 +333,7 @@ func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([
 	claimed := make(map[string]bool)
 	seenRoots := make(map[string]bool)
 	result := make([]ResolvedPackage, 0)
+	var missing []missingSource
 	for _, entry := range entries {
 		if claimed[entry.identity] {
 			continue
@@ -297,19 +382,24 @@ func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([
 				}
 			}
 		}
-		if root == "" {
-			continue
-		}
-		canonical, err := filepath.EvalSymlinks(root)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+		if root != "" {
+			canonical, err := filepath.EvalSymlinks(root)
+			if err == nil {
+				if strings.HasPrefix(entry.identity, "npm:") && !npmVersionMatches(source.Source, canonical) {
+					missing = append(missing, missingSource{source.Source, scope == 0, true})
+				}
+				if !seenRoots[canonical] {
+					seenRoots[canonical] = true
+					result = append(result, ResolvedPackage{canonical, source, delta})
+				}
 				continue
 			}
-			return nil, fmt.Errorf("resolve package root: %w", err)
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, nil, fmt.Errorf("resolve package root: %w", err)
+			}
 		}
-		if !seenRoots[canonical] {
-			seenRoots[canonical] = true
-			result = append(result, ResolvedPackage{canonical, source, delta})
+		if !strings.HasPrefix(entry.identity, "local:") && (scope == 1 || projectDir != "") {
+			missing = append(missing, missingSource{source: source.Source, project: scope == 0})
 		}
 	}
 	for _, install := range installs {
@@ -318,7 +408,7 @@ func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([
 		}
 		canonical, err := filepath.EvalSymlinks(install.root)
 		if err != nil {
-			return nil, fmt.Errorf("resolve installed package: %w", err)
+			return nil, nil, fmt.Errorf("resolve installed package: %w", err)
 		}
 		if seenRoots[canonical] {
 			continue
@@ -329,7 +419,7 @@ func ResolvePackageSources(settings *ai.Settings, userDir, projectDir string) ([
 		}
 		result = append(result, ResolvedPackage{Root: canonical})
 	}
-	return result, nil
+	return result, missing, nil
 }
 
 // CloneResolvedPackages isolates resource policies staged for a reload.

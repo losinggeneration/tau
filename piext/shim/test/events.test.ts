@@ -159,3 +159,31 @@ test("dispatch without makeCtx leaves ctx undefined (extensions must guard)", as
 	await router.dispatch("agent_start", "{}");
 	assert.equal(observedCtx, undefined);
 });
+
+test("project_trust: first yes/no answer wins and undecided or failing handlers fall through", async () => {
+	const router = new EventRouter();
+	const calls: string[] = [];
+	router.on("project_trust", (event) => {
+		calls.push(`undecided:${String(event["cwd"])}`);
+		return { trusted: "undecided" };
+	});
+	router.on("project_trust", () => {
+		calls.push("throws");
+		throw new Error("boom");
+	});
+	router.on("project_trust", async () => {
+		calls.push("yes");
+		return { trusted: "yes", remember: true };
+	});
+	router.on("project_trust", () => {
+		calls.push("late");
+		return { trusted: "no" };
+	});
+	const result = await router.dispatch("project_trust", JSON.stringify({ cwd: "/work" }));
+	assert.deepEqual(calls, ["undecided:/work", "throws", "yes"]);
+	assert.deepEqual(JSON.parse(result.responseData), { trusted: "yes", remember: true });
+
+	const undecided = new EventRouter();
+	undecided.on("project_trust", () => ({ trusted: "undecided" }));
+	assert.equal((await undecided.dispatch("project_trust", "{}")).responseData, "");
+});

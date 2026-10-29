@@ -166,16 +166,12 @@ func (o *Overlay) SetHidden(hidden bool) {
 		return
 	}
 
-	place := o.resolvedPlacement()
-	if place == nil {
-		place = roverlay.Centered{}
-	}
-	o.opts.Place = place
+	o.opts.Place = o.resolvedPlacement()
 	_ = o.app.Post(func(ctx *UpdateCtx) {
 		inner := ctx.ShowOverlay(rovel.OverlayOpts{
 			Root:      o.opts.Root,
 			Modal:     o.opts.Modal && !o.opts.NonCapturing,
-			Place:     place,
+			Place:     o.opts.Place,
 			OnDismiss: o.opts.OnDismiss,
 		})
 		o.setActive(inner)
@@ -228,17 +224,13 @@ func (a *App) ShowOverlay(opts OverlayOpts) *Overlay {
 		h.hidden = true
 		return h
 	}
-	place := h.resolvedPlacement()
-	if place == nil {
-		place = roverlay.Centered{}
-	}
-	h.opts.Place = place
+	h.opts.Place = h.resolvedPlacement()
 
 	_ = a.Post(func(ctx *UpdateCtx) {
 		inner := ctx.ShowOverlay(rovel.OverlayOpts{
 			Root:      h.opts.Root,
 			Modal:     h.opts.Modal && !h.opts.NonCapturing,
-			Place:     place,
+			Place:     h.opts.Place,
 			OnDismiss: h.opts.OnDismiss,
 		})
 		h.setActive(inner)

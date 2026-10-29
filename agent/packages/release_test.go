@@ -467,10 +467,9 @@ path = "skills"
 	assert.Equal(t, []string{"test-link-pkg"}, rec.pluginNames,
 		"link install of a plugin package should reload the plugin by name")
 
-	linkPath := filepath.Join(userDir, "test-link-pkg")
-	info, err := os.Lstat(linkPath)
+	info, err := os.Lstat(filepath.Join(userDir, "test-link-pkg", "tau-package.toml"))
 	require.NoError(t, err)
-	assert.NotZero(t, info.Mode()&os.ModeSymlink, "--link should create a symlink, not a copy")
+	assert.NotZero(t, info.Mode()&os.ModeSymlink, "--link should link source entries, not copy them")
 }
 
 func TestExtractTarGzRejectsPathsOutsidePackage(t *testing.T) {

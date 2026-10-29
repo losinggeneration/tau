@@ -2,13 +2,11 @@
 package session
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,11 +28,6 @@ type CLI struct {
 	Resolver  *ai.ModelResolver
 	model     *ai.Model
 	modelSpec ai.ModelSpec
-	// GistURL overrides the GitHub Gist API endpoint for tests.
-	GistURL string
-	// GistStatusCode overrides the expected HTTP status for gist creation.
-	// Defaults to http.StatusCreated (201).
-	GistStatusCode int
 }
 
 // NewCLI creates a CLI backed by the default session storage and credential store.
@@ -695,113 +688,6 @@ func (c *CLI) Export(ctx context.Context, id string, opts ExportOptions) error {
 
 	_, err = os.Stdout.Write(data)
 	return err
-}
-
-// Share posts a session to GitHub Gist and returns the URL.
-// If TAU_SHARE_VIEWER_URL is set, the returned URL will use that as the base
-// for viewing the shared session instead of the default https://pi.dev/session/.
-func (c *CLI) Share(ctx context.Context, id string, isPublic bool) (url string, err error) {
-	// Get GitHub credential
-	cred, err := c.Store.Get(ctx, "github")
-	if err != nil {
-		return "", fmt.Errorf("run `tau login github` first: no credential found for github")
-	}
-
-	var apiKey string
-	switch cred.Type {
-	case ai.CredentialTypeAPIKey:
-		if apiKey, err = store.APIKeyFromCredential(ctx, "github", cred); err != nil {
-			return "", err
-		}
-	case ai.CredentialTypeOAuth:
-		apiKey = cred.AccessToken
-	default:
-		return "", errors.New("github credential is not an API key or OAuth token")
-	}
-
-	if apiKey == "" {
-		return "", errors.New("github credential has no API key")
-	}
-
-	// Export to HTML for the gist
-	data, err := c.Storage.ExportHTML(id)
-	if err != nil {
-		return "", fmt.Errorf("export session: %w", err)
-	}
-
-	// Post to GitHub Gist API
-	reqBody := map[string]any{
-		"description": fmt.Sprintf("Tau session %s", id),
-		"public":      isPublic,
-		"files": map[string]map[string]string{
-			"session.html": {
-				"content": string(data),
-			},
-		},
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal gist request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.gistAPIURL(), bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("post gist: %w", err)
-	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close gist response body: %w", closeErr)
-		}
-	}()
-
-	// GistStatusCode allows tests to use a non-201 status code.
-	wantCode := http.StatusCreated
-	if c.GistStatusCode != 0 {
-		wantCode = c.GistStatusCode
-	}
-	if resp.StatusCode != wantCode {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("gist creation failed (status %d): %s", resp.StatusCode, string(respBody))
-	}
-
-	var gist struct {
-		ID      string `json:"id"`
-		HTMLURL string `json:"html_url"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&gist); err != nil {
-		return "", fmt.Errorf("parse gist response: %w", err)
-	}
-
-	// If TAU_SHARE_VIEWER_URL is set, return it with the gist ID appended
-	// This allows using a custom viewer URL instead of the default pi.dev/session/
-	if viewerURL := ai.ShareViewerURL(); viewerURL != "" {
-		if gist.ID == "" {
-			return "", errors.New("gist response missing id")
-		}
-		// Ensure viewer URL ends with / for clean concatenation
-		viewerURL = strings.TrimSuffix(viewerURL, "/")
-		return viewerURL + "/" + gist.ID, nil
-	}
-
-	return gist.HTMLURL, nil
-}
-
-// gistAPIURL returns the Gist API base URL. If CLI.GistURL is set it is used
-// as-is (for tests). Otherwise defaults to the GitHub Gist API endpoint.
-func (c *CLI) gistAPIURL() string {
-	if c.GistURL != "" {
-		return c.GistURL
-	}
-	return "https://api.github.com/gists"
 }
 
 // Helpers
