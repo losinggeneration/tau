@@ -57,12 +57,17 @@ type ToolFunc func(ctx ToolContext) (*ToolResult, error)
 // ToolContext contains context for tool execution.
 type ToolContext struct {
 	ExecuteTool func(ai.ToolCall) *ToolResult
-	Model       *ai.Model
-	Context     context.Context
-	ToolCallID  string
-	Name        string
-	Args        map[string]any
-	OnUpdate    func(*ToolResult)
+	// ExecuteToolContext is ExecuteTool with a per-call context; cancelling it
+	// cancels only that nested call.
+	ExecuteToolContext func(context.Context, ai.ToolCall) *ToolResult
+	// Tools are the tools nested calls may reach.
+	Tools      []Tool
+	Model      *ai.Model
+	Context    context.Context
+	ToolCallID string
+	Name       string
+	Args       map[string]any
+	OnUpdate   func(*ToolResult)
 
 	// SessionCWD is the session's current working directory.
 	// All tools that touch the filesystem resolve relative paths against this.

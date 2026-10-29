@@ -64,6 +64,21 @@ type ServerConfig struct {
 // IsEnabled reports whether the server should connect.
 func (c ServerConfig) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
 
+// Exposures returns the exposures the server's tools can have, known from
+// the config before the server connects.
+func (c ServerConfig) Exposures() []Exposure {
+	exposures := []Exposure{c.Exposure}
+	if c.Exposure == "" {
+		exposures[0] = ExposureCodemode
+	}
+	for _, o := range c.ToolExposure {
+		if !slices.Contains(exposures, o.Exposure) {
+			exposures = append(exposures, o.Exposure)
+		}
+	}
+	return exposures
+}
+
 // ToolExposureFor returns a tool's exposure: an exact toolExposure key, then
 // the first matching pattern, then the server exposure (default codemode).
 func (c ServerConfig) ToolExposureFor(tool string) Exposure {

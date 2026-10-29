@@ -64,6 +64,11 @@ type ServerState struct {
 	// Resources reports the resources capability; resources aren't listed on
 	// connect.
 	Resources bool
+	// Exposures are the exposures the server's tools can have.
+	Exposures []Exposure
+	// Summary is the first line of the configured description, or of the
+	// server's instructions once connected.
+	Summary string
 }
 
 // ToolState is one tool a connected server offers.
@@ -428,7 +433,8 @@ func (m *Manager) States() []ServerState {
 		state := ServerState{
 			Name: s.entry.Name, Scope: s.entry.Scope, Source: s.entry.Source, Transport: describeTransport(s.entry.Config),
 			Override: s.entry.Override, OAuth: s.auth != nil, Status: s.status, Error: s.err,
-			Exposure: exposure, Resources: s.resources,
+			Exposure: exposure, Resources: s.resources, Exposures: s.entry.Config.Exposures(),
+			Summary: s.summary(),
 		}
 		if s.entry.Scope == ScopeGlobal && s.entry.Override == "" {
 			state.ProjectConfig = m.projectConfig
@@ -444,10 +450,19 @@ func (m *Manager) States() []ServerState {
 // WaitDirect waits until every server that can expose direct tools has
 // connected or failed, or ctx ends.
 func (m *Manager) WaitDirect(ctx context.Context) error {
+	return m.wait(ctx, func(s *server) bool { return s.mayExposeDirect() })
+}
+
+// WaitAll waits until every server has connected or failed, or ctx ends.
+func (m *Manager) WaitAll(ctx context.Context) error {
+	return m.wait(ctx, func(*server) bool { return true })
+}
+
+func (m *Manager) wait(ctx context.Context, match func(*server) bool) error {
 	m.mu.Lock()
 	var waits []chan struct{}
 	for _, s := range m.servers {
-		if s.mayExposeDirect() {
+		if match(s) {
 			waits = append(waits, s.ready)
 		}
 	}
@@ -462,11 +477,19 @@ func (m *Manager) WaitDirect(ctx context.Context) error {
 	return nil
 }
 
-func (s *server) mayExposeDirect() bool {
-	if s.entry.Config.Exposure == ExposureDirect {
-		return true
+func (s *server) summary() string {
+	text := strings.TrimSpace(s.entry.Config.Description)
+	if text == "" && s.session != nil && s.status == StatusConnected {
+		if result := s.session.InitializeResult(); result != nil {
+			text = result.Instructions
+		}
 	}
-	return slices.ContainsFunc(s.entry.Config.ToolExposure, func(o ToolExposure) bool { return o.Exposure == ExposureDirect })
+	line, _, _ := strings.Cut(text, "\n")
+	return strings.TrimSpace(line)
+}
+
+func (s *server) mayExposeDirect() bool {
+	return slices.Contains(s.entry.Config.Exposures(), ExposureDirect)
 }
 
 // Close stops pending connections and closes every session. It waits for

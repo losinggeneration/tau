@@ -81,7 +81,7 @@ func ReachableToolsContext(ctx context.Context, current *AgentContext, caller To
 func reachableTools(current *AgentContext, words []string) []Tool {
 	return slices.DeleteFunc(CallableTools(current), func(tool Tool) bool {
 		for _, word := range words {
-			if (word == "*" || word == "all") || strings.Contains(word, tool.Name) {
+			if (word == "*" || word == "all") || strings.Contains(word, tool.Name) || strings.Contains(word, toolIdentifier(tool.Name)) {
 				return false
 			}
 			if tool.Namespace != nil && strings.Contains(word, tool.Namespace.Name) {

@@ -2060,54 +2060,60 @@ func executePreparedTool(ctx context.Context, agentCtx *AgentContext, assistantM
 		partial.NestedCalls = records
 		emitToolUpdate(prepared.toolCall, prepared.args, &partial, emit)
 	}
+	executeNested := func(callCtx context.Context, call ai.ToolCall) *ToolResult {
+		runCtx, cancelRun := context.WithCancel(nestedCtx)
+		defer cancelRun()
+		defer context.AfterFunc(callCtx, cancelRun)()
+		nestedMu.Lock()
+		if nestedClosed {
+			nestedMu.Unlock()
+			return &ToolResult{Content: "caller execution has ended", IsError: true, Rejection: context.Canceled}
+		}
+		nestedCount++
+		sequence := nestedCount
+		if call.ID == "" {
+			call.ID = fmt.Sprintf("%s/%d", prepared.toolCall.ID, nestedCount)
+		}
+		nestedWG.Add(1)
+		if len(running) == 128 {
+			running = slices.Delete(running, 0, 1)
+		}
+		running = append(running, runningCall{sequence: sequence, record: NestedToolCall{ID: call.ID, Name: call.Name, Status: "running"}})
+		nestedMu.Unlock()
+		publishNested()
+		defer nestedWG.Done()
+		nestedResult := RunToolCall(runCtx, &nestedContext, assistantMsg, call, config, func(*ToolResult) { publishNested() })
+		record := NestedToolCall{ID: call.ID, Name: call.Name, Status: "ok", DurationMs: nestedResult.DurationMs}
+		if nestedResult.IsError {
+			record.Status = "error"
+			record.Error = string([]rune(nestedResult.Content)[:min(500, len([]rune(nestedResult.Content)))])
+		}
+		if errors.Is(nestedResult.Rejection, context.Canceled) || errors.Is(nestedResult.Rejection, context.DeadlineExceeded) {
+			record.Status = "cancelled"
+		}
+		nestedMu.Lock()
+		// ponytail: retain the last 128 completions; persist full diagnostics if needed.
+		if len(nestedCalls) == 128 {
+			nestedCalls = slices.Delete(nestedCalls, 0, 1)
+		}
+		running = slices.DeleteFunc(running, func(call runningCall) bool { return call.sequence == sequence })
+		nestedCalls = append(nestedCalls, record)
+		if nestedResult.Usage != nil {
+			addToolUsage(&nestedUsage, *nestedResult.Usage)
+		}
+		nestedMu.Unlock()
+		publishNested()
+		return nestedResult
+	}
 	result, err := prepared.tool.Execute(ToolContext{
-		ExecuteTool: func(call ai.ToolCall) *ToolResult {
-			nestedMu.Lock()
-			if nestedClosed {
-				nestedMu.Unlock()
-				return &ToolResult{Content: "caller execution has ended", IsError: true, Rejection: context.Canceled}
-			}
-			nestedCount++
-			sequence := nestedCount
-			if call.ID == "" {
-				call.ID = fmt.Sprintf("%s/%d", prepared.toolCall.ID, nestedCount)
-			}
-			nestedWG.Add(1)
-			if len(running) == 128 {
-				running = slices.Delete(running, 0, 1)
-			}
-			running = append(running, runningCall{sequence: sequence, record: NestedToolCall{ID: call.ID, Name: call.Name, Status: "running"}})
-			nestedMu.Unlock()
-			publishNested()
-			defer nestedWG.Done()
-			nestedResult := RunToolCall(nestedCtx, &nestedContext, assistantMsg, call, config, func(*ToolResult) { publishNested() })
-			record := NestedToolCall{ID: call.ID, Name: call.Name, Status: "ok", DurationMs: nestedResult.DurationMs}
-			if nestedResult.IsError {
-				record.Status = "error"
-				record.Error = string([]rune(nestedResult.Content)[:min(500, len([]rune(nestedResult.Content)))])
-			}
-			if errors.Is(nestedResult.Rejection, context.Canceled) || errors.Is(nestedResult.Rejection, context.DeadlineExceeded) {
-				record.Status = "cancelled"
-			}
-			nestedMu.Lock()
-			// ponytail: retain the last 128 completions; persist full diagnostics if needed.
-			if len(nestedCalls) == 128 {
-				nestedCalls = slices.Delete(nestedCalls, 0, 1)
-			}
-			running = slices.DeleteFunc(running, func(call runningCall) bool { return call.sequence == sequence })
-			nestedCalls = append(nestedCalls, record)
-			if nestedResult.Usage != nil {
-				addToolUsage(&nestedUsage, *nestedResult.Usage)
-			}
-			nestedMu.Unlock()
-			publishNested()
-			return nestedResult
-		},
-		Model:      agentCtx.Model,
-		Context:    ctx,
-		ToolCallID: prepared.toolCall.ID,
-		Name:       prepared.toolCall.Name,
-		Args:       prepared.args,
+		ExecuteTool:        func(call ai.ToolCall) *ToolResult { return executeNested(nestedCtx, call) },
+		ExecuteToolContext: executeNested,
+		Tools:              nestedContext.Tools,
+		Model:              agentCtx.Model,
+		Context:            ctx,
+		ToolCallID:         prepared.toolCall.ID,
+		Name:               prepared.toolCall.Name,
+		Args:               prepared.args,
 		OnUpdate: func(partial *ToolResult) {
 			if partial == nil {
 				return

@@ -3,13 +3,16 @@ package sdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/losinggeneration/tau/agent"
+	"github.com/losinggeneration/tau/agent/codemode"
 	"github.com/losinggeneration/tau/agent/mcp"
 	"github.com/losinggeneration/tau/paths"
 	"github.com/losinggeneration/tau/ui"
@@ -38,7 +41,123 @@ func (s *agentSession) startMCP(projectTrusted bool) {
 		opts = append(opts, mcp.WithTransport(s.runtime.mcpTransport))
 	}
 	s.mcp = mcp.NewManager(cfg, s.cwd, version, opts...)
+	s.activateCodemode(cfg)
+	s.agent.SetSystemSection(mcpServersSection, renderMCPServersSection(s.mcp.States()))
 	s.mcp.Start()
+}
+
+// mcpServersSection names the system prompt section listing the servers
+// whose tools aren't declared to the model.
+const mcpServersSection = "mcp_servers"
+
+const (
+	maxServerDescriptionChars = 250
+	maxServersSectionChars    = 4096
+)
+
+// indirectMCP reports a server whose tools may be reached through codemode,
+// which Tau also uses for deferred tools since it has no tool_search.
+func indirectMCP(exposures []mcp.Exposure) bool {
+	return slices.Contains(exposures, mcp.ExposureCodemode) || slices.Contains(exposures, mcp.ExposureDeferred)
+}
+
+// activateCodemode makes the codemode tool active when enabled servers have
+// tools only it can reach, unless autoEnableCodemode is false, and warns once
+// when those tools stay unreachable.
+func (s *agentSession) activateCodemode(cfg mcp.Config) {
+	if !slices.ContainsFunc(cfg.Servers, func(e mcp.ServerEntry) bool { return e.Config.IsEnabled() && indirectMCP(e.Config.Exposures()) }) {
+		return
+	}
+	auto := cfg.AutoEnableCodemode == nil || *cfg.AutoEnableCodemode
+	tools := s.agent.State().Tools
+	i := slices.IndexFunc(tools, func(tool agent.Tool) bool { return tool.Name == codemode.ToolName })
+	if i < 0 {
+		s.ui.Notify(ui.NotifyWarn, "MCP tools are only reachable from the codemode or tool_search tool, but neither is active; they cannot be called.")
+		return
+	}
+	if tools[i].DefaultActive == nil || *tools[i].DefaultActive {
+		return
+	}
+	if !auto {
+		s.ui.Notify(ui.NotifyWarn, "MCP tools are only reachable from the codemode or tool_search tool, but neither is active (autoEnableCodemode is false); they cannot be called.")
+		return
+	}
+	tools[i].DefaultActive = nil
+	s.agent.SetTools(tools...)
+}
+
+// codemodeActive reports a registered codemode tool that is active or
+// activates at the next request.
+func (s *agentSession) codemodeActive() bool {
+	if slices.Contains(s.agent.ActiveTools(), codemode.ToolName) {
+		return true
+	}
+	return slices.ContainsFunc(s.agent.State().Tools, func(tool agent.Tool) bool {
+		return tool.Name == codemode.ToolName && (tool.DefaultActive == nil || *tool.DefaultActive)
+	})
+}
+
+// renderMCPServersSection lists every enabled server with codemode or
+// deferred tools and a one-line summary, so the model learns of servers no
+// declaration names. Nil when there are none.
+func renderMCPServersSection(states []mcp.ServerState) *string {
+	listed := slices.DeleteFunc(slices.Clone(states), func(state mcp.ServerState) bool {
+		return state.Status == mcp.StatusDisabled || !indirectMCP(state.Exposures)
+	})
+	if len(listed) == 0 {
+		return nil
+	}
+	slices.SortFunc(listed, func(a, b mcp.ServerState) int { return strings.Compare(a.Name, b.Name) })
+	intro := "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts."
+	heads := make([]string, len(listed))
+	for i, state := range listed {
+		heads[i] = "- " + mcp.Namespace(state.Name) + " (codemode)"
+	}
+	omitted := func(count int) []string {
+		switch count {
+		case 0:
+			return nil
+		case 1:
+			return []string{"- … 1 more server; find their tools with searchTools()"}
+		}
+		return []string{fmt.Sprintf("- … %d more servers; find their tools with searchTools()", count)}
+	}
+	size := func(kept int) int {
+		return utf8.RuneCountInString(strings.Join(append(append([]string{intro}, heads[:kept]...), omitted(len(listed)-kept)...), "\n"))
+	}
+	kept := len(listed)
+	for kept > 0 && size(kept) > maxServersSectionChars {
+		kept--
+	}
+	perServer := 0
+	if kept > 0 {
+		perServer = min(maxServerDescriptionChars, (maxServersSectionChars-size(kept))/kept-2)
+	}
+	lines := []string{intro}
+	for i, state := range listed[:kept] {
+		summary := ""
+		if perServer > 0 {
+			summary = truncateRunes(state.Summary, perServer)
+		}
+		if summary != "" {
+			lines = append(lines, heads[i]+": "+summary)
+		} else {
+			lines = append(lines, heads[i])
+		}
+	}
+	section := strings.Join(append(lines, omitted(len(listed)-kept)...), "\n")
+	return &section
+}
+
+func truncateRunes(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit <= 1 {
+		return ""
+	}
+	return strings.TrimRight(string(runes[:limit-1]), " \t\n") + "…"
 }
 
 // syncMCPTools replaces the session's MCP tools with the connected servers'
@@ -69,7 +188,14 @@ func (s *agentSession) waitMCPStartup(ctx context.Context) {
 	s.mcpStartup.Do(func() {
 		wait, cancel := context.WithTimeout(ctx, mcpStartupWait)
 		defer cancel()
-		if err := s.mcp.WaitDirect(wait); errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		// Codemode only sees tools declared when its call's request was
+		// prepared, so with codemode active the first prompt waits for every
+		// server it can reach.
+		waitFor := s.mcp.WaitDirect
+		if s.codemodeActive() {
+			waitFor = s.mcp.WaitAll
+		}
+		if err := waitFor(wait); errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			s.ui.Notify(ui.NotifyInfo, "MCP servers are still connecting; their tools become available once connected.")
 		}
 		s.syncMCPTools()
@@ -149,6 +275,7 @@ func (s *agentSession) OnMCPChange(fn func()) func() {
 
 func (s *agentSession) mcpChanged() {
 	s.syncMCPTools()
+	s.agent.SetSystemSection(mcpServersSection, renderMCPServersSection(s.mcp.States()))
 	s.mu.Lock()
 	listeners := slices.Collect(maps.Values(s.mcpListeners))
 	s.mu.Unlock()

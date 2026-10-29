@@ -2542,6 +2542,50 @@ func TestToolRegistryChangesCommitAtRequestBoundary(t *testing.T) {
 	}
 }
 
+func TestSystemSectionsCommitAtRequestBoundary(t *testing.T) {
+	var prompts []string
+	client := stubClient{stream: func(ctx context.Context, _ *ai.Model, prompt *ai.Context, handler ai.EventHandler, _ ...ai.Option) error {
+		prompts = append(prompts, ai.CurrentSystemPrompt(ai.NormalizeContext(prompt).Messages))
+		handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: ai.AssistantMessage{Role: "assistant", StopReason: ai.StopReasonStop, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "ok"}}}})
+		return nil
+	}}
+	a, err := New(NewConfig(WithSystemPrompt("base"), WithModel(&ai.Model{ID: "test"}), WithClientFactory(func(*ai.Model) (ai.Client, error) { return client, nil })))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections := func() int {
+		var n int
+		for _, message := range a.Messages() {
+			if message.Role == RoleSystem && len(message.Sections) > 0 {
+				n++
+			}
+		}
+		return n
+	}
+	a.SetSystemSection("servers", new("listed"))
+	if err := a.Prompt(t.Context(), NewUserMessage("first")); err != nil {
+		t.Fatal(err)
+	}
+	a.SetSystemSection("servers", new("listed"))
+	if err := a.Prompt(t.Context(), NewUserMessage("unchanged")); err != nil {
+		t.Fatal(err)
+	}
+	if sections() != 1 {
+		t.Fatalf("section entries = %d, want 1", sections())
+	}
+	a.SetSystemSection("servers", nil)
+	a.SetSystemSection("absent", nil)
+	if err := a.Prompt(t.Context(), NewUserMessage("removed")); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"base\n\nlisted", "base\n\nlisted", "base"}; !slices.Equal(prompts, want) {
+		t.Fatalf("request prompts = %q, want %q", prompts, want)
+	}
+	if sections() != 2 {
+		t.Fatalf("section entries = %d, want 2", sections())
+	}
+}
+
 func TestRegistryReloadRefreshesRestoredDeclaration(t *testing.T) {
 	tool := Tool{Name: "read", Description: "current schema"}
 	a, err := New(NewConfig(WithTools(tool), WithInitialMessages(&Message{Role: RoleSystem, ToolsAdded: []ai.Tool{{Name: "read", Description: "restored schema"}}})))

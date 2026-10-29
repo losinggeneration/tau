@@ -22,6 +22,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/losinggeneration/tau/agent/codemode"
+
 	"github.com/google/uuid"
 	"github.com/losinggeneration/tau/agent"
 	"github.com/losinggeneration/tau/agent/artifacts"
@@ -869,6 +871,8 @@ type agentSession struct {
 	overflowRecoveryAttempted bool
 	// virtualStates holds router state for sessions without a session file.
 	virtualStates map[string]json.RawMessage
+	// codemodeValues holds store() values for sessions without a session file.
+	codemodeValues map[string]json.RawMessage
 }
 
 // modelIDForEvent returns the model id for the session_start event payload,
@@ -5506,6 +5510,8 @@ func stringPtrValue(ptr *string) string {
 // history is loaded and appended to the agent's transcript.
 // Session options (Store, Settings, UI) override runtime defaults when provided.
 func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Session, err error) {
+	// codemodeSession is set once the session exists; codemode only calls into it while running.
+	var codemodeSession *agentSession
 	settings, _, compactionCfg := r.settingsState()
 	if err := ValidateToolSelection(opts.ToolAllowlist); err != nil {
 		return nil, fmt.Errorf("invalid tools option: %w", err)
@@ -5780,6 +5786,22 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 						tools = append(tools, tool)
 					}
 				}
+			}
+			// Codemode is registered inactive unless selected by name. Its store
+			// belongs to the session created below.
+			if !slices.Contains(opts.ToolDenylist, codemode.ToolName) {
+				tool := codemode.NewTool(&codemode.Store{
+					Load: func(ctx context.Context) (map[string]json.RawMessage, error) {
+						return codemodeSession.loadCodemodeStore(ctx)
+					},
+					Save: func(ctx context.Context, writes codemode.StoreWrites) error {
+						return codemodeSession.saveCodemodeStore(ctx, writes)
+					},
+				})
+				if slices.Contains(selection, codemode.ToolName) {
+					tool.DefaultActive = nil
+				}
+				tools = append(tools, tool)
 			}
 		}
 		agentCfg.Tools = append(agentCfg.Tools, tools...)
@@ -6259,6 +6281,7 @@ agentCreation:
 		isPersistedFunc:             opts.IsPersisted,
 		logger:                      sessionLogger,
 	}
+	codemodeSession = s
 
 	if resumedParentMsgID == nil && len(initialMessages) == 0 {
 		messages := a.Messages()

@@ -172,27 +172,16 @@ func virtualStateKey(model *ai.Model) string { return model.Provider + "/" + mod
 // large virtual-model sessions make that measurable.
 func (s *agentSession) virtualState(model *ai.Model) (json.RawMessage, error) {
 	s.mu.Lock()
-	writer, parent := s.sessionWriter, s.parentMsgID
 	state := s.virtualStates[virtualStateKey(model)]
 	s.mu.Unlock()
-	if writer == nil || parent == nil {
-		return state, nil
-	}
-	reader, err := sessionpkg.ReadFile(writer.Path())
+	entries, persisted, err := s.branchCustomEntries(VirtualModelStateEntry)
 	if err != nil {
 		return nil, fmt.Errorf("read virtual model state: %w", err)
 	}
-	manager := sessionpkg.NewManager(reader.Header().CWD)
-	manager.LoadEntries(reader)
-	branch := map[string]bool{}
-	for _, entry := range manager.GetBranch(*parent) {
-		branch[entry.ID] = true
+	if !persisted {
+		return state, nil
 	}
-	entries := reader.Entries()
 	for _, entry := range slices.Backward(entries) {
-		if entry.Type != sessionpkg.EntryTypeCustom || entry.CustomType == nil || *entry.CustomType != VirtualModelStateEntry || entry.ParentID == nil || !branch[*entry.ParentID] {
-			continue
-		}
 		var data virtualModelState
 		if err := json.Unmarshal(entry.Data, &data); err != nil {
 			return nil, fmt.Errorf("decode virtual model state %s: %w", entry.ID, err)
@@ -202,6 +191,34 @@ func (s *agentSession) virtualState(model *ai.Model) (json.RawMessage, error) {
 		}
 	}
 	return nil, nil
+}
+
+// branchCustomEntries returns the custom entries of customType that hang off
+// the current branch, oldest first. persisted is false when the session has
+// no file or position yet.
+func (s *agentSession) branchCustomEntries(customType string) (entries []sessionpkg.Entry, persisted bool, err error) {
+	s.mu.Lock()
+	writer, parent := s.sessionWriter, s.parentMsgID
+	s.mu.Unlock()
+	if writer == nil || parent == nil {
+		return nil, false, nil
+	}
+	reader, err := sessionpkg.ReadFile(writer.Path())
+	if err != nil {
+		return nil, true, err
+	}
+	manager := sessionpkg.NewManager(reader.Header().CWD)
+	manager.LoadEntries(reader)
+	branch := map[string]bool{}
+	for _, entry := range manager.GetBranch(*parent) {
+		branch[entry.ID] = true
+	}
+	for _, entry := range reader.Entries() {
+		if entry.Type == sessionpkg.EntryTypeCustom && entry.CustomType != nil && *entry.CustomType == customType && entry.ParentID != nil && branch[*entry.ParentID] {
+			entries = append(entries, entry)
+		}
+	}
+	return entries, true, nil
 }
 
 // storeVirtualState records router state after the current branch position.

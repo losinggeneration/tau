@@ -30,6 +30,7 @@ type Agent struct {
 	toolRegistryBaseline []Tool
 	toolRegistryChanged  bool
 	pendingActiveTools   []string
+	pendingSections      map[string]*string
 	activeToolsChanged   bool
 
 	// Event listeners
@@ -1111,6 +1112,26 @@ func (a *Agent) prepareRequest(ctx context.Context, request PrepareRequestContex
 		a.activeToolsChanged = false
 		a.pendingActiveTools = nil
 	}
+	if len(a.pendingSections) > 0 {
+		baseline := ai.CurrentSystemMessage(ConvertMessagesToAI(current.Messages))
+		for name, text := range a.pendingSections {
+			var have *string
+			if baseline != nil {
+				have = baseline.Sections[name]
+			}
+			if (have == nil && text == nil) || (have != nil && text != nil && *have == *text) {
+				continue
+			}
+			if delta == nil {
+				delta = &Message{Role: RoleSystem, Timestamp: time.Now()}
+			}
+			if delta.Sections == nil {
+				delta.Sections = map[string]*string{}
+			}
+			delta.Sections[name] = text
+		}
+		a.pendingSections = nil
+	}
 	a.toolRegistryChanged = false
 	a.toolRegistryBaseline = nil
 	a.mu.Unlock()
@@ -1119,7 +1140,7 @@ func (a *Agent) prepareRequest(ctx context.Context, request PrepareRequestContex
 	if update == nil {
 		update = &AgentRequestUpdate{}
 	}
-	if delta != nil && (len(delta.ToolsAdded) > 0 || len(delta.ToolsRemoved) > 0) {
+	if delta != nil && (len(delta.ToolsAdded) > 0 || len(delta.ToolsRemoved) > 0 || len(delta.Sections) > 0) {
 		update.Messages = append(update.Messages, delta)
 	}
 	update.Context = &snapshot
@@ -1139,6 +1160,17 @@ func visibleToolDeclarations(tools []Tool) ([]ai.Tool, error) {
 		declarations = append(declarations, declaration)
 	}
 	return declarations, nil
+}
+
+// SetSystemSection stages a named system prompt section for the next request.
+// A nil text removes the section. Unchanged values publish nothing.
+func (a *Agent) SetSystemSection(name string, text *string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pendingSections == nil {
+		a.pendingSections = map[string]*string{}
+	}
+	a.pendingSections[name] = text
 }
 
 // SetSystemPrompt sets the system prompt.

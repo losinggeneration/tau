@@ -101,7 +101,7 @@ func TestManagerConnectsServersAndAdaptsTools(t *testing.T) {
 	docs.AddResource(&sdkmcp.Resource{URI: "file:///r", Name: "r"}, func(context.Context, *sdkmcp.ReadResourceRequest) (*sdkmcp.ReadResourceResult, error) {
 		return nil, errors.New("resources must not be read on connect")
 	})
-	plain := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "plain"}, nil)
+	plain := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "plain"}, &sdkmcp.ServerOptions{Instructions: " Plain tools.\nSecond line."})
 	addTool(plain, strings.Repeat("x", 80), "long", nil)
 
 	var changes atomic.Int32
@@ -118,15 +118,19 @@ func TestManagerConnectsServersAndAdaptsTools(t *testing.T) {
 	assert.Equal(t, StatusDisabled, m.States()[0].Status, "nothing connects before Start")
 	m.Start()
 	require.NoError(t, m.WaitDirect(t.Context()))
+	require.NoError(t, m.WaitAll(t.Context()))
 	waitConnected(t, m)
 
 	states := m.States()
 	require.Len(t, states, 4)
 	assert.Equal(t, ServerState{
 		Name: "my-docs", Scope: ScopeGlobal, Transport: "fake", Status: StatusConnected, Exposure: ExposureCodemode, Resources: true,
-		Tools: []ToolState{{"a-b", "", ExposureHidden}, {"a_b", "", ExposureHidden}, {"search", "Search docs.", ExposureDirect}},
+		Tools:     []ToolState{{"a-b", "", ExposureHidden}, {"a_b", "", ExposureHidden}, {"search", "Search docs.", ExposureDirect}},
+		Exposures: []Exposure{ExposureCodemode, ExposureDirect, ExposureHidden}, Summary: "Docs",
 	}, states[0])
 	assert.Equal(t, StatusConnected, states[1].Status)
+	assert.Equal(t, "Plain tools.", states[1].Summary, "connected servers fall back to their instructions")
+	assert.Equal(t, []Exposure{ExposureCodemode}, states[1].Exposures)
 	assert.False(t, states[1].Resources)
 	assert.Equal(t, StatusFailed, states[2].Status)
 	assert.Equal(t, `MCP server "down" failed to connect: connection refused`, states[2].Error)
@@ -284,6 +288,7 @@ func TestManagerWaitDirectHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 	require.ErrorIs(t, m.WaitDirect(ctx), context.DeadlineExceeded)
+	require.ErrorIs(t, m.WaitAll(ctx), context.DeadlineExceeded)
 }
 
 func TestManagerConfigureSavesAndApplies(t *testing.T) {

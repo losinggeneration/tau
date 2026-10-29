@@ -2430,11 +2430,7 @@ func TestNewSessionPersistsMediumThinkingModelAndDefaultCodingTools(t *testing.T
 	state := agentSess.agent.State()
 	assert.Equal(t, agent.ThinkingMedium, state.ThinkingLevel)
 
-	var toolNames []string
-	for _, tool := range state.Tools {
-		toolNames = append(toolNames, tool.Name)
-	}
-	assert.Equal(t, []string{"read", "bash", "edit", "write"}, toolNames)
+	assert.Equal(t, []string{"read", "bash", "edit", "write"}, agentSess.agent.ActiveTools())
 
 	events, err := sess.Send(testContext(t), Message{Text: "hello"})
 	require.NoError(t, err)
@@ -5957,6 +5953,24 @@ func TestConfiguredDefaultTools(t *testing.T) {
 	assert.Contains(t, names, "read")
 }
 
+func TestCodemodeToolRegistersInactiveUnlessSelected(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	open := func(opts SessionOptions) ToolLoadout {
+		sess, err := rt.NewSession(testContext(t), opts)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
+		return sess.(ToolLoadout)
+	}
+	byDefault := open(SessionOptions{})
+	assert.NotContains(t, byDefault.ActiveTools(), "codemode")
+	require.NoError(t, byDefault.SetActiveTools(testContext(t), append(byDefault.ActiveTools(), "codemode")...))
+	assert.Contains(t, byDefault.ActiveTools(), "codemode")
+	assert.Contains(t, open(SessionOptions{ToolAllowlist: []string{"read", "codemode"}}).ActiveTools(), "codemode")
+}
+
 func TestSessionEnvelopePreservesTranscriptSystemChanges(t *testing.T) {
 	original := &agent.Message{ThinkingLevel: agent.ThinkingMax, Role: agent.RoleSystem, Sections: map[string]*string{"policy": new("updated")}, ToolsAdded: []ai.Tool{{Name: "read", Parameters: json.RawMessage(`{}`)}}, ToolsRemoved: []ai.ToolReference{{Name: "old"}}}
 	data, err := marshalSessionMessageEnvelope(original)
@@ -6019,7 +6033,7 @@ func TestSessionToolSelectionUsesConfiguredBase(t *testing.T) {
 		{name: "modifier inherits settings", selection: []string{"+grep"}, want: []string{"ls", "grep"}},
 		{name: "explicit empty", selection: []string{}, want: []string{}},
 		{name: "plain replaces", selection: []string{"read"}, want: []string{"read"}},
-		{name: "pattern", selection: []string{"*"}, want: []string{"read", "write", "edit", "bash", "grep", "find", "ls"}},
+		{name: "pattern", selection: []string{"*"}, want: []string{"read", "write", "edit", "bash", "grep", "find", "ls", "codemode"}},
 		{name: "mixed", selection: []string{"read", "+grep"}, invalid: true},
 		{name: "modifier pattern", selection: []string{"+*"}, invalid: true},
 	} {
@@ -6035,11 +6049,7 @@ func TestSessionToolSelectionUsesConfiguredBase(t *testing.T) {
 			}
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
-			names := []string{}
-			for _, tool := range sess.(*agentSession).agent.State().Tools {
-				names = append(names, tool.Name)
-			}
-			assert.ElementsMatch(t, tt.want, names)
+			assert.ElementsMatch(t, tt.want, sess.(*agentSession).agent.ActiveTools())
 		})
 	}
 }
