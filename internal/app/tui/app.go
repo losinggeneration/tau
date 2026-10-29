@@ -16,6 +16,7 @@ import (
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/autocomplete"
 	"github.com/losinggeneration/tau/tui/extensions"
 	"github.com/losinggeneration/tau/tui/keybindings"
 	"github.com/losinggeneration/tau/tui/widgets"
@@ -342,7 +343,10 @@ type App struct {
 	loginWorkers      sync.WaitGroup
 	// openURL and clipboardWrite default to the system browser and the
 	// toolkit clipboard; tests replace them so no helper process starts.
-	openURL        func(string) error
+	openURL func(string) error
+	// mcpMenu identifies the /mcp menu the dialog picker shows, so a stale
+	// menu's change listener unsubscribes.
+	mcpMenu        *int
 	clipboardWrite func(string, func(error))
 	// currentModel is the key (provider/id) of the session's active
 	// model. Cached so model items can be sorted with the active model
@@ -3638,6 +3642,25 @@ func (a *App) fileSelectorItems(text string, cursorLine, cursorCol int) tauui.Co
 	return tauui.NewCompletionSelector(suggestions)
 }
 
+// commandArgItems suggests the arguments of a local command with
+// CompleteArgs while its arguments are typed on the first line.
+func (a *App) commandArgItems(text string, cursorCol int) tauui.CompletionSelector {
+	before := text[:min(max(cursorCol, 0), len(text))]
+	name, args, ok := strings.Cut(strings.TrimPrefix(before, "/"), " ")
+	if !strings.HasPrefix(before, "/") || !ok || strings.Contains(before, "\n") || a.cmds == nil {
+		return tauui.CompletionSelector{}
+	}
+	cmd, ok := a.cmds.Lookup(name)
+	if !ok || cmd.CompleteArgs == nil {
+		return tauui.CompletionSelector{}
+	}
+	items := cmd.CompleteArgs(a, args)
+	if len(items) == 0 {
+		return tauui.CompletionSelector{}
+	}
+	return tauui.NewCompletionSelector(&autocomplete.Suggestions{Items: items, Prefix: args})
+}
+
 func (a *App) fileSelectorRoot() string {
 	if a != nil {
 		if state := a.sessionState(); state.CWD() != "" {
@@ -3953,21 +3976,26 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 	if a.editor != nil && a.editor.Text() == text {
 		cursorCol = a.editor.Model().Cursor()
 	}
+	var completion tauui.CompletionSelector
 	if shouldCheckFileSelector(text, cursorCol) {
-		if completion := a.fileSelectorItems(text, 0, cursorCol); len(completion.Items) > 0 {
-			if a.dialogPicker != nil && a.dialogPicker.Shown() {
-				a.dismissDialogCtx(ctx)
-			}
-			wasShown := a.selector.Shown()
-			wasSize := a.selector.MinSize()
-			a.selector.SetItems(completion.SelectorItems())
-			a.selector.SetShown(true)
-			a.selectorMode = selectorModeFiles
-			a.completionSelector = completion
-			forceLayout := wasShown && a.selector.MinSize() != wasSize
-			a.invalidateSelectorLayout(wasShown, forceLayout, ctx)
-			return
+		completion = a.fileSelectorItems(text, 0, cursorCol)
+	}
+	if len(completion.Items) == 0 {
+		completion = a.commandArgItems(text, cursorCol)
+	}
+	if len(completion.Items) > 0 {
+		if a.dialogPicker != nil && a.dialogPicker.Shown() {
+			a.dismissDialogCtx(ctx)
 		}
+		wasShown := a.selector.Shown()
+		wasSize := a.selector.MinSize()
+		a.selector.SetItems(completion.SelectorItems())
+		a.selector.SetShown(true)
+		a.selectorMode = selectorModeFiles
+		a.completionSelector = completion
+		forceLayout := wasShown && a.selector.MinSize() != wasSize
+		a.invalidateSelectorLayout(wasShown, forceLayout, ctx)
+		return
 	}
 
 	// Fork picker mode. Triggered by typing `/fork ` (with trailing

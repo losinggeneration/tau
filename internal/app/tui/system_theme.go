@@ -266,7 +266,9 @@ func systemSourceOf(color tauui.RGBColor) systemSource {
 	lab := rgbToOklab(color)
 	return systemSource{h, s, l, math.Hypot(lab[1], lab[2])}
 }
+
 func systemRGB(rgb [3]uint8) tauui.RGBColor { return tauui.RGBColor{R: rgb[0], G: rgb[1], B: rgb[2]} }
+
 func systemHex(color tauui.RGBColor) string {
 	return fmt.Sprintf("#%02x%02x%02x", color.R, color.G, color.B)
 }

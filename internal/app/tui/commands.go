@@ -12,6 +12,7 @@ import (
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/autocomplete"
 )
 
 type CredentialStore = store.CredentialStore
@@ -38,6 +39,10 @@ type Command struct {
 	// handler; instead the line is forwarded to the session as a normal
 	// prompt and the session's command registry handles it.
 	Handler func(app *App, args string)
+
+	// CompleteArgs, when set, suggests the text after `/<name> ` as it is
+	// typed. prefix is everything typed after the space.
+	CompleteArgs func(app *App, prefix string) []autocomplete.Item
 }
 
 // Commands is an ordered registry of slash commands. The zero value is
@@ -127,6 +132,7 @@ func NewCommands() *Commands {
 	// on the shell. Same workspace; the shell builtin's "run from the
 	// shell" reply is useless inside the TUI.
 	c.Register(Command{Name: "sessions", Description: "Browse saved sessions (resume, fork, rename, pin)", Handler: cmdSessionWorkspace})
+	c.Register(Command{Name: "mcp", CompleteArgs: completeMCPArgs, Description: "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure", Handler: cmdMCP})
 	c.Register(Command{Name: "hotkeys", Description: "Show keybinding hints", Handler: cmdHotkeys})
 	c.Register(Command{Name: "layout", Description: "Switch layout: fixed or document", Handler: cmdLayout})
 	c.Register(Command{Name: "fork", Description: "Fork session (space: pick point)", Handler: cmdForkOrStub})

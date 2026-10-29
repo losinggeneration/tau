@@ -26,6 +26,7 @@ import (
 	"github.com/losinggeneration/tau/agent"
 	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/compaction"
+	"github.com/losinggeneration/tau/agent/mcp"
 	"github.com/losinggeneration/tau/agent/plugins"
 	"github.com/losinggeneration/tau/agent/plugins/proto"
 	sessionpkg "github.com/losinggeneration/tau/agent/session"
@@ -745,6 +746,12 @@ var (
 
 type agentSession struct {
 	agent                *agent.Agent
+	mcp                  *mcp.Manager
+	mcpStartup           sync.Once
+	mcpErrors            []string
+	mcpTools             []agent.Tool
+	mcpListeners         map[int]func()
+	mcpListenerSeq       int
 	id                   string
 	cwd                  string
 	ui                   ui.UI
@@ -1382,6 +1389,7 @@ func (s *agentSession) runPreparedMessage(ctx context.Context, msg Message) erro
 
 	// Auto-compaction check: trigger if context usage exceeds threshold.
 	s.autoCompactIfDue(ctx)
+	s.waitMCPStartup(ctx)
 
 	messages := []*agent.Message{agentMsg}
 	if msg.SystemAddendum != "" {
@@ -2627,6 +2635,10 @@ func (s *agentSession) close(ctx context.Context, cleanupGrace time.Duration) er
 			s.runtime.currentSession = nil
 		}
 		s.runtime.mu.Unlock()
+	}
+
+	if s.mcp != nil {
+		err = errors.Join(err, s.mcp.Close())
 	}
 
 	// Close the session writer and release ownership.
@@ -4888,6 +4900,8 @@ func commandResultToToolResult(result commands.Result, err error) (content strin
 
 // runtime implements Runtime.
 type runtime struct {
+	// mcpTransport replaces MCP transports in tests.
+	mcpTransport mcp.TransportFactory
 	// pluginVirtualModels are the virtual models plugins last registered.
 	pluginVirtualMu     sync.Mutex
 	pluginVirtualModels []ai.VirtualModelDefinition
@@ -6254,6 +6268,9 @@ agentCreation:
 	}
 
 	hookSession = s
+	if !r.noTools {
+		s.startMCP(settings.ProjectResourcesTrustedAt(cwd))
+	}
 	if r.pluginManager != nil {
 		for _, registered := range r.pluginManager.Tools() {
 			s.pluginToolNames = append(s.pluginToolNames, registered.Name)
