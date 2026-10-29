@@ -1,7 +1,6 @@
 // Package oauth provides OAuth credential management for AI providers.
 //
 // Supported providers:
-//   - Anthropic (Claude Pro/Max)
 //   - GitHub Copilot
 //   - Google Gemini CLI
 //   - OpenAI Codex
@@ -45,7 +44,6 @@ func closeBody(resp *http.Response) error {
 type ProviderID string
 
 const (
-	ProviderAnthropic         ProviderID = "anthropic"
 	ProviderGitHubCopilot     ProviderID = "github-copilot"
 	ProviderGeminiCLI         ProviderID = "google-gemini-cli"
 	ProviderOpenAICodex       ProviderID = "openai-codex"
@@ -275,7 +273,6 @@ const providerGeminiCLILegacy ProviderID = "gemini-cli"
 // builtInProviders returns the list of built-in OAuth providers.
 func builtInProviders() []Provider {
 	return []Provider{
-		AnthropicOAuthProvider,
 		GitHubCopilotOAuthProvider,
 		GeminiCLIOAuthProvider,
 		AntigravityOAuthProvider,
@@ -723,15 +720,6 @@ func ExchangeCode(ctx context.Context, tokenURL string, params map[string]string
 		data.Set(k, v)
 	}
 	return postTokenRequest(ctx, tokenURL, "application/x-www-form-urlencoded", data.Encode())
-}
-
-// exchangeCodeJSON is ExchangeCode for token endpoints that take a JSON body.
-func exchangeCodeJSON(ctx context.Context, tokenURL string, params map[string]string) (*Credentials, error) {
-	body, err := json.Marshal(params)
-	if err != nil {
-		return nil, fmt.Errorf("encode token request: %w", err)
-	}
-	return postTokenRequest(ctx, tokenURL, "application/json", string(body))
 }
 
 func postTokenRequest(ctx context.Context, tokenURL, contentType, payload string) (_ *Credentials, err error) {

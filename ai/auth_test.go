@@ -79,11 +79,10 @@ func TestGetEnvAPIKeyAnthropicPrecedence(t *testing.T) {
 		t.Errorf("expected api-key-value, got %q", key)
 	}
 
-	// OAuth token takes priority
+	// Subscription tokens are never read from the environment.
 	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "oauth-token-value")
-	defer t.Setenv("ANTHROPIC_OAUTH_TOKEN", "")
-	if key := GetEnvAPIKey(ProviderAnthropic); key != "oauth-token-value" {
-		t.Errorf("expected oauth-token-value, got %q", key)
+	if key := GetEnvAPIKey(ProviderAnthropic); key != "api-key-value" {
+		t.Errorf("ANTHROPIC_OAUTH_TOKEN must be ignored, got %q", key)
 	}
 }
 
@@ -412,7 +411,6 @@ func TestHTTPTransportNoRetryOn401WithoutRefresh(t *testing.T) {
 func TestEnvAPIKeysMapContainsRequired(t *testing.T) {
 	required := []string{
 		"ANTHROPIC_API_KEY",
-		"ANTHROPIC_OAUTH_TOKEN",
 		"OPENAI_API_KEY",
 		"AZURE_OPENAI_API_KEY",
 		"GEMINI_API_KEY",

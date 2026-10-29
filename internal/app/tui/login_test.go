@@ -436,7 +436,7 @@ func TestLoginSelectsMethodProviderAndSavesAPIKey(t *testing.T) {
 
 func TestLoginReferenceMatchesLikeUpstream(t *testing.T) {
 	for _, tc := range []struct{ ref, header, filter string }{
-		{ref: "ANTHROPIC", header: "Select authentication method for Anthropic (Claude Pro/Max):"},
+		{ref: "ANTHROPIC", header: "Enter API key for anthropic"},
 		{ref: "openai", header: "Enter API key for openai"},
 		{ref: "nonexistent", header: "Select provider:", filter: "nonexistent"},
 	} {

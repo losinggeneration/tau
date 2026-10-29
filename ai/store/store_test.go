@@ -1250,6 +1250,12 @@ func TestAPIKeyFromCredentialRejectsCancelledAdmissionForEveryType(t *testing.T)
 	}
 }
 
+func TestAPIKeyFromCredentialPointsStoredClaudeSignInsAtClaudeAgent(t *testing.T) {
+	key, err := APIKeyFromCredential(t.Context(), ai.ProviderAnthropic, ai.NewOAuthCredential("access", "refresh", time.Now().Add(time.Hour), ""))
+	require.Empty(t, key)
+	require.ErrorContains(t, err, "use the claude-agent provider")
+}
+
 func TestAPIKeyFromCredentialScopesEnvironment(t *testing.T) {
 	t.Setenv("TAU_CREDENTIAL_OVERRIDE", "ambient-secret")
 	credential := ai.NewAPIKeyCredential("$TAU_CREDENTIAL_OVERRIDE")

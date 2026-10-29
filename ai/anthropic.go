@@ -22,63 +22,6 @@ import (
 // must NOT include /v1 — otherwise the final URL would be .../v1/v1/messages.
 const anthropicBaseURL = "https://api.anthropic.com"
 
-// Claude Code tool names for OAuth token handling.
-// Source: Claude Code 2.x canonical casing
-var claudeCodeTools = []string{
-	"Read",
-	"Write",
-	"Edit",
-	"Bash",
-	"Grep",
-	"Glob",
-	"AskUserQuestion",
-	"EnterPlanMode",
-	"ExitPlanMode",
-	"KillShell",
-	"NotebookEdit",
-	"Skill",
-	"Task",
-	"TaskOutput",
-	"TodoWrite",
-	"WebFetch",
-	"WebSearch",
-}
-
-// ccToolLookup maps lowercase tool names to their Claude Code canonical casing.
-var ccToolLookup map[string]string
-
-func init() {
-	ccToolLookup = make(map[string]string, len(claudeCodeTools))
-	for _, t := range claudeCodeTools {
-		ccToolLookup[strings.ToLower(t)] = t
-	}
-}
-
-// toClaudeCodeName converts a tool name to Claude Code canonical casing
-// if it matches a known Claude Code tool (case-insensitive).
-func toClaudeCodeName(name string) string {
-	if canonical, ok := ccToolLookup[strings.ToLower(name)]; ok {
-		return canonical
-	}
-	return name
-}
-
-// fromClaudeCodeName converts a Claude Code tool name back to the original
-// tool name if a matching tool is found in the provided tools list.
-func fromClaudeCodeName(name string, tools []Tool) string {
-	if len(tools) == 0 {
-		return name
-	}
-
-	lowerName := strings.ToLower(name)
-	for _, tool := range tools {
-		if strings.ToLower(tool.Name) == lowerName {
-			return tool.Name
-		}
-	}
-	return name
-}
-
 func isClaude55Model(modelID string) bool {
 	id := strings.ReplaceAll(strings.ToLower(modelID), ".", "-")
 	return strings.Contains(id, "opus-5-5") || strings.Contains(id, "sonnet-5-5") || strings.Contains(id, "haiku-5-5")
@@ -130,7 +73,13 @@ func mapReasoningLevelToAnthropicEffort(level ReasoningLevel, modelID string) st
 	}
 }
 
-// isOAuthToken checks if the API key is an OAuth token.
+// errAnthropicSubscriptionToken refuses Claude subscription OAuth tokens. The
+// Messages API only takes them from Claude Code, and Tau never presents itself
+// as Claude Code; the claude-agent provider is the supported way to use a
+// subscription.
+var errAnthropicSubscriptionToken = errors.New("anthropic: Claude subscription tokens aren't supported; use the claude-agent provider")
+
+// isOAuthToken checks if the API key is a Claude subscription OAuth token.
 func isOAuthToken(apiKey string) bool {
 	return strings.Contains(apiKey, "sk-ant-oat")
 }
@@ -139,7 +88,6 @@ type anthropicClient struct {
 	federation    *anthropicFederation
 	model         *Model
 	transport     *HTTPTransport
-	isOAuth       bool
 	tools         []Tool
 	transportOpts *TransportOption
 	// thinkingLevel is the managed effort stamped on streamed assistant messages.
@@ -211,7 +159,9 @@ func (c *anthropicClient) stream(ctx context.Context, model *Model, prompt *Cont
 			apiKey = o.envAPIKey(model.Provider)
 		}
 	}
-	c.isOAuth = model.Provider != ProviderGitHubCopilot && isOAuthToken(apiKey)
+	if model.Provider != ProviderGitHubCopilot && isOAuthToken(apiKey) {
+		return errAnthropicSubscriptionToken
+	}
 
 	c.tools = declared
 
@@ -374,31 +324,16 @@ func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options, 
 	}
 	betaFeatures = append(betaFeatures, extraBetas...)
 
-	// OAuth: includes claude-code and oauth betas + Claude Code identity headers
-	if c.isOAuth {
-		betaFeatures = append([]string{
-			"claude-code-20250219",
-			"oauth-2025-04-20",
-		}, betaFeatures...)
-
-		headers["authorization"] = "Bearer " + apiKey
+	if len(betaFeatures) > 0 {
 		headers["anthropic-beta"] = strings.Join(betaFeatures, ",")
-		headers["user-agent"] = "claude-cli/2.1.75"
-		headers["x-app"] = "cli"
-	} else {
-		// Standard or Copilot auth
-		if len(betaFeatures) > 0 {
-			headers["anthropic-beta"] = strings.Join(betaFeatures, ",")
-		}
-
-		if model.Provider == ProviderGitHubCopilot {
-			headers["authorization"] = "Bearer " + apiKey
-		} else if apiKey != "" {
-			headers["x-api-key"] = apiKey
-		}
+	}
+	if model.Provider == ProviderGitHubCopilot {
+		headers["authorization"] = "Bearer " + apiKey
+	} else if apiKey != "" {
+		headers["x-api-key"] = apiKey
 	}
 
-	if sessionID := cacheSessionID(o); sessionID != "" && !c.isOAuth && model.Provider != ProviderGitHubCopilot && model.Compat != nil && model.Compat.SendSessionAffinityHeaders {
+	if sessionID := cacheSessionID(o); sessionID != "" && model.Provider != ProviderGitHubCopilot && model.Compat != nil && model.Compat.SendSessionAffinityHeaders {
 		format := model.Compat.SessionAffinityFormat
 		if format == "" && (model.Provider == ProviderOpenRouter || strings.Contains(model.BaseURL, "openrouter.ai")) {
 			format = "openrouter"
@@ -481,9 +416,6 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 		converted := make([]anthropicTool, len(tools))
 		for i, t := range tools {
 			name := t.Name
-			if c.isOAuth {
-				name = toClaudeCodeName(t.Name)
-			}
 			parameters, strict, err := strictToolParameters(t, model.Compat != nil && model.Compat.SupportsStrictTools, anthropicUnsupportedStrictKeyword)
 			if err != nil {
 				return nil, err
@@ -507,9 +439,6 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 	req.Messages = msgs
 
 	systemBlocks := make([]anthropicSystemBlock, 0, 2)
-	if c.isOAuth {
-		systemBlocks = append(systemBlocks, anthropicSystemBlock{Type: "text", Text: "You are Claude Code, Anthropic's official CLI for Claude.", CacheControl: cacheControl})
-	}
 	if prompt.SystemPrompt != "" {
 		systemBlocks = append(systemBlocks, anthropicSystemBlock{Type: "text", Text: SanitizeSurrogates(prompt.SystemPrompt), CacheControl: cacheControl})
 	}
@@ -716,11 +645,7 @@ func (c *anthropicClient) convertMessages(prompt *Context, cacheControl *cacheCo
 					if redefined[tool.Name] {
 						continue
 					}
-					name := tool.Name
-					if c.isOAuth {
-						name = toClaudeCodeName(name)
-					}
-					blocks = append(blocks, anthropicContentBlock{Type: "tool_removal", Tool: map[string]any{"type": "tool_reference", "name": name}})
+					blocks = append(blocks, anthropicContentBlock{Type: "tool_removal", Tool: map[string]any{"type": "tool_reference", "name": tool.Name}})
 				}
 				definitions, err := toolDefinitions(m.ToolsAdded)
 				if err != nil {
@@ -859,9 +784,6 @@ func (c *anthropicClient) convertMessage(m Message, cacheControl *cacheControlPa
 				}
 				if b.Type == "toolCall" {
 					name := b.Name
-					if c.isOAuth {
-						name = toClaudeCodeName(b.Name)
-					}
 					blocks = append(blocks, anthropicContentBlock{
 						Type:  "tool_use",
 						ID:    b.ID,
@@ -1115,11 +1037,7 @@ func (c *anthropicClient) handleSSE(ctx context.Context, body io.Reader, handler
 				})
 				handler(ctx, ThinkingStart{ContentIndex: idx, Partial: assistant})
 			case "tool_use":
-				// Convert tool name from Claude Code canonical to original if OAuth
 				name := event.ContentBlock.Name
-				if c.isOAuth {
-					name = fromClaudeCodeName(name, c.tools)
-				}
 				assistant.Content = append(assistant.Content, ContentBlock{
 					Type: "toolCall",
 					ID:   event.ContentBlock.ID,
@@ -1332,9 +1250,6 @@ func (c *anthropicClient) convertResponseBlocks(blocks []anthropicResponseBlock)
 			})
 		case "tool_use":
 			name := b.Name
-			if c.isOAuth {
-				name = fromClaudeCodeName(name, c.tools)
-			}
 			result = append(result, ContentBlock{
 				Type:      "toolCall",
 				ID:        b.ID,

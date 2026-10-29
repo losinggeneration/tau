@@ -3,29 +3,17 @@ package oauth
 import "context"
 
 var (
-	anthropicProviderFactory     = NewAnthropicProvider
 	githubCopilotProviderFactory = NewGitHubCopilotProvider
 	geminiCLIProviderFactory     = NewGeminiCLIProvider
 	antigravityProviderFactory   = NewAntigravityProvider
 )
 
 var (
-	AnthropicOAuthProvider     = anthropicProviderFactory()
 	GitHubCopilotOAuthProvider = githubCopilotProviderFactory()
 	GeminiCLIOAuthProvider     = geminiCLIProviderFactory()
 	AntigravityOAuthProvider   = antigravityProviderFactory()
 	OpenAICodexOAuthProvider   = NewOpenAICodexProvider("pi")
 )
-
-// LoginAnthropic runs the Anthropic OAuth login flow.
-func LoginAnthropic(ctx context.Context, callbacks LoginCallbacks) (*Credentials, error) {
-	return anthropicProviderFactory().Login(ctx, callbacks)
-}
-
-// RefreshAnthropicToken refreshes Anthropic OAuth credentials from a refresh token.
-func RefreshAnthropicToken(ctx context.Context, refreshToken string) (*Credentials, error) {
-	return anthropicProviderFactory().RefreshToken(ctx, &Credentials{Refresh: refreshToken})
-}
 
 // LoginGitHubCopilot runs the GitHub Copilot OAuth login flow.
 func LoginGitHubCopilot(ctx context.Context, callbacks LoginCallbacks) (*Credentials, error) {

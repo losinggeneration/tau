@@ -378,7 +378,7 @@ func TestAnthropicToolChoiceReachesTransport(t *testing.T) {
 		{name: "parallel disabled", choice: map[string]any{"type": "tool", "name": "lookup", "disable_parallel_tool_use": true}, want: `{"type":"tool","name":"lookup","disable_parallel_tool_use":true}`},
 		{name: "parallel allowed", choice: map[string]any{"type": "tool", "name": "lookup", "disable_parallel_tool_use": false}, want: `{"type":"tool","name":"lookup","disable_parallel_tool_use":false}`},
 	} {
-		for _, key := range []string{"test-key", "sk-ant-oat-test"} {
+		for _, key := range []string{"test-key"} {
 			for _, format := range []string{"JSON", "SSE"} {
 				t.Run(tc.name+"/"+key+"/"+format, func(t *testing.T) {
 					model := &Model{ID: "claude-test", API: APIAnthropicMessages, Provider: ProviderAnthropic, BaseURL: "https://test.invalid", MaxTokens: 4096}
@@ -1432,14 +1432,14 @@ func TestAnthropicStrictSchemaAdmissionReachesTransport(t *testing.T) {
 						wire, err := io.ReadAll(req.Body)
 						require.NoError(t, err)
 						assert.Equal(t, payload, string(wire))
-						assert.Equal(t, "Bearer sk-ant-oat-test", req.Header.Get("Authorization"))
+						assert.Equal(t, "test-key", req.Header.Get("x-api-key"))
 						var body map[string]json.RawMessage
 						require.NoError(t, json.Unmarshal(wire, &body))
 						parameters, strict := schema.parameters, ""
 						if schema.keyword == "" {
 							parameters, strict = schema.converted, `,"strict":true`
 						}
-						definition := `{"name":"Read","description":"Read a value","eager_input_streaming":true,"input_schema":` + parameters + strict + `}`
+						definition := `{"name":"read","description":"Read a value","eager_input_streaming":true,"input_schema":` + parameters + strict + `}`
 						messages := `[{"role":"user","content":[{"type":"text","text":"question"}]}]`
 						tools := "[" + definition + "]"
 						if placement == "inline" {
@@ -1453,7 +1453,7 @@ func TestAnthropicStrictSchemaAdmissionReachesTransport(t *testing.T) {
 					})}
 					client, err := newAnthropicClient(model)
 					require.NoError(t, err)
-					opts := []Option{WithClient(client), WithAPIKey("sk-ant-oat-test"), WithCacheRetention("none"), WithMaxRetries(0), WithPayloadCallback(func(value any) any { callbacks++; payload = value.(string); return nil }), WithResponseCallback(func(response ProviderResponse) { responses++; assert.Equal(t, http.StatusOK, response.Status) })}
+					opts := []Option{WithClient(client), WithAPIKey("test-key"), WithCacheRetention("none"), WithMaxRetries(0), WithPayloadCallback(func(value any) any { callbacks++; payload = value.(string); return nil }), WithResponseCallback(func(response ProviderResponse) { responses++; assert.Equal(t, http.StatusOK, response.Status) })}
 					blocked := schema.keyword != "" && preference == "require"
 					check := func(message AssistantMessage) {
 						t.Helper()
@@ -1496,7 +1496,6 @@ func TestAnthropicStrictSchemaAdmissionReachesTransport(t *testing.T) {
 					require.NoError(t, err)
 					assert.Equal(t, string(before), string(after))
 					assert.Empty(t, client.tools)
-					assert.False(t, client.isOAuth)
 				})
 			}
 		}
@@ -1704,7 +1703,7 @@ func TestAnthropicInlineStrictFallbackReachesTransport(t *testing.T) {
 		"Too many strict tools (32)",
 		"Schemas contains too many parameters with union types (480 parameters with type arrays or anyOf)",
 	} {
-		for _, key := range []string{"test-key", "sk-ant-oat-test"} {
+		for _, key := range []string{"test-key"} {
 			for _, format := range []string{"JSON", "SSE"} {
 				t.Run(rejection+"/"+key+"/"+format, func(t *testing.T) {
 					model := &Model{ID: "claude-test", API: APIAnthropicMessages, Provider: ProviderAnthropic, BaseURL: "https://test.invalid", MaxTokens: 4096, Compat: &CompatibilitySettings{SupportsStrictTools: true, SupportsMidConvoSystemMessages: true, SupportsMidConvoToolChanges: true}}
@@ -1741,11 +1740,7 @@ func TestAnthropicInlineStrictFallbackReachesTransport(t *testing.T) {
 						definitions := body["tools"].([]any)
 						require.Len(t, definitions, 2)
 						initial := definitions[0].(map[string]any)
-						name := "read"
-						if key == "sk-ant-oat-test" {
-							name = "Read"
-						}
-						assert.Equal(t, name, initial["name"])
+						assert.Equal(t, "read", initial["name"])
 						assert.Equal(t, true, initial["strict"])
 						assert.Equal(t, map[string]any{"type": "ephemeral", "ttl": "1h"}, initial["cache_control"])
 						placeholder := definitions[1].(map[string]any)
@@ -1761,7 +1756,7 @@ func TestAnthropicInlineStrictFallbackReachesTransport(t *testing.T) {
 							block := blocks[0].(map[string]any)
 							assert.Equal(t, "tool_addition", block["type"])
 							definition := block["tool"].(map[string]any)["definition"].(map[string]any)
-							assert.Equal(t, name, definition["name"])
+							assert.Equal(t, "read", definition["name"])
 							assert.NotContains(t, definition, "cache_control")
 							wantSchema := `{"type":"object","properties":{"value":{"type":"string"},"optional":{"anyOf":[{"type":"number"},{"type":"null"}]}},"required":["optional","value"],"additionalProperties":false}`
 							if requests == 2 && i == 0 {
@@ -3391,7 +3386,6 @@ func TestAnthropicAuthHeadersAndInjectedRefreshMatchUpstream(t *testing.T) {
 		header, value                  string
 	}{
 		{name: "api key", provider: ProviderAnthropic, key: "sk-ant-api-old", refreshed: "sk-ant-api-new", header: "x-api-key", value: "%s"},
-		{name: "oauth", provider: ProviderAnthropic, key: "sk-ant-oat-old", refreshed: "sk-ant-oat-new", header: "Authorization", value: "Bearer %s"},
 		{name: "copilot", provider: ProviderGitHubCopilot, key: "copilot-old", refreshed: "copilot-new", header: "Authorization", value: "Bearer %s"},
 	} {
 		for _, outcome := range []string{"success", "close failure", "refresh failure", "second unauthorized"} {
@@ -3591,7 +3585,6 @@ func TestAnthropicSessionAffinityReachesTransport(t *testing.T) {
 		{name: "configured precedence", enabled: true, modelHeaders: map[string]string{"X-Session-Affinity": "model", "X-Extra": "model-extra"}, requestHeaders: map[string]string{"x-session-affinity": "caller"}, want: map[string]string{"x-session-affinity": "caller", "x-extra": "model-extra"}},
 		{name: "router configured precedence", enabled: true, format: "openrouter", modelHeaders: map[string]string{"X-Session-ID": "model"}, requestHeaders: map[string]string{"x-session-id": "caller"}, want: map[string]string{"x-session-id": "caller"}},
 		{name: "explicit header with none", enabled: true, retention: "none", requestHeaders: map[string]string{"X-Session-Affinity": "caller"}, want: map[string]string{"x-session-affinity": "caller"}},
-		{name: "OAuth excludes generated affinity", enabled: true, key: "sk-ant-oat-test"},
 		{name: "Copilot excludes generated affinity", enabled: true, provider: ProviderGitHubCopilot},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
@@ -3613,7 +3606,7 @@ func TestAnthropicSessionAffinityReachesTransport(t *testing.T) {
 				for _, name := range []string{"x-session-id", "x-session-affinity", "session_id", "session-id", "x-client-request-id", "x-extra"} {
 					assert.Equal(t, scenario.want[name], req.Header.Get(name), name)
 				}
-				if isOAuthToken(key) || scenario.provider == ProviderGitHubCopilot {
+				if scenario.provider == ProviderGitHubCopilot {
 					require.Equal(t, "Bearer "+key, req.Header.Get("Authorization"))
 					require.Empty(t, req.Header.Get("x-api-key"))
 				} else {
@@ -3687,7 +3680,6 @@ func TestAnthropicCachePlacementReachesTransport(t *testing.T) {
 		{name: "historical results then assistant", shape: "assistant"},
 		{name: "multiple result groups", shape: "groups"},
 		{name: "user image", shape: "user image"},
-		{name: "OAuth system blocks", key: "sk-ant-oat-test"},
 		{name: "native tool update", shape: "system", retention: "long", compat: `{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true}`},
 		{name: "interleaved system update", shape: "interleaved system", compat: `{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true}`},
 		{name: "system before missing result", shape: "system missing", compat: `{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true}`},
@@ -3751,9 +3743,6 @@ func TestAnthropicCachePlacementReachesTransport(t *testing.T) {
 			wantPaths := []string{"/system/0", "/tools/1"}
 			if model.Compat != nil && model.Compat.SupportsCacheControlOnTools != nil && !*model.Compat.SupportsCacheControlOnTools {
 				wantPaths = wantPaths[:1]
-			}
-			if isOAuthToken(key) {
-				wantPaths = append(wantPaths, "/system/1")
 			}
 			if lastPath != "" {
 				wantPaths = append(wantPaths, lastPath)
@@ -4475,7 +4464,7 @@ func TestAnthropicThinkingStartSignatureReachesTransport(t *testing.T) {
 func TestAnthropicAssistantOrderReachesTransport(t *testing.T) {
 	for _, format := range []string{"json", "sse"} {
 		for _, layout := range []string{"interleaved", "tools last"} {
-			for _, mode := range []string{"same model", "cross model", "OAuth strict fallback"} {
+			for _, mode := range []string{"same model", "cross model", "strict fallback"} {
 				t.Run(format+"/"+layout+"/"+mode, func(t *testing.T) {
 					model := &Model{ID: "source", API: APIAnthropicMessages, Provider: ProviderAnthropic, BaseURL: "https://test.invalid", MaxTokens: 4096, Compat: &CompatibilitySettings{SupportsStrictTools: true}}
 					first := map[string]any{"type": "tool_use", "id": "call_1", "name": "read", "input": map[string]any{"path": "one"}}
@@ -4529,7 +4518,7 @@ func TestAnthropicAssistantOrderReachesTransport(t *testing.T) {
 						if requests > 1 {
 							kind, data = "application/json", `{"content":[],"stop_reason":"end_turn"}`
 						}
-						if mode == "OAuth strict fallback" && requests == 2 {
+						if mode == "strict fallback" && requests == 2 {
 							status, data = http.StatusBadRequest, `{"error":{"type":"invalid_request_error","message":"Too many strict tools (21)"}}`
 						}
 						return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {kind}}, Body: io.NopCloser(strings.NewReader(data))}, nil
@@ -4571,9 +4560,8 @@ func TestAnthropicAssistantOrderReachesTransport(t *testing.T) {
 						thinking = map[string]any{"type": "text", "text": "reason"}
 					}
 					wantRequests := 2
-					if mode == "OAuth strict fallback" {
-						key, wantRequests = "sk-ant-oat-test", 3
-						first["name"], second["name"] = "Read", "Read"
+					if mode == "strict fallback" {
+						wantRequests = 3
 					}
 					wantBlocks := []any{first, thinking, text, second, tail}
 					if layout == "tools last" {
@@ -4604,7 +4592,7 @@ func TestAnthropicAssistantOrderReachesTransport(t *testing.T) {
 						}, body["messages"])
 						tools := body["tools"].([]any)
 						require.Len(t, tools, 1)
-						assert.Equal(t, mode != "OAuth strict fallback" || i < 2, tools[0].(map[string]any)["strict"] == true)
+						assert.Equal(t, mode != "strict fallback" || i < 2, tools[0].(map[string]any)["strict"] == true)
 					}
 					after, err := json.Marshal(prompt)
 					require.NoError(t, err)
@@ -4815,9 +4803,7 @@ func TestAnthropicOverlappingRequestsKeepResponseState(t *testing.T) {
 	for _, scenario := range []struct {
 		name, outerKey, innerKey, innerTool, outerName, innerName string
 	}{
-		{name: "OAuth then key", outerKey: "sk-ant-oat-outer", innerKey: "test-key", innerTool: "lookup", outerName: "read", innerName: "Read"},
-		{name: "key then OAuth", outerKey: "test-key", innerKey: "sk-ant-oat-inner", innerTool: "rEaD", outerName: "Read", innerName: "rEaD"},
-		{name: "separate OAuth loadouts", outerKey: "sk-ant-oat-outer", innerKey: "sk-ant-oat-inner", innerTool: "rEaD", outerName: "read", innerName: "rEaD"},
+		{name: "separate keys and loadouts", outerKey: "outer-key", innerKey: "inner-key", innerTool: "lookup", outerName: "Read", innerName: "Read"},
 	} {
 		for _, format := range []string{"JSON", "SSE"} {
 			t.Run(scenario.name+"/"+format, func(t *testing.T) {
@@ -4843,20 +4829,9 @@ func TestAnthropicOverlappingRequestsKeepResponseState(t *testing.T) {
 					if i == 1 {
 						key, tool, question, effort = scenario.innerKey, scenario.innerTool, "inner", "high"
 					}
-					if strings.HasPrefix(key, "sk-ant-oat") {
-						assert.Equal(t, "Bearer "+key, req.Header.Get("Authorization"))
-						assert.Empty(t, req.Header.Get("x-api-key"))
-						assert.Contains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
-						assert.JSONEq(t, `[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}]`, string(body["system"]))
-						if tool != "lookup" {
-							tool = "Read"
-						}
-					} else {
-						assert.Equal(t, key, req.Header.Get("x-api-key"))
-						assert.Empty(t, req.Header.Get("Authorization"))
-						assert.NotContains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
-						assert.NotContains(t, body, "system")
-					}
+					assert.Equal(t, key, req.Header.Get("x-api-key"))
+					assert.Empty(t, req.Header.Get("Authorization"))
+					assert.NotContains(t, body, "system")
 					assert.JSONEq(t, fmt.Sprintf(`[{"name":%q,"description":"","input_schema":{"type":"object"},"eager_input_streaming":true}]`, tool), string(body["tools"]))
 					assert.JSONEq(t, fmt.Sprintf(`[{"role":"user","content":[{"type":"text","text":%q}]},{"role":"system","content":[],"output_config":{"effort":%q}}]`, question, effort), string(body["messages"]))
 					block := `{"type":"tool_use","id":"call_overlap","name":"Read","input":{"n":9007199254740993}}`
@@ -4916,171 +4891,12 @@ func TestAnthropicOverlappingRequestsKeepResponseState(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, []int{2, 2, 2, 1}, []int{requests, callbacks, responses, terminals})
 				assert.Equal(t, [2]int{1, 1}, closes)
-				assert.False(t, client.isOAuth)
 				assert.Empty(t, client.tools)
 				assert.Empty(t, client.thinkingLevel)
 				after, err := json.Marshal([]any{model, outer, inner})
 				require.NoError(t, err)
 				assert.Equal(t, string(before), string(after))
 			})
-		}
-	}
-}
-
-func TestAnthropicOAuthToolNamesRoundTrip(t *testing.T) {
-	for _, format := range []string{"json", "sse"} {
-		for _, key := range []string{"sk-ant-oat-test", "test-key"} {
-			for _, tc := range []struct {
-				name     string
-				declared string
-				returned string
-				wire     string
-			}{
-				{name: "read", declared: "read", returned: "Read", wire: "Read"},
-				{name: "mixed case", declared: "tOdOwRiTe", returned: "TodoWrite", wire: "TodoWrite"},
-				{name: "custom", declared: "my_custom_tool", returned: "my_custom_tool", wire: "my_custom_tool"},
-				{name: "unknown", declared: "read", returned: "UnknownTool", wire: "Read"},
-				{name: "no alias", declared: "find", returned: "Glob", wire: "find"},
-				{name: "find round trip", declared: "find", returned: "find", wire: "find"},
-				{name: "no declarations", returned: "Read"},
-			} {
-				t.Run(format+"/"+key+"/"+tc.name, func(t *testing.T) {
-					model := &Model{ID: "source", API: APIAnthropicMessages, Provider: ProviderAnthropic, BaseURL: "https://test.invalid", MaxTokens: 4096}
-					prompt := &Context{Messages: []Message{{Role: "user", Content: "question"}}}
-					if tc.declared != "" {
-						prompt.Messages = append([]Message{{Role: "system", ToolsAdded: []Tool{{Name: tc.declared, Parameters: json.RawMessage(`{"type":"object","properties":{}}`)}}}}, prompt.Messages...)
-					}
-					wantName := tc.returned
-					if key == "sk-ant-oat-test" && strings.EqualFold(tc.declared, tc.returned) {
-						wantName = tc.declared
-					}
-					args := json.RawMessage(`{"n":9007199254740993}`)
-					block := `{"type":"tool_use","id":"call_1","name":"` + tc.returned + `","input":` + string(args) + `}`
-					response := `{"id":"msg_name","content":[` + block + `],"stop_reason":"tool_use","usage":{"input_tokens":11,"output_tokens":7}}`
-					kind := "application/json"
-					if format == "sse" {
-						kind = "text/event-stream"
-						response = "data: " + `{"type":"message_start","message":{"id":"msg_name","usage":{"input_tokens":11}}}` + "\n\n" +
-							"data: " + `{"type":"content_block_start","index":0,"content_block":` + block + `}` + "\n\n" +
-							"data: " + `{"type":"content_block_stop","index":0}` + "\n\n" +
-							"data: " + `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}` + "\n\n" +
-							"data: " + `{"type":"message_stop"}` + "\n\n"
-					}
-					var requests, callbacks, done, starts, ends int
-					var payloads []string
-					previous := http.DefaultClient
-					t.Cleanup(func() { http.DefaultClient = previous })
-					http.DefaultClient = &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-						requests++
-						require.Equal(t, "https://test.invalid/v1/messages", req.URL.String())
-						body, err := io.ReadAll(req.Body)
-						require.NoError(t, err)
-						payloads = append(payloads, string(body))
-						responseKind, data := kind, response
-						if requests > 1 {
-							responseKind, data = "application/json", `{"content":[],"stop_reason":"end_turn"}`
-						}
-						return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {responseKind}}, Body: io.NopCloser(strings.NewReader(data))}, nil
-					})}
-					client, err := newAnthropicClient(model)
-					require.NoError(t, err)
-					opts := []Option{WithAPIKey(key), WithCacheRetention("none"), WithPayloadCallback(func(payload any) any {
-						callbacks++
-						payloads = append(payloads, payload.(string))
-						return nil
-					})}
-					before, err := json.Marshal(prompt)
-					require.NoError(t, err)
-					var message AssistantMessage
-					err = client.Stream(t.Context(), model, prompt, func(_ context.Context, event StreamEvent) {
-						switch e := event.(type) {
-						case ToolCallStart:
-							starts++
-							require.Len(t, e.Partial.Content, 1)
-							assert.Equal(t, wantName, e.Partial.Content[0].Name)
-						case ToolCallEnd:
-							ends++
-							assert.Equal(t, wantName, e.ToolCall.Name)
-							assert.Equal(t, args, e.ToolCall.Arguments)
-						case Done:
-							done++
-							message = e.Message
-						case StreamError:
-							t.Errorf("unexpected stream error: %v", e)
-						}
-					}, opts...)
-					require.NoError(t, err)
-					// Request state stays off the shared client.
-					require.False(t, client.isOAuth)
-					require.Empty(t, client.tools)
-					require.Empty(t, client.thinkingLevel)
-					require.Equal(t, 1, done)
-					assert.Equal(t, []ContentBlock{{Type: ContentBlockToolCall, ID: "call_1", Name: wantName, Arguments: args}}, message.Content)
-					assert.Equal(t, "msg_name", message.ResponseID)
-					assert.Equal(t, model.ID, message.Model)
-					assert.Equal(t, model.API, message.API)
-					assert.Equal(t, model.Provider, message.Provider)
-					assert.Equal(t, StopReasonToolUse, message.StopReason)
-					assert.Equal(t, 11, message.Usage.Input)
-					assert.Equal(t, 7, message.Usage.Output)
-					wantEvents := 0
-					if format == "sse" {
-						wantEvents = 1
-					}
-					assert.Equal(t, wantEvents, starts)
-					assert.Equal(t, wantEvents, ends)
-					after, err := json.Marshal(prompt)
-					require.NoError(t, err)
-					require.JSONEq(t, string(before), string(after))
-					require.Len(t, payloads, 2)
-					assert.Equal(t, payloads[0], payloads[1])
-					var initial struct {
-						Tools []struct {
-							Name string `json:"name"`
-						} `json:"tools"`
-					}
-					require.NoError(t, json.Unmarshal([]byte(payloads[1]), &initial))
-					if tc.declared == "" {
-						assert.Empty(t, initial.Tools)
-					} else {
-						require.Len(t, initial.Tools, 1)
-						wire := tc.declared
-						if key == "sk-ant-oat-test" {
-							wire = tc.wire
-						}
-						assert.Equal(t, wire, initial.Tools[0].Name)
-					}
-					prompt.Messages = append(prompt.Messages,
-						Message{Role: "assistant", Content: message.Content, Provider: message.Provider, API: message.API, Model: message.Model},
-						Message{Role: "toolResult", ToolCallID: "call_1", ToolName: wantName, Content: "result"})
-					before, err = json.Marshal(prompt)
-					require.NoError(t, err)
-					result, err := client.Complete(t.Context(), model, prompt, opts...)
-					require.NoError(t, err)
-					require.NotNil(t, result)
-					require.Equal(t, StopReasonStop, result.StopReason)
-					require.Equal(t, 2, requests)
-					require.Equal(t, 2, callbacks)
-					require.Len(t, payloads, 4)
-					wireName := wantName
-					if key == "sk-ant-oat-test" && strings.EqualFold(tc.declared, tc.returned) {
-						wireName = tc.wire
-					}
-					wantMessages := `[{"role":"user","content":[{"type":"text","text":"question"}]},{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"` + wireName + `","input":` + string(args) + `}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result"}]}]`
-					assert.Equal(t, payloads[2], payloads[3])
-					for _, payload := range payloads[2:] {
-						var body struct {
-							Messages json.RawMessage `json:"messages"`
-						}
-						require.NoError(t, json.Unmarshal([]byte(payload), &body))
-						assert.JSONEq(t, wantMessages, string(body.Messages))
-						assert.Contains(t, string(body.Messages), string(args))
-					}
-					after, err = json.Marshal(prompt)
-					require.NoError(t, err)
-					require.JSONEq(t, string(before), string(after))
-				})
-			}
 		}
 	}
 }
@@ -7417,7 +7233,7 @@ func TestAnthropicSSEInitialBOMReachesTransport(t *testing.T) {
 func TestAnthropicEagerToolInputReachesTransport(t *testing.T) {
 	for _, compatibility := range []string{"nil", "unset", "on", "off"} {
 		for _, layout := range []string{"none", "flat", "native", "removed", "fallback", "override", "suppress"} {
-			for _, auth := range []string{"key", "oauth", "copilot"} {
+			for _, auth := range []string{"key", "copilot"} {
 				for _, responseKind := range []string{"JSON", "SSE"} {
 					for _, entry := range []string{"Stream", "Complete"} {
 						t.Run(compatibility+"/"+layout+"/"+auth+"/"+responseKind+"/"+entry, func(t *testing.T) {
@@ -7429,9 +7245,6 @@ func TestAnthropicEagerToolInputReachesTransport(t *testing.T) {
 								require.NoError(t, json.Unmarshal([]byte(`{"supportsEagerToolInputStreaming":`+fmt.Sprint(compatibility == "on")+`}`), model.Compat))
 							}
 							key := "test-key"
-							if auth == "oauth" {
-								key = "sk-ant-oat-test"
-							}
 							if auth == "copilot" {
 								model.Provider = ProviderGitHubCopilot
 							}
@@ -7501,11 +7314,7 @@ func TestAnthropicEagerToolInputReachesTransport(t *testing.T) {
 									require.Len(t, defs, wantDefs)
 									def := defs[0].(map[string]any)
 									checkDefinition(def, requests)
-									name := "read"
-									if auth == "oauth" {
-										name = "Read"
-									}
-									assert.Equal(t, name, def["name"])
+									assert.Equal(t, "read", def["name"])
 									assert.Equal(t, map[string]any{"type": "ephemeral"}, def["cache_control"])
 									if wantDefs == 2 {
 										placeholder := defs[1].(map[string]any)
@@ -7530,9 +7339,6 @@ func TestAnthropicEagerToolInputReachesTransport(t *testing.T) {
 									}
 								}
 								var wantBetas []string
-								if auth == "oauth" {
-									wantBetas = append(wantBetas, "claude-code-20250219", "oauth-2025-04-20")
-								}
 								if compatibility == "off" && layout != "none" && layout != "removed" {
 									wantBetas = append(wantBetas, "fine-grained-tool-streaming-2025-05-14")
 								}
@@ -7647,7 +7453,6 @@ func TestAnthropicHeaderOwnedAuthReachesTransport(t *testing.T) {
 		{name: "OAuth shaped header stays header owned", headers: map[string]string{"Authorization": "Bearer sk-ant-oat-gateway"}, valid: true},
 		{name: "absent"},
 		{name: "api key control", key: "test-key", valid: true},
-		{name: "OAuth control", key: "sk-ant-oat-test", valid: true},
 	} {
 		for _, fallback := range []bool{false, true} {
 			for _, responseKind := range []string{"JSON", "SSE"} {
@@ -7676,11 +7481,7 @@ func TestAnthropicHeaderOwnedAuthReachesTransport(t *testing.T) {
 							assert.Equal(t, "2023-06-01", req.Header.Get("anthropic-version"))
 							expected := make(http.Header)
 							if tc.key != "" {
-								if isOAuthToken(tc.key) {
-									expected.Set("Authorization", "Bearer "+tc.key)
-								} else {
-									expected.Set("x-api-key", tc.key)
-								}
+								expected.Set("x-api-key", tc.key)
 							}
 							for k, v := range tc.modelHeaders {
 								expected.Set(k, v)
@@ -7698,16 +7499,10 @@ func TestAnthropicHeaderOwnedAuthReachesTransport(t *testing.T) {
 							require.NoError(t, json.Unmarshal(wire, &body))
 							assert.Equal(t, true, body["stream"])
 							assert.Equal(t, model.ID, body["model"])
-							if isOAuthToken(tc.key) {
-								assert.Contains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
-								require.Len(t, body["system"], 2)
-								assert.Equal(t, "Read", body["tools"].([]any)[0].(map[string]any)["name"])
-							} else {
-								assert.NotContains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
-								assert.Empty(t, req.Header.Get("x-app"))
-								assert.Equal(t, []any{map[string]any{"type": "text", "text": "policy"}}, body["system"])
-								assert.Equal(t, "read", body["tools"].([]any)[0].(map[string]any)["name"])
-							}
+							assert.NotContains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
+							assert.Empty(t, req.Header.Get("x-app"))
+							assert.Equal(t, []any{map[string]any{"type": "text", "text": "policy"}}, body["system"])
+							assert.Equal(t, "read", body["tools"].([]any)[0].(map[string]any)["name"])
 							if fallback {
 								assert.Equal(t, requests == 1, body["tools"].([]any)[0].(map[string]any)["strict"] == true)
 							}
@@ -7942,16 +7737,14 @@ func TestAnthropicThinkingOffReachesTransport(t *testing.T) {
 }
 
 func TestAnthropicConfiguredHeadersStayRequestLocal(t *testing.T) {
-	for _, auth := range []string{"api key", "oauth", "copilot"} {
+	for _, auth := range []string{"api key", "copilot"} {
 		t.Run(auth, func(t *testing.T) {
 			model := &Model{ID: "claude-headers", API: APIAnthropicMessages, Provider: ProviderAnthropic, BaseURL: "https://test.invalid", MaxTokens: 4096, Reasoning: true, Headers: map[string]string{
 				"ANTHROPIC-BETA": "model-beta,model-beta, , other-model-beta",
 				"USER-AGENT":     "model-client", "X-APP": "model-app",
 			}}
 			key := "test-key"
-			if auth == "oauth" {
-				key = "sk-ant-oat-test"
-			} else if auth == "copilot" {
+			if auth == "copilot" {
 				model.Provider = ProviderGitHubCopilot
 			}
 			prompt := &Context{Messages: []Message{{Role: "user", Content: "question"}}}
@@ -8067,7 +7860,7 @@ func TestAnthropicInterleavedBetaReachesTransport(t *testing.T) {
 		{name: "caller replacement", reasoning: true, opts: []Option{WithThinkingEnabled(true)}, header: new("caller-beta")},
 		{name: "caller suppression", reasoning: true, opts: []Option{WithThinkingEnabled(true)}, header: new("")},
 	} {
-		for _, auth := range []string{"api key", "oauth", "copilot"} {
+		for _, auth := range []string{"api key", "copilot"} {
 			for _, responseKind := range []string{"JSON", "SSE"} {
 				for _, entry := range []string{"Stream", "Complete"} {
 					t.Run(tc.name+"/"+auth+"/"+responseKind+"/"+entry, func(t *testing.T) {
@@ -8076,9 +7869,7 @@ func TestAnthropicInterleavedBetaReachesTransport(t *testing.T) {
 							model.ID = tc.id
 						}
 						key := "test-key"
-						if auth == "oauth" {
-							key = "sk-ant-oat-test"
-						} else if auth == "copilot" {
+						if auth == "copilot" {
 							model.Provider = ProviderGitHubCopilot
 						}
 						prompt := &Context{SystemPrompt: "policy", Messages: []Message{{Role: "user", Content: "question"}}}
@@ -8092,9 +7883,6 @@ func TestAnthropicInterleavedBetaReachesTransport(t *testing.T) {
 							requests++
 							assert.Equal(t, "https://test.invalid/v1/messages", req.URL.String())
 							var betas []string
-							if auth == "oauth" {
-								betas = append(betas, "claude-code-20250219", "oauth-2025-04-20")
-							}
 							if tc.want {
 								betas = append(betas, "interleaved-thinking-2025-05-14")
 							}
@@ -8274,11 +8062,12 @@ func TestAnthropicMetadataReachesTransport(t *testing.T) {
 	}
 }
 
-func TestAnthropicCopilotCredentialShapingReachesTransport(t *testing.T) {
+func TestAnthropicNeverPresentsAsClaudeCode(t *testing.T) {
 	for _, provider := range []string{ProviderAnthropic, ProviderGitHubCopilot} {
 		for _, key := range []string{"test-key", "sk-ant-oat-test"} {
 			for _, entry := range []string{"Stream", "Complete"} {
 				t.Run(provider+"/"+key+"/"+entry, func(t *testing.T) {
+					refused := provider == ProviderAnthropic && key == "sk-ant-oat-test"
 					model := &Model{ID: "claude-test", API: APIAnthropicMessages, Provider: provider, BaseURL: "https://test.invalid", MaxTokens: 4096}
 					prompt := &Context{SystemPrompt: "policy", Messages: []Message{{Role: "user", Content: "question"}}, Tools: []Tool{{Name: "read", Parameters: json.RawMessage(`{"type":"object"}`)}}}
 					before, err := json.Marshal(prompt)
@@ -8292,33 +8081,23 @@ func TestAnthropicCopilotCredentialShapingReachesTransport(t *testing.T) {
 						wire, err := io.ReadAll(req.Body)
 						require.NoError(t, err)
 						assert.Equal(t, callbackPayload, string(wire))
+						assert.NotContains(t, string(wire), "Claude Code")
 						var body map[string]any
 						require.NoError(t, json.Unmarshal(wire, &body))
-						oauth := provider != ProviderGitHubCopilot && key == "sk-ant-oat-test"
-						wantSystem := []any{map[string]any{"type": "text", "text": "policy"}}
-						wantName := "read"
-						if oauth {
-							wantSystem = append([]any{map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}}, wantSystem...)
-							wantName = "Read"
-							assert.Equal(t, "claude-cli/2.1.75", req.Header.Get("User-Agent"))
-							assert.Equal(t, "cli", req.Header.Get("x-app"))
-							assert.Contains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
-						} else {
-							assert.Empty(t, req.Header.Get("x-app"))
-							assert.NotContains(t, req.Header.Get("User-Agent"), "claude-cli/")
-							assert.NotContains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
-						}
-						assert.Equal(t, wantSystem, body["system"])
-						assert.Equal(t, wantName, body["tools"].([]any)[0].(map[string]any)["name"])
-						if provider == ProviderGitHubCopilot || oauth {
+						assert.Equal(t, []any{map[string]any{"type": "text", "text": "policy"}}, body["system"])
+						assert.Equal(t, "read", body["tools"].([]any)[0].(map[string]any)["name"])
+						assert.Empty(t, req.Header.Get("x-app"))
+						assert.NotContains(t, req.Header.Get("User-Agent"), "claude-cli/")
+						assert.NotContains(t, req.Header.Get("anthropic-beta"), "claude-code")
+						assert.NotContains(t, req.Header.Get("anthropic-beta"), "oauth-2025-04-20")
+						if provider == ProviderGitHubCopilot {
 							assert.Equal(t, "Bearer "+key, req.Header.Get("Authorization"))
 							assert.Empty(t, req.Header.Get("x-api-key"))
-						} else {
-							assert.Equal(t, key, req.Header.Get("x-api-key"))
-						}
-						if provider == ProviderGitHubCopilot {
 							assert.Equal(t, "user", req.Header.Get("X-Initiator"))
 							assert.Equal(t, "conversation-edits", req.Header.Get("Openai-Intent"))
+						} else {
+							assert.Equal(t, key, req.Header.Get("x-api-key"))
+							assert.Empty(t, req.Header.Get("Authorization"))
 						}
 						return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: &anthropicEOFBody{Reader: strings.NewReader(`{"id":"msg_shape","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":2}}`), closes: &closes}}, nil
 					})}
@@ -8335,19 +8114,21 @@ func TestAnthropicCopilotCredentialShapingReachesTransport(t *testing.T) {
 						}, opts...)
 					} else {
 						message, err = client.Complete(t.Context(), model, prompt, opts...)
-						terminals++
+						if err == nil {
+							terminals++
+						}
+					}
+					if refused {
+						require.ErrorIs(t, err, errAnthropicSubscriptionToken)
+						assert.Nil(t, message)
+						assert.Equal(t, []int{0, 0, 0, 0}, []int{requests, payloads, closes, terminals}, "a subscription token never reaches the API")
+						return
 					}
 					require.NoError(t, err)
 					require.NotNil(t, message)
 					assert.Equal(t, []int{1, 1, 1, 1}, []int{requests, payloads, closes, terminals})
 					assert.Equal(t, StopReasonToolUse, message.StopReason)
-					wantName := "Read"
-					if provider != ProviderGitHubCopilot && key == "sk-ant-oat-test" {
-						wantName = "read"
-					}
-					assert.Equal(t, []ContentBlock{{Type: ContentBlockToolCall, ID: "call_1", Name: wantName, Arguments: json.RawMessage(`{}`)}}, message.Content)
-					assert.Equal(t, "msg_shape", message.ResponseID)
-					assert.Equal(t, 5, message.Usage.TotalTokens)
+					assert.Equal(t, []ContentBlock{{Type: ContentBlockToolCall, ID: "call_1", Name: "Read", Arguments: json.RawMessage(`{}`)}}, message.Content, "tool names come back as the model sent them")
 					after, err := json.Marshal(prompt)
 					require.NoError(t, err)
 					assert.Equal(t, string(before), string(after))

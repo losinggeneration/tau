@@ -3,6 +3,7 @@ package ai
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -231,8 +232,8 @@ func TestGetEnvAPIKeyAnthropicPrecedenceAfterRefactor(t *testing.T) {
 	}
 
 	t.Setenv("ANTHROPIC_OAUTH_TOKEN", "oauth-token")
-	if key := GetEnvAPIKey(ProviderAnthropic); key != "oauth-token" {
-		t.Errorf("expected oauth-token (OAuth takes priority), got %q", key)
+	if key := GetEnvAPIKey(ProviderAnthropic); key != "api-key" {
+		t.Errorf("ANTHROPIC_OAUTH_TOKEN must be ignored, got %q", key)
 	}
 }
 
@@ -274,7 +275,6 @@ func TestEnvAPIKeysDerivedFromRegistry(t *testing.T) {
 func TestEnvAPIKeysIncludesSpecialCaseVars(t *testing.T) {
 	required := []string{
 		"ANTHROPIC_API_KEY",
-		"ANTHROPIC_OAUTH_TOKEN",
 		"COPILOT_GITHUB_TOKEN",
 		"GH_TOKEN",
 		"GITHUB_TOKEN",
@@ -332,7 +332,7 @@ func TestEnvVarNamesSpecialCases(t *testing.T) {
 		provider string
 		contains []string
 	}{
-		{ProviderAnthropic, []string{"ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}},
+		{ProviderAnthropic, []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}},
 		{ProviderGitHubCopilot, []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}},
 		{ProviderOpenAICodex, []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}},
 		{ProviderAmazonBedrock, []string{"AWS_PROFILE", "AWS_ACCESS_KEY_ID"}},
@@ -428,10 +428,10 @@ func TestAnthropicBearerEnvironmentDiscoveryAndResolutionStaySeparate(t *testing
 	if EnvAPIKeys["ANTHROPIC_AUTH_TOKEN"] != ProviderAnthropic {
 		t.Error("bearer variable missing from credential inventory")
 	}
-	if names := envVarNames(ProviderAnthropic); len(names) != 3 || names[0] != "ANTHROPIC_AUTH_TOKEN" {
+	if names := envVarNames(ProviderAnthropic); !slices.Equal(names, []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}) {
 		t.Errorf("unexpected discovery order: %v", names)
 	}
-	if key := GetEnvAPIKey(ProviderAnthropic); key != "oauth" {
+	if key := GetEnvAPIKey(ProviderAnthropic); key != "key" {
 		t.Errorf("API-key helper must skip bearer auth, got %q", key)
 	}
 	headers := GetEnvHeaders(ProviderAnthropic)

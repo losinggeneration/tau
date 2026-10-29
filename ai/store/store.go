@@ -119,6 +119,9 @@ func APIKeyFromCredential(ctx context.Context, provider string, cred ai.Credenti
 		return key, nil
 	case ai.CredentialTypeOAuth:
 		oauthProvider, ok := oauth.GetProvider(oauth.ProviderID(provider))
+		if !ok && provider == ai.ProviderAnthropic {
+			return "", errors.New("anthropic: Claude subscription sign-in isn't supported; run `tau logout anthropic` and use the claude-agent provider")
+		}
 		if !ok {
 			return "", fmt.Errorf("no OAuth provider for %s", provider)
 		}

@@ -8987,7 +8987,6 @@ func TestSessionConfiguredCredentialPrecedence(t *testing.T) {
 		{name: "explicit", explicit: "explicit", credential: ai.NewAPIKeyCredential("stored"), configured: "$MISSING_SHOULD_NOT_RESOLVE", want: "explicit"},
 		{name: "stored", credential: ai.NewAPIKeyCredential("stored"), configured: "$MISSING_SHOULD_NOT_RESOLVE", want: "stored"},
 		{name: "stored reference", credential: ai.Credential{Type: ai.CredentialTypeAPIKey, APIKey: "${TAU_STORED_REF}-key", Env: map[string]string{"TAU_STORED_REF": "stored"}}, configured: "$MISSING_SHOULD_NOT_RESOLVE", want: "stored-key"},
-		{name: "oauth", credential: ai.NewOAuthCredential("oauth", "refresh", time.Now().Add(time.Hour), ""), configured: "$MISSING_SHOULD_NOT_RESOLVE", want: "oauth"},
 		{name: "configured", storeErr: ai.ErrCredentialNotFound, configured: "$TAU_CONFIG_TEST_KEY", want: "configured"},
 		{name: "configured scoped reference", credential: ai.Credential{Type: ai.CredentialTypeAPIKey, Env: map[string]string{"TAU_CONFIG_TEST_KEY": "scoped-config"}}, configured: "$TAU_CONFIG_TEST_KEY", want: "scoped-config"},
 		{name: "scoped fallback", credential: ai.Credential{Type: ai.CredentialTypeAPIKey, Env: map[string]string{"ANTHROPIC_API_KEY": "scoped-fallback"}}, want: "scoped-fallback"},
@@ -11208,7 +11207,7 @@ func TestAnthropicEnvironmentCredentialsSelectDefaultModel(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(`{"providers":{"anthropic":{"api":"anthropic-messages","models":[{"id":"claude-sonnet-4-6"}]}}}`), 0o600))
 	registry, err := ai.LoadModelRegistry(path)
 	require.NoError(t, err)
-	for _, variable := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"} {
+	for _, variable := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"} {
 		t.Run(variable, func(t *testing.T) {
 			for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"} {
 				t.Setenv(name, "")
@@ -11836,7 +11835,7 @@ func TestFileOAuthSnapshotReachesSummaryOptions(t *testing.T) {
 	credentials := store.NewFileBackend(filepath.Join(t.TempDir(), "auth.json"), store.Options{})
 	credential := ai.NewOAuthCredential("oauth-access", "refresh", time.Now().Add(time.Hour), "")
 	credential.Env = map[string]string{"ANTHROPIC_BASE_URL": "https://scoped.invalid"}
-	require.NoError(t, credentials.Set(t.Context(), ai.ProviderAnthropic, credential))
+	require.NoError(t, credentials.Set(t.Context(), ai.ProviderGitHubCopilot, credential))
 	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ExplicitModel: model, CredentialStore: credentials})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
@@ -11844,7 +11843,7 @@ func TestFileOAuthSnapshotReachesSummaryOptions(t *testing.T) {
 	require.NoError(t, err)
 	s := session.(*agentSession)
 	summaryModel := *s.model
-	summaryModel.Provider = ai.ProviderAnthropic
+	summaryModel.Provider = ai.ProviderGitHubCopilot
 	opts, err := s.compactionCompletionOptions(t.Context(), &summaryModel, agent.ThinkingOff)
 	require.NoError(t, err)
 	actual := ai.ExtractSimpleStreamOptions(opts)

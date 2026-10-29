@@ -96,13 +96,12 @@ func TestListProviders(t *testing.T) {
 	ResetProviders()
 
 	providers := ListProviders()
-	if len(providers) != 7 {
-		t.Fatalf("ListProviders count = %d, want 7 built-in providers", len(providers))
+	if len(providers) != 6 {
+		t.Fatalf("ListProviders count = %d, want 6 built-in providers", len(providers))
 	}
 
 	// Check that all expected providers are present
 	expectedIDs := map[ProviderID]bool{
-		ProviderAnthropic:         true,
 		ProviderGitHubCopilot:     true,
 		ProviderGeminiCLI:         true,
 		ProviderOpenAICodex:       true,
@@ -122,12 +121,12 @@ func TestGetProvider(t *testing.T) {
 	ResetProviders()
 
 	// Test getting existing provider
-	p, ok := GetProvider(ProviderAnthropic)
+	p, ok := GetProvider(ProviderGitHubCopilot)
 	if !ok {
-		t.Fatal("GetProvider(ProviderAnthropic) returned false, want true")
+		t.Fatal("GetProvider(ProviderGitHubCopilot) returned false, want true")
 	}
-	if p.ID() != ProviderAnthropic {
-		t.Errorf("GetProvider(ProviderAnthropic).ID() = %s, want %s", p.ID(), ProviderAnthropic)
+	if p.ID() != ProviderGitHubCopilot {
+		t.Errorf("GetProvider(ProviderGitHubCopilot).ID() = %s, want %s", p.ID(), ProviderGitHubCopilot)
 	}
 
 	// Test getting non-existent provider
@@ -185,17 +184,17 @@ func TestUnregister(t *testing.T) {
 func TestUnregisterBuiltInRestoresDefault(t *testing.T) {
 	ResetProviders()
 
-	original, ok := GetProvider(ProviderAnthropic)
+	original, ok := GetProvider(ProviderGitHubCopilot)
 	if !ok {
-		t.Fatal("Original Anthropic provider not found")
+		t.Fatal("Original GitHub Copilot provider not found")
 	}
 	originalName := original.Name()
 
-	// Unregister the built-in Anthropic provider
-	Unregister(ProviderAnthropic)
+	// Unregister the built-in GitHub Copilot provider
+	Unregister(ProviderGitHubCopilot)
 
 	// It should be restored, not removed
-	restored, ok := GetProvider(ProviderAnthropic)
+	restored, ok := GetProvider(ProviderGitHubCopilot)
 	if !ok {
 		t.Fatal("Unregister removed built-in provider instead of restoring")
 	}
@@ -231,9 +230,9 @@ func TestResetProviders(t *testing.T) {
 	}
 
 	// Built-in providers should still be present
-	_, ok = GetProvider(ProviderAnthropic)
+	_, ok = GetProvider(ProviderGitHubCopilot)
 	if !ok {
-		t.Error("ResetProviders removed built-in Anthropic provider")
+		t.Error("ResetProviders removed built-in GitHub Copilot provider")
 	}
 }
 
@@ -241,8 +240,8 @@ func TestGetProviderInfoList(t *testing.T) {
 	ResetProviders()
 
 	infos := GetProviderInfoList()
-	if len(infos) != 7 {
-		t.Fatalf("GetProviderInfoList count = %d, want 7", len(infos))
+	if len(infos) != 6 {
+		t.Fatalf("GetProviderInfoList count = %d, want 6", len(infos))
 	}
 
 	for _, info := range infos {
@@ -268,7 +267,6 @@ func TestOAuthBuiltInProviderOrder(t *testing.T) {
 	}
 
 	want := []ProviderID{
-		ProviderAnthropic,
 		ProviderGitHubCopilot,
 		ProviderGeminiCLI,
 		ProviderGoogleAntigravity,
@@ -289,16 +287,16 @@ func TestOAuthBuiltInProviderOrder(t *testing.T) {
 
 func TestProviderInfoType(t *testing.T) {
 	info := ProviderInfo{
-		ID:        ProviderAnthropic,
-		Name:      "Anthropic",
+		ID:        ProviderGitHubCopilot,
+		Name:      "GitHub Copilot",
 		Available: true,
 	}
 
-	if info.ID != ProviderAnthropic {
-		t.Errorf("ProviderInfo.ID = %s, want %s", info.ID, ProviderAnthropic)
+	if info.ID != ProviderGitHubCopilot {
+		t.Errorf("ProviderInfo.ID = %s, want %s", info.ID, ProviderGitHubCopilot)
 	}
-	if info.Name != "Anthropic" {
-		t.Errorf("ProviderInfo.Name = %s, want %s", info.Name, "Anthropic")
+	if info.Name != "GitHub Copilot" {
+		t.Errorf("ProviderInfo.Name = %s, want %s", info.Name, "GitHub Copilot")
 	}
 	if !info.Available {
 		t.Error("ProviderInfo.Available = false, want true")
@@ -313,9 +311,9 @@ func TestOAuthRegistryAliases(t *testing.T) {
 		t.Fatalf("GetOAuthProviders len = %d, want %d", len(providers), len(ListProviders()))
 	}
 
-	provider, ok := GetOAuthProvider(ProviderAnthropic)
-	if !ok || provider.ID() != ProviderAnthropic {
-		t.Fatal("GetOAuthProvider(ProviderAnthropic) failed")
+	provider, ok := GetOAuthProvider(ProviderGitHubCopilot)
+	if !ok || provider.ID() != ProviderGitHubCopilot {
+		t.Fatal("GetOAuthProvider(ProviderGitHubCopilot) failed")
 	}
 }
 
@@ -331,12 +329,10 @@ func TestGitHubCopilotHelperParity(t *testing.T) {
 }
 
 func TestOAuthHelperWrappers(t *testing.T) {
-	origAnthropic := anthropicProviderFactory
 	origCopilot := githubCopilotProviderFactory
 	origGemini := geminiCLIProviderFactory
 	origAntigravity := antigravityProviderFactory
 	t.Cleanup(func() {
-		anthropicProviderFactory = origAnthropic
 		githubCopilotProviderFactory = origCopilot
 		geminiCLIProviderFactory = origGemini
 		antigravityProviderFactory = origAntigravity
@@ -351,14 +347,6 @@ func TestOAuthHelperWrappers(t *testing.T) {
 		login      loginFunc
 		refresh    refreshFunc
 	}{
-		{
-			name: "anthropic",
-			setFactory: func(p *helperTestProvider) {
-				anthropicProviderFactory = func() Provider { return p }
-			},
-			login:   LoginAnthropic,
-			refresh: RefreshAnthropicToken,
-		},
 		{
 			name: "github-copilot",
 			setFactory: func(p *helperTestProvider) {
@@ -544,7 +532,7 @@ func TestCredentialsStoreSetAndGet(t *testing.T) {
 	store := NewCredentialsStore()
 
 	// Initially empty
-	_, ok := store.Get(ProviderAnthropic)
+	_, ok := store.Get(ProviderGitHubCopilot)
 	if ok {
 		t.Error("store.Get returned true for empty store")
 	}
@@ -555,10 +543,10 @@ func TestCredentialsStoreSetAndGet(t *testing.T) {
 		Access:  "access-token",
 		Expires: time.Now().UnixMilli() + 3600*1000,
 	}
-	store.Set(ProviderAnthropic, creds)
+	store.Set(ProviderGitHubCopilot, creds)
 
 	// Get should return them
-	got, ok := store.Get(ProviderAnthropic)
+	got, ok := store.Get(ProviderGitHubCopilot)
 	if !ok {
 		t.Fatal("store.Get returned false after Set")
 	}
@@ -570,17 +558,17 @@ func TestCredentialsStoreSetAndGet(t *testing.T) {
 func TestCredentialsStoreDelete(t *testing.T) {
 	store := NewCredentialsStore()
 
-	store.Set(ProviderAnthropic, &Credentials{
+	store.Set(ProviderGitHubCopilot, &Credentials{
 		Refresh: "refresh",
 		Access:  "access",
 		Expires: time.Now().UnixMilli() + 3600*1000,
 	})
 
 	// Delete
-	store.Delete(ProviderAnthropic)
+	store.Delete(ProviderGitHubCopilot)
 
 	// Should be gone
-	_, ok := store.Get(ProviderAnthropic)
+	_, ok := store.Get(ProviderGitHubCopilot)
 	if ok {
 		t.Error("store.Get returned true after Delete")
 	}
@@ -729,7 +717,7 @@ func TestCredentialsStoreGetAllProviders(t *testing.T) {
 	}
 
 	// Add some credentials
-	store.Set(ProviderAnthropic, &Credentials{})
+	store.Set(ProviderGitHubCopilot, &Credentials{})
 	store.Set(ProviderGeminiCLI, &Credentials{})
 
 	providers = store.GetAllProviders()
@@ -741,7 +729,7 @@ func TestCredentialsStoreGetAllProviders(t *testing.T) {
 	for _, p := range providers {
 		found[p] = true
 	}
-	if !found[ProviderAnthropic] || !found[ProviderGeminiCLI] {
+	if !found[ProviderGitHubCopilot] || !found[ProviderGeminiCLI] {
 		t.Errorf("GetAllProviders missing providers: %v", found)
 	}
 }
@@ -783,10 +771,10 @@ func TestDefaultStoreGetOAuthAPIKey(t *testing.T) {
 
 func TestDefaultStoreGetOAuthCredentials(t *testing.T) {
 	ResetProviders()
-	DeleteOAuthCredentials(ProviderAnthropic)
+	DeleteOAuthCredentials(ProviderGitHubCopilot)
 
 	// Initially nil
-	_, ok := GetOAuthCredentials(ProviderAnthropic)
+	_, ok := GetOAuthCredentials(ProviderGitHubCopilot)
 	if ok {
 		t.Error("GetOAuthCredentials returned true when none stored")
 	}
@@ -797,9 +785,9 @@ func TestDefaultStoreGetOAuthCredentials(t *testing.T) {
 		Access:  "test-access",
 		Expires: time.Now().UnixMilli() + 3600*1000,
 	}
-	SetOAuthCredentials(ProviderAnthropic, testCreds)
+	SetOAuthCredentials(ProviderGitHubCopilot, testCreds)
 
-	got, ok := GetOAuthCredentials(ProviderAnthropic)
+	got, ok := GetOAuthCredentials(ProviderGitHubCopilot)
 	if !ok {
 		t.Fatal("GetOAuthCredentials returned false after SetOAuthCredentials")
 	}
@@ -812,17 +800,17 @@ func TestDefaultStoreDeleteOAuthCredentials(t *testing.T) {
 	ResetProviders()
 
 	// Set credentials
-	SetOAuthCredentials(ProviderAnthropic, &Credentials{
+	SetOAuthCredentials(ProviderGitHubCopilot, &Credentials{
 		Refresh: "test",
 		Access:  "test",
 		Expires: time.Now().UnixMilli() + 3600*1000,
 	})
 
 	// Delete
-	DeleteOAuthCredentials(ProviderAnthropic)
+	DeleteOAuthCredentials(ProviderGitHubCopilot)
 
 	// Should be gone
-	_, ok := GetOAuthCredentials(ProviderAnthropic)
+	_, ok := GetOAuthCredentials(ProviderGitHubCopilot)
 	if ok {
 		t.Error("GetOAuthCredentials returned true after DeleteOAuthCredentials")
 	}
@@ -860,7 +848,7 @@ func TestDefaultStoreRefreshOAuthCredentials(t *testing.T) {
 
 func TestDefaultStoreRefreshOAuthCredentialsNoProvider(t *testing.T) {
 	ResetProviders()
-	DeleteOAuthCredentials(ProviderAnthropic)
+	DeleteOAuthCredentials(ProviderGitHubCopilot)
 
 	// Set credentials but unregister provider
 	SetOAuthCredentials("nonexistent-provider", &Credentials{

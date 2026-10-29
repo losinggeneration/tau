@@ -134,7 +134,7 @@ func envVarNames(provider string) []string {
 	// more than the single registry entry.
 	switch provider {
 	case ProviderAnthropic:
-		return []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+		return []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}
 	case ProviderGitHubCopilot, ProviderOpenAICodex:
 		return []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"}
 	case ProviderGoogleVertex:
@@ -192,7 +192,6 @@ func buildEnvAPIKeys() map[string]string {
 	}
 	// Special-case providers' additional env vars.
 	m["ANTHROPIC_AUTH_TOKEN"] = ProviderAnthropic
-	m["ANTHROPIC_OAUTH_TOKEN"] = ProviderAnthropic
 	m["ANTHROPIC_API_KEY"] = ProviderAnthropic
 	m["COPILOT_GITHUB_TOKEN"] = ProviderGitHubCopilot
 	m["GH_TOKEN"] = ProviderGitHubCopilot
@@ -248,10 +247,6 @@ func getEnvAPIKey(provider string, lookup func(string) string) string {
 	// Special-cased providers consult more than the single registry entry.
 	switch provider {
 	case ProviderAnthropic:
-		// OAuth token takes priority over the regular API key.
-		if key := lookup("ANTHROPIC_OAUTH_TOKEN"); key != "" {
-			return key
-		}
 		return lookup("ANTHROPIC_API_KEY")
 
 	case ProviderGitHubCopilot, ProviderOpenAICodex:
