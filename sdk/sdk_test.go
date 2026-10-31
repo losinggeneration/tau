@@ -1348,7 +1348,7 @@ func TestSession_SlashPromptExpandsAndContinues(t *testing.T) {
 	require.NoError(t, promptRegistry.Register(artifacts.Entry{
 		Kind:       artifacts.KindPrompt,
 		SourcePath: "review.md",
-		Raw:        []byte("---\ndescription: review\n---\nExpanded prompt for {{args}}"),
+		Raw:        []byte("---\ndescription: review\n---\nExpanded prompt for $ARGUMENTS"),
 	}))
 
 	rt, err := NewRuntime(RuntimeOptions{
@@ -1378,6 +1378,39 @@ func TestSession_SlashPromptExpandsAndContinues(t *testing.T) {
 	assert.NotContains(t, eventTypes, "tool_result")
 
 	assert.Equal(t, "Expanded prompt for failing test", promptText(t, provider.LastPrompt()))
+}
+
+func TestSessionSlashPromptsUseSharedExpansion(t *testing.T) {
+	for _, withCommands := range []bool{false, true} {
+		for _, tc := range []struct{ input, body, want string }{
+			{"/review \"two words\" tail", "$1|${@:2}|$ARGUMENTS", "two words|tail|two words tail"},
+			{"/review\nlabel-2", "arg1: $1", "arg1: label-2"},
+			{"/review\tlabel-2\n\nHere is some description #2.", "$1|${@:2}", "label-2|Here is some description #2."},
+			{"/review\ufefflabel", "$1", "label"},
+			{"/review", "${1:-fallback}|${@:9}", "fallback|"},
+			{"/review '$ARGUMENTS' '$@'", "$1|$2", "$ARGUMENTS|$@"},
+			{"/review argument", "{{args}}", "{{args}}"},
+		} {
+			t.Run(fmt.Sprintf("commands=%t/%s", withCommands, tc.input), func(t *testing.T) {
+				provider, model := registerRecordingProvider(t, "response")
+				prompts := artifacts.NewPromptRegistry(nil)
+				require.NoError(t, prompts.Register(artifacts.Entry{Kind: artifacts.KindPrompt, SourcePath: "review.md", Raw: []byte(tc.body)}))
+				opts := RuntimeOptions{CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model, ArtifactLoader: &fakeArtifactLoader{prompts: prompts, skills: artifacts.NewSkillRegistry(nil), themes: artifacts.NewThemeRegistry(nil)}}
+				if withCommands {
+					opts.CommandRegistry = commands.NewInMemoryRegistry()
+				}
+				rt, err := NewRuntime(opts)
+				require.NoError(t, err)
+				sess, err := rt.NewSession(testContext(t), SessionOptions{})
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
+				events, err := sess.Send(testContext(t), Message{Text: tc.input})
+				require.NoError(t, err)
+				collectSessionEvents(t, events)
+				assert.Equal(t, tc.want, promptText(t, provider.LastPrompt()))
+			})
+		}
+	}
 }
 
 // TestSession_SlashSkillSendsXMLUserMessage verifies that /skill:<id> <args>
@@ -11973,4 +12006,84 @@ func TestRuntimeRejectsInvalidProxyBeforeCredentialSetup(t *testing.T) {
 	require.ErrorContains(t, err, "httpProxy")
 	require.Nil(t, rt)
 	require.NoDirExists(t, filepath.Join(global, "credentials"))
+}
+
+func TestBuildSystemPromptResolvesExplicitSourcesBeforeDiscovery(t *testing.T) {
+	global, cwd := t.TempDir(), t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", global)
+	t.Chdir(cwd)
+	require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "SYSTEM.md"), []byte("DISCOVERED SYSTEM"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, ".tau", "APPEND_SYSTEM.md"), []byte("DISCOVERED APPEND"), 0o600))
+	require.NoError(t, os.WriteFile("custom.md", []byte("\ufeffFILE SYSTEM\ufeffBODY"), 0o600))
+	require.NoError(t, os.WriteFile("append.md", []byte("\ufeffFILE APPEND"), 0o600))
+	require.NoError(t, os.WriteFile("empty.md", nil, 0o600))
+	r := &runtime{settings: &ai.Settings{}, noContextFiles: true, logger: slog.Default()}
+	for _, tc := range []struct {
+		name, system string
+		appends      []string
+		want, absent []string
+	}{
+		{"discovered", "", nil, []string{"DISCOVERED SYSTEM", "DISCOVERED APPEND"}, nil},
+		{"files", "custom.md", []string{"append.md", "literal append"}, []string{"FILE SYSTEM\ufeffBODY", "FILE APPEND", "literal append"}, []string{"DISCOVERED", "custom.md", "append.md"}},
+		{"explicit empty appends", "literal system", []string{}, []string{"literal system"}, []string{"DISCOVERED"}},
+		{"empty file", "empty.md", []string{"empty.md"}, nil, []string{"DISCOVERED", "empty.md"}},
+		{"missing path stays literal", "missing.md", []string{"missing-append.md"}, []string{"missing.md", "missing-append.md"}, []string{"DISCOVERED"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prompt, err := r.buildSystemPrompt(cwd, nil, tc.system, tc.appends)
+			require.NoError(t, err)
+			for _, part := range tc.want {
+				assert.Contains(t, prompt, part)
+			}
+			for _, part := range tc.absent {
+				assert.NotContains(t, prompt, part)
+			}
+		})
+	}
+	// Explicit inputs bypass even unreadable discovered files.
+	require.NoError(t, os.Remove(filepath.Join(cwd, ".tau", "SYSTEM.md")))
+	require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau", "SYSTEM.md"), 0o700))
+	require.NoError(t, os.Remove(filepath.Join(cwd, ".tau", "APPEND_SYSTEM.md")))
+	require.NoError(t, os.Mkdir(filepath.Join(cwd, ".tau", "APPEND_SYSTEM.md"), 0o700))
+	prompt, err := r.buildSystemPrompt(cwd, nil, "custom.md", []string{"append.md"})
+	require.NoError(t, err)
+	assert.Contains(t, prompt, "FILE SYSTEM")
+	assert.Contains(t, prompt, "FILE APPEND")
+}
+
+func TestExplicitPromptFilesReloadInSession(t *testing.T) {
+	global, cwd := t.TempDir(), t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", global)
+	t.Chdir(cwd)
+	require.NoError(t, os.WriteFile("policy.md", []byte("FIRST FILE POLICY"), 0o600))
+	require.NoError(t, os.WriteFile("append.md", []byte("FIRST FILE APPEND"), 0o600))
+	_, model := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ExplicitModel: model, CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true, SystemPrompt: "policy.md", AppendSystemPrompts: []string{"append.md"}})
+	require.NoError(t, err)
+	concrete := sess.(*agentSession)
+	require.Contains(t, concrete.agent.Messages()[0].Content[0].Text, "FIRST FILE POLICY")
+	require.Contains(t, concrete.agent.Messages()[0].Content[0].Text, "FIRST FILE APPEND")
+	require.NoError(t, os.WriteFile("policy.md", []byte("SECOND FILE POLICY"), 0o600))
+	require.NoError(t, os.WriteFile("append.md", []byte("SECOND FILE APPEND"), 0o600))
+	require.NoError(t, concrete.ReloadSystemPrompt(t.Context()))
+	prompt := concrete.agent.Messages()[0].Content[0].Text
+	require.Contains(t, prompt, "SECOND FILE POLICY")
+	require.Contains(t, prompt, "SECOND FILE APPEND")
+	require.NotContains(t, prompt, "FIRST FILE")
+}
+
+func TestResolvePromptInputWarnsAndKeepsUnreadablePathLiteral(t *testing.T) {
+	var logs bytes.Buffer
+	r := &runtime{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+	path := t.TempDir()
+	assert.Equal(t, path, r.resolvePromptInput(path))
+	assert.Contains(t, logs.String(), "could not read prompt file")
+	logs.Reset()
+	missing := filepath.Join(path, "missing.md")
+	assert.Equal(t, missing, r.resolvePromptInput(missing))
+	assert.Empty(t, logs.String())
 }

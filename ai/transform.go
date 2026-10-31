@@ -187,18 +187,8 @@ func transformContentBlock(block ContentBlock, isSameModel bool, model *Model, a
 	case ContentBlockToolCall:
 		result := block
 
-		// Strip thoughtSignature for cross-model
-		if !isSameModel && block.ThoughtSignature != "" {
-			// Create a copy without thoughtSignature
-			result = ContentBlock{
-				Type:       block.Type,
-				ID:         block.ID,
-				Name:       block.Name,
-				Arguments:  block.Arguments,
-				Thinking:   block.Thinking,
-				ToolCallID: block.ToolCallID,
-				ToolName:   block.ToolName,
-			}
+		if !isSameModel {
+			result.ThoughtSignature = ""
 		}
 
 		// Normalize tool call ID if needed for cross-model

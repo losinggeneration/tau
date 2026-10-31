@@ -116,7 +116,7 @@ func TestThemeRegistry(t *testing.T) {
 		assert.Equal(t, "/first/theme.json", theme.SourcePath) // First should win
 	})
 
-	t.Run("Fallback to filename slug", func(t *testing.T) {
+	t.Run("Fallback to parent directory", func(t *testing.T) {
 		entry := Entry{
 			Tier:       TierUser,
 			Kind:       KindTheme,
@@ -634,8 +634,8 @@ func TestParsePromptDescriptionFallbackAndTruncation(t *testing.T) {
 		Raw:        []byte("\n\n" + longLine + "\nbody"),
 	})
 	require.NoError(t, err)
-	require.Len(t, []rune(prompt.Description), 60)
-	assert.Equal(t, string([]rune(longLine)[:60]), prompt.Description)
+	require.Len(t, []rune(prompt.Description), 63)
+	assert.Equal(t, string([]rune(longLine)[:60])+"...", prompt.Description)
 
 	prompt, err = parsePrompt(Entry{
 		Kind:       KindPrompt,
@@ -646,7 +646,7 @@ description: Frontmatter description that should win over body text even when bo
 Body line`),
 	})
 	require.NoError(t, err)
-	assert.Equal(t, string([]rune("Frontmatter description that should win over body text even when body starts differently")[:60]), prompt.Description)
+	assert.Equal(t, "Frontmatter description that should win over body text even when body starts differently", prompt.Description)
 }
 
 // TestSortEntries tests alphabetical sorting of entries.
@@ -1472,57 +1472,51 @@ func TestSlugify(t *testing.T) {
 func TestValidateName(t *testing.T) {
 	t.Run("Valid names", func(t *testing.T) {
 		// Name matches parent dir
-		assert.Empty(t, validateName("test-skill", "test-skill"))
-		assert.Empty(t, validateName("a", "a"))
-		assert.Empty(t, validateName("my-skill-123", "my-skill-123"))
-	})
-
-	t.Run("Name mismatch with parent dir", func(t *testing.T) {
-		errors := validateName("test-skill", "different-dir")
-		require.Len(t, errors, 1)
-		assert.Contains(t, errors[0], "does not match parent directory")
+		assert.Empty(t, validateName("test-skill"))
+		assert.Empty(t, validateName("a"))
+		assert.Empty(t, validateName("my-skill-123"))
 	})
 
 	t.Run("Name too long", func(t *testing.T) {
 		longName := strings.Repeat("a", MaxNameLength+1)
-		errors := validateName(longName, longName)
+		errors := validateName(longName)
 		require.Len(t, errors, 1)
 		assert.Contains(t, errors[0], "exceeds 64 characters")
 	})
 
 	t.Run("Invalid characters", func(t *testing.T) {
-		errors := validateName("TestSkill", "TestSkill")
+		errors := validateName("TestSkill")
 		require.Len(t, errors, 1)
 		assert.Contains(t, errors[0], "invalid characters")
 	})
 
 	t.Run("Uppercase characters", func(t *testing.T) {
-		errors := validateName("Test", "Test")
+		errors := validateName("Test")
 		require.Len(t, errors, 1)
 		assert.Contains(t, errors[0], "invalid characters")
 	})
 
 	t.Run("Leading hyphen", func(t *testing.T) {
-		errors := validateName("-test", "-test")
+		errors := validateName("-test")
 		require.Len(t, errors, 1)
 		assert.Contains(t, errors[0], "must not start or end with a hyphen")
 	})
 
 	t.Run("Trailing hyphen", func(t *testing.T) {
-		errors := validateName("test-", "test-")
+		errors := validateName("test-")
 		require.Len(t, errors, 1)
 		assert.Contains(t, errors[0], "must not start or end with a hyphen")
 	})
 
 	t.Run("Consecutive hyphens", func(t *testing.T) {
-		errors := validateName("test--skill", "test--skill")
+		errors := validateName("test--skill")
 		require.Len(t, errors, 1)
 		assert.Contains(t, errors[0], "must not contain consecutive hyphens")
 	})
 
 	t.Run("Multiple errors", func(t *testing.T) {
-		errors := validateName("Test-Skill-", "different")
-		assert.Len(t, errors, 3) // mismatch, invalid chars, leading/trailing
+		errors := validateName("Test-Skill-")
+		assert.Len(t, errors, 2) // invalid chars, leading/trailing
 	})
 }
 
@@ -1593,7 +1587,7 @@ tags: [test, unit]
 		assert.Equal(t, 2, len(skill.Tags))
 	})
 
-	t.Run("Fallback to filename slug", func(t *testing.T) {
+	t.Run("Fallback to parent directory", func(t *testing.T) {
 		entry := Entry{
 			Tier:       TierUser,
 			Kind:       KindSkill,
@@ -1606,9 +1600,9 @@ description: A skill with a description but no name
 		_, err := registry.Register(entry)
 		require.NoError(t, err)
 
-		skill, ok := registry.Get("my-unnamed-skill")
+		skill, ok := registry.Get("test")
 		require.True(t, ok)
-		assert.Equal(t, "my-unnamed-skill", skill.ID)
+		assert.Equal(t, "test", skill.ID)
 	})
 }
 
@@ -1931,7 +1925,7 @@ Please review: $@`
 		require.True(t, ok, "review command should be registered")
 		assert.Equal(t, "review", info.Name)
 		assert.Equal(t, "Review code changes", info.Description)
-		assert.Equal(t, "\"<files>\"", info.ArgumentHint)
+		assert.Equal(t, "<files>", info.ArgumentHint)
 		assert.Equal(t, commands.Prompt, info.Source)
 
 		// Execute the command.
@@ -2503,23 +2497,20 @@ ignored-dir/`
 	assert.Equal(t, 2, len(entries), "should have exactly 2 entries")
 }
 
-// TestSkillRegistryRejectsInvalidNames verifies that skills failing a
-// structural validation rule (length, charset, hyphen placement) are NOT
-// registered, while a name-vs-parent-dir mismatch (soft warning) IS.
-func TestSkillRegistryRejectsInvalidNames(t *testing.T) {
+// TestSkillRegistryLoadsInvalidNamesWithWarnings keeps skills reachable despite validation warnings.
+func TestSkillRegistryLoadsInvalidNamesWithWarnings(t *testing.T) {
 	tests := []struct {
 		name            string
 		frontmatterName string
 		parentDirName   string
-		wantRegistered  bool
 	}{
-		{"valid lowercase name matches parent", "my-skill", "my-skill", true},
-		{"soft mismatch still registers", "my-skill", "different", true},
-		{"uppercase rejected", "MySkill", "MySkill", false},
-		{"trailing hyphen rejected", "my-skill-", "my-skill-", false},
-		{"leading hyphen rejected", "-my-skill", "-my-skill", false},
-		{"consecutive hyphens rejected", "my--skill", "my--skill", false},
-		{"invalid chars rejected", "my_skill", "my_skill", false},
+		{"valid lowercase name matches parent", "my-skill", "my-skill"},
+		{"soft mismatch still registers", "my-skill", "different"},
+		{"uppercase warns", "MySkill", "MySkill"},
+		{"trailing hyphen warns", "my-skill-", "my-skill-"},
+		{"leading hyphen warns", "-my-skill", "-my-skill"},
+		{"consecutive hyphens warns", "my--skill", "my--skill"},
+		{"invalid chars warns", "my_skill", "my_skill"},
 	}
 
 	for _, tt := range tests {
@@ -2532,21 +2523,8 @@ func TestSkillRegistryRejectsInvalidNames(t *testing.T) {
 				Raw:        []byte("---\nname: " + tt.frontmatterName + "\ndescription: A test skill\n---\n# Body"),
 			}
 			_, err := registry.Register(entry)
-			if tt.wantRegistered {
-				if err != nil {
-					t.Errorf("expected registration, got error: %v", err)
-				}
-				if registry.Len() != 1 {
-					t.Errorf("registry.Len() = %d, want 1", registry.Len())
-				}
-			} else {
-				if err == nil {
-					t.Errorf("expected rejection, got nil error")
-				}
-				if registry.Len() != 0 {
-					t.Errorf("registry.Len() = %d, want 0 (rejected skill must not be registered)", registry.Len())
-				}
-			}
+			require.NoError(t, err)
+			assert.Equal(t, 1, registry.Len())
 		})
 	}
 }
@@ -2598,31 +2576,31 @@ func TestSkillRegistryLoadWithDiagnosticsReturnsAllDiagnostics(t *testing.T) {
 
 	diags := registry.LoadWithDiagnostics(entries)
 	if len(diags) != 2 {
-		t.Fatalf("LoadWithDiagnostics returned %d diagnostics, want 2 (1 error + 1 collision)", len(diags))
+		t.Fatalf("LoadWithDiagnostics returned %d diagnostics, want 2 (1 warning + 1 collision)", len(diags))
 	}
 
-	// Find the error and collision diagnostics.
-	var errDiag, collDiag *Diagnostic
+	// Find the warning and collision diagnostics.
+	var warnDiag, collDiag *Diagnostic
 	for i := range diags {
 		switch diags[i].Type {
-		case DiagnosticError:
-			errDiag = &diags[i]
+		case DiagnosticWarning:
+			warnDiag = &diags[i]
 		case DiagnosticCollision:
 			collDiag = &diags[i]
 		}
 	}
-	if errDiag == nil {
-		t.Errorf("expected one DiagnosticError diagnostic, got none")
-	} else if !strings.Contains(errDiag.Message, "invalid characters") {
-		t.Errorf("error diagnostic message = %q, want substring 'invalid characters'", errDiag.Message)
+	if warnDiag == nil {
+		t.Errorf("expected one DiagnosticWarning diagnostic, got none")
+	} else if !strings.Contains(warnDiag.Message, "invalid characters") {
+		t.Errorf("warning diagnostic message = %q, want substring 'invalid characters'", warnDiag.Message)
 	}
 	if collDiag == nil {
 		t.Errorf("expected one DiagnosticCollision diagnostic, got none")
 	}
 
-	// Registry should contain only the valid skill (invalid rejected, collision skipped).
-	if registry.Len() != 1 {
-		t.Errorf("registry.Len() = %d, want 1 (only valid-skill)", registry.Len())
+	// Both distinct skills load; the duplicate is skipped.
+	if registry.Len() != 2 {
+		t.Errorf("registry.Len() = %d, want 2 (valid and warned skills)", registry.Len())
 	}
 }
 

@@ -3,13 +3,19 @@
 package artifacts // import "github.com/losinggeneration/tau/agent/artifacts"
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf16"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Prompt represents a loaded prompt template.
@@ -77,33 +83,27 @@ func parsePrompt(entry Entry) (*Prompt, error) {
 		return nil, fmt.Errorf("artifacts: prompt parse error: %w", err)
 	}
 
-	// Parse YAML frontmatter (lenient)
-	frontmatter := make(map[string]any)
-	if len(yamlData) > 0 {
-		if fm, err := parseYAML(yamlData); err == nil {
-			frontmatter = fm
-		}
+	frontmatter, err := parseYAML(yamlData)
+	if err != nil {
+		return nil, fmt.Errorf("artifacts: prompt parse error: %w", err)
 	}
 
-	// Get description field (optional, falls back to first non-empty body line)
-	description, _ := getStringField(frontmatter, "description")
+	description, _ := frontmatter["description"].(string)
 	if description == "" {
-		// Fall back to first non-empty body line
 		for _, line := range strings.Split(string(body), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
+			if strings.TrimSpace(line) != "" {
+				units := utf16.Encode([]rune(line))
 				description = line
+				if len(units) > 60 {
+					description = string(utf16.Decode(units[:60])) + "..."
+				}
 				break
 			}
 		}
 	}
 
-	if len([]rune(description)) > 60 {
-		description = string([]rune(description)[:60])
-	}
-
 	// Get argument-hint field (optional)
-	argumentHint, _ := getStringField(frontmatter, "argument-hint")
+	argumentHint, _ := frontmatter["argument-hint"].(string)
 
 	// Command name = filename without .md
 	name := strings.TrimSuffix(filepath.Base(entry.SourcePath), ".md")
@@ -134,37 +134,10 @@ func parsePrompt(entry Entry) (*Prompt, error) {
 	}, nil
 }
 
-// parseYAML parses YAML frontmatter data into a map. Returns a lenient parser
-// that doesn't fail on minor errors.
 func parseYAML(data []byte) (map[string]any, error) {
 	result := make(map[string]any)
-
-	// Simple YAML parsing for frontmatter
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if key, val, found := strings.Cut(line, ":"); found && key != "" {
-			key = strings.TrimSpace(key)
-			val = strings.TrimSpace(val)
-
-			// Handle array values like [python, testing]
-			if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
-				val = strings.Trim(val, "[]")
-				parts := strings.Split(val, ",")
-				var arr []string
-				for _, p := range parts {
-					arr = append(arr, strings.TrimSpace(p))
-				}
-				result[key] = arr
-			} else if val == "" {
-				result[key] = nil
-			} else {
-				result[key] = val
-			}
-		}
+	if err := yaml.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("parse frontmatter: %w", err)
 	}
 	return result, nil
 }
@@ -275,18 +248,16 @@ func (r *PromptRegistry) Len() int {
 func ParseCommandArgs(argsString string) []string {
 	var args []string
 	var current strings.Builder
-	var inQuote rune = 0 // 0 = not in quote, '"' or '\'' = in quote
+	var inQuote rune
 
-	for i := 0; i < len(argsString); i++ {
-		ch := rune(argsString[i])
-
+	for _, ch := range argsString {
 		if inQuote != 0 {
 			// Inside a quoted string
 			if ch == inQuote {
 				// End of quoted string
 				inQuote = 0
 			} else {
-				current.WriteByte(byte(ch))
+				current.WriteRune(ch)
 			}
 			continue
 		}
@@ -296,14 +267,16 @@ func ParseCommandArgs(argsString string) []string {
 		case '"', '\'':
 			// Start of quoted string
 			inQuote = ch
-		case ' ', '\t':
-			// Whitespace separator
-			if current.Len() > 0 {
-				args = append(args, current.String())
-				current.Reset()
-			}
 		default:
-			current.WriteByte(byte(ch))
+			if unicode.Is(unicode.Zs, ch) || strings.ContainsRune("\t\v\f \n\r\u2028\u2029\ufeff", ch) {
+				// Whitespace separator
+				if current.Len() > 0 {
+					args = append(args, current.String())
+					current.Reset()
+				}
+			} else {
+				current.WriteRune(ch)
+			}
 		}
 	}
 
@@ -315,92 +288,57 @@ func ParseCommandArgs(argsString string) []string {
 	return args
 }
 
+var argumentPlaceholder = regexp.MustCompile(`\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)`)
+
 // SubstituteArgs substitutes argument placeholders in template content.
 // Supports:
 //   - $1, $2, ... for positional args
 //   - $@ and $ARGUMENTS for all args
+//   - ${N:-default}, ${@:-default} and ${ARGUMENTS:-default} for empty values
 //   - ${@:N} for args from Nth onwards (bash-style slicing)
 //   - ${@:N:L} for L args starting from Nth
 //
 // Note: Replacement happens on the template string only. Argument values
 // containing patterns like $1, $@, or $ARGUMENTS are NOT recursively substituted.
 func SubstituteArgs(content string, args []string) string {
-	result := content
-
-	// Replace $1, $2, etc. with positional args FIRST (before wildcards)
-	// This prevents wildcard replacement values containing $<digit> patterns from being re-substituted
-	result = substitutePositional(result, args)
-
-	// Replace ${@:start} or ${@:start:length} with sliced args (bash-style)
-	// Process BEFORE simple $@ to avoid conflicts
-	result = substituteSlice(result, args)
-
-	// Pre-compute all args joined (optimization)
-	allArgs := strings.Join(args, " ")
-
-	// Replace $ARGUMENTS with all args joined (new syntax, aligns with Claude, Codex, OpenCode)
-	result = strings.ReplaceAll(result, "$ARGUMENTS", allArgs)
-
-	// Replace $@ with all args joined (existing syntax)
-	result = strings.ReplaceAll(result, "$@", allArgs)
-
-	return result
-}
-
-// substitutePositional replaces $1, $2, etc. with positional args.
-func substitutePositional(content string, args []string) string {
-	// Use regex to find all $<digit> patterns
-	re := regexp.MustCompile(`\$(\d+)`)
-	return re.ReplaceAllStringFunc(content, func(match string) string {
-		// Extract the digit
-		numStr := match[1:] // Everything after $
-		index, err := strconv.Atoi(numStr)
+	all := strings.Join(args, " ")
+	number := func(value string) int {
+		n, err := strconv.Atoi(value)
+		if errors.Is(err, strconv.ErrRange) {
+			return math.MaxInt
+		}
 		if err != nil {
-			return match
+			return 0
 		}
-		// Convert to 0-indexed
-		idx := index - 1
-		if idx >= 0 && idx < len(args) {
-			return args[idx]
+		return n
+	}
+	positional := func(target string) string {
+		if target == "@" || target == "ARGUMENTS" {
+			return all
 		}
-		return ""
-	})
-}
-
-// substituteSlice replaces ${@:start} or ${@:start:length} with sliced args.
-func substituteSlice(content string, args []string) string {
-	// Regex to match ${@:N} or ${@:N:L}
-	re := regexp.MustCompile(`\$\{@:(\d+)(?::(\d+))?\}`)
-	return re.ReplaceAllStringFunc(content, func(match string) string {
-		// Parse the match
-		// ${@:N} or ${@:N:L}
-		rest := match[4 : len(match)-1] // Remove ${@: and }
-		var startStr, lengthStr string
-		var found bool
-		startStr, lengthStr, found = strings.Cut(rest, ":")
-		if !found {
-			startStr = rest
+		index := number(target) - 1
+		if index < 0 || index >= len(args) {
+			return ""
 		}
-
-		start, err := strconv.Atoi(startStr)
-		if err != nil {
-			return match
-		}
-
-		// Convert to 0-indexed (user provides 1-indexed)
-		start--
-		if start < 0 {
-			start = 0
-		}
-
-		if lengthStr != "" {
-			length, err := strconv.Atoi(lengthStr)
-			if err != nil {
-				return match
+		return args[index]
+	}
+	return argumentPlaceholder.ReplaceAllStringFunc(content, func(match string) string {
+		parts := argumentPlaceholder.FindStringSubmatch(match)
+		if parts[1] != "" {
+			if value := positional(parts[1]); value != "" {
+				return value
 			}
-			return strings.Join(args[start:min(start+length, len(args))], " ")
+			return parts[2]
 		}
-		return strings.Join(args[start:], " ")
+		if parts[3] != "" {
+			start := min(max(number(parts[3])-1, 0), len(args))
+			end := len(args)
+			if parts[4] != "" {
+				end = start + min(number(parts[4]), len(args)-start)
+			}
+			return strings.Join(args[start:end], " ")
+		}
+		return positional(parts[5])
 	})
 }
 

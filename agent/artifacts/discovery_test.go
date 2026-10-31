@@ -287,3 +287,22 @@ func TestWalkDeniedProjectSkipsAncestorSkillsAndImplicitPackages(t *testing.T) {
 	require.Len(t, skills, 1)
 	require.Equal(t, TierUser, skills[0].Tier)
 }
+
+func TestParseFrontmatterNormalizesLikeUpstream(t *testing.T) {
+	for _, tc := range []struct{ input, metadata, body string }{
+		{"\ufeff---\r\nname: test\r\n---\r\n\r\n body \r\n", "name: test", "body"},
+		{"---\rname: test\r---\r body ", "name: test", "body"},
+		{"---\nname: test\n---", "name: test", ""},
+		{"---\n---", "", ""},
+		{"---\nname: test\n---suffix", "name: test", "suffix"},
+		{"\ufeffplain\r\nbody\r", "", "plain\nbody\n"},
+		{"---\nmissing delimiter\r", "", "---\nmissing delimiter\n"},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			metadata, body, err := parseFrontmatter([]byte(tc.input))
+			require.NoError(t, err)
+			assert.Equal(t, tc.metadata, strings.TrimSpace(string(metadata)))
+			assert.Equal(t, tc.body, string(body))
+		})
+	}
+}

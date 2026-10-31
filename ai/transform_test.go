@@ -1028,3 +1028,40 @@ func TestTransformMessagesDropsUnsignedBlankThinking(t *testing.T) {
 		}
 	}
 }
+
+func TestTransformSignedToolCallsKeepNamespaceAcrossModels(t *testing.T) {
+	source := &Model{ID: "source", API: APIOpenAIResponses, Provider: ProviderOpenAI}
+	block := ContentBlock{Type: ContentBlockToolCall, ID: "call_1", Name: "lookup", Namespace: new("loaded"), Arguments: json.RawMessage(`{"id":9007199254740993}`), ThoughtSignature: "opaque"}
+	messages := []Message{
+		{Role: "assistant", Provider: source.Provider, API: source.API, Model: source.ID, StopReason: string(StopReasonToolUse), Content: []ContentBlock{block}},
+		{Role: "toolResult", ToolCallID: block.ID, ToolName: block.Name, Content: []ContentBlock{{Type: ContentBlockText, Text: "found"}}},
+	}
+	for _, same := range []bool{true, false} {
+		for _, normalize := range []bool{true, false} {
+			t.Run(fmt.Sprintf("same=%v/normalize=%v", same, normalize), func(t *testing.T) {
+				target := *source
+				if !same {
+					target.ID = "target"
+				}
+				var normalizer ToolCallIDNormalizer
+				if normalize {
+					normalizer = func(id string, _ *Model, _ *AssistantMessage) string { return "normalized_" + id }
+				}
+				ctx, err := TransformContext(&Context{Messages: messages}, &target, normalizer)
+				require.NoError(t, err)
+				got := ctx.Messages[0].ContentBlocks()[0]
+				want := block
+				if !same {
+					want.ThoughtSignature = ""
+					if normalize {
+						want.ID = "normalized_call_1"
+					}
+				}
+				assert.Equal(t, want, got)
+				assert.Equal(t, want.ID, ctx.Messages[1].ToolCallID)
+				assert.Equal(t, ctx.Messages, TransformMessages(messages, &target, nil, normalizer))
+				assert.Equal(t, block, messages[0].ContentBlocks()[0])
+			})
+		}
+	}
+}

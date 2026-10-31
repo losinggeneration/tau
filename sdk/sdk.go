@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/losinggeneration/tau/agent/codemode"
@@ -233,7 +234,8 @@ type SessionOptions struct {
 	SystemPrompt string
 	// AppendSystemPrompts are additional system prompt fragments appended
 	// after the resolved system prompt and any SYSTEM.md content. They
-	// stack in order; empty entries are skipped. Per-session.
+	// stack in order; empty entries are skipped. Nil discovers APPEND_SYSTEM.md;
+	// a non-nil slice replaces discovery. Entries and SystemPrompt may name files.
 	AppendSystemPrompts []string
 
 	// ToolAllowlist restricts the session's tool set to the named tools.
@@ -932,10 +934,10 @@ func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, err
 			return nil, ErrSessionBusy
 		}
 	}
-	if isSlashCommand {
+	if strings.HasPrefix(msg.Text, "/") {
 		if handled, resolved := s.resolveArtifactCommand(msg); handled {
 			msg = resolved
-		} else {
+		} else if s.cmdRegistry != nil {
 			s.mu.Unlock()
 			return s.executeSlashCommand(ctx, msg.Text)
 		}
@@ -1339,23 +1341,21 @@ func (s *agentSession) resolveArtifactCommand(msg Message) (bool, Message) {
 	if registry == nil {
 		return false, msg
 	}
-	prompt, found := registry.Get(name)
+	expanded, found := registry.Expand(name, args)
 	if !found {
 		return false, msg
 	}
-
-	msg.Text = strings.ReplaceAll(string(prompt.Body), "{{args}}", args)
+	msg.Text = expanded
 	return true, msg
 }
 
 func parseSlashCommand(line string) (name, args string) {
-	line = strings.TrimPrefix(strings.TrimSpace(line), "/")
-	parts := strings.SplitN(line, " ", 2)
-	name = strings.TrimSpace(parts[0])
-	if len(parts) > 1 {
-		args = strings.TrimSpace(parts[1])
+	line = strings.TrimPrefix(line, "/")
+	whitespace := func(r rune) bool { return unicode.IsSpace(r) && r != '\u0085' || r == '\ufeff' }
+	if i := strings.IndexFunc(line, whitespace); i >= 0 {
+		return line[:i], strings.TrimLeftFunc(line[i:], whitespace)
 	}
-	return name, args
+	return line, ""
 }
 
 // providerTriggerTokens returns provider-specific token caps for
@@ -6725,34 +6725,50 @@ func (r *runtime) buildSystemPromptWithPolicy(cwd string, skills *artifacts.Skil
 	if !settings.ProjectResourcesTrustedAt(cwd) {
 		promptCWD = ""
 	}
-	appendSys, err := loadPromptFile(paths.ConfigDir(), promptCWD, "APPEND_SYSTEM.md")
-	if err != nil {
-		return "", err
+	if appends == nil {
+		appendSys, err := loadPromptFile(paths.ConfigDir(), promptCWD, "APPEND_SYSTEM.md")
+		if err != nil {
+			return "", err
+		}
+		if appendSys != "" {
+			addendumParts = append(addendumParts, appendSys)
+		}
+	} else {
+		for _, input := range appends {
+			if body := r.resolvePromptInput(input); body != "" {
+				addendumParts = append(addendumParts, body)
+			}
+		}
 	}
-	if appendSys != "" {
-		addendumParts = append(addendumParts, appendSys)
-	}
-	for _, p := range appends {
-		if p != "" {
-			addendumParts = append(addendumParts, p)
+	var prompt string
+	if override != "" {
+		prompt = r.resolvePromptInput(override)
+	} else {
+		var err error
+		prompt, err = loadPromptFile(paths.ConfigDir(), promptCWD, "SYSTEM.md")
+		if err != nil {
+			return "", err
 		}
 	}
 
-	var prompt string
-	sys, err := loadPromptFile(paths.ConfigDir(), promptCWD, "SYSTEM.md")
-	if err != nil {
-		return "", err
-	}
-	if sys != "" {
-		prompt = sys
-	}
-	if override != "" {
-		prompt = override
-	}
 	if prompt != "" {
 		prompt += "\n\n"
 	}
 	return prompt + strings.Join(addendumParts, "\n\n"), nil
+}
+
+func (r *runtime) resolvePromptInput(input string) string {
+	if input == "" {
+		return ""
+	}
+	body, err := os.ReadFile(input)
+	if err == nil {
+		return strings.TrimPrefix(string(body), "\ufeff")
+	}
+	if !os.IsNotExist(err) && r.logger != nil {
+		r.logger.Warn("could not read prompt file; using literal input", "path", input, "error", err)
+	}
+	return input
 }
 
 // loadSystemPrompt reads SYSTEM.md from <cwd>/.tau first, then

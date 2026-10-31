@@ -711,6 +711,7 @@ func TestAnthropicBuildRequestWithAdaptiveThinking(t *testing.T) {
 	client := &anthropicClient{
 		model: &Model{
 			ID:        "claude-opus-4-7-20250514",
+			Compat:    &CompatibilitySettings{ForceAdaptiveThinking: true},
 			API:       APIAnthropicMessages,
 			Provider:  ProviderAnthropic,
 			MaxTokens: 8192,
@@ -826,6 +827,9 @@ func TestAnthropicBuildRequestWithGenericReasoning(t *testing.T) {
 				},
 			}
 
+			if tt.wantType == "adaptive" {
+				client.model.Compat = &CompatibilitySettings{ForceAdaptiveThinking: true}
+			}
 			var o options
 			o.reasoning = tt.reasoning
 			o.effort = tt.effort
@@ -5938,6 +5942,9 @@ func TestAnthropicDefaultThinkingBudgetReachesTransport(t *testing.T) {
 			if tc.modelID != "" {
 				model.ID = tc.modelID
 			}
+			if tc.thinking == "adaptive" {
+				model.Compat = &CompatibilitySettings{ForceAdaptiveThinking: true}
+			}
 			if tc.cap > 0 {
 				model.MaxTokens = tc.cap
 			}
@@ -7851,7 +7858,7 @@ func TestAnthropicInterleavedBetaReachesTransport(t *testing.T) {
 		{name: "disabled explicit beta", reasoning: true, opts: []Option{WithThinkingEnabled(false), WithInterleavedThinking(true)}},
 		{name: "off explicit beta", reasoning: true, opts: []Option{WithReasoning(ReasoningOff), WithInterleavedThinking(true)}},
 		{name: "nonreasoning explicit beta", opts: []Option{WithThinkingEnabled(true), WithInterleavedThinking(true)}},
-		{name: "adaptive id", id: "claude-sonnet-4-6", reasoning: true, opts: []Option{WithThinkingEnabled(true), WithInterleavedThinking(true)}},
+		{name: "adaptive id without flag", id: "claude-sonnet-4-6", reasoning: true, opts: []Option{WithThinkingEnabled(true), WithInterleavedThinking(true)}, want: true},
 		{name: "adaptive flag", reasoning: true, compat: &CompatibilitySettings{ForceAdaptiveThinking: true}, opts: []Option{WithThinkingEnabled(true), WithInterleavedThinking(true)}},
 		{name: "managed", reasoning: true, compat: &CompatibilitySettings{SupportsMidConvoEffort: true}, opts: []Option{WithThinkingEnabled(true), WithInterleavedThinking(true)}},
 		{name: "generic reasoning", reasoning: true, opts: []Option{WithReasoning(ReasoningHigh)}, want: true},
@@ -8979,5 +8986,32 @@ func TestAnthropicFederationAdmissionAndHeaderPrecedence(t *testing.T) {
 			require.Error(t, err)
 			require.Equal(t, tc.wantRequests, requests)
 		})
+	}
+}
+
+func TestAnthropicAdaptiveThinkingUsesCompatibilityNotModelID(t *testing.T) {
+	for _, id := range []string{"claude-opus-4-6", "claude-opus-4-7", "vendor--claude-opus-latest"} {
+		for _, adaptive := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/%t", id, adaptive), func(t *testing.T) {
+				model := &Model{ID: id, API: APIAnthropicMessages, Provider: ProviderAnthropic, Reasoning: true, MaxTokens: 32000, Compat: &CompatibilitySettings{ForceAdaptiveThinking: adaptive}}
+				client := &anthropicClient{model: model}
+				opts := &options{thinkingEnabled: true, reasoning: ReasoningHigh}
+				body, err := client.buildRequest(model, &Context{}, opts)
+				require.NoError(t, err)
+				var request anthropicRequest
+				require.NoError(t, json.Unmarshal([]byte(body), &request))
+				require.NotNil(t, request.Thinking)
+				if adaptive {
+					assert.Equal(t, "adaptive", request.Thinking.Type)
+					assert.NotNil(t, request.OutputConfig)
+				} else {
+					assert.Equal(t, "enabled", request.Thinking.Type)
+					assert.Positive(t, request.Thinking.BudgetTokens)
+					assert.Nil(t, request.OutputConfig)
+				}
+				betas := client.buildHeaders("key", model, opts)["anthropic-beta"]
+				assert.Equal(t, !adaptive, strings.Contains(betas, "interleaved-thinking-2025-05-14"))
+			})
+		}
 	}
 }

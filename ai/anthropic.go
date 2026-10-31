@@ -317,7 +317,7 @@ func (c *anthropicClient) buildHeaders(apiKey string, model *Model, o *options, 
 		(o.reasoning != "" && o.reasoning != ReasoningOff)
 	needsInterleavedBeta := model.Reasoning && activeThinking &&
 		(o.interleavedThinking == nil || *o.interleavedThinking) &&
-		!isAdaptiveThinkingModel(model.ID) && !anthropicManagedEffort(model) &&
+		!anthropicManagedEffort(model) &&
 		(model.Compat == nil || !model.Compat.ForceAdaptiveThinking)
 	if needsInterleavedBeta {
 		betaFeatures = append(betaFeatures, "interleaved-thinking-2025-05-14")
@@ -477,7 +477,7 @@ func (c *anthropicClient) buildRequest(model *Model, prompt *Context, o *options
 			active = "high"
 		}
 		req.Messages = insertAnthropicEffortMessages(req.Messages, levels, active)
-	case hasThinking && (isAdaptiveThinkingModel(model.ID) || model.Compat != nil && model.Compat.ForceAdaptiveThinking):
+	case hasThinking && (model.Compat != nil && model.Compat.ForceAdaptiveThinking):
 		req.Thinking = &anthropicThinking{Type: "adaptive", Display: display}
 		if effort != "" {
 			req.OutputConfig = &anthropicOutputConfig{Effort: effort}

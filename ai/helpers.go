@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -13,11 +14,10 @@ import (
 // completeViaStream collects the first terminal assistant event and waits for
 // Stream to return so transport and cleanup errors remain observable.
 func completeViaStream(ctx context.Context, s Streamer, model *Model, prompt *Context, opts ...Option) (*AssistantMessage, error) {
-	started := time.Now()
 	var result AssistantMessage
 	var terminal bool
 	var mu sync.Mutex
-	handler := func(_ context.Context, event StreamEvent) {
+	handler := timedEventHandler(func(_ context.Context, event StreamEvent) {
 		mu.Lock()
 		defer mu.Unlock()
 		if terminal {
@@ -31,15 +31,12 @@ func completeViaStream(ctx context.Context, s Streamer, model *Model, prompt *Co
 			terminal = true
 			result = e.Msg
 		}
-	}
+	})
 	if err := s.Stream(ctx, model, prompt, handler, opts...); err != nil {
 		return nil, err
 	}
 	if !terminal {
 		return nil, fmt.Errorf("stream ended without a terminal assistant event")
-	}
-	if result.DurationMs == nil {
-		result.DurationMs = new(float64(time.Since(started)) / float64(time.Millisecond))
 	}
 	return &result, nil
 }
@@ -208,17 +205,17 @@ func timedEventHandler(handler EventHandler) EventHandler {
 		if settled {
 			return
 		}
-		duration := float64(time.Since(started)) / float64(time.Millisecond)
+		duration := math.Round(float64(time.Since(started)) / float64(time.Millisecond))
 		switch terminal := event.(type) {
 		case Done:
 			settled = true
-			if terminal.Message.DurationMs == nil {
+			if terminal.Message.DurationMs == nil && terminal.Message.Timestamp >= started.UnixMilli() {
 				terminal.Message.DurationMs = new(duration)
 			}
 			event = terminal
 		case StreamError:
 			settled = true
-			if terminal.Msg.DurationMs == nil {
+			if terminal.Msg.DurationMs == nil && terminal.Msg.Timestamp >= started.UnixMilli() {
 				terminal.Msg.DurationMs = new(duration)
 			}
 			event = terminal

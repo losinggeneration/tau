@@ -135,72 +135,21 @@ func parseSkillWithDiagnostics(entry Entry) (*Skill, Diagnostic, error) {
 		return nil, diag, fmt.Errorf("artifacts: skill parse error: %w", err)
 	}
 
-	// Parse YAML frontmatter (lenient)
-	frontmatter := make(map[string]any)
-	if len(yamlData) > 0 {
-		if err := json.Unmarshal(yamlData, &frontmatter); err != nil {
-			// Fall back to simple lenient YAML parser
-			if fm, err := parseSimpleYAML(yamlData); err == nil {
-				frontmatter = fm
-			}
-		}
+	frontmatter, err := parseYAML(yamlData)
+	if err != nil {
+		return nil, diag, fmt.Errorf("artifacts: skill parse error: %w", err)
 	}
 
-	// Get parent directory name for validation
-	parentDirName := filepath.Base(filepath.Dir(entry.SourcePath))
-
-	// Get required name field
-	name, _ := getStringField(frontmatter, "name")
+	name, _ := frontmatter["name"].(string)
 	if name == "" {
-		// Fall back to filename slug (without extension)
-		slugPath := strings.TrimSuffix(entry.SourcePath, filepath.Ext(entry.SourcePath))
-		name = slugify(filepath.Base(slugPath))
+		name = filepath.Base(filepath.Dir(entry.SourcePath))
 	}
-
-	// Validate name and split into soft warnings vs. hard errors.
-	//
-	// Per the Agent Skills spec, structural rules (length, charset, hyphen
-	// placement, consecutive hyphens) are required for the skill to be
-	// reachable as a slash command and to compose into paths and IDs. A
-	// mismatch between the frontmatter name and the parent directory name
-	// is a soft warning: the skill is still functional, just possibly
-	// renamed relative to its on-disk location.
-	nameErrors := validateName(name, parentDirName)
-	structural := structuralNameErrors(nameErrors)
-	if len(structural) > 0 {
-		diag = Diagnostic{
-			Type:    DiagnosticError,
-			Message: strings.Join(structural, "; "),
-			Path:    entry.SourcePath,
-		}
-		return nil, diag, fmt.Errorf("artifacts: skill %s: invalid name %q: %s",
-			entry.SourcePath, name, strings.Join(structural, "; "))
+	description, _ := frontmatter["description"].(string)
+	warnings := append(validateName(name), validateDescription(description)...)
+	if len(warnings) > 0 {
+		diag = Diagnostic{Type: DiagnosticWarning, Message: strings.Join(warnings, "; "), Path: entry.SourcePath}
 	}
-	for _, warnMsg := range softNameWarnings(nameErrors) {
-		diag.Type = DiagnosticWarning
-		diag.Message = warnMsg
-		diag.Path = entry.SourcePath
-	}
-
-	// Get optional description
-	description, _ := getStringField(frontmatter, "description")
-
-	// Validate description; all description rules are hard errors (empty,
-	// whitespace-only, and over-length descriptions are all rejected).
-	descErrors := validateDescription(description)
-	if len(descErrors) > 0 {
-		msg := strings.Join(descErrors, "; ")
-		diag = Diagnostic{
-			Type:    DiagnosticError,
-			Message: msg,
-			Path:    entry.SourcePath,
-		}
-		return nil, diag, fmt.Errorf("artifacts: skill %s: invalid description: %s",
-			entry.SourcePath, msg)
-	}
-
-	// Per TS spec: if description is completely missing, reject the skill
-	if description == "" {
+	if strings.TrimSpace(description) == "" {
 		return nil, diag, fmt.Errorf("artifacts: skill %s: description is required", entry.SourcePath)
 	}
 
@@ -225,23 +174,21 @@ func parseSkillWithDiagnostics(entry Entry) (*Skill, Diagnostic, error) {
 	// for loose .md skills, use the parent directory of the file.
 	baseDir := filepath.Dir(entry.SourcePath)
 
-	// Extract disableModelInvocation (lenient: bool true or string "true")
-	var disableModelInvocation bool
-	if v, ok := frontmatter["disableModelInvocation"]; ok {
-		switch b := v.(type) {
+	disableModelInvocation, _ := frontmatter["disable-model-invocation"].(bool)
+	if _, present := frontmatter["disable-model-invocation"]; !present {
+		switch value := frontmatter["disableModelInvocation"].(type) {
 		case bool:
-			disableModelInvocation = b
+			disableModelInvocation = value
 		case string:
-			disableModelInvocation = strings.EqualFold(b, "true")
+			disableModelInvocation = strings.EqualFold(value, "true")
 		}
-		delete(frontmatter, "disableModelInvocation")
 	}
 
 	// Collect extra fields
 	extra := make(map[string]any)
 	for k, v := range frontmatter {
 		switch k {
-		case "name", "description", "version", "tags":
+		case "name", "description", "version", "tags", "disable-model-invocation", "disableModelInvocation":
 			// Skip, already handled
 		default:
 			extra[k] = v
@@ -265,12 +212,8 @@ func parseSkillWithDiagnostics(entry Entry) (*Skill, Diagnostic, error) {
 
 // validateName validates a skill name per Agent Skills spec.
 // Returns a slice of error messages (empty if valid).
-func validateName(name string, parentDirName string) []string {
+func validateName(name string) []string {
 	var errors []string
-
-	if name != parentDirName {
-		errors = append(errors, fmt.Sprintf(`name "%s" does not match parent directory "%s"`, name, parentDirName))
-	}
 
 	if len(name) > MaxNameLength {
 		errors = append(errors, fmt.Sprintf("name exceeds %d characters (%d)", MaxNameLength, len(name)))
@@ -303,35 +246,6 @@ func isValidSkillName(name string) bool {
 		}
 	}
 	return true
-}
-
-// structuralNameErrors returns the subset of validateName messages that
-// describe hard validation failures (length, charset, hyphen placement,
-// consecutive hyphens). These reject a skill outright; the parent-dir
-// mismatch is not a structural error and is reported separately as a
-// soft warning.
-func structuralNameErrors(nameErrors []string) []string {
-	var out []string
-	for _, msg := range nameErrors {
-		if strings.Contains(msg, "does not match parent directory") {
-			continue
-		}
-		out = append(out, msg)
-	}
-	return out
-}
-
-// softNameWarnings returns the parent-directory mismatch warnings from a
-// validateName result. Exported only as a private helper because the
-// caller already split out structural errors.
-func softNameWarnings(nameErrors []string) []string {
-	var out []string
-	for _, msg := range nameErrors {
-		if strings.Contains(msg, "does not match parent directory") {
-			out = append(out, msg)
-		}
-	}
-	return out
 }
 
 // validateDescription validates a skill description per Agent Skills spec.

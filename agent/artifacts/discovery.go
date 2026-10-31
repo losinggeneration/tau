@@ -1035,28 +1035,18 @@ func deduplicateByRealPath(entries []Entry) []Entry {
 
 // parseFrontmatter extracts YAML frontmatter from markdown content.
 func parseFrontmatter(data []byte) (yamlData, body []byte, err error) {
-	if !bytes.HasPrefix(data, []byte("---\n")) && !bytes.HasPrefix(data, []byte("---\r\n")) {
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	data = bytes.ReplaceAll(data, []byte("\r"), []byte("\n"))
+	if !bytes.HasPrefix(data, []byte("---")) {
 		return nil, data, nil
 	}
-
-	rest := data[4:]
-	idx := bytes.Index(rest, []byte("\n---\n"))
-	if idx == -1 {
-		idx = bytes.Index(rest, []byte("\r\n---\r\n"))
-		if idx == -1 {
-			return nil, data, nil
-		}
-		yamlData = rest[:idx]
-		body = rest[idx+7:]
-	} else {
-		yamlData = rest[:idx]
-		body = rest[idx+5:]
+	idx := bytes.Index(data[3:], []byte("\n---"))
+	if idx < 0 {
+		return nil, data, nil
 	}
-
-	body = bytes.TrimPrefix(body, []byte("\n"))
-	body = bytes.TrimPrefix(body, []byte("\r\n"))
-
-	return yamlData, body, nil
+	end := idx + 3
+	return data[min(4, end):end], bytes.TrimSpace(data[end+4:]), nil
 }
 
 // slugify converts a string to a URL-safe slug.

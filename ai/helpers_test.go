@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockClient is a test client that records Stream calls.
@@ -409,7 +414,7 @@ func TestCompleteWithModelAndOptions(t *testing.T) {
 }
 
 func TestCompleteViaStreamRecordsDuration(t *testing.T) {
-	msg, err := completeViaStream(context.Background(), &mockClient{}, &Model{}, &Context{})
+	msg, err := completeViaStream(t.Context(), &stubStreamer{events: []StreamEvent{Done{Message: AssistantMessage{Timestamp: time.Now().Add(time.Hour).UnixMilli()}}}}, &Model{}, &Context{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,5 +479,55 @@ func TestTimedEventHandlerIgnoresEventsAfterTerminal(t *testing.T) {
 				t.Fatalf("received %d events; want start and original terminal", len(got))
 			}
 		})
+	}
+}
+
+func TestResponseTimingSkipsHistoricalMessages(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		for _, tc := range []struct {
+			name      string
+			timestamp int64
+			duration  *float64
+			timed     bool
+		}{
+			{"historical", 1, nil, false},
+			{"missing timestamp", 0, nil, false},
+			{"current", time.Now().Add(time.Hour).UnixMilli(), nil, true},
+			{"existing historical", 1, new(12.5), true},
+			{"existing current", time.Now().Add(time.Hour).UnixMilli(), new(0.0), true},
+		} {
+			t.Run(fmt.Sprintf("%s/error=%v", tc.name, failed), func(t *testing.T) {
+				message := AssistantMessage{Role: "assistant", Timestamp: tc.timestamp, DurationMs: tc.duration}
+				var event StreamEvent = Done{Message: message}
+				if failed {
+					event = StreamError{Msg: message}
+				}
+				var streamed AssistantMessage
+				handler := timedEventHandler(func(_ context.Context, event StreamEvent) {
+					switch e := event.(type) {
+					case Done:
+						streamed = e.Message
+					case StreamError:
+						streamed = e.Msg
+					}
+				})
+				handler(t.Context(), event)
+				completed, err := completeViaStream(t.Context(), &stubStreamer{events: []StreamEvent{event}}, &Model{}, &Context{})
+				require.NoError(t, err)
+				for _, got := range []AssistantMessage{streamed, *completed} {
+					if !tc.timed {
+						assert.Nil(t, got.DurationMs)
+						continue
+					}
+					require.NotNil(t, got.DurationMs)
+					if tc.duration != nil {
+						assert.Equal(t, *tc.duration, *got.DurationMs)
+					} else {
+						assert.GreaterOrEqual(t, *got.DurationMs, 0.0)
+						assert.Equal(t, math.Trunc(*got.DurationMs), *got.DurationMs)
+					}
+				}
+			})
+		}
 	}
 }

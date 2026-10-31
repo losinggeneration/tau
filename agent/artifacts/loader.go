@@ -287,7 +287,7 @@ func (l *Loader) registerCommands() {
 			Source:       commands.Prompt,
 			SourcePath:   prompt.SourcePath,
 		}
-		// Create a handler that expands {{args}} and returns the result.
+		// Create a handler that expands prompt arguments and returns the result.
 		// The actual dispatch (e.g., sending to LLM) is up to the caller;
 		// we return the expanded content as output for now.
 		handler := commands.Handler(func(ctx context.Context, args string, ui commands.CommandUI, sess commands.CommandSession) (commands.Result, error) {
