@@ -5787,6 +5787,14 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 					}
 				}
 			}
+			if !slices.Contains(opts.ToolDenylist, toolSearchName) {
+				// The closure runs only after the session exists.
+				tool := toolSearchTool(func(tc agent.ToolContext) (*agent.ToolResult, error) { return codemodeSession.searchAndLoadTools(tc) })
+				if slices.Contains(selection, toolSearchName) {
+					tool.DefaultActive = nil
+				}
+				tools = append(tools, tool)
+			}
 			// Codemode is registered inactive unless selected by name. Its store
 			// belongs to the session created below.
 			if !slices.Contains(opts.ToolDenylist, codemode.ToolName) {
@@ -5798,6 +5806,20 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 						return codemodeSession.saveCodemodeStore(ctx, writes)
 					},
 				})
+				tool.PrepareLoadout = func(ctx context.Context, loadout agent.ToolLoadout) (agent.ToolLoadoutChanges, error) {
+					if err := ctx.Err(); err != nil {
+						return agent.ToolLoadoutChanges{}, err
+					}
+					codemodeSession.mu.Lock()
+					settings := codemodeSession.settings.Codemode
+					codemodeSession.mu.Unlock()
+					budget := 3000
+					if settings.InlineBudget != nil && *settings.InlineBudget >= 0 {
+						budget = *settings.InlineBudget
+					}
+					return codemode.PrepareLoadout(loadout, settings.Mode, budget), nil
+				}
+
 				if slices.Contains(selection, codemode.ToolName) {
 					tool.DefaultActive = nil
 				}

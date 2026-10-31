@@ -217,3 +217,69 @@ func TestReachReadinessCancellationPreventsExecution(t *testing.T) {
 		t.Fatalf("cancelled readiness executed work: %+v, executions=%d", result, executions)
 	}
 }
+
+func TestRequestLoadoutProjectionKeepsActivationAndRegistry(t *testing.T) {
+	for _, historical := range []bool{false, true} {
+		calls := 0
+		hook := Tool{Name: "scripts", Exposure: ToolModelOnly, PrepareLoadout: func(_ context.Context, loadout ToolLoadout) (ToolLoadoutChanges, error) {
+			calls++
+			if len(loadout.Declared) != 3 || len(loadout.Callable) != 2 || len(loadout.Registered) != 5 {
+				t.Errorf("unexpected loadout sizes: %d %d %d", len(loadout.Declared), len(loadout.Callable), len(loadout.Registered))
+			}
+			return ToolLoadoutChanges{Descriptions: map[string]string{"scripts": "generated", "deferred": "script call"}, HiddenDeclarations: []string{"read"}}, nil
+		}}
+		inactive := Tool{Name: "inactive", DefaultActive: new(false)}
+		tools := []Tool{{Name: "read", Description: "original"}, hook, {Name: "deferred", Exposure: ToolDeferred}, inactive, {Name: "hidden", Exposure: ToolHidden}}
+		history := &Message{Role: RoleSystem, ToolsAdded: []ai.Tool{{Name: "read", Description: "original"}, {Name: "scripts"}, {Name: "deferred"}}}
+		current := &AgentContext{Tools: tools, Messages: []*Message{history, NewUserMessage("hi")}}
+		if !historical {
+			tools[2].Exposure = ToolDirect
+			current.Messages = []*Message{NewUserMessage("hi")}
+		}
+		client := stubClient{stream: func(ctx context.Context, _ *ai.Model, prompt *ai.Context, handler ai.EventHandler, _ ...ai.Option) error {
+			baseline := ai.CurrentSystemMessage(ai.NormalizeContext(prompt).Messages)
+			if baseline == nil || len(baseline.ToolsAdded) != 2 {
+				t.Fatalf("declarations: %+v", baseline)
+			}
+			for _, declaration := range baseline.ToolsAdded {
+				if declaration.Name == "read" || declaration.Name == "hidden" {
+					t.Errorf("hidden declaration: %s", declaration.Name)
+				}
+				if declaration.Name == "scripts" && declaration.Description != "generated" {
+					t.Error("description not projected")
+				}
+			}
+			handler(ctx, ai.Done{Message: ai.AssistantMessage{Role: "assistant", StopReason: ai.StopReasonStop}})
+			return nil
+		}}
+		for range 2 {
+			_, err := streamAssistantResponse(t.Context(), current, AgentLoopConfig{ConvertToLlm: DefaultConvertToLlm}, client, &ai.Model{ID: "test"}, "", nil, func(Event) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if calls != 2 || len(history.ToolsAdded) != 3 || tools[0].Description != "original" || len(CallableTools(current)) != 2 {
+			t.Fatal("projection changed persistent activation or registry")
+		}
+	}
+}
+
+func TestLoadoutHookErrorsAndInactiveHooks(t *testing.T) {
+	failure := errors.New("loadout failure")
+	tool := Tool{Name: "hook", PrepareLoadout: func(context.Context, ToolLoadout) (ToolLoadoutChanges, error) { return ToolLoadoutChanges{}, failure }}
+	current := &AgentContext{Tools: []Tool{tool}}
+	request := &ai.Context{Tools: []ai.Tool{{Name: "hook"}}}
+	if err := projectToolLoadout(t.Context(), current, request); !errors.Is(err, failure) {
+		t.Fatalf("hook error: %v", err)
+	}
+	request.Tools = nil
+	if err := projectToolLoadout(t.Context(), current, request); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	request.Tools = []ai.Tool{{Name: "hook"}}
+	if err := projectToolLoadout(ctx, current, request); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation: %v", err)
+	}
+}

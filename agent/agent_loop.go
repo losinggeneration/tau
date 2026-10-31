@@ -1279,6 +1279,10 @@ func streamAssistantResponse(
 		})
 	}
 
+	if err := projectToolLoadout(ctx, agentCtx, aiCtx); err != nil {
+		return nil, err
+	}
+
 	var (
 		mu             sync.Mutex
 		partialMessage *Message

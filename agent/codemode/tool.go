@@ -25,8 +25,7 @@ const (
 
 var textOutputSchema = map[string]any{"type": "string"}
 
-// Description is upstream's intro and globals list. Nested tools aren't listed
-// because Tau has no per-request loadout hook to rebuild it from.
+// Description is upstream's intro and globals list.
 const Description = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n" +
 	"- `await tools.<name>({ ...args })` resolves to a string, or an object if the tool's declaration says so, and rejects with an Error on failure. A tool whose declaration returns an object resolves on failure too when it returned that object; check its fields. Calls still running when the script ends are cancelled.\n" +
 	"- Optional first line: `// @options: {\"max_output_tokens\": 10000, \"timeout_ms\": 60000}`\n\n" +
@@ -74,6 +73,9 @@ func ApplyStoreWrites(values map[string]json.RawMessage, data json.RawMessage) e
 func NewTool(store *Store) agent.Tool {
 	inactive := false
 	return agent.Tool{
+		PrepareLoadout: func(_ context.Context, loadout agent.ToolLoadout) (agent.ToolLoadoutChanges, error) {
+			return PrepareLoadout(loadout, "on", 3000), nil
+		},
 		Name:          ToolName,
 		Label:         ToolName,
 		Description:   Description,

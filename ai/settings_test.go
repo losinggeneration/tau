@@ -1398,3 +1398,30 @@ func TestMergeSettingsKeepsProxyGlobal(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "httpProxy")
 }
+
+func TestCodemodeSettingsPreserveExplicitZeroBudget(t *testing.T) {
+	settings, err := ParseSettings([]byte(`{"codemode":{"mode":"only","inlineBudget":0}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "only", settings.Codemode.Mode)
+	require.NotNil(t, settings.Codemode.InlineBudget)
+	assert.Zero(t, *settings.Codemode.InlineBudget)
+	data, err := json.Marshal(settings)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"inlineBudget":0`)
+}
+
+func TestCodemodeSettingsMergePerField(t *testing.T) {
+	user, err := ParseSettings([]byte(`{"codemode":{"mode":"only","inlineBudget":400}}`))
+	require.NoError(t, err)
+	project, err := ParseSettings([]byte(`{"codemode":{"mode":"on","inlineBudget":0}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(user, project)
+	assert.Equal(t, "on", merged.Codemode.Mode)
+	require.NotNil(t, merged.Codemode.InlineBudget)
+	assert.Zero(t, *merged.Codemode.InlineBudget)
+	project, err = ParseSettings([]byte(`{"codemode":{"inlineBudget":10}}`))
+	require.NoError(t, err)
+	merged = MergeSettings(user, project)
+	assert.Equal(t, "only", merged.Codemode.Mode)
+	assert.Equal(t, 10, *merged.Codemode.InlineBudget)
+}

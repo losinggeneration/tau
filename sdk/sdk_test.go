@@ -6033,7 +6033,7 @@ func TestSessionToolSelectionUsesConfiguredBase(t *testing.T) {
 		{name: "modifier inherits settings", selection: []string{"+grep"}, want: []string{"ls", "grep"}},
 		{name: "explicit empty", selection: []string{}, want: []string{}},
 		{name: "plain replaces", selection: []string{"read"}, want: []string{"read"}},
-		{name: "pattern", selection: []string{"*"}, want: []string{"read", "write", "edit", "bash", "grep", "find", "ls", "codemode"}},
+		{name: "pattern", selection: []string{"*"}, want: []string{"read", "write", "edit", "bash", "grep", "find", "ls", "codemode", "tool_search"}},
 		{name: "mixed", selection: []string{"read", "+grep"}, invalid: true},
 		{name: "modifier pattern", selection: []string{"+*"}, invalid: true},
 	} {

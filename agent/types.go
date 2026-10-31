@@ -27,7 +27,22 @@ type ToolNamespace struct {
 	Instructions string   `json:"instructions,omitempty"`
 }
 
+// ToolLoadout is the unmodified registry and active declarations for one request.
+type ToolLoadout struct {
+	Declared   []Tool
+	Callable   []Tool
+	Registered []Tool
+}
+
+// ToolLoadoutChanges projects descriptions and hides declarations without
+// changing activation or nested-call permissions.
+type ToolLoadoutChanges struct {
+	Descriptions       map[string]string
+	HiddenDeclarations []string
+}
+
 type Tool struct {
+	PrepareLoadout      func(context.Context, ToolLoadout) (ToolLoadoutChanges, error)
 	WaitReady           func(context.Context) error
 	Namespace           *ToolNamespace
 	DefaultActive       *bool

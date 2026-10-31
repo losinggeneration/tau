@@ -19,7 +19,7 @@ import (
 )
 
 // mcpStartupWait bounds how long the first prompt waits for servers that can
-// expose direct tools.
+// expose tools through direct declarations or active discovery.
 var mcpStartupWait = 10 * time.Second
 
 // startMCP connects the session's configured MCP servers in the background.
@@ -41,7 +41,7 @@ func (s *agentSession) startMCP(projectTrusted bool) {
 		opts = append(opts, mcp.WithTransport(s.runtime.mcpTransport))
 	}
 	s.mcp = mcp.NewManager(cfg, s.cwd, version, opts...)
-	s.activateCodemode(cfg)
+	s.activateDiscovery(cfg)
 	s.agent.SetSystemSection(mcpServersSection, renderMCPServersSection(s.mcp.States()))
 	s.mcp.Start()
 }
@@ -55,45 +55,63 @@ const (
 	maxServersSectionChars    = 4096
 )
 
-// indirectMCP reports a server whose tools may be reached through codemode,
-// which Tau also uses for deferred tools since it has no tool_search.
+// indirectMCP reports a server with tools reached through discovery.
 func indirectMCP(exposures []mcp.Exposure) bool {
 	return slices.Contains(exposures, mcp.ExposureCodemode) || slices.Contains(exposures, mcp.ExposureDeferred)
 }
 
-// activateCodemode makes the codemode tool active when enabled servers have
-// tools only it can reach, unless autoEnableCodemode is false, and warns once
-// when those tools stay unreachable.
-func (s *agentSession) activateCodemode(cfg mcp.Config) {
-	if !slices.ContainsFunc(cfg.Servers, func(e mcp.ServerEntry) bool { return e.Config.IsEnabled() && indirectMCP(e.Config.Exposures()) }) {
+func (s *agentSession) activateDiscovery(cfg mcp.Config) {
+	var needsCodemode, needsSearch bool
+	for _, entry := range cfg.Servers {
+		if !entry.Config.IsEnabled() {
+			continue
+		}
+		exposures := entry.Config.Exposures()
+		needsCodemode = needsCodemode || slices.Contains(exposures, mcp.ExposureCodemode)
+		needsSearch = needsSearch || slices.Contains(exposures, mcp.ExposureDeferred)
+	}
+	if !needsCodemode && !needsSearch {
 		return
 	}
 	auto := cfg.AutoEnableCodemode == nil || *cfg.AutoEnableCodemode
 	tools := s.agent.State().Tools
-	i := slices.IndexFunc(tools, func(tool agent.Tool) bool { return tool.Name == codemode.ToolName })
-	if i < 0 {
-		s.ui.Notify(ui.NotifyWarn, "MCP tools are only reachable from the codemode or tool_search tool, but neither is active; they cannot be called.")
+	active := s.agent.ActiveTools()
+	var hasCodemode, reachable, changed bool
+	for i, tool := range tools {
+		if tool.ReachesTools == nil && tool.ReachTools == nil {
+			continue
+		}
+		if tool.Name != codemode.ToolName && tool.Name != toolSearchName {
+			continue
+		}
+		hasCodemode = hasCodemode || tool.Name == codemode.ToolName
+		activate := tool.Name == codemode.ToolName && needsCodemode && auto || tool.Name == toolSearchName && needsSearch
+		if activate && !slices.Contains(active, tool.Name) {
+			active = append(active, tool.Name)
+			tools[i].DefaultActive = nil
+			changed = true
+		}
+		reachable = reachable || slices.Contains(active, tool.Name)
+	}
+	if changed {
+		// Keep late direct registrations and restored deferred declarations;
+		// an exact startup loadout would replace them.
+		s.agent.SetTools(tools...)
+	}
+	if reachable {
 		return
 	}
-	if tools[i].DefaultActive == nil || *tools[i].DefaultActive {
-		return
+	reason := ""
+	if needsCodemode && hasCodemode && !auto {
+		reason = " (autoEnableCodemode is false)"
 	}
-	if !auto {
-		s.ui.Notify(ui.NotifyWarn, "MCP tools are only reachable from the codemode or tool_search tool, but neither is active (autoEnableCodemode is false); they cannot be called.")
-		return
-	}
-	tools[i].DefaultActive = nil
-	s.agent.SetTools(tools...)
+	s.ui.Notify(ui.NotifyWarn, "MCP tools are only reachable from the codemode or tool_search tool, but neither is active"+reason+"; they cannot be called.")
 }
 
-// codemodeActive reports a registered codemode tool that is active or
-// activates at the next request.
-func (s *agentSession) codemodeActive() bool {
-	if slices.Contains(s.agent.ActiveTools(), codemode.ToolName) {
-		return true
-	}
+func (s *agentSession) discoveryActive() bool {
+	active := s.agent.ActiveTools()
 	return slices.ContainsFunc(s.agent.State().Tools, func(tool agent.Tool) bool {
-		return tool.Name == codemode.ToolName && (tool.DefaultActive == nil || *tool.DefaultActive)
+		return (tool.Name == codemode.ToolName || tool.Name == toolSearchName) && (tool.ReachesTools != nil || tool.ReachTools != nil) && (slices.Contains(active, tool.Name) || tool.DefaultActive == nil || *tool.DefaultActive)
 	})
 }
 
@@ -108,10 +126,20 @@ func renderMCPServersSection(states []mcp.ServerState) *string {
 		return nil
 	}
 	slices.SortFunc(listed, func(a, b mcp.ServerState) int { return strings.Compare(a.Name, b.Name) })
-	intro := "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts."
+	intro := "MCP servers whose tools are not declared to you."
+	if slices.ContainsFunc(listed, func(state mcp.ServerState) bool { return slices.Contains(state.Exposures, mcp.ExposureCodemode) }) {
+		intro += " Call the tools of `codemode` servers from codemode scripts."
+	}
+	if slices.ContainsFunc(listed, func(state mcp.ServerState) bool { return !slices.Contains(state.Exposures, mcp.ExposureCodemode) }) {
+		intro += " Load the tools of `tool_search` servers with `tool_search`."
+	}
 	heads := make([]string, len(listed))
 	for i, state := range listed {
-		heads[i] = "- " + mcp.Namespace(state.Name) + " (codemode)"
+		reach := "tool_search"
+		if slices.Contains(state.Exposures, mcp.ExposureCodemode) {
+			reach = "codemode"
+		}
+		heads[i] = "- " + mcp.Namespace(state.Name) + " (" + reach + ")"
 	}
 	omitted := func(count int) []string {
 		switch count {
@@ -188,11 +216,10 @@ func (s *agentSession) waitMCPStartup(ctx context.Context) {
 	s.mcpStartup.Do(func() {
 		wait, cancel := context.WithTimeout(ctx, mcpStartupWait)
 		defer cancel()
-		// Codemode only sees tools declared when its call's request was
-		// prepared, so with codemode active the first prompt waits for every
-		// server it can reach.
+		// Discovery sees a request's tool snapshot, so the first request
+		// waits for every server when a discovery tool is active.
 		waitFor := s.mcp.WaitDirect
-		if s.codemodeActive() {
+		if s.discoveryActive() {
 			waitFor = s.mcp.WaitAll
 		}
 		if err := waitFor(wait); errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {

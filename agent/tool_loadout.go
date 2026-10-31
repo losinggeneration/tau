@@ -290,3 +290,59 @@ func searchTerms(text string) []string {
 	}
 	return result
 }
+
+// projectToolLoadout applies active tools' hooks to a request-owned copy only.
+func projectToolLoadout(ctx context.Context, current *AgentContext, request *ai.Context) error {
+	normalized := ai.NormalizeContext(request)
+	baseline := ai.CurrentSystemMessage(normalized.Messages)
+	loadout := ToolLoadout{Registered: slices.Clone(current.Tools), Callable: CallableTools(current)}
+	if baseline != nil {
+		for _, tool := range current.Tools {
+			if modelDeclarable(tool) && slices.ContainsFunc(baseline.ToolsAdded, func(t ai.Tool) bool { return t.Name == tool.Name }) {
+				loadout.Declared = append(loadout.Declared, tool)
+			}
+		}
+	}
+	descriptions := make(map[string]string)
+	hidden := make(map[string]bool)
+	for _, tool := range loadout.Declared {
+		if tool.PrepareLoadout == nil {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		changes, err := tool.PrepareLoadout(ctx, loadout)
+		if err != nil {
+			return fmt.Errorf("prepare tool %s loadout: %w", tool.Name, err)
+		}
+		maps.Copy(descriptions, changes.Descriptions)
+		for _, name := range changes.HiddenDeclarations {
+			hidden[name] = true
+		}
+	}
+	project := func(tools []ai.Tool) []ai.Tool {
+		result := make([]ai.Tool, 0, len(tools))
+		for _, tool := range tools {
+			if hidden[tool.Name] {
+				continue
+			}
+			if description, ok := descriptions[tool.Name]; ok {
+				tool.Description = description
+			}
+			result = append(result, tool)
+		}
+		return result
+	}
+	request.Tools = project(request.Tools)
+	request.Messages = slices.Clone(request.Messages)
+	for i := range request.Messages {
+		message := &request.Messages[i]
+		if message.Role != "system" {
+			continue
+		}
+		message.ToolsAdded = project(message.ToolsAdded)
+		message.ToolsRemoved = slices.DeleteFunc(slices.Clone(message.ToolsRemoved), func(tool ai.ToolReference) bool { return hidden[tool.Name] })
+	}
+	return ctx.Err()
+}

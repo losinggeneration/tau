@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -179,8 +180,8 @@ func TestRenderMCPServersSectionListsIndirectServers(t *testing.T) {
 		{Name: "my-docs", Exposures: []mcp.Exposure{mcp.ExposureDirect, mcp.ExposureCodemode}, Summary: "Search the docs."},
 	})
 	require.NotNil(t, section)
-	assert.Equal(t, "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts.\n"+
-		"- mcp__my_docs (codemode): Search the docs.\n- mcp__zeta (codemode)", *section)
+	assert.Equal(t, "MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts. Load the tools of `tool_search` servers with `tool_search`.\n"+
+		"- mcp__my_docs (codemode): Search the docs.\n- mcp__zeta (tool_search)", *section)
 
 	var many []mcp.ServerState
 	for i := range 200 {
@@ -271,4 +272,109 @@ func TestSessionWarnsWhenAutoEnableCodemodeIsOff(t *testing.T) {
 	require.NoError(t, err)
 	collectSessionEvents(t, events)
 	assert.NotContains(t, promptToolNames(provider), "codemode")
+}
+
+func TestDeferredMCPActivatesToolSearchAndLoadsNextRequest(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", configDir)
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "mcp.json"), []byte(`{"autoEnableCodemode":false,"mcpServers":{"docs":{"command":"docs","exposure":"deferred"},"direct":{"command":"direct","exposure":"direct"}}}`), 0o600))
+	provider, model := registerRecordingProvider(t, "reply")
+	userInterface := &notifyRecordingUI{}
+	rt, err := NewRuntime(RuntimeOptions{
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		ExplicitModel:   model, UI: userInterface, SessionsDir: t.TempDir(),
+	})
+	require.NoError(t, err)
+	var generation atomic.Int32
+	rt.(*runtime).mcpTransport = func(entry mcp.ServerEntry, _ string) (sdkmcp.Transport, error) {
+		clientT, serverT := sdkmcp.NewInMemoryTransports()
+		server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: entry.Name}, nil)
+		description := "Direct search"
+		if entry.Name == "docs" {
+			description = fmt.Sprintf("Search docs generation %d", generation.Add(1))
+		}
+		server.AddTool(&sdkmcp.Tool{Name: "search", Description: description, InputSchema: map[string]any{"type": "object"}}, func(context.Context, *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+			return &sdkmcp.CallToolResult{}, nil
+		})
+		ss, err := server.Connect(t.Context(), serverT, nil)
+		if err != nil {
+			return nil, err
+		}
+		t.Cleanup(func() { require.NoError(t, ss.Close()) })
+		return clientT, nil
+	}
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close(context.Background())) })
+	s := sess.(*agentSession)
+	events, err := sess.Send(testContext(t), Message{Text: "first"})
+	require.NoError(t, err)
+	collectSessionEvents(t, events)
+	assert.Contains(t, promptToolNames(provider), toolSearchName)
+	assert.Contains(t, promptToolNames(provider), "mcp__direct__search")
+	assert.NotContains(t, promptToolNames(provider), "codemode")
+	assert.NotContains(t, promptToolNames(provider), "mcp__docs__search")
+	assert.Empty(t, userInterface.Messages())
+	assert.Contains(t, provider.LastPrompt().SystemPrompt+ai.CurrentSystemPrompt(provider.LastPrompt().Messages), "- mcp__docs (tool_search)")
+	result := agent.RunToolCall(t.Context(), &agent.AgentContext{Tools: s.RegisteredTools()}, nil,
+		ai.ToolCall{Name: toolSearchName, Arguments: json.RawMessage(`{"query":"search"}`)}, agent.AgentLoopConfig{})
+	require.False(t, result.IsError, result.Content)
+	assert.Equal(t, map[string]any{"loaded": []string{"mcp__docs__search"}}, result.Details)
+	events, err = sess.Send(testContext(t), Message{Text: "next"})
+	require.NoError(t, err)
+	collectSessionEvents(t, events)
+	assert.Contains(t, promptToolNames(provider), "mcp__docs__search")
+	require.NoError(t, sess.(MCPStatus).MCPReconnect(t.Context(), "docs"))
+	events, err = sess.Send(testContext(t), Message{Text: "reconnected"})
+	require.NoError(t, err)
+	collectSessionEvents(t, events)
+	assert.Contains(t, promptToolNames(provider), "mcp__docs__search")
+	var description string
+	for _, tool := range provider.LastPrompt().Tools {
+		if tool.Name == "mcp__docs__search" {
+			description = tool.Description
+		}
+	}
+	assert.Contains(t, description, "generation 2", "reconnect refreshes the loaded declaration")
+	id := sess.ID()
+	require.NoError(t, sess.Close(t.Context()))
+	resumed, err := rt.ResumeSession(t.Context(), id, SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resumed.Close(context.Background())) })
+	events, err = resumed.Send(testContext(t), Message{Text: "resumed"})
+	require.NoError(t, err)
+	collectSessionEvents(t, events)
+	assert.Contains(t, promptToolNames(provider), "mcp__docs__search")
+}
+
+func TestMCPDiscoveryRequiresReachingTools(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		tools    []agent.Tool
+		exposure mcp.Exposure
+		auto     bool
+		want     []string
+		warning  bool
+	}{
+		{name: "deferred ignores auto codemode", tools: []agent.Tool{toolSearchTool(nil)}, exposure: mcp.ExposureDeferred, want: []string{toolSearchName}},
+		{name: "codemode disabled", tools: []agent.Tool{{Name: "codemode", DefaultActive: new(false), ReachesTools: func(map[string]any) []string { return []string{"all"} }}}, exposure: mcp.ExposureCodemode, warning: true},
+		{name: "same name no reach", tools: []agent.Tool{{Name: toolSearchName, DefaultActive: new(false)}}, exposure: mcp.ExposureDeferred, auto: true, warning: true},
+		{name: "active replacement reaches both", tools: []agent.Tool{{Name: toolSearchName, ReachTools: func(context.Context, map[string]any) ([]string, error) { return []string{"all"}, nil }}}, exposure: mcp.ExposureCodemode, want: []string{toolSearchName}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := agent.New(agent.NewConfig(agent.WithTools(tc.tools...)))
+			require.NoError(t, err)
+			userInterface := &notifyRecordingUI{}
+			s := &agentSession{agent: a, ui: userInterface}
+			s.activateDiscovery(mcp.Config{AutoEnableCodemode: &tc.auto, Servers: []mcp.ServerEntry{{Name: "docs", Config: mcp.ServerConfig{Exposure: tc.exposure}}}})
+			var active []string
+			for _, tool := range a.State().Tools {
+				if slices.Contains(a.ActiveTools(), tool.Name) || tool.DefaultActive == nil || *tool.DefaultActive {
+					active = append(active, tool.Name)
+				}
+			}
+			assert.Equal(t, tc.want, active)
+			assert.Equal(t, tc.warning, len(userInterface.Messages()) > 0)
+		})
+	}
 }

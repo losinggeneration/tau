@@ -271,6 +271,12 @@ func (p *PackageSource) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// CodemodeSettings controls script tool declarations sent to the model.
+type CodemodeSettings struct {
+	Mode         string `json:"mode,omitempty"`
+	InlineBudget *int   `json:"inlineBudget,omitempty"`
+}
+
 // Settings is the merged contents of ~/.tau/agent/settings.json and
 // <cwd>/.tau/settings.json. Mirrors the Pi settings.json schema documented
 // only the tau/Tau prefix substitutions are intentional.
@@ -280,6 +286,7 @@ func (p *PackageSource) UnmarshalJSON(data []byte) error {
 //
 //nolint:recvcheck // MarshalJSON takes a value so Settings values keep explicit zeros.
 type Settings struct {
+	Codemode       CodemodeSettings `json:"codemode,omitempty"`
 	present        map[string]json.RawMessage
 	resourceBases  map[string]string
 	resourceScopes map[string][2]settingsResourceScope
@@ -998,6 +1005,12 @@ func MergeSettings(user, project *Settings) *Settings {
 	out.FullscreenWheelScrollLines = slices.Clone(out.FullscreenWheelScrollLines)
 
 	// Embedded groups: per-field override.
+	if project.Codemode.Mode != "" {
+		out.Codemode.Mode = project.Codemode.Mode
+	}
+	if project.Codemode.InlineBudget != nil {
+		out.Codemode.InlineBudget = new(*project.Codemode.InlineBudget)
+	}
 	out.Compaction = mergeCompaction(user.Compaction, project.Compaction)
 	out.Retry = mergeRetry(user.Retry, project.Retry)
 	out.ThinkingBudgets = mergeThinkingBudgetsSettings(user.ThinkingBudgets, project.ThinkingBudgets)
