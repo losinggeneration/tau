@@ -5,7 +5,11 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // Match is the result of comparing a query against text.
@@ -25,8 +29,9 @@ var (
 // better. It mirrors Pi's tui/src/fuzzy.ts scoring, including the swapped
 // alpha/numeric fallback used for model names such as codex52 vs gpt-5.2-codex.
 func MatchString(query, text string) Match {
-	queryLower := strings.ToLower(query)
-	textLower := strings.ToLower(text)
+	lower := cases.Lower(language.Und)
+	queryLower := lower.String(query)
+	textLower := lower.String(text)
 
 	primary := matchNormalized(queryLower, textLower)
 	if primary.Matches {
@@ -52,14 +57,14 @@ func MatchString(query, text string) Match {
 // query, sorted by total fuzzy score. Empty or whitespace-only queries return a
 // shallow copy in the original order.
 func Filter[T any](items []T, query string, text func(T) string) []T {
-	if strings.TrimSpace(query) == "" {
+	if strings.TrimFunc(query, isWhitespace) == "" {
 		out := make([]T, len(items))
 		copy(out, items)
 
 		return out
 	}
 
-	tokens := strings.FieldsFunc(query, func(r rune) bool { return r == '/' || unicode.IsSpace(r) })
+	tokens := strings.FieldsFunc(query, func(r rune) bool { return r == '/' || isWhitespace(r) })
 	if len(tokens) == 0 {
 		out := make([]T, len(items))
 		copy(out, items)
@@ -114,8 +119,8 @@ func matchNormalized(queryLower, textLower string) Match {
 		return Match{Matches: true, Score: 0}
 	}
 
-	query := []rune(queryLower)
-	text := []rune(textLower)
+	query := utf16.Encode([]rune(queryLower))
+	text := utf16.Encode([]rune(textLower))
 	if len(query) > len(text) {
 		return Match{Matches: false, Score: 0}
 	}
@@ -130,7 +135,7 @@ func matchNormalized(queryLower, textLower string) Match {
 			continue
 		}
 
-		wordBoundary := i == 0 || isBoundary(text[i-1])
+		wordBoundary := i == 0 || isBoundary(rune(text[i-1]))
 		if lastMatchIndex == i-1 {
 			consecutiveMatches++
 			score -= float64(consecutiveMatches * 5)
@@ -161,12 +166,14 @@ func matchNormalized(queryLower, textLower string) Match {
 	return Match{Matches: true, Score: score}
 }
 
+func isWhitespace(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' }
+
 func isBoundary(r rune) bool {
 	switch r {
-	case ' ', '\t', '\n', '\r', '-', '_', '.', '/', ':':
+	case '-', '_', '.', '/', ':':
 		return true
 	default:
-		return false
+		return isWhitespace(r)
 	}
 }
 

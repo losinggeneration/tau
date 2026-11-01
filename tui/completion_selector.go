@@ -46,14 +46,20 @@ func (c CompletionSelector) SelectorItems() []SelectorItem {
 // rows directly. The returned line slice/cursor are autocomplete.ApplyCompletion
 // results.
 func (c CompletionSelector) Apply(lines []string, cursorLine, cursorCol, focused int, selectedName string) (autocomplete.ApplyResult, bool) {
-	if c.Prefix == "" || len(c.Items) == 0 {
+	selected := c.Suggestions(focused, selectedName)
+	if selected == nil {
 		return autocomplete.ApplyResult{}, false
 	}
+	return autocomplete.ApplyCompletion(lines, cursorLine, cursorCol, selected.Items[0], selected.Prefix), true
+}
+
+// Suggestions returns the selected completion and its replacement prefix.
+func (c CompletionSelector) Suggestions(focused int, selectedName string) *autocomplete.Suggestions {
 	item, ok := c.focusedItem(focused, selectedName)
 	if !ok {
-		return autocomplete.ApplyResult{}, false
+		return nil
 	}
-	return autocomplete.ApplyCompletion(lines, cursorLine, cursorCol, item, c.Prefix), true
+	return &autocomplete.Suggestions{Items: []autocomplete.Item{item}, Prefix: c.Prefix}
 }
 
 func (c CompletionSelector) focusedItem(focused int, selectedName string) (autocomplete.Item, bool) {

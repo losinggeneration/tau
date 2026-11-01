@@ -2,6 +2,7 @@ package editor
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"regexp"
 	"slices"
@@ -64,6 +65,9 @@ type Editor struct {
 	autocompleteVisible  int
 	autocompleteProvider SuggestionProvider
 	autocompleteSeq      int
+	autocompleteCancel   context.CancelFunc
+	autocompleteForce    bool
+	autocompleteTriggers []rune
 	scrollOffset         int
 	largePasteThreshold  int
 	largePastes          map[string]string
@@ -142,6 +146,7 @@ func (e *Editor) HistoryIndex() int {
 }
 
 func (e *Editor) HistoryPrev() {
+	e.last = ""
 	if len(e.history) == 0 {
 		return
 	}
@@ -161,6 +166,7 @@ func (e *Editor) HistoryPrev() {
 }
 
 func (e *Editor) HistoryNext() {
+	e.last = ""
 	if len(e.history) == 0 || !e.historyBrowsing {
 		return
 	}
@@ -179,12 +185,21 @@ func (e *Editor) HistoryNext() {
 
 func (e *Editor) SetAutocomplete(s *autocomplete.Suggestions) {
 	e.autocomplete = s
-	e.autocompleteIndex = 0
+	e.autocompleteIndex = s.FocusedIndex()
 }
 
 func (e *Editor) SetAutocompleteProvider(provider SuggestionProvider) {
 	e.CancelAutocomplete()
 	e.autocompleteProvider = provider
+	e.autocompleteTriggers = []rune{'@', '#'}
+	if custom, ok := provider.(interface{ TriggerCharacters() []rune }); ok {
+		for _, r := range custom.TriggerCharacters() {
+			if r > 0xffff || r == '/' || (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' || slices.Contains(e.autocompleteTriggers, r) {
+				continue
+			}
+			e.autocompleteTriggers = append(e.autocompleteTriggers, r)
+		}
+	}
 }
 
 func (e *Editor) UpdateAutocomplete(ctx context.Context, force bool) error {
@@ -195,21 +210,141 @@ func (e *Editor) UpdateAutocomplete(ctx context.Context, force bool) error {
 		e.autocomplete = nil
 		return nil
 	}
+	if e.autocompleteCancel != nil {
+		e.autocompleteCancel()
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
+	e.autocompleteCancel = cancel
+	defer cancel()
 	e.autocompleteSeq++
 	seq := e.autocompleteSeq
 	pos := e.completionPosition()
 	value, cursor := e.text, e.cursor
-	suggestions, err := e.autocompleteProvider.GetSuggestions(ctx, e.Lines(), pos.Line, pos.Col, force)
+	suggestions, err := e.autocompleteProvider.GetSuggestions(requestCtx, e.Lines(), pos.Line, pos.Col, force)
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if seq != e.autocompleteSeq || e.text != value || e.cursor != cursor {
+	if seq != e.autocompleteSeq {
+		return nil
+	}
+	if e.text != value || e.cursor != cursor {
+		e.CancelAutocomplete()
 		return nil
 	}
 	e.SetAutocomplete(suggestions)
+	e.autocompleteForce = force
+	return nil
+}
+
+// RefreshAutocomplete updates an open list without applying a single result.
+func (e *Editor) RefreshAutocomplete(ctx context.Context) error {
+	if !e.AutocompleteVisible() {
+		return nil
+	}
+	if err := e.UpdateAutocomplete(ctx, e.autocompleteForce); err != nil {
+		return fmt.Errorf("refresh completion: %w", err)
+	}
+	return nil
+}
+
+// IsAtCommandStart reports whether only the initial slash and indentation precede the cursor.
+func (e *Editor) IsAtCommandStart() bool {
+	pos := e.completionPosition()
+	if pos.Line != 0 {
+		return false
+	}
+	before := strings.TrimFunc(e.Lines()[0][:pos.Col], func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	return before == "" || before == "/"
+}
+
+// Shared CJK Script_Extensions characters are absent from Go's script tables.
+var sharedCJKCharacters = &unicode.RangeTable{
+	R16: []unicode.Range16{
+		{Lo: 0xb7, Hi: 0xb7, Stride: 1},
+		{Lo: 0x2c7, Hi: 0x2c7, Stride: 1},
+		{Lo: 0x2c9, Hi: 0x2cb, Stride: 1},
+		{Lo: 0x2d9, Hi: 0x2d9, Stride: 1},
+		{Lo: 0x305, Hi: 0x305, Stride: 1},
+		{Lo: 0x323, Hi: 0x323, Stride: 1},
+		{Lo: 0x2ff0, Hi: 0x2fff, Stride: 1},
+		{Lo: 0x3001, Hi: 0x3003, Stride: 1},
+		{Lo: 0x3006, Hi: 0x3006, Stride: 1},
+		{Lo: 0x3008, Hi: 0x3011, Stride: 1},
+		{Lo: 0x3013, Hi: 0x301f, Stride: 1},
+		{Lo: 0x302a, Hi: 0x302d, Stride: 1},
+		{Lo: 0x3030, Hi: 0x3035, Stride: 1},
+		{Lo: 0x3037, Hi: 0x3037, Stride: 1},
+		{Lo: 0x303c, Hi: 0x303f, Stride: 1},
+		{Lo: 0x3099, Hi: 0x309c, Stride: 1},
+		{Lo: 0x30a0, Hi: 0x30a0, Stride: 1},
+		{Lo: 0x30fb, Hi: 0x30fc, Stride: 1},
+		{Lo: 0x3190, Hi: 0x319f, Stride: 1},
+		{Lo: 0x31c0, Hi: 0x31e5, Stride: 1},
+		{Lo: 0x31ef, Hi: 0x31ef, Stride: 1},
+		{Lo: 0x3220, Hi: 0x3247, Stride: 1},
+		{Lo: 0x3280, Hi: 0x32b0, Stride: 1},
+		{Lo: 0x32c0, Hi: 0x32cb, Stride: 1},
+		{Lo: 0x32ff, Hi: 0x32ff, Stride: 1},
+		{Lo: 0x3358, Hi: 0x3370, Stride: 1},
+		{Lo: 0x337b, Hi: 0x337f, Stride: 1},
+		{Lo: 0x33e0, Hi: 0x33fe, Stride: 1},
+		{Lo: 0xa700, Hi: 0xa707, Stride: 1},
+		{Lo: 0xfe45, Hi: 0xfe46, Stride: 1},
+		{Lo: 0xff61, Hi: 0xff65, Stride: 1},
+		{Lo: 0xff70, Hi: 0xff70, Stride: 1},
+		{Lo: 0xff9e, Hi: 0xff9f, Stride: 1},
+	},
+	R32: []unicode.Range32{
+		{Lo: 0x1d360, Hi: 0x1d371, Stride: 1},
+		{Lo: 0x1f250, Hi: 0x1f251, Stride: 1},
+	},
+}
+
+// IsAutocompleteTrigger reports whether a typed character can start or retry completion.
+func (e *Editor) IsAutocompleteTrigger(r rune) bool {
+	if slices.Contains(e.autocompleteTriggers, r) {
+		pos := e.completionPosition()
+		return autocomplete.HasTriggerPrefix(e.Lines()[pos.Line][:pos.Col], e.autocompleteTriggers)
+	}
+	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul, unicode.Bopomofo, sharedCJKCharacters) || r == '/' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune(".-_", r)
+}
+
+// TriggerAutocomplete requests regular completion in command or symbol context.
+func (e *Editor) TriggerAutocomplete(ctx context.Context) error {
+	pos := e.completionPosition()
+	before := e.Lines()[pos.Line][:pos.Col]
+	slash := strings.TrimLeftFunc(before, func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	if (pos.Line != 0 || !strings.HasPrefix(slash, "/")) && !autocomplete.HasTriggerPrefix(before, e.autocompleteTriggers) {
+		return nil
+	}
+	if err := e.UpdateAutocomplete(ctx, false); err != nil {
+		return fmt.Errorf("trigger completion: %w", err)
+	}
+	return nil
+}
+
+// CompleteOnTab requests suggestions and applies a single forced file result.
+func (e *Editor) CompleteOnTab(ctx context.Context) error {
+	pos := e.completionPosition()
+	lines := e.Lines()
+	before := strings.TrimLeftFunc(lines[pos.Line][:pos.Col], func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	force := pos.Line != 0 || !strings.HasPrefix(before, "/") || strings.Contains(before, " ")
+	if force {
+		if admission, ok := e.autocompleteProvider.(interface{ ShouldTriggerFileCompletion([]string, int, int) bool }); ok && !admission.ShouldTriggerFileCompletion(lines, pos.Line, pos.Col) {
+			return ctx.Err()
+		}
+	}
+	value, cursor := e.text, e.cursor
+	seq := e.autocompleteSeq + 1
+	if err := e.UpdateAutocomplete(ctx, force); err != nil {
+		return fmt.Errorf("complete on Tab: %w", err)
+	}
+	if e.autocompleteSeq == seq && e.text == value && e.cursor == cursor && force && e.autocomplete != nil && len(e.autocomplete.Items) == 1 {
+		e.ApplyAutocomplete()
+	}
 	return nil
 }
 
@@ -261,7 +396,16 @@ func (e *Editor) VisibleAutocompleteItems() []autocomplete.Item {
 	}
 	return append([]autocomplete.Item(nil), e.autocomplete.Items[start:end]...)
 }
-func (e *Editor) CancelAutocomplete() { e.autocompleteSeq++; e.autocomplete = nil }
+
+func (e *Editor) CancelAutocomplete() {
+	if e.autocompleteCancel != nil {
+		e.autocompleteCancel()
+		e.autocompleteCancel = nil
+	}
+	e.autocompleteSeq++
+	e.autocomplete = nil
+}
+
 func (e *Editor) AutocompleteNext() {
 	if e.autocomplete != nil && len(e.autocomplete.Items) > 0 {
 		e.autocompleteIndex = (e.autocompleteIndex + 1) % len(e.autocomplete.Items)
@@ -285,7 +429,13 @@ func (e *Editor) ApplyAutocomplete() {
 	}
 	lines := e.Lines()
 	pos := e.completionPosition()
-	res := autocomplete.ApplyCompletion(lines, pos.Line, pos.Col, e.autocomplete.Items[e.autocompleteIndex], e.autocomplete.Prefix)
+	apply := autocomplete.ApplyCompletion
+	if provider, ok := e.autocompleteProvider.(interface {
+		ApplyCompletion([]string, int, int, autocomplete.Item, string) autocomplete.ApplyResult
+	}); ok {
+		apply = provider.ApplyCompletion
+	}
+	res := apply(lines, pos.Line, pos.Col, e.autocomplete.Items[e.autocompleteIndex], e.autocomplete.Prefix)
 	e.pushUndo()
 	e.setText(joinLines(res.Lines))
 	cursor := res.CursorCol
@@ -293,7 +443,7 @@ func (e *Editor) ApplyAutocomplete() {
 		cursor += len(line) + 1
 	}
 	e.SetCursor(cursor)
-	e.autocomplete = nil
+	e.CancelAutocomplete()
 }
 
 func (e *Editor) Insert(s string) {
@@ -336,7 +486,7 @@ func (e *Editor) Paste(s string) {
 	}
 	e.insertAtomic(s, "paste")
 }
-func (e *Editor) Newline() { e.insertAtomic("\n", "") }
+func (e *Editor) Newline() { e.CancelAutocomplete(); e.insertAtomic("\n", "") }
 func (e *Editor) Submit() {
 	text := strings.TrimSpace(e.ExpandedText())
 	e.Reset()

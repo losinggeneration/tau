@@ -2,6 +2,7 @@ package editor
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -1502,4 +1503,348 @@ func TestEditorEmptyPasteCancelsCompletionAndBreaksTyping(t *testing.T) {
 	e.Paste("")
 	assert.False(t, e.historyBrowsing)
 	assert.Equal(t, "history", e.Text())
+}
+
+func TestEditorAutocompleteFocusPrefersExactThenPrefixValue(t *testing.T) {
+	for _, tc := range []struct {
+		prefix string
+		values []string
+		want   int
+	}{{"arg", []string{"arg-more", "arg"}, 1}, {"arg", []string{"other", "argument"}, 1}, {"Arg", []string{"other", "argument"}, 0}, {"", []string{"other", "argument"}, 0}, {"missing", []string{"other", "argument"}, 0}} {
+		e := New()
+		s := &autocomplete.Suggestions{Prefix: tc.prefix}
+		for _, value := range tc.values {
+			s.Items = append(s.Items, autocomplete.Item{Value: value, Label: "arg"})
+		}
+		e.SetAutocomplete(s)
+		assert.Equal(t, tc.want, e.AutocompleteIndex(), "prefix=%q", tc.prefix)
+	}
+}
+
+func TestEditorTabCompletionAdmissionAndOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		text         string
+		cursor       int
+		force, admit bool
+	}{{"/hel", 4, false, true}, {"\ufeff/hel", 7, false, true}, {"/help arg", 9, true, true}, {"/help ", 6, true, true}, {"later\n/hel", 10, true, true}, {"later\n./no", 10, true, true}} {
+		t.Run(tc.text, func(t *testing.T) {
+			e := New()
+			e.SetText(tc.text)
+			e.SetCursor(tc.cursor)
+			calls := 0
+			e.SetAutocompleteProvider(suggestionFunc(func(_ context.Context, lines []string, line, col int, force bool) (*autocomplete.Suggestions, error) {
+				calls++
+				assert.Equal(t, tc.force, force)
+				assert.Equal(t, strings.Split(tc.text, "\n"), lines)
+				assert.Equal(t, strings.Count(tc.text[:tc.cursor], "\n"), line)
+				assert.Equal(t, tc.cursor-strings.LastIndexByte(tc.text[:tc.cursor], '\n')-1, col)
+				return nil, nil
+			}))
+			require.NoError(t, e.CompleteOnTab(context.Background()))
+			assert.Equal(t, tc.admit, calls == 1)
+		})
+	}
+	for _, mode := range []string{"nested", "cancel", "error"} {
+		t.Run(mode, func(t *testing.T) {
+			e := New()
+			e.SetText("./no")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			failure := errors.New("provider failed")
+			e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+				switch mode {
+				case "nested":
+					e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+						return &autocomplete.Suggestions{Prefix: "./no", Items: []autocomplete.Item{{Value: "./new"}}}, nil
+					}))
+					require.NoError(t, e.UpdateAutocomplete(ctx, true))
+				case "cancel":
+					cancel()
+				case "error":
+					return nil, failure
+				}
+				return &autocomplete.Suggestions{Prefix: "./no", Items: []autocomplete.Item{{Value: "./stale"}}}, nil
+			}))
+			err := e.CompleteOnTab(ctx)
+			switch mode {
+			case "nested":
+				require.NoError(t, err)
+				require.True(t, e.AutocompleteVisible())
+				assert.Equal(t, "./new", e.VisibleAutocompleteItems()[0].Value)
+			case "cancel":
+				require.ErrorIs(t, err, context.Canceled)
+			case "error":
+				require.ErrorIs(t, err, failure)
+			}
+			assert.Equal(t, "./no", e.Text())
+		})
+	}
+}
+
+func TestEditorTabDoesNotApplyOldListAfterProviderMovesCursor(t *testing.T) {
+	e := New()
+	e.SetText("./no")
+	e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+		e.SetCursor(0)
+		return &autocomplete.Suggestions{Prefix: "./no", Items: []autocomplete.Item{{Value: "./new"}}}, nil
+	}))
+	e.SetAutocomplete(&autocomplete.Suggestions{Prefix: "./no", Items: []autocomplete.Item{{Value: "./old"}}})
+	require.NoError(t, e.CompleteOnTab(t.Context()))
+	assert.Equal(t, "./no", e.Text())
+	assert.Zero(t, e.Cursor())
+}
+
+func TestEditorRefreshDropsListWhenProviderChangesPosition(t *testing.T) {
+	for _, mode := range []string{"text", "cursor"} {
+		t.Run(mode, func(t *testing.T) {
+			e := New()
+			e.SetText("./no")
+			e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+				if mode == "text" {
+					e.Insert("t")
+				} else {
+					e.SetCursor(0)
+				}
+				return &autocomplete.Suggestions{Prefix: "./no", Items: []autocomplete.Item{{Value: "./new"}}}, nil
+			}))
+			e.SetAutocomplete(&autocomplete.Suggestions{Prefix: "./no", Items: []autocomplete.Item{{Value: "./old"}}})
+			require.NoError(t, e.RefreshAutocomplete(t.Context()))
+			assert.False(t, e.AutocompleteVisible())
+			if mode == "text" {
+				assert.Equal(t, "./not", e.Text())
+			} else {
+				assert.Equal(t, "./no", e.Text())
+				assert.Zero(t, e.Cursor())
+			}
+		})
+	}
+}
+
+func TestEditorRefreshPreservesProviderErrorIdentity(t *testing.T) {
+	e := New()
+	e.SetText("./no")
+	failure := errors.New("completion unavailable")
+	calls := 0
+	e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+		calls++
+		return nil, failure
+	}))
+	require.NoError(t, e.RefreshAutocomplete(t.Context()))
+	assert.Zero(t, calls)
+	e.SetAutocomplete(&autocomplete.Suggestions{Prefix: "./no", Items: []autocomplete.Item{{Value: "./old"}}})
+	require.ErrorIs(t, e.RefreshAutocomplete(t.Context()), failure)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "./no", e.Text())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, e.RefreshAutocomplete(ctx), context.Canceled)
+	assert.Equal(t, 1, calls)
+}
+
+func TestEditorNewlineCancelsCompletionAndPendingResult(t *testing.T) {
+	for _, mode := range []string{"visible", "pending"} {
+		t.Run(mode, func(t *testing.T) {
+			e := New()
+			e.SetText("/he")
+			if mode == "visible" {
+				e.SetAutocomplete(&autocomplete.Suggestions{Prefix: "/he", Items: []autocomplete.Item{{Value: "help"}}})
+				e.Newline()
+			} else {
+				e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+					e.Newline()
+					return &autocomplete.Suggestions{Prefix: "/he", Items: []autocomplete.Item{{Value: "help"}}}, nil
+				}))
+				require.NoError(t, e.UpdateAutocomplete(t.Context(), false))
+			}
+			assert.False(t, e.AutocompleteVisible())
+			assert.Equal(t, "/he\n", e.Text())
+			e.Undo()
+			assert.Equal(t, "/he", e.Text())
+			assert.False(t, e.AutocompleteVisible())
+		})
+	}
+}
+
+func TestEditorAutocompleteCancelsProviderContext(t *testing.T) {
+	for _, mode := range []string{"cancel", "paste", "text", "provider", "nested"} {
+		t.Run(mode, func(t *testing.T) {
+			e := New()
+			e.SetText("/he")
+			nested := false
+			e.SetAutocompleteProvider(suggestionFunc(func(ctx context.Context, _ []string, _, _ int, _ bool) (*autocomplete.Suggestions, error) {
+				if nested {
+					return &autocomplete.Suggestions{Prefix: "/he", Items: []autocomplete.Item{{Value: "latest"}}}, nil
+				}
+				switch mode {
+				case "cancel":
+					e.CancelAutocomplete()
+				case "paste":
+					e.Paste("x")
+				case "text":
+					e.SetText("replacement")
+				case "provider":
+					e.SetAutocompleteProvider(nil)
+				case "nested":
+					nested = true
+					require.NoError(t, e.UpdateAutocomplete(t.Context(), false))
+				}
+				assert.ErrorIs(t, ctx.Err(), context.Canceled)
+				return &autocomplete.Suggestions{Prefix: "/he", Items: []autocomplete.Item{{Value: "stale"}}}, nil
+			}))
+			require.NoError(t, e.UpdateAutocomplete(t.Context(), false))
+			if mode == "nested" {
+				require.True(t, e.AutocompleteVisible())
+				assert.Equal(t, "latest", e.VisibleAutocompleteItems()[0].Value)
+			} else {
+				assert.False(t, e.AutocompleteVisible())
+			}
+		})
+	}
+}
+
+func TestEditorApplyingCompletionCancelsProviderRequest(t *testing.T) {
+	e := New()
+	e.SetText("@no")
+	e.SetAutocompleteProvider(suggestionFunc(func(ctx context.Context, _ []string, _, _ int, _ bool) (*autocomplete.Suggestions, error) {
+		e.ApplyAutocomplete()
+		assert.ErrorIs(t, ctx.Err(), context.Canceled)
+		return &autocomplete.Suggestions{Prefix: "@no", Items: []autocomplete.Item{{Value: "@stale", Label: "stale"}}}, nil
+	}))
+	e.SetAutocomplete(&autocomplete.Suggestions{Prefix: "@no", Items: []autocomplete.Item{{Value: "@note.md", Label: "note.md"}}})
+	require.NoError(t, e.UpdateAutocomplete(t.Context(), false))
+	assert.False(t, e.AutocompleteVisible())
+	assert.Equal(t, "@note.md ", e.Text())
+	e.Undo()
+	assert.Equal(t, "@no", e.Text())
+}
+
+type admissionSuggestionProvider struct {
+	suggestionFunc
+	allow  bool
+	checks int
+}
+
+func (p *admissionSuggestionProvider) ShouldTriggerFileCompletion(_ []string, _, _ int) bool {
+	p.checks++
+	return p.allow
+}
+
+func TestEditorTabUsesProviderFileAdmission(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		t.Run(strconv.FormatBool(allow), func(t *testing.T) {
+			e := New()
+			e.SetText("plain")
+			calls := 0
+			provider := &admissionSuggestionProvider{allow: allow, suggestionFunc: func(_ context.Context, _ []string, _, _ int, force bool) (*autocomplete.Suggestions, error) {
+				calls++
+				assert.True(t, force)
+				return &autocomplete.Suggestions{Prefix: "plain", Items: []autocomplete.Item{{Value: "plain.md", Label: "plain.md"}}}, nil
+			}}
+			e.SetAutocompleteProvider(provider)
+			require.NoError(t, e.CompleteOnTab(t.Context()))
+			assert.Equal(t, 1, provider.checks)
+			if allow {
+				assert.Equal(t, 1, calls)
+				assert.Equal(t, "plain.md", e.Text())
+			} else {
+				assert.Zero(t, calls)
+				assert.Equal(t, "plain", e.Text())
+			}
+		})
+	}
+	e := New()
+	e.SetText("first\n/hel")
+	calls := 0
+	e.SetAutocompleteProvider(suggestionFunc(func(_ context.Context, _ []string, _, _ int, force bool) (*autocomplete.Suggestions, error) {
+		calls++
+		assert.True(t, force)
+		return &autocomplete.Suggestions{Prefix: "/hel", Items: []autocomplete.Item{{Value: "hello", Label: "hello"}}}, nil
+	}))
+	require.NoError(t, e.CompleteOnTab(t.Context()))
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "first\n/hello ", e.Text())
+}
+
+type applicationSuggestionProvider struct {
+	suggestionFunc
+	apply func([]string, int, int, autocomplete.Item, string) autocomplete.ApplyResult
+}
+
+func (p applicationSuggestionProvider) ApplyCompletion(lines []string, line, col int, item autocomplete.Item, prefix string) autocomplete.ApplyResult {
+	return p.apply(lines, line, col, item, prefix)
+}
+
+func TestEditorUsesProviderCompletionApplication(t *testing.T) {
+	for _, tab := range []bool{false, true} {
+		t.Run(strconv.FormatBool(tab), func(t *testing.T) {
+			e := New()
+			e.Paste(strings.Repeat("x", 1100))
+			marker := e.Text()
+			e.Insert("\nask #na suffix")
+			e.SetCursor(len(marker) + len("\nask #na"))
+			before, cursor := e.Text(), e.Cursor()
+			calls := 0
+			item := autocomplete.Item{Value: "internal-id", Label: "display name"}
+			e.SetAutocompleteProvider(applicationSuggestionProvider{suggestionFunc: func(_ context.Context, lines []string, line, col int, force bool) (*autocomplete.Suggestions, error) {
+				assert.Equal(t, tab, force)
+				return &autocomplete.Suggestions{Prefix: "#na", Items: []autocomplete.Item{item}}, nil
+			}, apply: func(lines []string, line, col int, selected autocomplete.Item, prefix string) autocomplete.ApplyResult {
+				calls++
+				assert.Equal(t, []string{marker, "ask #na suffix"}, lines)
+				assert.Equal(t, 1, line)
+				assert.Equal(t, len("ask #na"), col)
+				assert.Equal(t, item, selected)
+				assert.Equal(t, "#na", prefix)
+				lines[1] = "ask 名前 suffix"
+				return autocomplete.ApplyResult{Lines: lines, CursorLine: 1, CursorCol: len("ask 名前")}
+			}})
+			if tab {
+				require.NoError(t, e.CompleteOnTab(t.Context()))
+			} else {
+				require.NoError(t, e.UpdateAutocomplete(t.Context(), false))
+				e.ApplyAutocomplete()
+			}
+			assert.Equal(t, 1, calls)
+			assert.Equal(t, marker+"\nask 名前 suffix", e.Text())
+			assert.Equal(t, len(marker)+len("\nask 名前"), e.Cursor())
+			assert.Equal(t, strings.Repeat("x", 1100)+"\nask 名前 suffix", e.ExpandedText())
+			assert.False(t, e.AutocompleteVisible())
+			e.Undo()
+			assert.Equal(t, before, e.Text())
+			assert.Equal(t, cursor, e.Cursor())
+			assert.Equal(t, strings.Repeat("x", 1100)+"\nask #na suffix", e.ExpandedText())
+		})
+	}
+}
+
+func TestEditorHistoryBoundaryBreaksTypingUndo(t *testing.T) {
+	for _, mode := range []string{"empty previous", "empty next", "next from draft"} {
+		t.Run(mode, func(t *testing.T) {
+			e := New()
+			if mode == "next from draft" {
+				e.AddHistory("entry")
+			}
+			e.Insert("before")
+			if mode == "empty previous" {
+				e.HistoryPrev()
+			} else {
+				e.HistoryNext()
+			}
+			e.Insert("after")
+			e.Undo()
+			assert.Equal(t, "before", e.Text())
+			e.Undo()
+			assert.Empty(t, e.Text())
+		})
+	}
+}
+
+func TestEditorCompletionRetriesSharedCJKCharacters(t *testing.T) {
+	e := New()
+	for _, r := range "ˇˉ˙\u0305\u0323⿰〆〓〪〱〷〼゙゛ー㆐㇀㇯㈠㉇㊀㋀㋿㍘㍻㏠꜀ｰﾞ𝍠🉐" {
+		assert.True(t, e.IsAutocompleteTrigger(r), "U+%04X", r)
+	}
+	for _, r := range "éΩ🙂⁂" {
+		assert.False(t, e.IsAutocompleteTrigger(r), "U+%04X", r)
+	}
 }

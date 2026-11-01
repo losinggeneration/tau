@@ -2,9 +2,16 @@ package autocomplete
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCombinedProviderSlashCommandSuggestions(t *testing.T) {
@@ -129,11 +136,27 @@ func TestApplyCompletionAtFileAddsSpaceForFilesNotDirectories(t *testing.T) {
 }
 
 func TestShouldTriggerFileCompletion(t *testing.T) {
-	if ShouldTriggerFileCompletion([]string{"/he"}, 0, len("/he")) {
-		t.Fatalf("slash command should not trigger file completion")
-	}
-	if !ShouldTriggerFileCompletion([]string{"/open "}, 0, len("/open ")) {
-		t.Fatalf("slash command argument should trigger file completion")
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"/he", false},
+		{" /he", false},
+		{"/open ", false},
+		{"  /open  ", false},
+		{"\t/open\t", false},
+		{"/open R", true},
+		{"/open  R ", true},
+		{"R", true},
+		{"", true},
+		{"@file", true},
+		{" \t", true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			if got := ShouldTriggerFileCompletion([]string{tc.value}, 0, len(tc.value)); got != tc.want {
+				t.Fatalf("value=%q got=%t want=%t", tc.value, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -449,24 +472,28 @@ func TestAtHomePathCompletion(t *testing.T) {
 	}
 }
 
-func TestSlashCommandArgumentCompletionRunsWhenForced(t *testing.T) {
+func TestForcedCompletionUsesFilesInsteadOfSlashArguments(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "README.md"), "body")
 	called := false
-	provider, err := NewCombinedProvider(WithCommands([]SlashCommand{{
-		Name: "open",
-		CompleteArgs: func(ctx context.Context, prefix string) ([]Item, error) {
-			called = true
-			return []Item{{Value: "README.md", Label: "README.md"}}, nil
-		},
-	}}))
+	provider, err := NewCombinedProvider(WithBasePath(dir), WithCommands([]SlashCommand{{Name: "open", CompleteArgs: func(context.Context, string) ([]Item, error) { called = true; return []Item{{Value: "wrong"}}, nil }}}))
 	if err != nil {
-		t.Fatalf("NewCombinedProvider: %v", err)
+		t.Fatal(err)
 	}
-	suggestions, err := provider.GetSuggestions(context.Background(), []string{"/open R"}, 0, len("/open R"), true)
+	suggestions, err := provider.GetSuggestions(t.Context(), []string{"/open R"}, 0, len("/open R"), true)
 	if err != nil {
-		t.Fatalf("GetSuggestions: %v", err)
+		t.Fatal(err)
 	}
-	if !called || suggestions == nil || suggestions.Prefix != "R" {
-		t.Fatalf("called=%v suggestions=%+v, want forced slash args", called, suggestions)
+	if called || suggestions == nil || suggestions.Prefix != "R" || len(suggestions.Items) != 1 || suggestions.Items[0].Value != "README.md" {
+		t.Fatalf("called=%t suggestions=%+v", called, suggestions)
+	}
+	absolute := filepath.ToSlash(filepath.Join(dir, "R"))
+	suggestions, err = provider.GetSuggestions(t.Context(), []string{absolute}, 0, len(absolute), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if suggestions == nil || suggestions.Prefix != absolute || len(suggestions.Items) != 1 || suggestions.Items[0].Value != filepath.ToSlash(filepath.Join(dir, "README.md")) {
+		t.Fatalf("absolute suggestions=%+v", suggestions)
 	}
 }
 
@@ -486,4 +513,575 @@ func TestWalkFileSearcherHonorsCancelledContext(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Search with cancelled context error = nil")
 	}
+}
+
+func TestQuotedFileSuggestionsUsePathAndAttachmentOrdering(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "z folder"))
+	mustWrite(t, filepath.Join(dir, "a file"), "body")
+	provider, err := NewCombinedProvider(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"\"", "@\"./"} {
+		suggestions, err := provider.GetSuggestions(t.Context(), []string{prefix}, 0, len(prefix), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if suggestions == nil || len(suggestions.Items) != 2 {
+			t.Fatalf("prefix=%q suggestions=%+v", prefix, suggestions)
+		}
+		first, second := "z folder/", "a file"
+		if strings.HasPrefix(prefix, "@") {
+			first, second = second, first
+		}
+		if got := suggestions.Items[0]; got.Label != first {
+			t.Fatalf("prefix=%q first=%+v", prefix, got)
+		}
+		if got := suggestions.Items[1]; got.Label != second {
+			t.Fatalf("prefix=%q second=%+v", prefix, got)
+		}
+	}
+}
+
+func TestSlashSuggestionsIgnoreLeadingWhitespaceAndPreserveItOnApply(t *testing.T) {
+	for _, leading := range []string{"  ", "\t", "\u3000"} {
+		provider, err := NewCombinedProvider(WithCommands([]SlashCommand{{Name: "help"}, {Name: "open", CompleteArgs: func(context.Context, string) ([]Item, error) { return []Item{{Value: "file.txt"}}, nil }}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct{ query, prefix, value, want string }{{"/he", "/he", "help", "/help "}, {"/open fi", "fi", "file.txt", "/open file.txt"}} {
+			line := leading + tc.query
+			suggestions, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if suggestions == nil || suggestions.Prefix != tc.prefix || len(suggestions.Items) != 1 || suggestions.Items[0].Value != tc.value {
+				t.Fatalf("line=%q suggestions=%+v", line, suggestions)
+			}
+			result := ApplyCompletion([]string{line}, 0, len(line), suggestions.Items[0], suggestions.Prefix)
+			if result.Lines[0] != leading+tc.want || result.CursorCol != len(leading+tc.want) {
+				t.Fatalf("line=%q result=%+v", line, result)
+			}
+		}
+	}
+}
+
+func TestSlashSkillsRankBareNamesAndKeepPrefixShorthand(t *testing.T) {
+	provider, err := NewCombinedProvider(WithCommands([]SlashCommand{
+		{Name: "skill:deep-research"}, {Name: "skill:research-idea"}, {Name: "skill:to-sidecar"}, {Name: "skill:brainstorm"}, {Name: "model"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		query string
+		want  []string
+	}{
+		{"idea", []string{"skill:research-idea", "skill:to-sidecar", "skill:deep-research"}},
+		{"mod", []string{"model"}},
+		{"skill:side", []string{"skill:to-sidecar", "skill:research-idea"}},
+		{"skill", []string{"skill:deep-research", "skill:research-idea", "skill:to-sidecar", "skill:brainstorm"}},
+		{"skbra", []string{"skill:brainstorm"}},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			line := "/" + tc.query
+			suggestions, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if suggestions == nil {
+				t.Fatalf("no suggestions for %q", line)
+			}
+			values := make([]string, len(suggestions.Items))
+			for i, item := range suggestions.Items {
+				values[i] = item.Value
+			}
+			if !slices.Equal(values, tc.want) {
+				t.Fatalf("query=%q values=%q want=%q", tc.query, values, tc.want)
+			}
+		})
+	}
+}
+
+func TestPathCompletionsRespectUnicodeSeparators(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "文档"))
+	mustWrite(t, filepath.Join(dir, "文档", "说明.md"), "body")
+	provider, err := NewCombinedProvider(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, separator := range " \t\u3000\u00a0\ufeff，：；。！？（「《·𖿢" {
+		for _, tc := range []struct {
+			prefix, value string
+			force         bool
+		}{
+			{"文档/说", "文档/说明.md", true},
+			{"./文档/说", "./文档/说明.md", false},
+			{"@文档/说", "@文档/说明.md ", false},
+			{"\"文档/说", "\"文档/说明.md\"", true},
+		} {
+			before := "查看𠮷" + string(separator)
+			line := before + tc.prefix + " 后文"
+			col := len(before + tc.prefix)
+			got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, col, tc.force)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil || got.Prefix != tc.prefix || len(got.Items) != 1 {
+				t.Fatalf("line=%q got=%+v", line, got)
+			}
+			result := ApplyCompletion([]string{line}, 0, col, got.Items[0], got.Prefix)
+			if result.Lines[0] != before+tc.value+" 后文" || result.CursorCol != len(before+tc.value) {
+				t.Fatalf("line=%q result=%+v", line, result)
+			}
+		}
+		line := "查看" + string(separator)
+		for _, force := range []bool{false, true} {
+			got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), force)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil || got.Prefix != "" || len(got.Items) != 1 || got.Items[0].Value != "文档/" {
+				t.Fatalf("line=%q force=%t got=%+v", line, force, got)
+			}
+		}
+	}
+	for _, line := range []string{"=", "'", "(", "`"} {
+		got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+		if err != nil || got != nil {
+			t.Fatalf("nonseparator ending line=%q got=%+v err=%v", line, got, err)
+		}
+	}
+	got, err := provider.GetSuggestions(t.Context(), []string{""}, 0, 0, false)
+	if err != nil || got != nil {
+		t.Fatalf("empty text got=%+v err=%v", got, err)
+	}
+}
+
+func TestPathCompletionsStripOnlyUnclosedProseWrappers(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"src", "[slug]", "(group)", "my dir"} {
+		mustMkdir(t, filepath.Join(dir, name))
+		mustWrite(t, filepath.Join(dir, name, "main.go"), "body")
+	}
+	provider, err := NewCombinedProvider(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wrapper := range []string{"", "(", "[", "{", "<", "`", "((", "(`"} {
+		for _, tc := range []struct{ prefix, value string }{
+			{"src/ma", "src/main.go"},
+			{"./src/ma", "./src/main.go"},
+			{"@src/ma", "@src/main.go "},
+			{"\"my dir/ma", "\"my dir/main.go\""},
+			{"@\"my dir/ma", "@\"my dir/main.go\" "},
+			{"[slug]/ma", "[slug]/main.go"},
+			{"(group)/ma", "(group)/main.go"},
+		} {
+			if wrapper != "" && (tc.prefix == "[slug]/ma" || tc.prefix == "(group)/ma") {
+				continue
+			}
+			before := "see " + wrapper
+			line := before + tc.prefix
+			got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil || got.Prefix != tc.prefix || len(got.Items) != 1 {
+				t.Fatalf("line=%q got=%+v", line, got)
+			}
+			result := ApplyCompletion([]string{line}, 0, len(line), got.Items[0], got.Prefix)
+			if result.Lines[0] != before+tc.value || result.CursorCol != len(before+tc.value) {
+				t.Fatalf("line=%q result=%+v", line, result)
+			}
+		}
+	}
+	for _, line := range []string{"name@example", "name@\"my dir/ma", "name(\"my dir/ma"} {
+		got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+		if err != nil || got != nil {
+			t.Fatalf("embedded line=%q got=%+v err=%v", line, got, err)
+		}
+	}
+}
+
+func TestPathCompletionsQuoteSeparatorsAndRespectLiteralQuotedPaths(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "归档"))
+	mustWrite(t, filepath.Join(dir, "归档", "说明.md"), "body")
+	provider, err := NewCombinedProvider(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, separator := range []string{" ", "\t", "\u3000", "\u00a0", "\ufeff", "，", "。", "𖿢"} {
+		name := "资料" + separator + "归档"
+		mustMkdir(t, filepath.Join(dir, name))
+		mustWrite(t, filepath.Join(dir, name, "说明.md"), "body")
+		for _, marker := range []string{"", "@"} {
+			line := marker + name + "/说"
+			got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil || got.Prefix != "归档/说" || len(got.Items) != 1 || got.Items[0].Value != "归档/说明.md" {
+				t.Fatalf("line=%q got=%+v", line, got)
+			}
+			prefix := marker + "资料"
+			line = "查看，" + prefix
+			got, err = provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil || got.Prefix != prefix {
+				t.Fatalf("line=%q got=%+v", line, got)
+			}
+			want := marker + "\"" + name + "/\""
+			if !slices.ContainsFunc(got.Items, func(item Item) bool { return item.Value == want }) {
+				t.Fatalf("line=%q got=%+v want=%q", line, got, want)
+			}
+		}
+		line := "查看，\"" + name + "/说\"后文"
+		col := len(line) - len("\"后文")
+		got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, col, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Prefix != "\""+name+"/说" || len(got.Items) != 1 {
+			t.Fatalf("quoted line=%q got=%+v", line, got)
+		}
+		result := ApplyCompletion([]string{line}, 0, col, got.Items[0], got.Prefix)
+		if result.Lines[0] != "查看，\""+name+"/说明.md\"后文" || result.CursorCol != len("查看，\""+name+"/说明.md\"") {
+			t.Fatalf("line=%q result=%+v", line, result)
+		}
+	}
+	for _, r := range []rune{'\u0085', 'a', '𠮷'} {
+		line := string(r) + "文档/说"
+		if prefix, _ := extractPathPrefix(line, true); prefix != line {
+			t.Fatalf("nonseparator %U prefix=%q", r, prefix)
+		}
+	}
+}
+
+type fileSearchFunc func(context.Context, string, string, int) ([]Item, error)
+
+func (f fileSearchFunc) Search(ctx context.Context, base, query string, limit int) ([]Item, error) {
+	return f(ctx, base, query, limit)
+}
+
+func TestCombinedProviderDiscardsResultsAfterCancellation(t *testing.T) {
+	for _, kind := range []string{"arguments", "files", "empty files"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			calls := 0
+			result := func() []Item {
+				calls++
+				cancel()
+				if kind == "empty files" {
+					return nil
+				}
+				return []Item{{Value: "stale", Label: "stale"}}
+			}
+			provider, err := NewCombinedProvider(WithCommands([]SlashCommand{{Name: "cmd", CompleteArgs: func(context.Context, string) ([]Item, error) { return result(), nil }}}), WithFileSearcher(fileSearchFunc(func(context.Context, string, string, int) ([]Item, error) { return result(), nil })))
+			if err != nil {
+				t.Fatal(err)
+			}
+			line := "@s"
+			if kind == "arguments" {
+				line = "/cmd s"
+			}
+			suggestions, err := provider.GetSuggestions(ctx, []string{line}, 0, len(line), false)
+			if calls != 1 || suggestions != nil || !errors.Is(err, context.Canceled) {
+				t.Fatalf("calls=%d suggestions=%+v err=%v", calls, suggestions, err)
+			}
+		})
+	}
+}
+
+func TestRecursiveCompletionKeepsStrongMatchesPastEarlyCandidates(t *testing.T) {
+	dir := t.TempDir()
+	for i := range 205 {
+		mustWrite(t, filepath.Join(dir, fmt.Sprintf("aquery%03d", i)), "body")
+	}
+	mustMkdir(t, filepath.Join(dir, "z"))
+	mustWrite(t, filepath.Join(dir, "z", "query"), "body")
+	for _, searcher := range []FileSearcher{nil, WalkFileSearcher{}} {
+		provider, err := NewCombinedProvider(WithBasePath(dir), WithFileSearcher(searcher))
+		if err != nil {
+			t.Fatal(err)
+		}
+		line := "@query"
+		got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || len(got.Items) != 20 || got.Items[0].Value != "@z/query" {
+			t.Fatalf("searcher=%T suggestions=%+v", searcher, got)
+		}
+	}
+}
+
+func TestRecursiveCompletionBreaksScoreTiesByDepthThenLength(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "nested"))
+	for _, name := range []string{"nested/match", "match-long", "match-a", "match-z"} {
+		mustWrite(t, filepath.Join(dir, filepath.FromSlash(name)), "body")
+	}
+	for _, searcher := range []FileSearcher{nil, WalkFileSearcher{}} {
+		provider, err := NewCombinedProvider(WithBasePath(dir), WithFileSearcher(searcher))
+		if err != nil {
+			t.Fatal(err)
+		}
+		line := "@mat"
+		got, err := provider.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"@match-a", "@match-z", "@match-long", "@nested/match"}
+		if got == nil {
+			t.Fatal("no suggestions")
+		}
+		values := make([]string, len(got.Items))
+		for i, item := range got.Items {
+			values[i] = item.Value
+		}
+		if !slices.Equal(values, want) {
+			t.Fatalf("searcher=%T values=%q want=%q", searcher, values, want)
+		}
+	}
+}
+
+func TestAttachmentScopedQueriesSearchRecursively(t *testing.T) {
+	dir := t.TempDir()
+	scope := filepath.Join(dir, "scope")
+	mustMkdir(t, filepath.Join(scope, "nested"))
+	mustWrite(t, filepath.Join(scope, "nested", "target.md"), "body")
+	mustWrite(t, filepath.Join(dir, "outside-target.md"), "body")
+	t.Setenv("HOME", dir)
+	for _, base := range []string{"scope/", "./scope/", "~/scope/", filepath.ToSlash(scope) + "/"} {
+		for _, query := range []string{"", "arg"} {
+			for _, quoted := range []bool{false, true} {
+				raw := base + query
+				prefix := "@" + raw
+				if quoted {
+					prefix = "@\"" + raw
+				}
+				provider, err := NewCombinedProvider(WithBasePath(dir))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := provider.GetSuggestions(t.Context(), []string{prefix}, 0, len(prefix), false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got == nil || got.Prefix != prefix {
+					t.Fatalf("prefix=%q suggestions=%+v", prefix, got)
+				}
+				found := false
+				for _, item := range got.Items {
+					if strings.Contains(item.Value, "outside") {
+						t.Fatalf("scope leaked: %+v", got)
+					}
+					if item.Label != "target.md" {
+						continue
+					}
+					want := "@" + base + "nested/target.md"
+					if quoted {
+						want = "@\"" + base + "nested/target.md\""
+					}
+					if item.Value != want || item.Description != base+"nested/target.md" {
+						t.Fatalf("prefix=%q item=%+v want=%q", prefix, item, want)
+					}
+					found = true
+				}
+				if !found {
+					t.Fatalf("prefix=%q missing nested match: %+v", prefix, got)
+				}
+			}
+		}
+	}
+}
+
+func TestDirectPathCompletionPreservesDotSlashForPartialNames(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "note.md"), "body")
+	mustMkdir(t, filepath.Join(dir, "notes"))
+	provider, err := NewCombinedProvider(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"./no", "\"./no"} {
+		got, err := provider.GetSuggestions(t.Context(), []string{prefix}, 0, len(prefix), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || len(got.Items) != 2 {
+			t.Fatalf("prefix=%q suggestions=%+v", prefix, got)
+		}
+		want := []string{"./notes/", "./note.md"}
+		if strings.HasPrefix(prefix, "\"") {
+			want = []string{"\"./notes/\"", "\"./note.md\""}
+		}
+		for i, item := range got.Items {
+			if item.Value != want[i] {
+				t.Fatalf("prefix=%q value=%q want=%q", prefix, item.Value, want[i])
+			}
+		}
+	}
+}
+
+func TestSlashCompletionUsesJavaScriptWhitespace(t *testing.T) {
+	p, err := NewCombinedProvider(WithCommands([]SlashCommand{{Name: "help"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		before, after string
+		want          bool
+	}{{"\ufeff", "\ufeff", true}, {"\u00a0", "\u00a0", true}, {"\u0085", "", false}} {
+		line := tc.before + "/he"
+		got, err := p.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !tc.want {
+			if got != nil {
+				t.Fatalf("unexpected slash completion: %+v", got)
+			}
+			continue
+		}
+		if got == nil || got.Prefix != "/he" || len(got.Items) != 1 {
+			t.Fatalf("line=%q got=%+v", line, got)
+		}
+		result := ApplyCompletion([]string{line}, 0, len(line), got.Items[0], got.Prefix)
+		if result.Lines[0] != tc.before+"/help " {
+			t.Fatalf("line=%q result=%+v", line, result)
+		}
+		if ShouldTriggerFileCompletion([]string{line + tc.after}, 0, len(line+tc.after)) {
+			t.Fatalf("unexpected file trigger %q", line+tc.after)
+		}
+	}
+}
+
+func TestSlashQueryUsesJavaScriptWhitespace(t *testing.T) {
+	p, err := NewCombinedProvider(WithCommands([]SlashCommand{{Name: "help"}, {Name: "skill:helper"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		query string
+		want  bool
+	}{{"he\ufeff", true}, {"he\u0085", false}} {
+		line := "/" + tc.query
+		got, err := p.GetSuggestions(t.Context(), []string{line}, 0, len(line), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !tc.want {
+			if got != nil {
+				t.Fatalf("unexpected results %+v", got)
+			}
+			continue
+		}
+		if got == nil || len(got.Items) != 2 || got.Items[0].Value != "help" || got.Prefix != line {
+			t.Fatalf("suggestions=%+v", got)
+		}
+	}
+}
+
+func TestAttachmentCompletionFollowsSymlinkedDirectories(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	mustWrite(t, filepath.Join(outside, "linked.md"), "body")
+	if err := os.Symlink(outside, filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	p, err := NewCombinedProvider(WithBasePath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ prefix, value, label string }{{"@linked", "@alias/linked.md", "linked.md"}, {"@alias", "@alias/", "alias/"}, {"@alias/li", "@alias/linked.md", "linked.md"}} {
+		got, err := p.GetSuggestions(t.Context(), []string{tc.prefix}, 0, len(tc.prefix), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 1
+		if tc.prefix == "@alias" {
+			count = 2
+		}
+		if got == nil || len(got.Items) != count || got.Items[0].Value != tc.value || got.Items[0].Label != tc.label {
+			t.Fatalf("prefix=%q got=%+v", tc.prefix, got)
+		}
+		if count == 2 && got.Items[1].Value != "@alias/linked.md" {
+			t.Fatalf("unexpected descendant: %+v", got.Items[1])
+		}
+	}
+}
+
+func TestAttachmentDiscoveryHonorsLocalIgnoreRules(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, ".gitignore"), "*blocked.md\n")
+	mustWrite(t, filepath.Join(dir, "blocked.md"), "")
+	mustWrite(t, filepath.Join(dir, "visible.md"), "")
+	for _, opts := range [][]Option{{}, {WithFileSearcher(WalkFileSearcher{})}} {
+		opts = append(opts, WithBasePath(dir))
+		p, err := NewCombinedProvider(opts...)
+		require.NoError(t, err)
+		got, err := p.GetSuggestions(t.Context(), []string{"@.md"}, 0, len("@.md"), false)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.Len(t, got.Items, 1)
+		assert.Equal(t, "@visible.md", got.Items[0].Value)
+	}
+}
+
+func TestFileCompletionUsesUnicodeLowercaseMapping(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"i.txt", "İ.txt", "ΟΣ"} {
+		mustWrite(t, filepath.Join(dir, name), "")
+	}
+	p, err := NewCombinedProvider(WithBasePath(dir))
+	require.NoError(t, err)
+	for _, tc := range []struct{ prefix, want string }{{"./İ", "./İ.txt"}, {"./i\u0307", "./İ.txt"}, {"./ος", "./ΟΣ"}, {"@i\u0307", "@İ.txt"}, {"@ος", "@ΟΣ"}} {
+		t.Run(tc.prefix, func(t *testing.T) {
+			got, err := p.GetSuggestions(t.Context(), []string{tc.prefix}, 0, len(tc.prefix), false)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			require.Len(t, got.Items, 1)
+			assert.Equal(t, tc.want, got.Items[0].Value)
+		})
+	}
+}
+
+func TestFileScoringUsesUnicodeLowercaseMapping(t *testing.T) {
+	for _, tc := range []struct {
+		path, query string
+		want        int
+	}{{"İ", "i\u0307", 100}, {"İ.txt", "i\u0307", 80}, {"ΟΣ", "ος", 100}, {"ΟΣ.txt", "οσ", 80}, {"ΟΣ.txt", "ος", 0}, {"dir/ΟΣ/file", "ος", 30}, {"i.txt", "İ", 0}} {
+		assert.Equal(t, tc.want, scoreEntry(tc.path, tc.query, false), "path=%q query=%q", tc.path, tc.query)
+	}
+}
+
+func TestQuotedAttachmentWhitespaceQueryStaysLiteral(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "plain.md"), "")
+	mustWrite(t, filepath.Join(dir, "with space.md"), "")
+	p, err := NewCombinedProvider(WithBasePath(dir))
+	require.NoError(t, err)
+	got, err := p.GetSuggestions(t.Context(), []string{"@\" "}, 0, len("@\" "), false)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Len(t, got.Items, 1)
+	assert.Equal(t, "@\"with space.md\"", got.Items[0].Value)
+}
+
+func TestHasTriggerPrefixUsesEditorBoundaries(t *testing.T) {
+	for _, value := range []string{"@", "later @src", "查看，#12", "`$item", "see ([-arg", "@\"with space", "\ufeff#issue", "@file=name"} {
+		assert.True(t, HasTriggerPrefix(value, []rune{'@', '#', '$', '-'}), value)
+	}
+	for _, value := range []string{"email@src", "foo(@src", "问题#12", "=@src", "'@src", "@src other", "#src。tail", "@src\u00a0tail"} {
+		assert.False(t, HasTriggerPrefix(value, []rune{'@', '#', '$', '-'}), value)
+	}
+	assert.False(t, HasTriggerPrefix("$item", []rune{'@', '#'}))
 }

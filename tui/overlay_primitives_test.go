@@ -1,12 +1,16 @@
 package tui
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/losinggeneration/tau/tui/autocomplete"
 	"github.com/losinggeneration/tau/tui/keybindings"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPrimitivesInsertShiftedCharacter(t *testing.T) {
@@ -525,4 +529,331 @@ func TestEditorPrimitiveSubmitsWhitespaceAsEmptyAfterReset(t *testing.T) {
 	assert.Equal(t, 1, calls)
 	p.HandleInput("\x1b[45;5u")
 	assert.Empty(t, p.ensureModel().Text())
+}
+
+func TestEditorPrimitiveTabRequestsCompletion(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.input.tab": {"f2"}}))
+	for _, names := range [][]string{{"note.md"}, {"note.md", "notes.md"}} {
+		t.Run(strings.Join(names, ","), func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range names {
+				assert.NoError(t, os.WriteFile(filepath.Join(dir, name), nil, 0o600))
+			}
+			var submitted bool
+			p := &EditorPrimitive{OnSubmit: func(string) { submitted = true }}
+			m := p.ensureModel()
+			provider, err := autocomplete.NewCombinedProvider(autocomplete.WithBasePath(dir))
+			assert.NoError(t, err)
+			m.SetAutocompleteProvider(provider)
+			text := "前文\n./no 后文"
+			m.SetText(text)
+			m.SetCursor(len(text) - len(" 后文"))
+			p.HandleKey(KeyEvent{Key: KeyTab})
+			assert.Equal(t, text, m.Text())
+			assert.False(t, m.AutocompleteVisible())
+			p.HandleKey(KeyEvent{Key: KeyF2})
+			if len(names) == 1 {
+				assert.Equal(t, "前文\n./note.md 后文", m.Text())
+				assert.Equal(t, len("前文\n./note.md"), m.Cursor())
+				assert.False(t, m.AutocompleteVisible())
+				m.Undo()
+				assert.Equal(t, text, m.Text())
+			} else {
+				assert.True(t, m.AutocompleteVisible())
+				assert.Equal(t, text, m.Text())
+				p.HandleKey(KeyEvent{Key: KeyF2})
+				assert.Equal(t, "前文\n./note.md 后文", m.Text())
+			}
+			assert.False(t, submitted)
+		})
+	}
+	p := &EditorPrimitive{}
+	m := p.ensureModel()
+	provider, err := autocomplete.NewCombinedProvider(autocomplete.WithCommands([]autocomplete.SlashCommand{{Name: "help"}}), autocomplete.WithBasePath(t.TempDir()))
+	assert.NoError(t, err)
+	m.SetAutocompleteProvider(provider)
+	m.SetText("/hel")
+	p.HandleKey(KeyEvent{Key: KeyF2})
+	assert.True(t, m.AutocompleteVisible())
+	assert.Equal(t, "/hel", m.Text())
+	p.HandleKey(KeyEvent{Key: KeyF2})
+	assert.Equal(t, "/help ", m.Text())
+}
+
+func TestEditorPrimitiveRefreshesOpenCompletionAfterEditsAndMovement(t *testing.T) {
+	for _, mode := range []string{"regular", "forced"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range []string{"note.md", "notes.md"} {
+				assert.NoError(t, os.WriteFile(filepath.Join(dir, name), nil, 0o600))
+			}
+			p := &EditorPrimitive{}
+			m := p.ensureModel()
+			provider, err := autocomplete.NewCombinedProvider(autocomplete.WithBasePath(dir), autocomplete.WithCommands([]autocomplete.SlashCommand{{Name: "help"}, {Name: "history"}}))
+			assert.NoError(t, err)
+			m.SetAutocompleteProvider(provider)
+			if mode == "regular" {
+				m.SetText("/h")
+			} else {
+				m.SetText("./no")
+			}
+			p.HandleKey(KeyEvent{Key: KeyTab})
+			assert.True(t, m.AutocompleteVisible())
+			if mode == "regular" {
+				p.HandleInput("e")
+				assert.Equal(t, "/he", m.Text())
+				assert.Len(t, m.VisibleAutocompleteItems(), 1)
+				assert.Equal(t, "help", m.VisibleAutocompleteItems()[0].Value)
+				p.HandleKey(KeyEvent{Key: KeyHome})
+				assert.False(t, m.AutocompleteVisible())
+			} else {
+				p.HandleInput("te.")
+				assert.Equal(t, "./note.", m.Text())
+				assert.Len(t, m.VisibleAutocompleteItems(), 1)
+				assert.Equal(t, "./note.md", m.VisibleAutocompleteItems()[0].Value)
+				p.HandleKey(KeyEvent{Key: KeyHome})
+				assert.True(t, m.AutocompleteVisible())
+				assert.Len(t, m.VisibleAutocompleteItems(), 2)
+				assert.Zero(t, m.Cursor())
+			}
+		})
+	}
+}
+
+func TestEditorPrimitiveTriggersFirstLineSlashCompletion(t *testing.T) {
+	for _, prefix := range []string{"", "  ", "\ufeff"} {
+		t.Run(prefix, func(t *testing.T) {
+			p := &EditorPrimitive{}
+			m := p.ensureModel()
+			provider, err := autocomplete.NewCombinedProvider(autocomplete.WithCommands([]autocomplete.SlashCommand{{Name: "help"}, {Name: "history"}}))
+			assert.NoError(t, err)
+			m.SetAutocompleteProvider(provider)
+			m.SetText(prefix)
+			p.HandleInput("/")
+			assert.True(t, m.AutocompleteVisible())
+			p.HandleInput("he")
+			assert.True(t, m.AutocompleteVisible())
+			assert.Len(t, m.VisibleAutocompleteItems(), 1)
+			p.HandleInput("z")
+			assert.False(t, m.AutocompleteVisible())
+			p.HandleKey(KeyEvent{Key: KeyBackspace})
+			assert.True(t, m.AutocompleteVisible())
+			assert.Equal(t, prefix+"/he", m.Text())
+			m.CancelAutocomplete()
+			m.SetCursor(m.Cursor() - 1)
+			p.HandleKey(KeyEvent{Key: KeyDelete})
+			assert.True(t, m.AutocompleteVisible())
+			assert.Equal(t, prefix+"/h", m.Text())
+		})
+	}
+	for _, prefix := range []string{"前文\n", "ordinary ", "\u0085"} {
+		p := &EditorPrimitive{}
+		m := p.ensureModel()
+		provider, err := autocomplete.NewCombinedProvider(autocomplete.WithCommands([]autocomplete.SlashCommand{{Name: "help"}}))
+		assert.NoError(t, err)
+		m.SetAutocompleteProvider(provider)
+		m.SetText(prefix)
+		p.HandleInput("/hel")
+		assert.False(t, m.AutocompleteVisible())
+	}
+}
+
+func TestEditorPrimitiveTriggersAttachmentCompletion(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"note.md", "other.md"} {
+		assert.NoError(t, os.WriteFile(filepath.Join(dir, name), nil, 0o600))
+	}
+	for _, prefix := range []string{"", "later\n", "文字（", "`"} {
+		t.Run(prefix, func(t *testing.T) {
+			p := &EditorPrimitive{}
+			m := p.ensureModel()
+			provider, err := autocomplete.NewCombinedProvider(autocomplete.WithBasePath(dir))
+			assert.NoError(t, err)
+			m.SetAutocompleteProvider(provider)
+			m.SetText(prefix)
+			p.HandleInput("@")
+			assert.True(t, m.AutocompleteVisible())
+			assert.Len(t, m.VisibleAutocompleteItems(), 2)
+			p.HandleInput("note")
+			assert.True(t, m.AutocompleteVisible())
+			require.Len(t, m.VisibleAutocompleteItems(), 1)
+			assert.Equal(t, "@note.md", m.VisibleAutocompleteItems()[0].Value)
+			assert.Equal(t, prefix+"@note", m.Text())
+			p.HandleInput("z")
+			assert.False(t, m.AutocompleteVisible())
+			p.HandleKey(KeyEvent{Key: KeyBackspace})
+			assert.True(t, m.AutocompleteVisible())
+			require.Len(t, m.VisibleAutocompleteItems(), 1)
+		})
+	}
+	p := &EditorPrimitive{}
+	m := p.ensureModel()
+	provider, err := autocomplete.NewCombinedProvider(autocomplete.WithBasePath(dir))
+	assert.NoError(t, err)
+	m.SetAutocompleteProvider(provider)
+	p.HandleInput("email@note")
+	assert.False(t, m.AutocompleteVisible())
+	assert.Equal(t, "email@note", m.Text())
+}
+
+type symbolSuggestionProvider struct {
+	triggers []rune
+	requests []string
+}
+
+func (p *symbolSuggestionProvider) TriggerCharacters() []rune { return p.triggers }
+func (p *symbolSuggestionProvider) GetSuggestions(_ context.Context, lines []string, line, col int, _ bool) (*autocomplete.Suggestions, error) {
+	p.requests = append(p.requests, lines[line][:col])
+	return nil, nil
+}
+
+func TestEditorPrimitiveUsesProviderSymbolTriggers(t *testing.T) {
+	for _, trigger := range []string{"@", "#", "$", "-"} {
+		for _, before := range []string{"", "later\n", "查看，", "see ([", "`"} {
+			t.Run(before+trigger, func(t *testing.T) {
+				p := &EditorPrimitive{}
+				provider := &symbolSuggestionProvider{triggers: []rune{'$', '-'}}
+				m := p.ensureModel()
+				m.SetAutocompleteProvider(provider)
+				m.SetText(before)
+				p.HandleInput(trigger)
+				require.Equal(t, []string{strings.TrimPrefix(before, "later\n") + trigger}, provider.requests)
+				p.HandleInput("r")
+				assert.Len(t, provider.requests, 2)
+			})
+		}
+	}
+	for _, value := range []string{"email@src", "foo(@src", "问题#12", "=@src", "'@src", "./src", "$item"} {
+		p := &EditorPrimitive{}
+		provider := &symbolSuggestionProvider{}
+		p.ensureModel().SetAutocompleteProvider(provider)
+		p.HandleInput(value)
+		assert.Empty(t, provider.requests, value)
+	}
+	p := &EditorPrimitive{}
+	m := p.ensureModel()
+	m.SetAutocompleteProvider(&symbolSuggestionProvider{triggers: []rune{'$'}})
+	provider := &symbolSuggestionProvider{}
+	m.SetAutocompleteProvider(provider)
+	p.HandleInput("$item")
+	assert.Empty(t, provider.requests)
+}
+
+func TestEditorPrimitiveSlashOnlyStartsCommandAtMessageStart(t *testing.T) {
+	for _, prefix := range []string{"/inspect", "/inspect arg", "/inspect path", "first\n"} {
+		t.Run(prefix, func(t *testing.T) {
+			p := &EditorPrimitive{}
+			provider := &symbolSuggestionProvider{}
+			m := p.ensureModel()
+			m.SetAutocompleteProvider(provider)
+			m.SetText(prefix)
+			p.HandleInput("/")
+			assert.Empty(t, provider.requests)
+			assert.Equal(t, prefix+"/", m.Text())
+		})
+	}
+	p := &EditorPrimitive{}
+	provider := &symbolSuggestionProvider{}
+	m := p.ensureModel()
+	m.SetAutocompleteProvider(provider)
+	m.SetText(" \ufeff")
+	p.HandleInput("/")
+	assert.Equal(t, []string{" \ufeff/"}, provider.requests)
+}
+
+func TestEditorPrimitiveRetriesCompletionForCJKLetters(t *testing.T) {
+	for _, letter := range []string{"说", "あ", "カ", "한", "ㄅ", "𠮷"} {
+		t.Run(letter, func(t *testing.T) {
+			p := &EditorPrimitive{}
+			provider := &symbolSuggestionProvider{}
+			m := p.ensureModel()
+			m.SetAutocompleteProvider(provider)
+			m.SetText("查看，@dir/")
+			p.HandleInput(letter)
+			assert.Equal(t, []string{"查看，@dir/" + letter}, provider.requests)
+			assert.Equal(t, "查看，@dir/"+letter, m.Text())
+		})
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"文档", "我的 文档", "资料，归档"} {
+		require.NoError(t, os.Mkdir(filepath.Join(dir, name), 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name, "说明.md"), nil, 0o600))
+		t.Run(name, func(t *testing.T) {
+			p := &EditorPrimitive{}
+			m := p.ensureModel()
+			provider, err := autocomplete.NewCombinedProvider(autocomplete.WithBasePath(dir))
+			require.NoError(t, err)
+			m.SetAutocompleteProvider(provider)
+			prefix := "@文"
+			if name != "文档" {
+				prefix = "@\"" + name
+			}
+			m.SetText(prefix)
+			value := "@" + name + "/"
+			if name != "文档" {
+				value = "@\"" + name + "/\""
+			}
+			m.SetAutocomplete(&autocomplete.Suggestions{Prefix: prefix, Items: []autocomplete.Item{{Value: value, Label: name + "/"}}})
+			p.HandleKey(KeyEvent{Key: KeyTab})
+			require.False(t, m.AutocompleteVisible())
+			p.HandleInput("说")
+			require.True(t, m.AutocompleteVisible())
+			require.Len(t, m.VisibleAutocompleteItems(), 1)
+			assert.Contains(t, m.VisibleAutocompleteItems()[0].Value, "说明.md")
+			assert.Contains(t, m.Text(), "/说")
+			assert.NotContains(t, m.Text(), "说明.md")
+		})
+	}
+}
+
+func TestEditorPrimitiveSymbolInsertionDoesNotRetrySlashContext(t *testing.T) {
+	for _, symbol := range []rune{'@', '#', '$', '-'} {
+		t.Run(string(symbol), func(t *testing.T) {
+			p := &EditorPrimitive{}
+			provider := &symbolSuggestionProvider{triggers: []rune{'$', '-'}}
+			m := p.ensureModel()
+			m.SetAutocompleteProvider(provider)
+			m.SetText("/inspect")
+			p.HandleInput(string(symbol))
+			assert.Empty(t, provider.requests)
+			assert.Equal(t, "/inspect"+string(symbol), m.Text())
+		})
+	}
+	p := &EditorPrimitive{}
+	provider := &symbolSuggestionProvider{triggers: []rune{'-'}}
+	m := p.ensureModel()
+	m.SetAutocompleteProvider(provider)
+	m.SetText("/inspect ")
+	p.HandleInput("-")
+	assert.Equal(t, []string{"/inspect -"}, provider.requests)
+}
+
+func TestEditorPrimitiveNewlineDoesNotRefreshCompletion(t *testing.T) {
+	p := &EditorPrimitive{}
+	m := p.ensureModel()
+	provider := &symbolSuggestionProvider{}
+	m.SetAutocompleteProvider(provider)
+	m.SetText("/he")
+	m.SetAutocomplete(&autocomplete.Suggestions{Prefix: "/he", Items: []autocomplete.Item{{Value: "help"}}})
+	p.HandleKey(KeyEvent{Key: KeyEnter, Mod: ModShift})
+	assert.Equal(t, "/he\n", m.Text())
+	assert.False(t, m.AutocompleteVisible())
+	assert.Empty(t, provider.requests)
+}
+
+func TestEditorPrimitiveRetriesCompletionForSharedCJKCharacters(t *testing.T) {
+	for _, letter := range []string{"ー", "ｰ", "゙", "ˇ", "〆", "㆐", "㋿", "𝍠", "🉐"} {
+		t.Run(letter, func(t *testing.T) {
+			p := &EditorPrimitive{}
+			provider := &symbolSuggestionProvider{}
+			m := p.ensureModel()
+			m.SetAutocompleteProvider(provider)
+			m.SetText("@dir/")
+			p.HandleInput(letter)
+			assert.Equal(t, []string{"@dir/" + letter}, provider.requests)
+			assert.Equal(t, "@dir/"+letter, m.Text())
+		})
+	}
 }

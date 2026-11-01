@@ -12,10 +12,11 @@ type Debouncer struct {
 	provider *CombinedProvider
 	delay    time.Duration
 
-	mu     sync.Mutex
-	seq    int
-	cancel context.CancelFunc
-	stale  int
+	requestMu sync.Mutex
+	mu        sync.Mutex
+	seq       int
+	cancel    context.CancelFunc
+	stale     int
 }
 
 // NewDebouncer creates a request debouncer for editor autocomplete.
@@ -44,17 +45,27 @@ func (d *Debouncer) Request(ctx context.Context, lines []string, cursorLine, cur
 
 	if d.delay > 0 {
 		timer := time.NewTimer(d.delay)
+		defer timer.Stop()
 		select {
 		case <-timer.C:
 		case <-reqCtx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil, nil
+			return nil, ctx.Err()
 		}
 	}
 
-	suggestions, err := d.provider.GetSuggestions(reqCtx, lines, cursorLine, cursorCol, force)
+	d.requestMu.Lock()
+	defer d.requestMu.Unlock()
+	var suggestions *Suggestions
+	err := reqCtx.Err()
+	if err == nil {
+		suggestions, err = d.provider.GetSuggestions(reqCtx, lines, cursorLine, cursorCol, force)
+	}
+	if reqCtx.Err() != nil {
+		suggestions = nil
+		if err == nil {
+			err = reqCtx.Err()
+		}
+	}
 
 	d.mu.Lock()
 	stale := seq != d.seq

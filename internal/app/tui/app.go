@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/sdk"
@@ -52,10 +53,7 @@ const (
 	// can bubble to the Root and send the prompt.
 	AppActionEditorSubmit
 
-	// AppActionEditorComplete is Tab in the editor when the inline
-	// selector is visible. Applies the selector's focused item to the
-	// editor and dismisses the selector if appropriate. Falls through
-	// to the default ActionFocusNext when the selector is not visible.
+	// AppActionEditorComplete applies a visible choice or requests completion.
 	AppActionEditorComplete
 
 	// AppActionSelectorUp, AppActionSelectorDown, AppActionSelectorPageUp,
@@ -322,7 +320,9 @@ type App struct {
 	// displaying so the editor's OnChange handler can decide
 	// whether the new text should keep showing the same mode
 	// (e.g. typing more characters of a command or model filter).
-	selectorMode selectorMode
+	selectorMode     selectorMode
+	completionSeq    int
+	forcedCompletion bool
 	// completionSelector mirrors the top-level autocomplete provider's suggestions
 	// while the inline selector is showing provider-backed completions (currently
 	// @file references). The selector only owns rendering/focus; the provider owns
@@ -932,19 +932,16 @@ func New(opts Options) (*App, error) {
 		a.onEditorTextChanged(text, ctx)
 	})
 
-	// Wire the editor's cursor-only-move callback. The model picker
-	// can be "armed" via this path: after the user picks a model
-	// (which fills `/model <id>` into the editor and dismisses the
-	// picker), moving the cursor back into the model name re-opens
-	// the picker so the user can re-pick without typing the slash
-	// command from scratch. Without this hook the picker would only
-	// return when the user types or deletes something.
-	editor.SetOnCursorMove(func(_ tauui.EditorCursorMoveEvent, ctx *tauui.Ctx) {
-		if ctx == nil {
+	// Keep regular completion in sync with cursor movement. Model picking also
+	// reopens after applying a choice when the cursor returns to its name.
+	editor.SetOnCursorMove(func(e tauui.EditorCursorMoveEvent, ctx *tauui.Ctx) {
+		if ctx == nil || e.Reason != tauui.EditorCursorMoveNavigate {
 			return
 		}
 		text := a.editor.Text()
-		if strings.HasPrefix(text, "/model") {
+		if a.forcedCompletion && a.selectorVisible() {
+			a.requestCompletion(ctx, true, false)
+		} else if strings.HasPrefix(text, "/model") || (a.selectorVisible() && (a.selectorMode == selectorModeCommands || a.selectorMode == selectorModeFiles)) {
 			a.refreshSelector(text, ctx)
 		}
 	})
@@ -1854,6 +1851,9 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 		if kb.Matches(ks, "tui.input.submit") {
 			return AppActionEditorSubmit, true
 		}
+	}
+	if ctx == tauui.KeyCtxTextInput && keybindings.DefaultManager().Matches(ks, "tui.input.tab") {
+		return AppActionEditorComplete, true
 	}
 	if ctx == tauui.KeyCtxTextInput {
 		return (keymap.EditorKeymap{}).Resolve(ctx, ks)
@@ -3547,22 +3547,6 @@ func (a *App) completionItems(prefix string) []Command {
 	return local
 }
 
-// commandSelectorItems returns the slash-command list (local + session)
-// as tauui.SelectorItems for the inline selector. Names are bare (the
-// selector displays them as-is; the "/name" form would be re-applied
-// when the user confirms).
-func (a *App) commandSelectorItems(prefix string) []tauui.SelectorItem {
-	cmds := a.completionItems(prefix)
-	items := make([]tauui.SelectorItem, 0, len(cmds))
-	for _, c := range cmds {
-		items = append(items, tauui.SelectorItem{
-			Name:        c.Name,
-			Description: c.Description,
-		})
-	}
-	return items
-}
-
 func (a *App) modelAuthContext() context.Context {
 	if a != nil && a.ctx != nil {
 		return a.ctx
@@ -3679,35 +3663,37 @@ func (a *App) modelSelectorItems(prefix string) []tauui.SelectorItem {
 // autocomplete provider. The provider owns file discovery, fuzzy matching,
 // quoting, and scoped path semantics; internal/app/tui only adapts its items to
 // selector rows and applies the chosen completion later.
-func (a *App) fileSelectorItems(text string, cursorLine, cursorCol int) tauui.CompletionSelector {
+func (a *App) fileSelectorItems(text string, cursorCol int) tauui.CompletionSelector {
 	provider, err := a.buildAutocompleteProvider()
 	if err != nil || provider == nil {
 		return tauui.CompletionSelector{}
 	}
-	suggestions, err := provider.GetSuggestions(a.ctxOrBackground(), []string{text}, cursorLine, cursorCol, false)
+	before := text[:min(max(cursorCol, 0), len(text))]
+	lineStart := strings.LastIndexByte(before, '\n') + 1
+	suggestions, err := provider.GetSuggestions(a.ctxOrBackground(), strings.Split(text, "\n"), strings.Count(before, "\n"), len(before)-lineStart, false)
 	if err != nil || suggestions == nil || len(suggestions.Items) == 0 || !strings.HasPrefix(suggestions.Prefix, "@") {
 		return tauui.CompletionSelector{}
 	}
 	return tauui.NewCompletionSelector(suggestions)
 }
 
-// commandArgItems suggests the arguments of a local command with
-// CompleteArgs while its arguments are typed on the first line.
+// commandArgItems delegates argument completion on the active logical line.
 func (a *App) commandArgItems(text string, cursorCol int) tauui.CompletionSelector {
 	before := text[:min(max(cursorCol, 0), len(text))]
-	name, args, ok := strings.Cut(strings.TrimPrefix(before, "/"), " ")
-	if !strings.HasPrefix(before, "/") || !ok || strings.Contains(before, "\n") || a.cmds == nil {
+	lineStart := strings.LastIndexByte(before, '\n') + 1
+	command := strings.TrimLeftFunc(before[lineStart:], func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	if lineStart != 0 || !strings.HasPrefix(command, "/") || !strings.Contains(command, " ") {
 		return tauui.CompletionSelector{}
 	}
-	cmd, ok := a.cmds.Lookup(name)
-	if !ok || cmd.CompleteArgs == nil {
+	provider, err := a.buildAutocompleteProvider()
+	if err != nil || provider == nil {
 		return tauui.CompletionSelector{}
 	}
-	items := cmd.CompleteArgs(a, args)
-	if len(items) == 0 {
+	suggestions, err := provider.GetSuggestions(a.ctxOrBackground(), strings.Split(text, "\n"), strings.Count(before, "\n"), len(before)-lineStart, false)
+	if err != nil {
 		return tauui.CompletionSelector{}
 	}
-	return tauui.NewCompletionSelector(&autocomplete.Suggestions{Items: items, Prefix: args})
+	return tauui.NewCompletionSelector(suggestions)
 }
 
 func (a *App) fileSelectorRoot() string {
@@ -3989,6 +3975,13 @@ func (a *App) refreshEditorChrome() {
 // selector's rect is empty — so the selector never appears even
 // though Shown() is true.
 func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
+	if a.forcedCompletion && a.selectorVisible() {
+		a.requestCompletion(ctx, true, false)
+		return
+	}
+	a.forcedCompletion = false
+	a.completionSeq++
+	seq := a.completionSeq
 	if a.selector == nil {
 		return
 	}
@@ -4021,16 +4014,29 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 	// Keep this path behind a cheap lexical guard. Building the provider snapshots
 	// session slash commands and may walk the filesystem for @ suggestions; doing
 	// that on every ordinary character made fast typing burn CPU and feel sticky.
+	draftText, draftCursor := text, len(text)
+	if a.editor != nil {
+		draftText, draftCursor = a.editor.Text(), a.editor.Model().Cursor()
+	}
 	cursorCol := len(text)
 	if a.editor != nil && a.editor.Text() == text {
 		cursorCol = a.editor.Model().Cursor()
 	}
 	var completion tauui.CompletionSelector
 	if shouldCheckFileSelector(text, cursorCol) {
-		completion = a.fileSelectorItems(text, 0, cursorCol)
+		completion = a.fileSelectorItems(text, cursorCol)
 	}
 	if len(completion.Items) == 0 {
 		completion = a.commandArgItems(text, cursorCol)
+	}
+	if seq != a.completionSeq {
+		return
+	}
+	if a.editor != nil && (a.editor.Text() != draftText || a.editor.Model().Cursor() != draftCursor) {
+		wasShown := a.selector.Shown()
+		a.dismissSelector()
+		a.invalidateSelectorLayout(wasShown, false, ctx)
+		return
 	}
 	if len(completion.Items) > 0 {
 		if a.dialogPicker != nil && a.dialogPicker.Shown() {
@@ -4039,6 +4045,7 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 		wasShown := a.selector.Shown()
 		wasSize := a.selector.MinSize()
 		a.selector.SetItems(completion.SelectorItems())
+		a.selector.SetFocused((&autocomplete.Suggestions{Prefix: completion.Prefix, Items: completion.Items}).FocusedIndex())
 		a.selector.SetShown(true)
 		a.selectorMode = selectorModeFiles
 		a.completionSelector = completion
@@ -4146,29 +4153,32 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 	wasShown := a.selector.Shown()
 	wasSize := a.selector.MinSize()
 
-	// Slash-command filter mode. The first line of the text must start
-	// with `/` and have no whitespace between the slash and the cursor
-	// (otherwise we're past the name-typing phase and the argument
-	// shouldn't trigger the popup).
-	line := text
-	if i := strings.IndexAny(line, "\n"); i >= 0 {
-		line = line[:i]
-	}
-	if !strings.HasPrefix(line, "/") || strings.ContainsAny(line[1:], " \t") {
+	// Slash-name completion follows the provider on the active logical line.
+	before := text[:min(max(cursorCol, 0), len(text))]
+	lineStart := strings.LastIndexByte(before, '\n') + 1
+	line := before[lineStart:]
+	commandLine := strings.TrimLeftFunc(line, func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	if lineStart != 0 || !strings.HasPrefix(commandLine, "/") || strings.Contains(commandLine, " ") {
 		a.dismissSelector()
 		a.invalidateSelectorLayout(wasShown, false, ctx)
 		return
 	}
-	prefix := strings.TrimPrefix(line, "/")
-	items := a.commandSelectorItems(prefix)
-	if len(items) == 0 {
+	provider, err := a.buildAutocompleteProvider()
+	var suggestions *autocomplete.Suggestions
+	if err == nil && provider != nil {
+		suggestions, err = provider.GetSuggestions(a.ctxOrBackground(), []string{line}, 0, len(line), false)
+	}
+	if err != nil || suggestions == nil || !strings.HasPrefix(suggestions.Prefix, "/") {
 		a.dismissSelector()
 		a.invalidateSelectorLayout(wasShown, false, ctx)
 		return
 	}
-	a.selector.SetItems(items)
+	completion = tauui.NewCompletionSelector(suggestions)
+	a.selector.SetItems(completion.SelectorItems())
+	a.selector.SetFocused((&autocomplete.Suggestions{Prefix: completion.Prefix, Items: completion.Items}).FocusedIndex())
 	a.selector.SetShown(true)
 	a.selectorMode = selectorModeCommands
+	a.completionSelector = completion
 	forceLayout := wasShown && a.selector.MinSize() != wasSize
 	a.invalidateSelectorLayout(wasShown, forceLayout, ctx)
 }
@@ -4187,14 +4197,7 @@ func shouldCheckFileSelector(text string, cursor int) bool {
 	before := text[:cursor]
 	lineStart := strings.LastIndexByte(before, '\n') + 1
 	line := before[lineStart:]
-	idx := strings.LastIndexByte(line, '@')
-	if idx < 0 {
-		return false
-	}
-	if idx > 0 && !isFileRefBoundary(rune(line[idx-1])) {
-		return false
-	}
-	return !strings.ContainsAny(line[idx+1:], " \t\n")
+	return autocomplete.HasAttachmentPrefix(line) && autocomplete.HasTriggerPrefix(line, []rune{'@'})
 }
 
 // invalidateSelectorLayout emits the toolkit signals needed to keep
@@ -4285,9 +4288,12 @@ func (a *App) applySelector(_ int, item tauui.SelectorItem) {
 		// territory. The pending key is only meaningful when the
 		// editor contains exactly the bare id the picker filled.
 		a.pendingModelKey = ""
-		newText := "/" + item.Name + " "
-		a.editor.SetText(ctx, newText)
-		a.refreshSelector(newText, ctx)
+		if selected := a.completionSelector.Suggestions(-1, item.Name); selected != nil {
+			a.editor.ApplyAutocomplete(ctx, selected)
+		} else {
+			a.editor.SetText(ctx, "/"+item.Name+" ")
+		}
+		a.refreshSelector(a.editor.Text(), ctx)
 	case selectorModeModels:
 		// Fill the editor with `/model <id>` (just the model id, in
 		// Pi style — the provider isn't part of what the user types).
@@ -4320,13 +4326,11 @@ func (a *App) applySelector(_ int, item tauui.SelectorItem) {
 		a.dismissSelector()
 		a.invalidateSelectorLayout(true, false, ctx)
 	case selectorModeFiles:
-		newText, cursor, ok := a.applyFileSelectorCompletion(item.Name)
-		if !ok {
-			newText = tauui.ReplaceActiveAtReference(a.editor.Text(), item.Name)
-			cursor = len(newText)
+		if selected := a.completionSelector.Suggestions(a.selector.Focused(), item.Name); selected != nil {
+			a.editor.ApplyAutocomplete(ctx, selected)
+		} else {
+			a.editor.SetText(ctx, tauui.ReplaceActiveAtReference(a.editor.Text(), item.Name))
 		}
-		a.editor.SetText(ctx, newText)
-		a.editor.Model().SetCursor(cursor)
 		a.dismissSelector()
 		a.invalidateSelectorLayout(true, false, ctx)
 	case selectorModeFork:
@@ -4338,21 +4342,9 @@ func (a *App) applySelector(_ int, item tauui.SelectorItem) {
 	}
 }
 
-func (a *App) applyFileSelectorCompletion(name string) (string, int, bool) {
-	if a == nil || a.editor == nil {
-		return "", 0, false
-	}
-	res, ok := a.completionSelector.Apply([]string{a.editor.Text()}, 0, a.editor.Model().Cursor(), a.selector.Focused(), name)
-	if !ok || len(res.Lines) == 0 {
-		return "", 0, false
-	}
-	return res.Lines[0], res.CursorCol, true
-}
-
 // applySelectorFromAction is the entry point for the
-// AppActionEditorComplete handler (Tab key). Returns false when no
-// picker is visible so the toolkit's default Tab handler (focus next)
-// can take over.
+// AppActionEditorComplete handler (Tab key). With no picker it requests
+// completion on the active logical line.
 //
 // The dialog picker claims Tab when it's visible — Tab activates
 // the focused item the same way Enter does.
@@ -4366,12 +4358,76 @@ func (a *App) applySelectorFromAction(ctx *tauui.Ctx) bool {
 		return true
 	}
 	if a.selector == nil || !a.selector.Shown() {
-		return false
+		return a.requestTabCompletion(ctx)
 	}
 	// The tauui.Selector has no concept of focused index selection here;
 	// we delegate to its HandleAction entry point by calling
 	// handleSelectorAction with ActionSelect so it routes to onSelect.
 	return a.handleSelectorAction(int(tauui.ActionSelect))
+}
+
+func (a *App) requestTabCompletion(ctx *tauui.Ctx) bool {
+	if a.editor == nil || a.selector == nil {
+		return false
+	}
+	text := a.editor.Text()
+	cursor := a.editor.Model().Cursor()
+	before := text[:cursor]
+	lineStart := strings.LastIndexByte(before, '\n') + 1
+	command := strings.TrimLeftFunc(before[lineStart:], func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	force := lineStart != 0 || !strings.HasPrefix(command, "/") || strings.Contains(command, " ")
+	return a.requestCompletion(ctx, force, true)
+}
+
+func (a *App) requestCompletion(ctx *tauui.Ctx, force, explicitTab bool) bool {
+	a.completionSeq++
+	seq := a.completionSeq
+	text := a.editor.Text()
+	cursor := a.editor.Model().Cursor()
+	before := text[:cursor]
+	lineStart := strings.LastIndexByte(before, '\n') + 1
+	lines := strings.Split(text, "\n")
+	line := strings.Count(before, "\n")
+	col := len(before) - lineStart
+	if force && !autocomplete.ShouldTriggerFileCompletion(lines, line, col) {
+		return true
+	}
+	provider, err := a.buildAutocompleteProvider()
+	if err != nil || provider == nil {
+		return true
+	}
+	suggestions, err := provider.GetSuggestions(a.ctxOrBackground(), lines, line, col, force)
+	if seq != a.completionSeq {
+		return true
+	}
+	if a.editor.Text() != text || a.editor.Model().Cursor() != cursor {
+		wasShown := a.selector.Shown()
+		a.dismissSelector()
+		a.invalidateSelectorLayout(wasShown, false, ctx)
+		return true
+	}
+	if err != nil || suggestions == nil || len(suggestions.Items) == 0 {
+		wasShown := a.selector.Shown()
+		a.dismissSelector()
+		a.invalidateSelectorLayout(wasShown, false, ctx)
+		return true
+	}
+	if force && explicitTab && len(suggestions.Items) == 1 {
+		a.editor.ApplyAutocomplete(ctx, suggestions)
+		return true
+	}
+	wasShown := a.selector.Shown()
+	a.completionSelector = tauui.NewCompletionSelector(suggestions)
+	a.forcedCompletion = force
+	a.selector.SetItems(a.completionSelector.SelectorItems())
+	a.selector.SetFocused(suggestions.FocusedIndex())
+	a.selector.SetShown(true)
+	a.selectorMode = selectorModeFiles
+	if !force && strings.HasPrefix(suggestions.Prefix, "/") {
+		a.selectorMode = selectorModeCommands
+	}
+	a.invalidateSelectorLayout(wasShown, false, ctx)
+	return true
 }
 
 // activateAndSend is the AppActionSelectorActivate handler. It applies
@@ -4490,6 +4546,7 @@ func (a *App) handleSelectorAction(act int) bool {
 // dismissSelector hides the inline selector and resets its mode. Safe to
 // call unconditionally; a no-op when the selector is already hidden.
 func (a *App) dismissSelector() {
+	a.completionSeq++
 	if a.selector == nil {
 		return
 	}
@@ -4502,6 +4559,7 @@ func (a *App) dismissSelector() {
 	}
 	a.selector.SetShown(false)
 	a.selectorMode = selectorModeNone
+	a.forcedCompletion = false
 	a.completionSelector = tauui.CompletionSelector{}
 }
 

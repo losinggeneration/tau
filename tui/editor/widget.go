@@ -110,6 +110,18 @@ func (w *Widget) SetText(ctx *rovel.Ctx, s string) {
 	w.notifyCursorMoveIfChanged(old, CursorMoveSetText, ctx)
 }
 
+// ApplyAutocomplete applies the model's selected completion and notifies the host.
+func (w *Widget) ApplyAutocomplete(ctx *rovel.Ctx) {
+	if !w.Model().AutocompleteVisible() {
+		return
+	}
+	old := w.Model().Cursor()
+	w.Model().ApplyAutocomplete()
+	w.invalidate(ctx)
+	w.notifyChange(ctx)
+	w.notifyCursorMoveIfChanged(old, CursorMoveEdit, ctx)
+}
+
 // Reset discards the draft and notifies the host of the empty editor.
 func (w *Widget) Reset(ctx *rovel.Ctx) {
 	old := w.Model().Cursor()

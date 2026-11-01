@@ -44,3 +44,19 @@ func TestReplaceActiveAtReference(t *testing.T) {
 		t.Fatalf("ReplaceActiveAtReference = %q", got)
 	}
 }
+
+func TestCompletionSelectorAppliesEmptyPrefixBeforeSuffix(t *testing.T) {
+	selector := NewCompletionSelector(&autocomplete.Suggestions{Items: []autocomplete.Item{{Value: "文档/说明.md", Label: "说明.md"}}})
+	lines := []string{"前文", "查看， 后文"}
+	result, ok := selector.Apply(lines, 1, len("查看，"), 0, "")
+	if !ok || len(result.Lines) != 2 || result.Lines[0] != "前文" || result.Lines[1] != "查看，文档/说明.md 后文" || result.CursorLine != 1 || result.CursorCol != len("查看，文档/说明.md") {
+		t.Fatalf("result=%+v ok=%t", result, ok)
+	}
+	if lines[1] != "查看， 后文" {
+		t.Fatalf("source modified: %q", lines)
+	}
+	empty := CompletionSelector{}
+	if _, ok := empty.Apply(lines, 1, len("查看，"), 0, ""); ok {
+		t.Fatal("empty selector applied")
+	}
+}

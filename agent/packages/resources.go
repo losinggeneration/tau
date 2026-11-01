@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/losinggeneration/tau/internal/ignore"
 )
 
 // ResourceKind represents the type of resource being collected.
@@ -31,7 +33,7 @@ type Resource struct {
 // will only return explicit entries (package.json pi.extensions or index.ts/index.js)
 // and will NOT collect loose .ts/.js files from the root directory.
 // This matches the TypeScript collectAutoExtensionEntries() behavior.
-func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resource, error) {
+func collectExtensionResources(dir string, parentIgnore *ignore.Matcher) ([]Resource, error) {
 	var resources []Resource
 
 	pi, err := ReadPiManifest(dir)
@@ -87,7 +89,7 @@ func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resou
 	}
 
 	// Smart discovery: collect .ts and .js files in directory
-	ignore, err := newIgnoreMatcher(dir, dir)
+	ignore, err := ignore.New(dir, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +117,7 @@ func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resou
 			isDir = info.IsDir()
 			isFile = info.Mode().IsRegular()
 		}
-		if isIgnored(ignore, path, isDir) {
+		if ignore.Ignored(path, isDir) {
 			continue
 		}
 
@@ -139,7 +141,7 @@ func collectExtensionResources(dir string, parentIgnore *ignoreMatcher) ([]Resou
 			continue
 		}
 
-		if isIgnored(ignore, path, false) {
+		if ignore.Ignored(path, false) {
 			continue
 		}
 
@@ -169,7 +171,7 @@ func collectSkillResources(dir string, rootDir string, skillMode string) ([]Reso
 		return nil, nil
 	}
 
-	ignore, err := newIgnoreMatcher(dir, rootDir)
+	ignore, err := ignore.New(dir, rootDir)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +183,7 @@ func collectSkillResources(dir string, rootDir string, skillMode string) ([]Reso
 		return nil, fmt.Errorf("stat skill entry: %w", err)
 	}
 	if err == nil && !skillInfo.IsDir() {
-		if !isIgnored(ignore, skillMDPath, false) {
+		if !ignore.Ignored(skillMDPath, false) {
 			resources = append(resources, Resource{
 				Path:  skillMDPath,
 				Kind:  ResourceKindSkill,
@@ -206,7 +208,7 @@ func collectSkillResources(dir string, rootDir string, skillMode string) ([]Reso
 		path := filepath.Join(dir, name)
 
 		if entry.IsDir() {
-			if isIgnored(ignore, path, true) {
+			if ignore.Ignored(path, true) {
 				continue
 			}
 
@@ -219,7 +221,7 @@ func collectSkillResources(dir string, rootDir string, skillMode string) ([]Reso
 		} else {
 			// Check for loose .md files (not SKILL.md)
 			if strings.HasSuffix(name, ".md") && name != "SKILL.md" {
-				if isIgnored(ignore, path, false) {
+				if ignore.Ignored(path, false) {
 					continue
 				}
 				resources = append(resources, Resource{
@@ -250,7 +252,7 @@ func collectPromptResources(dir string) ([]Resource, error) {
 		return nil, nil
 	}
 
-	ignore, err := newIgnoreMatcher(dir, dir)
+	ignore, err := ignore.New(dir, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +279,7 @@ func collectPromptResources(dir string) ([]Resource, error) {
 
 		// Only collect .md files
 		if strings.HasSuffix(name, ".md") {
-			if isIgnored(ignore, path, false) {
+			if ignore.Ignored(path, false) {
 				continue
 			}
 			resources = append(resources, Resource{
@@ -307,7 +309,7 @@ func collectThemeResources(dir string) ([]Resource, error) {
 		return nil, nil
 	}
 
-	ignore, err := newIgnoreMatcher(dir, dir)
+	ignore, err := ignore.New(dir, dir)
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +336,7 @@ func collectThemeResources(dir string) ([]Resource, error) {
 
 		// Only collect .json files
 		if strings.HasSuffix(name, ".json") {
-			if isIgnored(ignore, path, false) {
+			if ignore.Ignored(path, false) {
 				continue
 			}
 			resources = append(resources, Resource{

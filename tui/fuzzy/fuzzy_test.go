@@ -1,6 +1,9 @@
 package fuzzy
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestMatchStringEmptyQueryMatchesEverything(t *testing.T) {
 	result := MatchString("", "anything")
@@ -139,5 +142,67 @@ func TestFilterRanksExactMatchFirstAndSplitsSlashTokens(t *testing.T) {
 	models := []string{"openai/gpt-5.2", "anthropic/claude-opus-4-6"}
 	if got := Filter(models, "opus/anthropic", id); len(got) != 1 || got[0] != "anthropic/claude-opus-4-6" {
 		t.Fatalf("reordered provider/model query: %v", got)
+	}
+}
+
+func TestFilterUsesJavaScriptWhitespace(t *testing.T) {
+	items := []string{"alpha beta", "beta alpha", "alpha\u0085beta"}
+	for _, tc := range []struct {
+		query string
+		want  []string
+	}{
+		{"\ufeff", items},
+		{"beta\ufeffalpha", []string{"alpha beta", "alpha\u0085beta", "beta alpha"}},
+		{"\u0085", []string{"alpha\u0085beta"}},
+		{"\ufeffalpha\ufeff", []string{"alpha beta", "alpha\u0085beta", "beta alpha"}},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			assertStrings(t, Filter(items, tc.query, func(s string) string { return s }), tc.want)
+		})
+	}
+}
+
+func TestMatchStringScoresJavaScriptWhitespaceBoundaries(t *testing.T) {
+	for _, separator := range []rune{'\u00a0', '\ufeff', '\v', '\f', '\u2028', '\u0085'} {
+		want := -9.9
+		if separator == '\u0085' {
+			want = 0.1
+		}
+		got := MatchString("b", string(separator)+"b")
+		if !got.Matches || math.Abs(got.Score-want) > 1e-9 {
+			t.Errorf("separator=%U got=%+v want=%v", separator, got, want)
+		}
+	}
+}
+
+func TestMatchStringScoresUTF16CodeUnits(t *testing.T) {
+	for _, tc := range []struct {
+		query, text string
+		score       float64
+	}{{"😀", "😀", -124.9}, {"x", "😀x", 0.2}, {"ab", "a😀b", -10.7}, {"字", "字", -115}} {
+		got := MatchString(tc.query, tc.text)
+		if !got.Matches || math.Abs(got.Score-tc.score) > 1e-9 {
+			t.Errorf("%q/%q got=%+v want=%v", tc.query, tc.text, got, tc.score)
+		}
+	}
+}
+
+func TestMatchStringUsesUnicodeLowercaseMappings(t *testing.T) {
+	for _, tc := range []struct {
+		query, text string
+		matches     bool
+		score       float64
+	}{
+		{"İ", "i", false, 0},
+		{"i\u0307", "İ", true, -124.9},
+		{"ΟΣ", "ος", true, -124.9},
+		{"ΟΣΑ", "οσα", true, -139.7},
+		{"Σ", "ς", false, 0},
+		{"Σ", "σ", true, -115},
+	} {
+		got := MatchString(tc.query, tc.text)
+		if got.Matches != tc.matches || math.Abs(got.Score-tc.score) > 1e-9 {
+			t.Errorf("%q/%q got=%+v want=%t,%v", tc.query, tc.text, got, tc.matches, tc.score)
+		}
 	}
 }

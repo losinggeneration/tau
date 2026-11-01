@@ -10,6 +10,7 @@ import (
 
 	"github.com/losinggeneration/rovel"
 
+	"github.com/losinggeneration/tau/tui/autocomplete"
 	editorkit "github.com/losinggeneration/tau/tui/editor"
 )
 
@@ -202,6 +203,13 @@ func (p *PromptEditor) SetInlineImagePreview(marker string, data []byte, mime st
 
 func (p *PromptEditor) SetText(ctx *Ctx, s string) {
 	p.ensure().SetText(ctx, s)
+	p.pruneInlineImagePreviews()
+}
+
+// ApplyAutocomplete applies a selected completion without replacing draft storage.
+func (p *PromptEditor) ApplyAutocomplete(ctx *Ctx, suggestions *autocomplete.Suggestions) {
+	p.Model().SetAutocomplete(suggestions)
+	p.ensure().ApplyAutocomplete(ctx)
 	p.pruneInlineImagePreviews()
 }
 

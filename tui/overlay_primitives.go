@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"log/slog"
 	"strings"
 
 	rovelansi "github.com/losinggeneration/rovel/backend/ansi"
@@ -238,6 +240,22 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 		return
 	}
 	m := p.ensureModel()
+	value, cursor := m.Text(), m.Cursor()
+	triggerCompletion := false
+	defer func() {
+		if m.Text() == value && m.Cursor() == cursor {
+			return
+		}
+		var err error
+		if m.AutocompleteVisible() {
+			err = m.RefreshAutocomplete(context.Background())
+		} else if triggerCompletion && m.Text() != value {
+			err = m.TriggerAutocomplete(context.Background())
+		}
+		if err != nil {
+			slog.Warn("editor completion refresh failed", "error", err)
+		}
+	}()
 	if m.HandleJumpKey(ke) {
 		return
 	}
@@ -274,6 +292,9 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 	}
 	switch {
 	case kb.Matches(key, "tui.input.tab"):
+		if err := m.CompleteOnTab(context.Background()); err != nil {
+			slog.Warn("editor completion failed", "error", err)
+		}
 		return
 	case kb.Matches(key, "tui.editor.deleteToLineEnd"):
 		m.DeleteToLineEnd()
@@ -284,8 +305,10 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 	case kb.Matches(key, "tui.editor.deleteWordForward"):
 		m.DeleteWordForward()
 	case kb.Matches(key, "tui.editor.deleteCharBackward"):
+		triggerCompletion = true
 		m.DeleteBackward()
 	case kb.Matches(key, "tui.editor.deleteCharForward"):
+		triggerCompletion = true
 		m.DeleteForward()
 	case kb.Matches(key, "tui.editor.yank"):
 		m.Yank()
@@ -341,6 +364,10 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 	default:
 		if r, ok := ansi.TextRune(ke); ok {
 			m.Insert(string(r))
+			triggerCompletion = m.IsAutocompleteTrigger(r)
+			if r == '/' {
+				triggerCompletion = m.IsAtCommandStart()
+			}
 		}
 	}
 }

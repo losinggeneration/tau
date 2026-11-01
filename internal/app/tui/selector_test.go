@@ -134,7 +134,7 @@ func TestRefreshSelectorFiltersCommands(t *testing.T) {
 		t.Fatal("filtered /c returned no items")
 	}
 	for _, it := range items {
-		if len(it.Name) < 1 || (it.Name[0] != 'c' && it.Name[0] != 'C') {
+		if !strings.Contains(strings.ToLower(it.Name), "c") {
 			t.Errorf("non-matching item leaked: %q", it.Name)
 		}
 	}
@@ -1955,14 +1955,14 @@ func TestAppKeymapUpDownRoutesToSelector(t *testing.T) {
 	}
 }
 
-// TestAppKeymapTabUsesToolkitDefaultWhenSelectorHidden verifies that with
-// the selector hidden, Tab resolves to toolkit focus navigation.
-func TestAppKeymapTabUsesToolkitDefaultWhenSelectorHidden(t *testing.T) {
+// TestAppKeymapTabRequestsCompletionWhenSelectorHidden verifies that with
+// the selector hidden, Tab requests completion.
+func TestAppKeymapTabRequestsCompletionWhenSelectorHidden(t *testing.T) {
 	a := newAppWithSelector(t)
 	km := appKeymap{app: a}
 
-	if act, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyTab}); !ok || act != tauui.ActionFocusNext {
-		t.Errorf("Tab with selector hidden = (%v, %v), want ActionFocusNext", act, ok)
+	if act, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyTab}); !ok || act != AppActionEditorComplete {
+		t.Errorf("Tab with selector hidden = (%v, %v), want AppActionEditorComplete", act, ok)
 	}
 }
 

@@ -5,10 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/losinggeneration/tau/tui/fuzzy"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // Item is an autocomplete entry.
@@ -31,6 +36,23 @@ type SlashCommand struct {
 type Suggestions struct {
 	Items  []Item
 	Prefix string
+}
+
+// FocusedIndex prefers an exact value, then the first case-sensitive prefix match.
+func (s *Suggestions) FocusedIndex() int {
+	if s == nil || s.Prefix == "" {
+		return 0
+	}
+	prefixIndex := -1
+	for i, item := range s.Items {
+		if item.Value == s.Prefix {
+			return i
+		}
+		if prefixIndex < 0 && strings.HasPrefix(item.Value, s.Prefix) {
+			prefixIndex = i
+		}
+	}
+	return max(prefixIndex, 0)
 }
 
 // ApplyResult is the updated editor text after applying a completion.
@@ -103,7 +125,13 @@ func NewCombinedProvider(opts ...Option) (*CombinedProvider, error) {
 
 // GetSuggestions returns suggestions for the current cursor position. A nil
 // result means no autocomplete should be shown.
-func (p *CombinedProvider) GetSuggestions(ctx context.Context, lines []string, cursorLine, cursorCol int, force bool) (*Suggestions, error) {
+func (p *CombinedProvider) GetSuggestions(ctx context.Context, lines []string, cursorLine, cursorCol int, force bool) (suggestions *Suggestions, err error) {
+	defer func() {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			suggestions = nil
+			err = fmt.Errorf("autocomplete: cancelled: %w", ctxErr)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("autocomplete: cancelled: %w", err)
 	}
@@ -119,20 +147,21 @@ func (p *CombinedProvider) GetSuggestions(ctx context.Context, lines []string, c
 		return &Suggestions{Items: items, Prefix: atPrefix}, nil
 	}
 
-	if strings.HasPrefix(textBeforeCursor, "/") {
-		space := strings.Index(textBeforeCursor, " ")
-		if space == -1 || strings.Contains(textBeforeCursor[1:space], ":") {
-			prefix := textBeforeCursor[1:]
+	commandText := strings.TrimLeftFunc(textBeforeCursor, isWhitespace)
+	if !force && strings.HasPrefix(commandText, "/") {
+		space := strings.Index(commandText, " ")
+		if space == -1 || strings.Contains(commandText[1:space], ":") {
+			prefix := commandText[1:]
 			items := p.commandItems()
 			filtered := filterAutocompleteItems(items, prefix)
 			if len(filtered) == 0 {
 				return nil, nil
 			}
-			return &Suggestions{Items: filtered, Prefix: textBeforeCursor}, nil
+			return &Suggestions{Items: filtered, Prefix: commandText}, nil
 		}
 
-		commandName := textBeforeCursor[1:space]
-		argText := textBeforeCursor[space+1:]
+		commandName := commandText[1:space]
+		argText := commandText[space+1:]
 		for _, command := range p.commands {
 			if command.Name != commandName || command.CompleteArgs == nil {
 				continue
@@ -175,7 +204,7 @@ func ApplyCompletion(lines []string, cursorLine, cursorCol int, item Item, prefi
 		afterCursor = afterCursor[1:]
 	}
 
-	isSlashCommand := strings.HasPrefix(prefix, "/") && strings.TrimSpace(beforePrefix) == "" && !strings.Contains(prefix[1:], "/")
+	isSlashCommand := strings.HasPrefix(prefix, "/") && strings.TrimFunc(beforePrefix, isWhitespace) == "" && !strings.Contains(prefix[1:], "/")
 	if isSlashCommand {
 		newLines[cursorLine] = beforePrefix + "/" + item.Value + " " + afterCursor
 		return ApplyResult{Lines: newLines, CursorLine: cursorLine, CursorCol: len(beforePrefix) + len(item.Value) + 2}
@@ -197,19 +226,39 @@ func ApplyCompletion(lines []string, cursorLine, cursorCol int, item Item, prefi
 	return ApplyResult{Lines: newLines, CursorLine: cursorLine, CursorCol: len(beforePrefix) + cursorOffset(item, isDir)}
 }
 
+// ShouldTriggerFileCompletion excludes a bare slash command from forced file requests.
+func (p *CombinedProvider) ShouldTriggerFileCompletion(lines []string, line, col int) bool {
+	return ShouldTriggerFileCompletion(lines, line, col)
+}
+
 // ShouldTriggerFileCompletion reports whether Tab should trigger file completion.
 func ShouldTriggerFileCompletion(lines []string, cursorLine, cursorCol int) bool {
 	text := sliceString(lineAt(lines, cursorLine), 0, cursorCol)
-	trimmed := strings.TrimSpace(text)
-	return !strings.HasPrefix(trimmed, "/") || strings.Contains(trimmed, " ") || strings.Contains(text, " ")
+	trimmed := strings.TrimFunc(text, isWhitespace)
+	return !strings.HasPrefix(trimmed, "/") || strings.Contains(trimmed, " ")
 }
 
 func filterAutocompleteItems(items []Item, query string) []Item {
-	query = strings.TrimSpace(query)
+	query = strings.TrimFunc(query, isWhitespace)
 	if query == "" {
 		return append([]Item(nil), items...)
 	}
 
+	if !strings.Contains(query, ":") || strings.HasPrefix(query, "skill:") {
+		text := func(item Item) string { return strings.TrimPrefix(item.Value, "skill:") }
+		primary := fuzzy.Filter(items, query, text)
+		matched := make(map[string]bool, len(primary))
+		for _, item := range primary {
+			matched[item.Value] = true
+		}
+		var remaining []Item
+		for _, item := range items {
+			if strings.HasPrefix(item.Value, "skill:") && !matched[item.Value] {
+				remaining = append(remaining, item)
+			}
+		}
+		return append(primary, fuzzy.Filter(remaining, query, func(item Item) string { return item.Value })...)
+	}
 	tokens := strings.Fields(query)
 	scoped := false
 	for _, token := range tokens {
@@ -293,8 +342,10 @@ func (p *CombinedProvider) getFileSuggestions(prefix string) []Item {
 		return nil
 	}
 	items := make([]Item, 0, len(entries))
+	lower := cases.Lower(language.Und)
+	searchPrefix = lower.String(searchPrefix)
 	for _, entry := range entries {
-		if !strings.HasPrefix(strings.ToLower(entry.Name()), strings.ToLower(searchPrefix)) {
+		if !strings.HasPrefix(lower.String(entry.Name()), searchPrefix) {
 			continue
 		}
 		isDir := entry.IsDir()
@@ -318,126 +369,42 @@ func (p *CombinedProvider) getRecursiveFileSuggestions(ctx context.Context, quer
 	if ctx.Err() != nil {
 		return nil
 	}
-	if isPathPrefix(query) {
-		return p.getAtPathSuggestions(query, quoted)
-	}
-	if p.fuzzyFiles != nil {
-		items, err := p.fuzzyFiles.Search(ctx, p.basePath, query, 20)
-		if err != nil || ctx.Err() != nil {
-			return nil
-		}
-		out := make([]Item, 0, len(items))
-		for _, item := range items {
-			isDir := strings.HasSuffix(item.Label, "/") || strings.HasSuffix(item.Value, "/")
-			value := item.Value
-			if value == "" {
-				value = item.Label
-			}
-			value = buildCompletionValue(value, parsedPathPrefix{IsAtPrefix: true, IsQuotedPrefix: quoted})
-			if isDir && !strings.HasSuffix(value, "/") && !strings.HasSuffix(value, "/\"") {
-				value += "/"
-			}
-			item.Value = value
-			out = append(out, item)
-		}
-		return out
-	}
 	base := p.basePath
-	displayBase := ""
-	search := filepath.ToSlash(query)
-	if slash := strings.LastIndex(search, "/"); slash >= 0 {
-		displayBase = search[:slash+1]
-		base = p.resolvePath(displayBase)
-		search = search[slash+1:]
+	var displayBase string
+	if slash := strings.LastIndexByte(query, '/'); slash >= 0 {
+		display := query[:slash+1]
+		candidate := p.resolvePath(p.expandHome(display))
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			base, displayBase, query = candidate, display, query[slash+1:]
+		}
 	}
-	info, err := os.Stat(base)
-	if err != nil || !info.IsDir() {
+	searcher := p.fuzzyFiles
+	if searcher == nil {
+		searcher = WalkFileSearcher{}
+	}
+	items, err := searcher.Search(ctx, base, query, 20)
+	if err != nil || ctx.Err() != nil {
 		return nil
 	}
-	type scored struct {
-		item  Item
-		score int
+	out := make([]Item, 0, len(items))
+	for _, item := range items {
+		isDir := strings.HasSuffix(item.Label, "/") || strings.HasSuffix(item.Value, "/")
+		value := item.Value
+		if value == "" {
+			value = item.Label
+		}
+		if displayBase != "" {
+			value = displayBase + value
+			item.Description = displayBase + strings.TrimSuffix(value[len(displayBase):], "/")
+		}
+		value = buildCompletionValue(value, parsedPathPrefix{IsAtPrefix: true, IsQuotedPrefix: quoted})
+		if isDir && !strings.HasSuffix(value, "/") && !strings.HasSuffix(value, "/\"") {
+			value += "/"
+		}
+		item.Value = value
+		out = append(out, item)
 	}
-	var scoredItems []scored
-	_ = filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
-		if err != nil || path == base || ctx.Err() != nil {
-			return nil
-		}
-		name := d.Name()
-		if name == ".git" {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(base, path)
-		if err != nil {
-			return nil
-		}
-		display := filepath.ToSlash(filepath.Join(displayBase, rel))
-		isDir := d.IsDir()
-		score := scoreEntry(display, search, isDir)
-		if search == "" {
-			score = 1
-		}
-		if score <= 0 {
-			return nil
-		}
-		completion := display
-		if isDir {
-			completion += "/"
-		}
-		value := buildCompletionValue(completion, parsedPathPrefix{IsAtPrefix: true, IsQuotedPrefix: quoted})
-		scoredItems = append(scoredItems, scored{item: Item{Value: value, Label: name + dirSuffix(isDir), Description: display}, score: score})
-		if len(scoredItems) > 200 {
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	sort.Slice(scoredItems, func(i, j int) bool { return scoredItems[i].score > scoredItems[j].score })
-	if len(scoredItems) > 20 {
-		scoredItems = scoredItems[:20]
-	}
-	items := make([]Item, len(scoredItems))
-	for i, scored := range scoredItems {
-		items[i] = scored.item
-	}
-	return items
-}
-
-func (p *CombinedProvider) getAtPathSuggestions(query string, quoted bool) []Item {
-	parsed := parsedPathPrefix{RawPrefix: query, IsAtPrefix: true, IsQuotedPrefix: quoted}
-	searchDir, searchPrefix, ok := p.searchLocation(query)
-	if !ok {
-		return nil
-	}
-	entries, err := os.ReadDir(searchDir)
-	if err != nil {
-		return nil
-	}
-	items := make([]Item, 0, len(entries))
-	for _, entry := range entries {
-		if !strings.HasPrefix(strings.ToLower(entry.Name()), strings.ToLower(searchPrefix)) {
-			continue
-		}
-		isDir := entry.IsDir()
-		if !isDir && entry.Type()&os.ModeSymlink != 0 {
-			if info, err := os.Stat(filepath.Join(searchDir, entry.Name())); err == nil {
-				isDir = info.IsDir()
-			}
-		}
-		rel := filepath.ToSlash(buildRelativePath(query, entry.Name()))
-		if isDir {
-			rel += "/"
-		}
-		items = append(items, Item{Value: buildCompletionValue(rel, parsed), Label: entry.Name() + dirSuffix(isDir), Description: rel})
-	}
-	sortItems(items)
-	return items
-}
-
-func isPathPrefix(query string) bool {
-	return strings.HasPrefix(query, "/") || strings.HasPrefix(query, "./") || strings.HasPrefix(query, "../") || strings.HasPrefix(query, "~/") || strings.ContainsAny(query, `/\\`)
+	return out
 }
 
 func (p *CombinedProvider) searchLocation(raw string) (string, string, bool) {
@@ -472,9 +439,10 @@ func (p *CombinedProvider) expandHome(path string) string {
 }
 
 func scoreEntry(filePath, query string, isDir bool) int {
-	name := strings.ToLower(filepath.Base(filePath))
-	q := strings.ToLower(query)
-	full := strings.ToLower(filePath)
+	lower := cases.Lower(language.Und)
+	name := lower.String(filepath.Base(filePath))
+	q := lower.String(query)
+	full := lower.String(filePath)
 	score := 0
 	switch {
 	case name == q:
@@ -515,7 +483,7 @@ func buildCompletionValue(path string, p parsedPathPrefix) string {
 	if p.IsAtPrefix {
 		prefix = "@"
 	}
-	if p.IsQuotedPrefix || strings.Contains(path, " ") {
+	if p.IsQuotedPrefix || strings.ContainsFunc(path, isAutocompleteSeparator) {
 		return prefix + "\"" + path + "\""
 	}
 	return prefix + path
@@ -528,6 +496,9 @@ func buildRelativePath(prefix, name string) string {
 	if strings.ContainsAny(prefix, `/\`) {
 		dir := filepath.Dir(prefix)
 		if dir == "." {
+			if strings.HasPrefix(prefix, "./") {
+				return "./" + name
+			}
 			return name
 		}
 		if dir == "/" {
@@ -554,11 +525,45 @@ func extractPathPrefix(text string, force bool) (string, bool) {
 	if idx >= 0 {
 		prefix = text[idx+1:]
 	}
-	if force || strings.Contains(prefix, "/") || strings.HasPrefix(prefix, ".") || strings.HasPrefix(prefix, "~/") || (prefix == "" && strings.HasSuffix(text, " ")) {
+	prefix = stripLeadingWrappers(prefix)
+	last, _ := utf8.DecodeLastRuneInString(text)
+	if force || strings.Contains(prefix, "/") || strings.HasPrefix(prefix, ".") || strings.HasPrefix(prefix, "~/") || (prefix == "" && text != "" && isAutocompleteSeparator(last)) {
 		return prefix, true
 	}
 	return "", false
 }
+
+// HasTriggerPrefix checks editor trigger tokens after whitespace or prose punctuation.
+func HasTriggerPrefix(text string, triggers []rune) bool {
+	if quote := strings.LastIndexByte(text, '"'); quote > 0 && text[quote-1] == '@' && slices.Contains(triggers, '@') {
+		start := quote - 1
+		for start > 0 && wrapperCloser(text[start-1]) != 0 {
+			start--
+		}
+		if start == 0 {
+			return true
+		}
+		previous, _ := utf8.DecodeLastRuneInString(text[:start])
+		if isAutocompleteSeparator(previous) {
+			return true
+		}
+	}
+	start := 0
+	for index, r := range text {
+		if isAutocompleteSeparator(r) {
+			start = index + utf8.RuneLen(r)
+		}
+	}
+	token := text[start:]
+	for len(token) > 0 && wrapperCloser(token[0]) != 0 {
+		token = token[1:]
+	}
+	first, _ := utf8.DecodeRuneInString(token)
+	return len(token) > 0 && slices.Contains(triggers, first)
+}
+
+// HasAttachmentPrefix reports whether the text before a cursor ends in an active attachment token.
+func HasAttachmentPrefix(text string) bool { return extractAtPrefix(text) != "" }
 
 func extractAtPrefix(text string) string {
 	if quoted := extractQuotedPrefix(text); strings.HasPrefix(quoted, "@\"") {
@@ -569,8 +574,9 @@ func extractAtPrefix(text string) string {
 	if idx >= 0 {
 		start = idx + 1
 	}
-	if start < len(text) && text[start] == '@' {
-		return text[start:]
+	token := stripLeadingWrappers(text[start:])
+	if strings.HasPrefix(token, "@") {
+		return token
 	}
 	return ""
 }
@@ -602,17 +608,59 @@ func extractQuotedPrefix(text string) string {
 }
 
 func findLastDelimiter(text string) int {
-	for i := len(text) - 1; i >= 0; i-- {
-		switch text[i] {
-		case ' ', '\t', '"', '\'', '=':
-			return i
+	last := -1
+	for i, r := range text {
+		if strings.ContainsRune(" \t\"'=", r) || isAutocompleteSeparator(r) {
+			last = i + utf8.RuneLen(r) - 1
 		}
 	}
-	return -1
+	return last
+}
+
+func stripLeadingWrappers(token string) string {
+	for len(token) > 0 {
+		closer := wrapperCloser(token[0])
+		if closer == 0 || strings.ContainsRune(token[1:], rune(closer)) {
+			break
+		}
+		token = token[1:]
+	}
+	return token
+}
+
+func wrapperCloser(r byte) byte {
+	switch r {
+	case '(':
+		return ')'
+	case '[':
+		return ']'
+	case '{':
+		return '}'
+	case '<':
+		return '>'
+	case '`':
+		return '`'
+	default:
+		return 0
+	}
+}
+
+func isWhitespace(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' }
+
+func isAutocompleteSeparator(r rune) bool {
+	// CJK punctuation with the upstream Script_Extensions set, plus fullwidth prose punctuation.
+	return isWhitespace(r) || strings.ContainsRune("·—‘’“”…、。〃〈〉《》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〽゠・﹅﹆！（），．：；？［］｛｝｡｢｣､･𖿢", r)
 }
 
 func isTokenStart(text string, index int) bool {
-	return index == 0 || strings.ContainsRune(" \t\"'=", rune(text[index-1]))
+	for index > 0 && wrapperCloser(text[index-1]) != 0 {
+		index--
+	}
+	if index == 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(text[:index])
+	return strings.ContainsRune(" \t\"'=", r) || isAutocompleteSeparator(r)
 }
 
 func lineAt(lines []string, n int) string {
@@ -651,7 +699,7 @@ func dirSuffix(isDir bool) string {
 
 func sortItems(items []Item) {
 	sort.Slice(items, func(i, j int) bool {
-		ai, bi := strings.HasSuffix(items[i].Value, "/"), strings.HasSuffix(items[j].Value, "/")
+		ai, bi := strings.HasSuffix(items[i].Label, "/"), strings.HasSuffix(items[j].Label, "/")
 		if ai != bi {
 			return ai
 		}

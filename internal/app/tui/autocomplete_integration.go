@@ -20,10 +20,16 @@ func newAutocompleteCommandProvider(app *App) []autocomplete.SlashCommand {
 	local := app.cmds.All()
 	out := make([]autocomplete.SlashCommand, 0, len(local)+8)
 	for _, c := range local {
-		out = append(out, autocomplete.SlashCommand{
-			Name:        c.Name,
-			Description: c.Description,
-		})
+		command := autocomplete.SlashCommand{Name: c.Name, Description: c.Description}
+		if c.CompleteArgs != nil {
+			command.CompleteArgs = func(ctx context.Context, prefix string) ([]autocomplete.Item, error) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return c.CompleteArgs(app, prefix), nil
+			}
+		}
+		out = append(out, command)
 	}
 	for _, ext := range app.externalCommands() {
 		out = append(out, autocomplete.SlashCommand{
