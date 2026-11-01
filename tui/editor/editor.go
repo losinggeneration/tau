@@ -82,7 +82,7 @@ func New() *Editor {
 func (e *Editor) SetText(s string) {
 	e.CancelJump()
 	e.CancelAutocomplete()
-	s = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"), "\t", "    ")
+	s = normalizeText(s)
 	if e.text != s {
 		e.pushUndo()
 	}
@@ -121,7 +121,7 @@ func (e *Editor) LargePastes() map[string]string {
 }
 
 func (e *Editor) AddHistory(s string) {
-	s = strings.TrimSpace(s)
+	s = strings.TrimFunc(s, isWhitespace)
 	if s == "" || (len(e.history) > 0 && e.history[len(e.history)-1] == s) {
 		return
 	}
@@ -256,7 +256,7 @@ func (e *Editor) IsAtCommandStart() bool {
 	if pos.Line != 0 {
 		return false
 	}
-	before := strings.TrimFunc(e.Lines()[0][:pos.Col], func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	before := strings.TrimFunc(e.Lines()[0][:pos.Col], isWhitespace)
 	return before == "" || before == "/"
 }
 
@@ -316,7 +316,7 @@ func (e *Editor) IsAutocompleteTrigger(r rune) bool {
 func (e *Editor) TriggerAutocomplete(ctx context.Context) error {
 	pos := e.completionPosition()
 	before := e.Lines()[pos.Line][:pos.Col]
-	slash := strings.TrimLeftFunc(before, func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	slash := strings.TrimLeftFunc(before, isWhitespace)
 	if (pos.Line != 0 || !strings.HasPrefix(slash, "/")) && !autocomplete.HasTriggerPrefix(before, e.autocompleteTriggers) {
 		return nil
 	}
@@ -330,7 +330,7 @@ func (e *Editor) TriggerAutocomplete(ctx context.Context) error {
 func (e *Editor) CompleteOnTab(ctx context.Context) error {
 	pos := e.completionPosition()
 	lines := e.Lines()
-	before := strings.TrimLeftFunc(lines[pos.Line][:pos.Col], func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	before := strings.TrimLeftFunc(lines[pos.Line][:pos.Col], isWhitespace)
 	force := pos.Line != 0 || !strings.HasPrefix(before, "/") || strings.Contains(before, " ")
 	if force {
 		if admission, ok := e.autocompleteProvider.(interface{ ShouldTriggerFileCompletion([]string, int, int) bool }); ok && !admission.ShouldTriggerFileCompletion(lines, pos.Line, pos.Col) {
@@ -464,6 +464,15 @@ func (e *Editor) Insert(s string) {
 	e.desiredColValid = false
 }
 
+// InsertTextAtCursor inserts normalized text as one undoable edit, without paste markers.
+func (e *Editor) InsertTextAtCursor(s string) {
+	if s == "" {
+		return
+	}
+	e.CancelAutocomplete()
+	e.insertAtomic(normalizeText(s), "")
+}
+
 func (e *Editor) Paste(s string) {
 	e.CancelAutocomplete()
 	e.resetHistoryBrowse()
@@ -488,7 +497,7 @@ func (e *Editor) Paste(s string) {
 }
 func (e *Editor) Newline() { e.CancelAutocomplete(); e.insertAtomic("\n", "") }
 func (e *Editor) Submit() {
-	text := strings.TrimSpace(e.ExpandedText())
+	text := strings.TrimFunc(e.ExpandedText(), isWhitespace)
 	e.Reset()
 	if e.submit != nil {
 		e.submit(text)
@@ -1163,8 +1172,10 @@ func (e *Editor) insertAtomic(s, last string) {
 	e.desiredColValid = false
 }
 
+func isWhitespace(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' }
+
 func (e *Editor) shouldPushInsertUndo(s string) bool {
-	return e.last != "insert" || strings.ContainsFunc(s, func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	return e.last != "insert" || strings.ContainsFunc(s, isWhitespace)
 }
 
 func (e *Editor) verticalDesiredCol(current int) int {
@@ -1352,6 +1363,10 @@ func VisualLines(value string, width int) []string {
 	return out
 }
 
+func normalizeText(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"), "\t", "    ")
+}
+
 var pasteCtrlSequence = regexp.MustCompile(`\x1b\[[0-9]+;5u`)
 
 func normalizePasteText(s string) string {
@@ -1370,9 +1385,7 @@ func normalizePasteText(s string) string {
 			return sequence
 		}
 	})
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.ReplaceAll(s, "\r", "\n")
-	s = strings.ReplaceAll(s, "\t", "    ")
+	s = normalizeText(s)
 	out := make([]rune, 0, len(s))
 	for _, r := range s {
 		if r == '\n' || !unicode.IsControl(r) {

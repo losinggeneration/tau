@@ -2480,7 +2480,7 @@ func (a *App) editorTextForSubmit() string {
 	if a == nil || a.editor == nil || a.editor.Model() == nil {
 		return ""
 	}
-	return strings.TrimSpace(a.editor.Model().ExpandedText())
+	return strings.TrimFunc(a.editor.Model().ExpandedText(), func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
 }
 
 func (a *App) expandInlineFileReferences(text string) (string, []ai.ContentBlock, error) {

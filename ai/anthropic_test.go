@@ -4747,10 +4747,12 @@ func TestAnthropicBlankTextReplayReachesTransport(t *testing.T) {
 			}}
 			transformed, err := TransformContext(prompt, model, normalizeAnthropicToolCallIDNormalizer)
 			require.NoError(t, err)
-			if tc.name != "assistant unsigned blank thinking" {
-				require.Len(t, transformed.Messages, 4)
-				require.Equal(t, tc.content, transformed.Messages[1].Content)
+			require.Len(t, transformed.Messages, 4)
+			wantContent := tc.content
+			if tc.content == nil || tc.name == "assistant unsigned blank thinking" {
+				wantContent = []ContentBlock{}
 			}
+			require.Equal(t, wantContent, transformed.Messages[1].Content)
 			before, err := json.Marshal(prompt)
 			require.NoError(t, err)
 			want := `[{"role":"user","content":[{"type":"text","text":"question"}]},`

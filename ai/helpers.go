@@ -195,6 +195,12 @@ func CompleteSimple(ctx context.Context, modelOrProvider any, prompt *Context, s
 	return CompleteSimpleProvider(ctx, provider, prompt, simple)
 }
 
+// TimedEventHandler times newly started responses and forwards events through
+// the first terminal event. Existing durations and historical responses are kept.
+func TimedEventHandler(handler EventHandler) EventHandler {
+	return timedEventHandler(handler)
+}
+
 func timedEventHandler(handler EventHandler) EventHandler {
 	started := time.Now()
 	var mu sync.Mutex

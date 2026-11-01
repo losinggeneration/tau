@@ -627,6 +627,7 @@ func detectModelCompat(m *Model) OpenAICompletionsCompat {
 type StopReason string
 
 const (
+	StopReasonPending StopReason = "pending"
 	StopReasonStop    StopReason = "stop"
 	StopReasonLength  StopReason = "length"
 	StopReasonToolUse StopReason = "toolUse"
@@ -781,15 +782,7 @@ func (m *Message) ToAssistantMessage() (AssistantMessage, bool) {
 
 // IsErrorMessage returns true if this is an errored or aborted assistant message.
 func (m *Message) IsErrorMessage() bool {
-	if m.Role != "assistant" {
-		return false
-	}
-	// Check stop reason for error/abort
-	if m.StopReason == string(StopReasonError) || m.StopReason == string(StopReasonAborted) {
-		return true
-	}
-	// Also check for empty content blocks (no text, no tool calls, no thinking)
-	return len(m.ContentBlocks()) == 0
+	return m.Role == "assistant" && (m.StopReason == string(StopReasonError) || m.StopReason == string(StopReasonAborted))
 }
 
 // ModelInfo holds model identification from an augmented message.

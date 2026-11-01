@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/losinggeneration/tau/ai"
 )
@@ -49,6 +50,7 @@ func StreamProxy(
 	authToken string,
 	opts ...ai.Option,
 ) (err error) {
+	handler = ai.TimedEventHandler(handler)
 	// Like upstream, request failures surface as terminal assistant error
 	// events as well as the returned error.
 	failRequest := func(err error) error {
@@ -98,9 +100,7 @@ func StreamProxy(
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
-	}
+	req.Header.Set("Authorization", "Bearer "+authToken)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -112,13 +112,20 @@ func StreamProxy(
 		}
 	}()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
 			return failRequest(fmt.Errorf("proxy: status %d: %w", resp.StatusCode, readErr))
 		}
 
-		return failRequest(fmt.Errorf("proxy: status %d: %s", resp.StatusCode, string(body)))
+		message := fmt.Sprintf("Proxy error: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		var errorData struct {
+			Error string `json:"error"`
+		}
+		if decodeErr := json.Unmarshal(body, &errorData); decodeErr == nil && errorData.Error != "" {
+			message = "Proxy error: " + errorData.Error
+		}
+		return failRequest(errors.New(message))
 	}
 
 	// Stream response
@@ -257,7 +264,7 @@ func streamProxyResponse(ctx context.Context, model *ai.Model, body io.Reader, h
 	// Initialize partial message matching pi-mono's structure (proxy.ts:90-106)
 	partial := &ai.AssistantMessage{
 		Role:       "assistant",
-		StopReason: ai.StopReasonStop,
+		StopReason: ai.StopReasonPending,
 		Content:    []ai.ContentBlock{},
 		API:        model.API,
 		Provider:   model.Provider,
@@ -307,8 +314,7 @@ func streamProxyResponse(ctx context.Context, model *ai.Model, body io.Reader, h
 			return fail(fmt.Errorf("proxy: read: %w", readErr))
 		}
 
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+		if !strings.HasPrefix(line, "data: ") {
 			if readErr != nil {
 				break
 			}
@@ -316,7 +322,9 @@ func streamProxyResponse(ctx context.Context, model *ai.Model, body io.Reader, h
 			continue
 		}
 
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		data := strings.TrimFunc(strings.TrimPrefix(line, "data: "), func(r rune) bool {
+			return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff'
+		})
 		if data == "" {
 			if readErr != nil {
 				break

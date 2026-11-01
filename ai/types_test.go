@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestModelSupportsInput(t *testing.T) {
@@ -798,5 +800,16 @@ func TestCompletionsCacheCompatibilityResolution(t *testing.T) {
 	model.Compat = &CompatibilitySettings{CacheControlFormat: "none"}
 	if got := model.GetCompat().CacheControlFormat; got != "none" {
 		t.Fatalf("overridden format=%q", got)
+	}
+}
+
+func TestMessageErrorClassificationUsesStopReason(t *testing.T) {
+	for _, role := range []string{"assistant", "user", "toolResult"} {
+		for _, reason := range []string{"", "stop", "length", "toolUse", "error", "aborted"} {
+			for _, content := range []any{nil, []ContentBlock{}, []ContentBlock{{Type: ContentBlockThinking}}, "text"} {
+				msg := Message{Role: role, StopReason: reason, Content: content}
+				require.Equal(t, role == "assistant" && (reason == "error" || reason == "aborted"), msg.IsErrorMessage(), "role=%s reason=%s content=%#v", role, reason, content)
+			}
+		}
 	}
 }

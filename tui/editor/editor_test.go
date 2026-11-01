@@ -1848,3 +1848,97 @@ func TestEditorCompletionRetriesSharedCJKCharacters(t *testing.T) {
 		assert.False(t, e.IsAutocompleteTrigger(r), "U+%04X", r)
 	}
 }
+
+func TestEditorHistoryTrimsJavaScriptWhitespace(t *testing.T) {
+	e := New()
+	e.AddHistory("\ufeff first \ufeff")
+	e.AddHistory("first")
+	e.AddHistory("\ufeff \u00a0")
+	e.AddHistory("\u0085")
+	assert.Equal(t, []string{"first", "\u0085"}, e.HistoryEntries())
+	e.HistoryPrev()
+	assert.Equal(t, "\u0085", e.Text())
+	e.HistoryPrev()
+	assert.Equal(t, "first", e.Text())
+}
+
+func TestEditorSubmitTrimsJavaScriptWhitespace(t *testing.T) {
+	for _, tc := range []struct{ draft, want string }{{"\ufeff message \ufeff", "message"}, {"\ufeff\u00a0", ""}, {"\u0085", "\u0085"}} {
+		t.Run(tc.draft, func(t *testing.T) {
+			e := New()
+			e.SetText(tc.draft)
+			calls := 0
+			e.SetOnSubmit(func(value string) { calls++; assert.Equal(t, tc.want, value); assert.Empty(t, e.Text()) })
+			e.Submit()
+			assert.Equal(t, 1, calls)
+			assert.Empty(t, e.Text())
+		})
+	}
+}
+
+func TestEditorProgrammaticInsertionNormalizesAndStaysAtomic(t *testing.T) {
+	for _, tc := range []struct{ insert, want string }{
+		{"/tmp/image.png", "/tmp/image.png"}, {"line1\nline2\nline3", "line1\nline2\nline3"}, {"界\r\n🙂\r\tend", "界\n🙂\n    end"},
+	} {
+		t.Run(tc.insert, func(t *testing.T) {
+			e := New()
+			e.SetText("hello world")
+			e.SetCursor(len("hello"))
+			e.Insert("X")
+			before := e.Text()
+			cursor := e.Cursor()
+			e.SetAutocomplete(&autocomplete.Suggestions{Prefix: "X", Items: []autocomplete.Item{{Value: "choice"}}})
+			e.InsertTextAtCursor(tc.insert)
+			assert.Equal(t, "helloX"+tc.want+" world", e.Text())
+			assert.Equal(t, cursor+len(tc.want), e.Cursor())
+			assert.False(t, e.AutocompleteVisible())
+			e.Insert("Y")
+			e.Undo()
+			assert.Equal(t, "helloX"+tc.want+" world", e.Text())
+			e.Undo()
+			assert.Equal(t, before, e.Text())
+			assert.Equal(t, cursor, e.Cursor())
+			e.Undo()
+			assert.Equal(t, "hello world", e.Text())
+		})
+	}
+}
+
+func TestEditorProgrammaticInsertionRetainsPasteStorageAndExitsHistory(t *testing.T) {
+	e := New()
+	e.SetLargePasteThreshold(3)
+	e.Paste("stored body")
+	marker := e.Text()
+	pastes := e.LargePastes()
+	e.AddHistory("history")
+	e.HistoryPrev()
+	require.True(t, e.historyBrowsing)
+	e.InsertTextAtCursor("[image]")
+	assert.False(t, e.historyBrowsing)
+	assert.Equal(t, pastes, e.LargePastes())
+	e.Undo()
+	assert.Equal(t, "history", e.Text())
+	assert.Equal(t, pastes, e.LargePastes())
+	e.HistoryNext()
+	assert.Equal(t, "history", e.Text())
+	e.setText(marker)
+	e.SetCursor(len(marker))
+	e.InsertTextAtCursor("/image")
+	assert.Equal(t, "stored body/image", e.ExpandedText())
+	assert.Equal(t, 1, e.nextPaste)
+	e.Undo()
+	assert.Equal(t, "stored body", e.ExpandedText())
+	e.Paste("next body")
+	assert.Contains(t, e.Text(), "[paste #2")
+}
+
+func TestEditorEmptyProgrammaticInsertionLeavesStateAlone(t *testing.T) {
+	e := New()
+	e.Insert("a")
+	e.SetAutocomplete(&autocomplete.Suggestions{Prefix: "a", Items: []autocomplete.Item{{Value: "abc"}}})
+	e.InsertTextAtCursor("")
+	assert.True(t, e.AutocompleteVisible())
+	e.Insert("b")
+	e.Undo()
+	assert.Empty(t, e.Text())
+}

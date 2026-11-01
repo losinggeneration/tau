@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -1175,4 +1177,299 @@ func TestExtractSimpleStreamOptionsOwnsProviderEnvironment(t *testing.T) {
 	actual["OPENAI_API_KEY"] = "changed-forwarded"
 	again := extractSimpleStreamOptions([]ai.Option{option})
 	require.Equal(t, "scoped-key", again["env"].(map[string]string)["OPENAI_API_KEY"])
+}
+
+func TestProxyAcceptsSuccessfulHTTPStatuses(t *testing.T) {
+	for _, status := range []int{200, 201, 202, 206, 299, 300, 400} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			model := testProxyModel()
+			calls, closes := 0, 0
+			withMockHTTPClient(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: status, Header: make(http.Header), Body: &proxyStatusBody{Reader: strings.NewReader("data: {\"type\":\"text_start\",\"contentIndex\":0}\ndata: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"accepted\"}\ndata: {\"type\":\"done\",\"reason\":\"stop\"}\n"), closes: &closes}}, nil
+			}))
+			for _, entry := range []string{"stream", "stream options", "complete", "complete options"} {
+				t.Run(entry, func(t *testing.T) {
+					var events []ai.StreamEvent
+					var msg *ai.AssistantMessage
+					var err error
+					handler := func(_ context.Context, e ai.StreamEvent) { events = append(events, e) }
+					options := ProxyStreamOptions{ProxyURL: "https://proxy.test", AuthToken: "token"}
+					switch entry {
+					case "stream":
+						err = StreamProxy(t.Context(), model, &ai.Context{}, handler, options.ProxyURL, options.AuthToken)
+					case "stream options":
+						err = StreamProxyWithOptions(t.Context(), model, &ai.Context{}, handler, options)
+					case "complete":
+						msg, err = CompleteProxy(t.Context(), model, &ai.Context{}, options.ProxyURL, options.AuthToken)
+					case "complete options":
+						msg, err = CompleteProxyWithOptions(t.Context(), model, &ai.Context{}, options)
+					}
+					if status >= 300 {
+						require.ErrorContains(t, err, fmt.Sprintf("Proxy error: %d", status))
+						require.Nil(t, msg)
+						if strings.HasPrefix(entry, "stream") {
+							require.Len(t, events, 1)
+							require.IsType(t, ai.StreamError{}, events[0])
+						}
+						return
+					}
+					require.NoError(t, err)
+					if strings.HasPrefix(entry, "stream") {
+						require.Len(t, events, 3)
+						done, ok := events[2].(ai.Done)
+						require.True(t, ok)
+						msg = &done.Message
+					}
+					require.NotNil(t, msg)
+					require.Equal(t, ai.StopReasonStop, msg.StopReason)
+					require.Len(t, msg.Content, 1)
+					require.Equal(t, "accepted", msg.Content[0].Text)
+				})
+			}
+			require.Equal(t, 4, calls)
+			require.Equal(t, 4, closes)
+		})
+	}
+}
+
+type proxyStatusBody struct {
+	*strings.Reader
+	closes *int
+}
+
+func (b *proxyStatusBody) Close() error { *b.closes++; return nil }
+
+func TestProxyDataFieldsRequireExactPrefix(t *testing.T) {
+	for _, prefix := range []string{"data:", " data: ", "\tdata: ", "\ufeffdata: "} {
+		t.Run(prefix, func(t *testing.T) {
+			body := iotest.OneByteReader(strings.NewReader(prefix + `{"type":"done","reason":"length"}` + "\r\n" + strings.Join([]string{
+				`: keepalive`, `event: ignored`, `data: {"type":"text_start","contentIndex":0}`, `data: {"type":"text_delta","contentIndex":0,"delta":"名前 👩‍💻"}`, `data: {"type":"done","reason":"stop","providerThinkingLevel":"high"}`,
+			}, "\n")))
+			var events []ai.StreamEvent
+			require.NoError(t, streamProxyResponse(t.Context(), testProxyModel(), body, func(_ context.Context, event ai.StreamEvent) { events = append(events, event) }))
+			require.Len(t, events, 3)
+			require.IsType(t, ai.TextStart{}, events[0])
+			require.IsType(t, ai.TextDelta{}, events[1])
+			done, ok := events[2].(ai.Done)
+			require.True(t, ok)
+			require.Equal(t, ai.StopReasonStop, done.Reason)
+			require.Equal(t, "high", done.Message.ProviderThinkingLevel)
+			require.Len(t, done.Message.Content, 1)
+			require.Equal(t, "名前 👩‍💻", done.Message.Content[0].Text)
+		})
+	}
+}
+
+func TestProxyAuthorizationIsIndependentOfProviderHeaders(t *testing.T) {
+	for _, token := range []string{"", "proxy-token"} {
+		t.Run(token, func(t *testing.T) {
+			calls := 0
+			withMockHTTPClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				require.Equal(t, []string{"Bearer " + token}, req.Header.Values("Authorization"))
+				require.Equal(t, "application/json", req.Header.Get("Content-Type"))
+				require.Empty(t, req.Header.Get("X-Provider"))
+				var request struct {
+					Options struct {
+						Headers map[string]string `json:"headers"`
+					} `json:"options"`
+				}
+				require.NoError(t, json.NewDecoder(req.Body).Decode(&request))
+				require.Equal(t, map[string]string{"Authorization": "provider-secret", "X-Provider": "private"}, request.Options.Headers)
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`data: {"type":"done","reason":"stop"}`)), Header: make(http.Header)}, nil
+			}))
+			headers := map[string]string{"Authorization": "provider-secret", "X-Provider": "private"}
+			_, err := CompleteProxy(t.Context(), testProxyModel(), &ai.Context{}, "https://proxy.test", token, ai.WithHeaders(headers))
+			require.NoError(t, err)
+			_, err = CompleteProxyWithOptions(t.Context(), testProxyModel(), &ai.Context{}, ProxyStreamOptions{ProxyURL: "https://proxy.test", AuthToken: token, Headers: headers})
+			require.NoError(t, err)
+			require.Equal(t, 2, calls)
+			require.Equal(t, "provider-secret", headers["Authorization"])
+		})
+	}
+}
+
+func TestProxyPartialMessagesRemainPendingUntilTerminal(t *testing.T) {
+	for _, reason := range []string{"stop", "length", "toolUse", "error", "aborted"} {
+		t.Run(reason, func(t *testing.T) {
+			kind := "done"
+			if reason == "error" || reason == "aborted" {
+				kind = "error"
+			}
+			body := strings.NewReader(strings.Join([]string{`data: {"type":"start"}`, `data: {"type":"text_start","contentIndex":0}`, `data: {"type":"text_delta","contentIndex":0,"delta":"answer"}`, `data: {"type":"text_end","contentIndex":0}`, fmt.Sprintf(`data: {"type":%q,"reason":%q}`, kind, reason)}, "\n"))
+			count := 0
+			require.NoError(t, streamProxyResponse(t.Context(), testProxyModel(), body, func(_ context.Context, event ai.StreamEvent) {
+				count++
+				switch e := event.(type) {
+				case ai.Start:
+					require.Equal(t, ai.StopReason("pending"), e.Partial.StopReason)
+				case ai.TextStart:
+					require.Equal(t, ai.StopReason("pending"), e.Partial.StopReason)
+				case ai.TextDelta:
+					require.Equal(t, ai.StopReason("pending"), e.Partial.StopReason)
+				case ai.TextEnd:
+					require.Equal(t, ai.StopReason("pending"), e.Partial.StopReason)
+				case ai.Done:
+					require.Equal(t, ai.StopReason(reason), e.Message.StopReason)
+				case ai.StreamError:
+					require.Equal(t, ai.StopReason(reason), e.Msg.StopReason)
+				default:
+					t.Fatalf("unexpected event %T", e)
+				}
+			}))
+			require.Equal(t, 5, count)
+		})
+	}
+}
+
+func TestProxyTimesTerminalMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		historical bool
+		duration   *float64
+	}{
+		{name: "done", body: `data: {"type":"done","reason":"stop"}`},
+		{name: "error", body: `data: {"type":"error","reason":"error"}`},
+		{name: "dropped", body: `data: {"type":"start"}`},
+		{name: "historical", body: "data: {\"type\":\"start\",\"message\":{\"timestamp\":1}}\ndata: {\"type\":\"done\",\"reason\":\"stop\"}", historical: true},
+		{name: "explicit", body: "data: {\"type\":\"start\",\"message\":{\"timestamp\":1,\"durationMs\":12.5}}\ndata: {\"type\":\"done\",\"reason\":\"stop\"}", duration: new(12.5)},
+	} {
+		for _, mode := range []string{"stream", "stream options", "complete", "complete options"} {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				withMockHTTPClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+				}))
+				var message *ai.AssistantMessage
+				terminals := 0
+				handler := func(_ context.Context, event ai.StreamEvent) {
+					switch e := event.(type) {
+					case ai.Done:
+						message = &e.Message
+						terminals++
+					case ai.StreamError:
+						message = &e.Msg
+						terminals++
+					}
+				}
+				options := ProxyStreamOptions{ProxyURL: "https://proxy.test"}
+				var err error
+				switch mode {
+				case "stream":
+					err = StreamProxy(t.Context(), testProxyModel(), &ai.Context{}, handler, options.ProxyURL, "")
+				case "stream options":
+					err = StreamProxyWithOptions(t.Context(), testProxyModel(), &ai.Context{}, handler, options)
+				case "complete":
+					message, err = CompleteProxy(t.Context(), testProxyModel(), &ai.Context{}, options.ProxyURL, "")
+				case "complete options":
+					message, err = CompleteProxyWithOptions(t.Context(), testProxyModel(), &ai.Context{}, options)
+				}
+				require.NoError(t, err)
+				require.NotNil(t, message)
+				if strings.HasPrefix(mode, "stream") {
+					require.Equal(t, 1, terminals)
+				}
+				if tc.historical {
+					require.Nil(t, message.DurationMs)
+				} else {
+					require.NotNil(t, message.DurationMs)
+					if tc.duration != nil {
+						require.Equal(t, *tc.duration, *message.DurationMs)
+					} else {
+						require.GreaterOrEqual(t, *message.DurationMs, 0.0)
+						require.Equal(t, math.Trunc(*message.DurationMs), *message.DurationMs)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestProxyTimesRequestFailures(t *testing.T) {
+	failure := errors.New("transport unavailable")
+	withMockHTTPClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, failure }))
+	for _, options := range []bool{false, true} {
+		t.Run(fmt.Sprint(options), func(t *testing.T) {
+			terminals := 0
+			handler := func(_ context.Context, event ai.StreamEvent) {
+				e, ok := event.(ai.StreamError)
+				require.True(t, ok)
+				terminals++
+				require.ErrorIs(t, e.Err, failure)
+				require.NotNil(t, e.Msg.DurationMs)
+				require.GreaterOrEqual(t, *e.Msg.DurationMs, 0.0)
+			}
+			var err error
+			if options {
+				err = StreamProxyWithOptions(t.Context(), testProxyModel(), &ai.Context{}, handler, ProxyStreamOptions{ProxyURL: "https://proxy.test"})
+			} else {
+				err = StreamProxy(t.Context(), testProxyModel(), &ai.Context{}, handler, "https://proxy.test", "")
+			}
+			require.ErrorIs(t, err, failure)
+			require.Equal(t, 1, terminals)
+		})
+	}
+}
+
+func TestProxyHTTPErrorDiagnostics(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"message", `{"error":"rate limited"}`, "Proxy error: rate limited"},
+		{"unicode", `{"error":"denied 界\nretry later"}`, "Proxy error: denied 界\nretry later"},
+		{"empty", `{"error":""}`, "Proxy error: 429 Too Many Requests"},
+		{"null", `{"error":null}`, "Proxy error: 429 Too Many Requests"},
+		{"absent", `{}`, "Proxy error: 429 Too Many Requests"},
+		{"invalid", "private upstream details", "Proxy error: 429 Too Many Requests"},
+		{"trailing", `{"error":"do not accept"} junk`, "Proxy error: 429 Too Many Requests"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closes := 0
+			withMockHTTPClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 429, Status: "429 Too Many Requests", Body: &proxyStatusBody{Reader: strings.NewReader(tc.body), closes: &closes}}, nil
+			}))
+			var terminal ai.StreamError
+			count := 0
+			err := StreamProxy(t.Context(), testProxyModel(), &ai.Context{}, func(_ context.Context, event ai.StreamEvent) {
+				var ok bool
+				terminal, ok = event.(ai.StreamError)
+				require.True(t, ok)
+				count++
+			}, "https://proxy.test", "")
+			require.EqualError(t, err, tc.want)
+			require.Equal(t, tc.want, terminal.Msg.ErrorMessage)
+			require.Equal(t, err, terminal.Err)
+			require.Equal(t, ai.StopReasonError, terminal.Msg.StopReason)
+			require.Equal(t, 1, count)
+			msg, err := CompleteProxyWithOptions(t.Context(), testProxyModel(), &ai.Context{}, ProxyStreamOptions{ProxyURL: "https://proxy.test"})
+			require.Nil(t, msg)
+			require.EqualError(t, err, tc.want)
+			require.Equal(t, 2, closes)
+		})
+	}
+}
+
+func TestProxyEventDataUsesJavaScriptWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name, data string
+		valid      bool
+	}{
+		{"BOM wrapped", "\ufeff{\"type\":\"done\",\"reason\":\"stop\"}\ufeff", true},
+		{"BOM empty", "\ufeff\u00a0", true},
+		{"NEL prefix", "\u0085{\"type\":\"done\",\"reason\":\"stop\"}", false},
+		{"NEL suffix", "{\"type\":\"done\",\"reason\":\"stop\"}\u0085", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []ai.StreamEvent
+			err := streamProxyResponse(t.Context(), testProxyModel(), strings.NewReader("data: "+tc.data+"\ndata: {\"type\":\"done\",\"reason\":\"stop\"}"), func(_ context.Context, event ai.StreamEvent) { events = append(events, event) })
+			require.Len(t, events, 1)
+			if tc.valid {
+				require.NoError(t, err)
+				require.IsType(t, ai.Done{}, events[0])
+			} else {
+				require.Error(t, err)
+				require.IsType(t, ai.StreamError{}, events[0])
+				var syntax *json.SyntaxError
+				require.ErrorAs(t, err, &syntax)
+			}
+		})
+	}
 }

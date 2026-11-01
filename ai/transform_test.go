@@ -942,6 +942,9 @@ func TestTransformMessagesDowngradesUnsupportedImages(t *testing.T) {
 							message.Content = wantBlocks
 						}
 					}
+					if content == nil {
+						message.Content = []ContentBlock{}
+					}
 					want = append(want, message)
 				}
 				prompt := &Context{Messages: messages, SystemPrompt: "shorthand", Tools: []Tool{{Name: "read"}}}
@@ -981,6 +984,12 @@ func TestTransformMessagesDropsUnsignedBlankThinking(t *testing.T) {
 		{name: "empty", block: ContentBlock{Type: ContentBlockThinking}},
 		{name: "spaces", block: ContentBlock{Type: ContentBlockThinking, Thinking: " \t\r\n"}},
 		{name: "unicode spaces", block: ContentBlock{Type: ContentBlockThinking, Thinking: "\u00a0\u2003\u2028"}},
+		{name: "BOM whitespace", block: ContentBlock{Type: ContentBlockThinking, Thinking: " \ufeff\u00a0"}},
+		{name: "NEL is reasoning", block: ContentBlock{Type: ContentBlockThinking, Thinking: "\u0085"}, text: "\u0085"},
+		{name: "legacy BOM whitespace", block: ContentBlock{Type: ContentBlockThinking, Text: "\ufeff"}},
+		{name: "legacy NEL is reasoning", block: ContentBlock{Type: ContentBlockThinking, Text: "\u0085"}, text: "\u0085"},
+		{name: "signed BOM", block: ContentBlock{Type: ContentBlockThinking, Thinking: "\ufeff", ThoughtSignature: "opaque"}},
+		{name: "signed NEL", block: ContentBlock{Type: ContentBlockThinking, Thinking: "\u0085", ThoughtSignature: "opaque"}, text: "\u0085"},
 		{name: "legacy blank", block: ContentBlock{Type: ContentBlockThinking, Text: " \t\n"}},
 		{name: "thinking takes precedence", block: ContentBlock{Type: ContentBlockThinking, Thinking: " \t", Text: "not reasoning"}},
 		{name: "nonblank", block: ContentBlock{Type: ContentBlockThinking, Thinking: " \t reason \n"}, text: " \t reason \n"},
@@ -1081,4 +1090,77 @@ func TestTransformNormalizerReceivesNativeEffort(t *testing.T) {
 	assert.Equal(t, "high", normalized.Messages[0].ProviderThinkingLevel)
 	assert.Equal(t, "call_normalized", normalized.Messages[1].ToolCallID)
 	assert.Equal(t, "high", source.ProviderThinkingLevel)
+}
+
+func TestTransformMessagesRetainsSuccessfulEmptyAssistantTurns(t *testing.T) {
+	model := &Model{Provider: ProviderAnthropic, API: APIAnthropicMessages, ID: "target"}
+	for _, source := range []string{"target", "other"} {
+		for _, reason := range []string{"stop", "length", "error", "aborted"} {
+			for _, entry := range []string{"context", "messages"} {
+				t.Run(source+"/"+reason+"/"+entry, func(t *testing.T) {
+					messages := []Message{
+						{Role: "user", Content: "question"},
+						{Role: "assistant", Provider: model.Provider, API: model.API, Model: source, StopReason: reason, ID: "empty", Content: []ContentBlock{}},
+						{Role: "assistant", Provider: model.Provider, API: model.API, Model: source, StopReason: reason, ID: "blank", Content: []ContentBlock{{Type: ContentBlockThinking, Thinking: " \ufeff"}}},
+						{Role: "assistant", Provider: model.Provider, API: model.API, Model: source, StopReason: reason, ID: "redacted", Content: []ContentBlock{{Type: ContentBlockThinking, Redacted: true, Thinking: "hidden", ThoughtSignature: "opaque"}}},
+						{Role: "user", Content: "next"},
+					}
+					before, err := json.Marshal(messages)
+					require.NoError(t, err)
+					var got []Message
+					if entry == "context" {
+						result, err := TransformContext(&Context{Messages: messages}, model, nil)
+						require.NoError(t, err)
+						got = result.Messages
+					} else {
+						got = TransformMessages(messages, model, nil, nil)
+					}
+					if reason == "error" || reason == "aborted" {
+						require.Equal(t, []Message{messages[0], messages[4]}, got)
+					} else {
+						want := append([]Message(nil), messages...)
+						want[2].Content = []ContentBlock{}
+						if source != "target" {
+							want[3].Content = []ContentBlock{}
+						}
+						require.Equal(t, want, got)
+					}
+					after, err := json.Marshal(messages)
+					require.NoError(t, err)
+					require.Equal(t, before, after)
+				})
+			}
+		}
+	}
+}
+
+func TestTransformMessagesNormalizesNullContent(t *testing.T) {
+	model := &Model{ID: "target", Input: []InputType{InputText, InputImage}}
+	for _, role := range []string{"system", "user", "assistant", "toolResult", "tool"} {
+		for _, content := range []any{nil, []ContentBlock(nil)} {
+			for _, entry := range []string{"context", "messages"} {
+				t.Run(role+"/"+fmt.Sprintf("%T", content)+"/"+entry, func(t *testing.T) {
+					message := Message{Role: role, Content: content, ID: "retain", Timestamp: 42, StopReason: "stop"}
+					messages := []Message{message}
+					before, err := json.Marshal(messages)
+					require.NoError(t, err)
+					var got []Message
+					if entry == "context" {
+						result, err := TransformContext(&Context{Messages: messages}, model, nil)
+						require.NoError(t, err)
+						got = result.Messages
+					} else {
+						got = TransformMessages(messages, model, nil, nil)
+					}
+					want := message
+					want.Content = []ContentBlock{}
+					require.Equal(t, []Message{want}, got)
+					after, err := json.Marshal(messages)
+					require.NoError(t, err)
+					require.Equal(t, before, after)
+					require.Equal(t, got, TransformMessages(got, model, nil, nil))
+				})
+			}
+		}
+	}
 }

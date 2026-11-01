@@ -562,3 +562,25 @@ func TestWidgetReadOnlyNavigationDoesNotReplaceTextWithHistory(t *testing.T) {
 	assert.Equal(t, "first\nsecond", m.Text())
 	assert.Less(t, m.Cursor(), len(m.Text()))
 }
+
+func TestWidgetProgrammaticInsertionNotifiesOnce(t *testing.T) {
+	m := New()
+	m.SetText("界 suffix")
+	m.SetCursor(len("界"))
+	w := NewWidgetOpts(WidgetOpts{Model: m})
+	ctx, _ := widgetMouseCtx(w)
+	var changes []string
+	var moves []CursorMoveEvent
+	w.SetOnChange(func(s string, _ *rovel.Ctx) { changes = append(changes, s) })
+	w.SetOnCursorMove(func(move CursorMoveEvent, _ *rovel.Ctx) { moves = append(moves, move) })
+	w.InsertTextAtCursor(ctx, "\r\n🙂\t")
+	assert.Equal(t, "界\n🙂     suffix", m.Text())
+	assert.Equal(t, []string{m.Text()}, changes)
+	assert.Equal(t, []CursorMoveEvent{{Cursor: len("界\n🙂    "), Reason: CursorMoveEdit}}, moves)
+	w.InsertTextAtCursor(ctx, "")
+	assert.Len(t, changes, 1)
+	assert.Len(t, moves, 1)
+	m.Undo()
+	assert.Equal(t, "界 suffix", m.Text())
+	assert.Equal(t, len("界"), m.Cursor())
+}

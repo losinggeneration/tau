@@ -110,6 +110,18 @@ func (w *Widget) SetText(ctx *rovel.Ctx, s string) {
 	w.notifyCursorMoveIfChanged(old, CursorMoveSetText, ctx)
 }
 
+// InsertTextAtCursor applies a programmatic insertion and notifies the host once.
+func (w *Widget) InsertTextAtCursor(ctx *rovel.Ctx, s string) {
+	if s == "" {
+		return
+	}
+	old := w.Model().Cursor()
+	w.Model().InsertTextAtCursor(s)
+	w.invalidate(ctx)
+	w.notifyChange(ctx)
+	w.notifyCursorMoveIfChanged(old, CursorMoveEdit, ctx)
+}
+
 // ApplyAutocomplete applies the model's selected completion and notifies the host.
 func (w *Widget) ApplyAutocomplete(ctx *rovel.Ctx) {
 	if !w.Model().AutocompleteVisible() {

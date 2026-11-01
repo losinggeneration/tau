@@ -1926,3 +1926,33 @@ func TestNativeArgumentRefreshClearsOldListAfterCallbackEdit(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeSubmissionTrimsJavaScriptWhitespace(t *testing.T) {
+	for _, draft := range []string{"\ufeff /capture value \ufeff", "\ufeff\u00a0"} {
+		t.Run(draft, func(t *testing.T) {
+			a := newTestApp(t)
+			a.editor = newPromptEditorForTest()
+			a.footer = newFooterForTest()
+			ctx := testCtx()
+			ctx.FocusedID = a.editor.ID()
+			var handled []string
+			a.cmds.Register(Command{Name: "capture", Handler: func(_ *App, args string) { handled = append(handled, args) }})
+			a.editor.SetText(ctx, draft)
+			require.True(t, a.trySubmit(ctx))
+			assert.Empty(t, a.editor.Text())
+			if strings.Contains(draft, "capture") {
+				assert.Equal(t, []string{"value"}, handled)
+				assert.Equal(t, []string{"/capture value"}, a.editor.Model().HistoryEntries())
+			} else {
+				assert.Empty(t, handled)
+				assert.Empty(t, a.editor.Model().HistoryEntries())
+			}
+			a.editor.Model().Undo()
+			assert.Empty(t, a.editor.Text())
+		})
+	}
+	a := newTestApp(t)
+	a.editor = newPromptEditorForTest()
+	a.editor.Model().SetText("\u0085")
+	assert.Equal(t, "\u0085", a.editorTextForSubmit())
+}

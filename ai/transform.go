@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ToolCallIDNormalizer is a function that normalizes a tool call ID for a
@@ -54,6 +55,9 @@ func transformMessages(messages []Message, model *Model, messageModels []ModelIn
 // transformMessage transforms a single message for the target model.
 // This is the first pass of the transform algorithm.
 func transformMessage(msg Message, model *Model, info *ModelInfo, toolCallIDMap map[string]string, normalizeToolCallID ToolCallIDNormalizer) Message {
+	if blocks, ok := msg.Content.([]ContentBlock); msg.Content == nil || (ok && blocks == nil) {
+		msg.Content = []ContentBlock{}
+	}
 	role := normalizeMessageRole(msg.Role)
 	if (role == "user" || role == "toolResult") && !model.SupportsInput(InputImage) {
 		if blocks, ok := msg.Content.([]ContentBlock); ok && len(blocks) > 0 {
@@ -157,7 +161,9 @@ func transformContentBlock(block ContentBlock, isSameModel bool, model *Model, a
 		if thinking == "" {
 			thinking = block.Text
 		}
-		if strings.TrimSpace(thinking) == "" {
+		if strings.TrimFunc(thinking, func(r rune) bool {
+			return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff'
+		}) == "" {
 			return nil
 		}
 
@@ -242,7 +248,6 @@ func insertSyntheticToolResults(messages []Message, toolCallIDMap map[string]str
 			// If we have pending orphaned tool calls from a previous assistant, insert synthetic results now
 			insertSynthetic()
 
-			// Skip errored/aborted assistant messages entirely.
 			// Skip errored/aborted assistant messages entirely.
 			// These are incomplete turns that shouldn't be replayed:
 			// - May have partial content (reasoning without message, incomplete tool calls)
