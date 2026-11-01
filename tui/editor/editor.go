@@ -2,12 +2,18 @@ package editor
 
 import (
 	"context"
+	"maps"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 
+	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/text"
+	"github.com/losinggeneration/tau/tui/ansi"
 	"github.com/losinggeneration/tau/tui/autocomplete"
 	"github.com/losinggeneration/tau/tui/killring"
 	"github.com/losinggeneration/tau/tui/undostack"
@@ -19,6 +25,17 @@ type State struct {
 }
 type Position struct{ Line, Col int }
 
+type editorSnapshot struct {
+	State
+	pastes       map[string]string
+	pasteCounter int
+}
+
+func cloneEditorSnapshot(s editorSnapshot) editorSnapshot {
+	s.pastes = maps.Clone(s.pastes)
+	return s
+}
+
 type SuggestionProvider interface {
 	GetSuggestions(ctx context.Context, lines []string, cursorLine, cursorCol int, force bool) (*autocomplete.Suggestions, error)
 }
@@ -29,14 +46,14 @@ type Editor struct {
 	submit               func(string)
 	cancelled            bool
 	kill                 killring.Ring
-	undo                 *undostack.Stack[State]
+	undo                 *undostack.Stack[editorSnapshot]
 	last                 string
 	yankStart, yankEnd   int
 	selectionStart       int
 	selectionEnd         int
 	history              []string
 	historyIndex         int
-	historyDraft         string
+	historyDraft         State
 	historyBrowsing      bool
 	desiredCol           int
 	desiredColValid      bool
@@ -49,13 +66,22 @@ type Editor struct {
 	largePasteThreshold  int
 	largePastes          map[string]string
 	nextPaste            int
+	jumpDirection        int
 }
 
 func New() *Editor {
-	return &Editor{undo: undostack.New(func(s State) State { return s }), yankStart: -1, yankEnd: -1, selectionStart: -1, selectionEnd: -1, historyIndex: -1, desiredCol: -1, autocompleteVisible: 5, largePasteThreshold: 1000, largePastes: map[string]string{}}
+	return &Editor{undo: undostack.New(cloneEditorSnapshot), yankStart: -1, yankEnd: -1, selectionStart: -1, selectionEnd: -1, historyIndex: -1, desiredCol: -1, autocompleteVisible: 5, largePasteThreshold: 1000, largePastes: map[string]string{}}
 }
 
 func (e *Editor) SetText(s string) {
+	e.CancelJump()
+	e.CancelAutocomplete()
+	s = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"), "\t", "    ")
+	if e.text != s {
+		e.pushUndo()
+	}
+	clear(e.largePastes)
+	e.nextPaste = 0
 	e.setText(s)
 	e.resetHistoryBrowse()
 }
@@ -68,7 +94,7 @@ func (e *Editor) SetCursor(pos int) {
 	if pos > len(e.text) {
 		pos = len(e.text)
 	}
-	e.cursor = text.ClampCluster(e.text, pos)
+	e.cursor = e.clampSegment(pos)
 	e.breakChains()
 }
 func (e *Editor) SetOnSubmit(fn func(string)) { e.submit = fn }
@@ -90,12 +116,15 @@ func (e *Editor) LargePastes() map[string]string {
 
 func (e *Editor) AddHistory(s string) {
 	s = strings.TrimSpace(s)
-	if s == "" {
+	if s == "" || (len(e.history) > 0 && e.history[len(e.history)-1] == s) {
 		return
 	}
 	e.history = append(e.history, s)
+	if len(e.history) > 100 {
+		e.history = append([]string(nil), e.history[len(e.history)-100:]...)
+	}
 	e.historyIndex = len(e.history)
-	e.historyDraft = ""
+	e.historyDraft = State{}
 	e.historyBrowsing = false
 }
 
@@ -118,12 +147,14 @@ func (e *Editor) HistoryPrev() {
 		e.historyIndex = len(e.history)
 	}
 	if !e.historyBrowsing {
-		e.historyDraft = e.text
+		e.pushUndo()
+		e.historyDraft = State{e.text, e.cursor}
 		e.historyBrowsing = true
 	}
 	if e.historyIndex > 0 {
 		e.historyIndex--
 		e.setText(e.history[e.historyIndex])
+		e.cursor = 0
 	}
 }
 
@@ -138,9 +169,10 @@ func (e *Editor) HistoryNext() {
 	}
 	e.historyIndex = len(e.history)
 	draft := e.historyDraft
-	e.historyDraft = ""
+	e.historyDraft = State{}
 	e.historyBrowsing = false
-	e.setText(draft)
+	e.setText(draft.Text)
+	e.cursor = draft.Cursor
 }
 
 func (e *Editor) SetAutocomplete(s *autocomplete.Suggestions) {
@@ -159,7 +191,7 @@ func (e *Editor) UpdateAutocomplete(ctx context.Context, force bool) error {
 	}
 	e.autocompleteSeq++
 	seq := e.autocompleteSeq
-	pos := e.Position()
+	pos := e.completionPosition()
 	suggestions, err := e.autocompleteProvider.GetSuggestions(ctx, e.Lines(), pos.Line, pos.Col, force)
 	if seq != e.autocompleteSeq {
 		return nil
@@ -223,15 +255,25 @@ func (e *Editor) AutocompletePrev() {
 	}
 }
 
+func (e *Editor) completionPosition() Position {
+	before := e.text[:e.cursor]
+	return Position{strings.Count(before, "\n"), len(before) - strings.LastIndex(before, "\n") - 1}
+}
+
 func (e *Editor) ApplyAutocomplete() {
 	if e.autocomplete == nil || len(e.autocomplete.Items) == 0 {
 		return
 	}
 	lines := e.Lines()
-	pos := e.Position()
+	pos := e.completionPosition()
 	res := autocomplete.ApplyCompletion(lines, pos.Line, pos.Col, e.autocomplete.Items[e.autocompleteIndex], e.autocomplete.Prefix)
-	e.SetText(joinLines(res.Lines))
-	e.SetPosition(Position{res.CursorLine, res.CursorCol})
+	e.pushUndo()
+	e.setText(joinLines(res.Lines))
+	cursor := res.CursorCol
+	for _, line := range res.Lines[:res.CursorLine] {
+		cursor += len(line) + 1
+	}
+	e.SetCursor(cursor)
 	e.autocomplete = nil
 }
 
@@ -248,11 +290,7 @@ func (e *Editor) Insert(s string) {
 	}
 	e.text = e.text[:e.cursor] + s + e.text[e.cursor:]
 	e.cursor += len(s)
-	if isCoalescableTyping(s) {
-		e.last = "insert"
-	} else {
-		e.last = ""
-	}
+	e.last = "insert"
 	e.yankStart = -1
 	e.desiredColValid = false
 }
@@ -261,6 +299,7 @@ func (e *Editor) Paste(s string) {
 	if s == "" {
 		return
 	}
+	e.CancelAutocomplete()
 	e.resetHistoryBrowse()
 	s = normalizePasteText(s)
 	if s == "" {
@@ -269,49 +308,63 @@ func (e *Editor) Paste(s string) {
 	if needsLeadingPasteSpace(e.text, e.cursor, s) {
 		s = " " + s
 	}
-	if isLargePaste(s) || (e.largePasteThreshold > 0 && len(s) > e.largePasteThreshold) {
-		e.nextPaste++
-		id := e.nextPaste
+	if isLargePaste(s) || (e.largePasteThreshold > 0 && len(utf16.Encode([]rune(s))) > e.largePasteThreshold) {
+		id := e.nextPaste + 1
 		marker := pasteMarker(id, s)
-		e.largePastes[marker] = s
 		e.insertAtomic(marker, "paste")
+		e.nextPaste = id
+		e.largePastes[marker] = s
 		return
 	}
 	e.insertAtomic(s, "paste")
 }
-func (e *Editor) Newline() { e.Insert("\n") }
+func (e *Editor) Newline() { e.insertAtomic("\n", "") }
 func (e *Editor) Submit() {
 	text := strings.TrimSpace(e.ExpandedText())
 	if text == "" {
 		return
 	}
-	e.text = ""
-	e.cursor = 0
-	e.largePastes = map[string]string{}
-	e.undo = undostack.New(func(s State) State { return s })
-	e.breakChains()
+	e.Reset()
 	if e.submit != nil {
 		e.submit(text)
 	}
 }
+
+// Reset discards the draft and its undo state while retaining history and kills.
+func (e *Editor) Reset() {
+	e.CancelJump()
+	e.text = ""
+	e.cursor = 0
+	clear(e.largePastes)
+	e.nextPaste = 0
+	e.CancelAutocomplete()
+	e.resetHistoryBrowse()
+	e.scrollOffset = 0
+	e.undo.Clear()
+	e.breakChains()
+}
+
 func (e *Editor) Cancel() { e.cancelled = true }
 func (e *Editor) Undo() {
+	e.resetHistoryBrowse()
 	st, ok := e.undo.Pop()
 	if !ok {
 		return
 	}
 	e.text = st.Text
 	e.cursor = st.Cursor
+	e.largePastes = st.pastes
+	e.nextPaste = st.pasteCounter
 	e.breakChains()
 }
 
 func (e *Editor) MoveLeft() {
-	e.cursor = text.PrevCluster(e.text, e.cursor)
+	e.cursor = e.previousSegment(e.cursor)
 	e.breakChains()
 }
 
 func (e *Editor) MoveRight() {
-	e.cursor = text.NextCluster(e.text, e.cursor)
+	e.cursor = e.nextSegment(e.cursor)
 	e.breakChains()
 }
 
@@ -356,11 +409,11 @@ func (e *Editor) MoveDown() {
 }
 
 func (e *Editor) MoveVisualUp(width int) {
-	e.moveVisual(width, -1)
+	e.MoveVisual(width, -1)
 }
 
 func (e *Editor) MoveVisualDown(width int) {
-	e.moveVisual(width, 1)
+	e.MoveVisual(width, 1)
 }
 
 func (e *Editor) AtVisualTop(width int) bool {
@@ -392,6 +445,7 @@ func (e *Editor) PageDown(n int) {
 }
 
 func (e *Editor) DeleteBackward() string {
+	e.last = ""
 	if e.cursor == 0 {
 		return ""
 	}
@@ -401,22 +455,20 @@ func (e *Editor) DeleteBackward() string {
 	e.moveLeftNoBreak()
 	deleted := e.text[e.cursor:old]
 	e.text = e.text[:e.cursor] + e.text[old:]
-	e.kill.Push(deleted, killring.PushOptions{Prepend: true, Accumulate: e.last == "kill"})
-	e.last = "kill"
+	e.removePaste(deleted)
 	return deleted
 }
 
 func (e *Editor) DeleteForward() string {
+	e.last = ""
 	if e.cursor >= len(e.text) {
 		return ""
 	}
 	e.resetHistoryBrowse()
 	e.pushUndo()
-	next := text.NextCluster(e.text, e.cursor)
+	next := e.nextSegment(e.cursor)
 	deleted := e.text[e.cursor:next]
 	e.text = e.text[:e.cursor] + e.text[next:]
-	e.kill.Push(deleted, killring.PushOptions{Accumulate: e.last == "kill"})
-	e.last = "kill"
 	return deleted
 }
 
@@ -427,8 +479,12 @@ func (e *Editor) DeleteToLineStart() string {
 	e.resetHistoryBrowse()
 	e.pushUndo()
 	old := e.cursor
-	for e.cursor > 0 && e.text[e.cursor-1] != '\n' {
-		e.moveLeftNoBreak()
+	if e.text[e.cursor-1] == '\n' {
+		e.cursor--
+	} else {
+		for e.cursor > 0 && e.text[e.cursor-1] != '\n' {
+			e.moveLeftNoBreak()
+		}
 	}
 	deleted := e.text[e.cursor:old]
 	e.text = e.text[:e.cursor] + e.text[old:]
@@ -444,12 +500,13 @@ func (e *Editor) DeleteToLineEnd() string {
 	e.resetHistoryBrowse()
 	e.pushUndo()
 	start := e.cursor
-	for e.cursor < len(e.text) {
-		r, sz := utf8.DecodeRuneInString(e.text[e.cursor:])
-		if r == '\n' {
-			break
+	if e.text[e.cursor] == '\n' {
+		e.cursor++
+	} else {
+		for e.cursor < len(e.text) && e.text[e.cursor] != '\n' {
+			_, sz := utf8.DecodeRuneInString(e.text[e.cursor:])
+			e.cursor += sz
 		}
-		e.cursor += sz
 	}
 	end := e.cursor
 	deleted := e.text[start:end]
@@ -467,20 +524,7 @@ func (e *Editor) DeleteWordBackward() string {
 	e.resetHistoryBrowse()
 	e.pushUndo()
 	old := e.cursor
-	for e.cursor > 0 {
-		r, _ := utf8.DecodeLastRuneInString(e.text[:e.cursor])
-		if !unicode.IsSpace(r) {
-			break
-		}
-		e.moveLeftNoBreak()
-	}
-	for e.cursor > 0 {
-		r, _ := utf8.DecodeLastRuneInString(e.text[:e.cursor])
-		if unicode.IsSpace(r) {
-			break
-		}
-		e.moveLeftNoBreak()
-	}
+	e.moveWordLeftNoBreak()
 	deleted := e.text[e.cursor:old]
 	e.text = e.text[:e.cursor] + e.text[old:]
 	e.kill.Push(deleted, killring.PushOptions{Prepend: true, Accumulate: e.last == "kill"})
@@ -495,13 +539,7 @@ func (e *Editor) DeleteWordForward() string {
 	e.resetHistoryBrowse()
 	e.pushUndo()
 	start := e.cursor
-	for e.cursor < len(e.text) {
-		r, sz := utf8.DecodeRuneInString(e.text[e.cursor:])
-		e.cursor += sz
-		if unicode.IsSpace(r) {
-			break
-		}
-	}
+	e.moveWordRightNoBreak()
 	end := e.cursor
 	deleted := e.text[start:end]
 	e.text = e.text[:start] + e.text[end:]
@@ -542,43 +580,111 @@ func (e *Editor) YankPop() {
 }
 
 func (e *Editor) MoveWordLeft() {
-	for e.cursor > 0 {
+	e.moveWordLeftNoBreak()
+	e.breakChains()
+}
+
+func (e *Editor) moveWordLeftNoBreak() {
+	if e.cursor > 0 && e.text[e.cursor-1] == '\n' {
+		e.cursor--
+		return
+	}
+	for e.cursor > 0 && e.text[e.cursor-1] != '\n' {
 		r, _ := utf8.DecodeLastRuneInString(e.text[:e.cursor])
 		if !unicode.IsSpace(r) {
 			break
 		}
 		e.moveLeftNoBreak()
 	}
-	for e.cursor > 0 {
+	if start, end, ok := e.markerAt(e.cursor - 1); ok && end == e.cursor {
+		e.cursor = start
+		return
+	}
+	for e.cursor > 0 && e.text[e.cursor-1] != '\n' {
+		if _, _, ok := e.markerAt(e.cursor - 1); ok {
+			break
+		}
 		r, _ := utf8.DecodeLastRuneInString(e.text[:e.cursor])
 		if unicode.IsSpace(r) {
 			break
 		}
 		e.moveLeftNoBreak()
 	}
-	e.breakChains()
 }
 
 func (e *Editor) MoveWordRight() {
-	for e.cursor < len(e.text) {
+	e.moveWordRightNoBreak()
+	e.breakChains()
+}
+
+func (e *Editor) moveWordRightNoBreak() {
+	if e.cursor < len(e.text) && e.text[e.cursor] == '\n' {
+		e.cursor++
+		return
+	}
+	for e.cursor < len(e.text) && e.text[e.cursor] != '\n' {
 		r, sz := utf8.DecodeRuneInString(e.text[e.cursor:])
 		if !unicode.IsSpace(r) {
 			break
 		}
 		e.cursor += sz
 	}
-	for e.cursor < len(e.text) {
+	if start, end, ok := e.markerAt(e.cursor); ok && start == e.cursor {
+		e.cursor = end
+		return
+	}
+	for e.cursor < len(e.text) && e.text[e.cursor] != '\n' {
+		if _, _, ok := e.markerAt(e.cursor); ok {
+			break
+		}
 		r, sz := utf8.DecodeRuneInString(e.text[e.cursor:])
 		if unicode.IsSpace(r) {
 			break
 		}
 		e.cursor += sz
 	}
-	e.breakChains()
 }
 
+// HandleJumpKey consumes jump hotkeys and the next printable target.
+func (e *Editor) HandleJumpKey(key event.KeyEvent) bool {
+	direction := 0
+	if key.Key == event.KeyRune && key.Rune == ']' {
+		switch key.Mod {
+		case event.ModCtrl:
+			direction = 1
+		case event.ModCtrl | event.ModAlt:
+			direction = -1
+		}
+	}
+	pending := e.jumpDirection
+	e.jumpDirection = 0
+	if direction != 0 {
+		if pending == 0 {
+			e.jumpDirection = direction
+		}
+		return true
+	}
+	if pending == 0 {
+		return false
+	}
+	target, ok := ansi.TextRune(key)
+	if !ok {
+		return false
+	}
+	if pending > 0 {
+		e.JumpForward(target)
+	} else {
+		e.JumpBackward(target)
+	}
+	return true
+}
+
+// CancelJump leaves any pending one-key character jump.
+func (e *Editor) CancelJump() { e.jumpDirection = 0 }
+
 func (e *Editor) JumpForward(target rune) bool {
-	for pos := e.cursor; pos < len(e.text); {
+	_, size := utf8.DecodeRuneInString(e.text[e.cursor:])
+	for pos := e.cursor + size; pos < len(e.text); {
 		r, sz := utf8.DecodeRuneInString(e.text[pos:])
 		pos += sz
 		if r == target {
@@ -627,10 +733,66 @@ func (e *Editor) EnsureCursorVisible(maxRows, wrapWidth int) {
 	}
 }
 
-func (e *Editor) ExpandedText() string {
-	out := e.text
+var pasteMarkerPattern = regexp.MustCompile(`\[paste #([0-9]+)(?: (?:[0-9]+ chars|\+[0-9]+ lines))?\]`)
+
+func (e *Editor) removePaste(deleted string) {
+	match := pasteMarkerPattern.FindStringSubmatch(deleted)
+	if match == nil {
+		return
+	}
+	target, err := strconv.Atoi(match[1])
+	if err != nil {
+		return
+	}
+	renumber := func(marker string) string {
+		span := pasteMarkerPattern.FindStringSubmatchIndex(marker)
+		id, err := strconv.Atoi(marker[span[2]:span[3]])
+		if err != nil || id <= target {
+			return marker
+		}
+		return marker[:span[2]] + strconv.Itoa(id-1) + marker[span[3]:]
+	}
+	pastes := make(map[string]string, len(e.largePastes))
 	for marker, body := range e.largePastes {
-		out = strings.ReplaceAll(out, marker, body)
+		id := pasteMarkerPattern.FindStringSubmatch(marker)[1]
+		if id != match[1] {
+			pastes[renumber(marker)] = body
+		}
+	}
+	e.largePastes = pastes
+	e.nextPaste--
+	before := pasteMarkerPattern.ReplaceAllStringFunc(e.text[:e.cursor], renumber)
+	after := pasteMarkerPattern.ReplaceAllStringFunc(e.text[e.cursor:], renumber)
+	e.text = before + after
+	e.cursor = len(before)
+}
+
+func (e *Editor) ExpandedText() string {
+	bodies := make(map[string]string, len(e.largePastes))
+	var ids []string
+	for marker, body := range e.largePastes {
+		match := pasteMarkerPattern.FindStringSubmatch(marker)
+		if match == nil {
+			continue
+		}
+		ids = append(ids, match[1])
+		bodies[match[1]] = body
+	}
+	slices.SortFunc(ids, func(a, b string) int {
+		if len(a) != len(b) {
+			return len(a) - len(b)
+		}
+		return strings.Compare(a, b)
+	})
+	out := e.text
+	for _, id := range ids {
+		prefix := "[paste #" + id
+		out = pasteMarkerPattern.ReplaceAllStringFunc(out, func(marker string) string {
+			if strings.HasPrefix(marker, prefix+" ") || marker == prefix+"]" {
+				return bodies[id]
+			}
+			return marker
+		})
 	}
 	return out
 }
@@ -677,7 +839,7 @@ func (e *Editor) SetPosition(p Position) {
 	}
 	line := lines[p.Line]
 	off += text.OffsetAtColumnBias(line, p.Col, text.BiasLeft)
-	e.cursor = off
+	e.cursor = e.clampSegment(off)
 	e.breakChains()
 }
 
@@ -721,8 +883,51 @@ func (e *Editor) CutSelection() string {
 	return deleted
 }
 
+func (e *Editor) markerAt(pos int) (int, int, bool) {
+	if pos < 0 || pos >= len(e.text) || len(e.largePastes) == 0 {
+		return 0, 0, false
+	}
+	for _, span := range pasteMarkerPattern.FindAllStringSubmatchIndex(e.text, -1) {
+		if pos < span[0] {
+			break
+		}
+		if pos >= span[1] {
+			continue
+		}
+		prefix := "[paste #" + e.text[span[2]:span[3]]
+		for marker := range e.largePastes {
+			if strings.HasPrefix(marker, prefix+" ") || marker == prefix+"]" {
+				return span[0], span[1], true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func (e *Editor) clampSegment(pos int) int {
+	pos = text.ClampCluster(e.text, pos)
+	if start, _, ok := e.markerAt(pos); ok {
+		return start
+	}
+	return pos
+}
+
+func (e *Editor) previousSegment(pos int) int {
+	if start, _, ok := e.markerAt(pos - 1); ok {
+		return start
+	}
+	return text.PrevCluster(e.text, pos)
+}
+
+func (e *Editor) nextSegment(pos int) int {
+	if _, end, ok := e.markerAt(pos); ok {
+		return end
+	}
+	return text.NextCluster(e.text, pos)
+}
+
 func (e *Editor) moveLeftNoBreak() {
-	e.cursor = text.PrevCluster(e.text, e.cursor)
+	e.cursor = e.previousSegment(e.cursor)
 }
 
 func (e *Editor) setText(s string) {
@@ -738,15 +943,16 @@ func (e *Editor) setText(s string) {
 
 func (e *Editor) resetHistoryBrowse() {
 	e.historyIndex = len(e.history)
-	e.historyDraft = ""
+	e.historyDraft = State{}
 	e.historyBrowsing = false
 }
 
-func (e *Editor) pushUndo() { e.undo.Push(State{e.text, e.cursor}) }
+func (e *Editor) pushUndo() {
+	e.undo.Push(editorSnapshot{State: State{e.text, e.cursor}, pastes: e.largePastes, pasteCounter: e.nextPaste})
+}
+
 func (e *Editor) breakChains() {
-	if e.last != "kill" {
-		e.last = ""
-	}
+	e.last = ""
 	e.yankStart = -1
 	e.yankEnd = -1
 	e.clearSelection()
@@ -767,12 +973,7 @@ func (e *Editor) insertAtomic(s, last string) {
 }
 
 func (e *Editor) shouldPushInsertUndo(s string) bool {
-	return e.last != "insert" || !isCoalescableTyping(s)
-}
-
-func isCoalescableTyping(s string) bool {
-	r, sz := utf8.DecodeRuneInString(s)
-	return r != utf8.RuneError && sz == len(s) && !unicode.IsSpace(r)
+	return e.last != "insert" || strings.ContainsFunc(s, func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
 }
 
 func (e *Editor) verticalDesiredCol(current int) int {
@@ -789,10 +990,7 @@ func (e *Editor) clampByte(pos int) int {
 	if pos > len(e.text) {
 		pos = len(e.text)
 	}
-	for pos > 0 && pos < len(e.text) && !utf8.RuneStart(e.text[pos]) {
-		pos--
-	}
-	return pos
+	return text.ClampCluster(e.text, pos)
 }
 
 func (e *Editor) hasSelection() bool {
@@ -815,7 +1013,8 @@ func (e *Editor) deleteSelectionNoUndo() string {
 	return deleted
 }
 
-func (e *Editor) moveVisual(width, delta int) {
+// MoveVisual moves by delta wrapped rows while retaining the desired display column.
+func (e *Editor) MoveVisual(width, delta int) {
 	if width <= 0 {
 		width = 1
 	}
@@ -825,18 +1024,37 @@ func (e *Editor) moveVisual(width, delta int) {
 		flatIndex += len(segments[i])
 	}
 	flatIndex += visualLine
-	target := flatIndex + delta
-	if target < 0 || target >= totalSegments(segments) {
+	target := max(0, min(flatIndex+delta, totalSegments(segments)-1))
+	if target == flatIndex {
 		return
 	}
 	desired := e.verticalDesiredCol(visualCol)
-	targetLine, targetVisualLine := locateSegment(segments, target)
-	segmentLen := segments[targetLine][targetVisualLine]
-	col := desired
-	if col > segmentLen {
-		col = segmentLen
+	for target < totalSegments(segments) {
+		targetLine, targetVisualLine := locateSegment(segments, target)
+		segmentLen := segments[targetLine][targetVisualLine]
+		if targetVisualLine < len(segments[targetLine])-1 {
+			segmentLen = max(0, segmentLen-1)
+		}
+		col := min(desired, segmentLen)
+		lineStart := 0
+		lines := e.Lines()
+		for i := 0; i < targetLine; i++ {
+			lineStart += len(lines[i]) + 1
+		}
+		segmentCol := 0
+		for i := 0; i < targetVisualLine; i++ {
+			segmentCol += segments[targetLine][i]
+		}
+		segmentStart := lineStart + text.OffsetAtColumnBias(lines[targetLine], segmentCol, text.BiasLeft)
+		candidate := lineStart + text.OffsetAtColumnBias(lines[targetLine], segmentCol+col, text.BiasLeft)
+		if start, _, ok := e.markerAt(candidate); ok && start < segmentStart && delta > 0 {
+			target++
+			continue
+		}
+		e.setVisualPosition(width, targetLine, targetVisualLine, col)
+		break
 	}
-	e.setVisualPosition(width, targetLine, targetVisualLine, col)
+
 	e.desiredCol = desired
 	e.desiredColValid = true
 }
@@ -850,7 +1068,7 @@ func (e *Editor) visualPosition(width int) (line, visualLine, visualCol int, seg
 	}
 	line = pos.Line
 	col := pos.Col
-	for visualLine < len(segments[line])-1 && col > segments[line][visualLine] {
+	for visualLine < len(segments[line])-1 && col >= segments[line][visualLine] {
 		col -= segments[line][visualLine]
 		visualLine++
 	}
@@ -943,7 +1161,24 @@ func VisualLines(value string, width int) []string {
 	return out
 }
 
+var pasteCtrlSequence = regexp.MustCompile(`\x1b\[[0-9]+;5u`)
+
 func normalizePasteText(s string) string {
+	// tmux can encode control letters inside bracketed paste as CSI-u.
+	s = pasteCtrlSequence.ReplaceAllStringFunc(s, func(sequence string) string {
+		code, err := strconv.Atoi(sequence[2 : len(sequence)-3])
+		if err != nil {
+			return sequence
+		}
+		switch {
+		case code >= 'a' && code <= 'z':
+			return string(rune(code - 'a' + 1))
+		case code >= 'A' && code <= 'Z':
+			return string(rune(code - 'A' + 1))
+		default:
+			return sequence
+		}
+	})
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
 	s = strings.ReplaceAll(s, "\t", "    ")
@@ -957,23 +1192,23 @@ func normalizePasteText(s string) string {
 }
 
 func needsLeadingPasteSpace(text string, cursor int, paste string) bool {
-	if cursor <= 0 || paste == "" || strings.HasPrefix(paste, " ") || strings.HasPrefix(paste, "\n") {
+	if cursor <= 0 || paste == "" || !strings.ContainsRune("/~.", rune(paste[0])) {
 		return false
 	}
-	prev, _ := utf8.DecodeLastRuneInString(text[:cursor])
-	return unicode.IsLetter(prev) || unicode.IsDigit(prev) || prev == '_' || prev == '.' || prev == '/'
+	prev := text[cursor-1]
+	return prev >= 'a' && prev <= 'z' || prev >= 'A' && prev <= 'Z' || prev >= '0' && prev <= '9' || prev == '_'
 }
 
 func isLargePaste(s string) bool {
-	return strings.Count(s, "\n")+1 > 10 || len(s) > 1000
+	return strings.Count(s, "\n")+1 > 10 || len(utf16.Encode([]rune(s))) > 1000
 }
 
 func pasteMarker(id int, s string) string {
 	lines := strings.Count(s, "\n") + 1
-	if lines > 1 {
+	if lines > 10 {
 		return "[paste #" + strconv.Itoa(id) + " +" + strconv.Itoa(lines) + " lines]"
 	}
-	return "[paste #" + strconv.Itoa(id) + " " + strconv.Itoa(len(s)) + " chars]"
+	return "[paste #" + strconv.Itoa(id) + " " + strconv.Itoa(len(utf16.Encode([]rune(s)))) + " chars]"
 }
 
 func joinLines(lines []string) string {

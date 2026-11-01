@@ -303,23 +303,13 @@ func TestPiInputUndoCoalescesWordChars(t *testing.T) {
 	if got := i.Value(); got != "hello world" {
 		t.Fatalf("value = %q, want %q", got, "hello world")
 	}
-	// The Go implementation creates an undo boundary at the space,
-	// so three undo units: "hello", " ", "world".
-	// Pi coalesces " world" into one unit. We verify the behavior
-	// is close to Pi: at least word chars coalesce.
 	i.Undo()
-	// Undo should remove "world" (the last coalesced unit)
-	if got := i.Value(); got != "hello " {
-		t.Fatalf("after first undo = %q, want %q", got, "hello ")
-	}
-	i.Undo()
-	// Undo should remove " " (space)
 	if got := i.Value(); got != "hello" {
-		t.Fatalf("after second undo = %q, want %q", got, "hello")
+		t.Fatalf("first undo = %q, want hello", got)
 	}
 	i.Undo()
 	if got := i.Value(); got != "" {
-		t.Fatalf("after third undo = %q, want empty", got)
+		t.Fatalf("second undo = %q, want empty", got)
 	}
 }
 
@@ -478,5 +468,56 @@ func TestPiInputCursorMovementStartsNewUndoUnit(t *testing.T) {
 	i.Undo()
 	if got := i.Value(); got != "" {
 		t.Fatalf("after second undo = %q, want empty", got)
+	}
+}
+
+func TestInputTypingUndoIncludesWhitespaceWithFollowingWord(t *testing.T) {
+	for _, separator := range []string{" ", "\t", "\u00a0", "\ufeff"} {
+		t.Run(separator, func(t *testing.T) {
+			i := New()
+			for _, part := range []string{"hel", "lo", separator, "wor", "ld"} {
+				i.Insert(part)
+			}
+			i.Undo()
+			if i.Value() != "hello" {
+				t.Fatalf("first undo = %q", i.Value())
+			}
+			i.Undo()
+			if i.Value() != "" {
+				t.Fatalf("second undo = %q", i.Value())
+			}
+		})
+	}
+}
+
+func TestInputCharacterDeletesDoNotKillAndMovementBreaksKills(t *testing.T) {
+	for _, action := range []string{"backward", "forward", "move", "undo", "boundary"} {
+		t.Run(action, func(t *testing.T) {
+			i := New()
+			i.SetValue("one two")
+			i.DeleteWordBackward()
+			switch action {
+			case "backward":
+				i.DeleteBackward()
+			case "forward":
+				i.SetCursor(0)
+				i.DeleteForward()
+				i.End()
+			case "move":
+				i.MoveLeft()
+				i.MoveRight()
+			case "undo":
+				i.Undo()
+			case "boundary":
+				i.DeleteForward()
+			}
+			if got := i.kill.Entries(); len(got) != 1 || got[0] != "two" {
+				t.Fatalf("character edit changed ring: %v", got)
+			}
+			i.DeleteWordBackward()
+			if got := i.kill.Entries(); len(got) != 2 || got[0] != "two" {
+				t.Fatalf("kill chain was retained: %v", got)
+			}
+		})
 	}
 }

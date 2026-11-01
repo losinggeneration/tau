@@ -4,6 +4,7 @@ import (
 	"unicode"
 
 	"github.com/losinggeneration/rovel/text"
+	"github.com/losinggeneration/tau/tui/ansi"
 	inputmodel "github.com/losinggeneration/tau/tui/input"
 )
 
@@ -45,33 +46,51 @@ func (c *InputComponent) Render(width int) []string {
 		return nil
 	}
 	m := c.ensure()
-	prompt := c.Prompt
+	return []string{renderInputRow(m, c.Prompt, c.Focused, width)}
+}
+
+func renderInputRow(m *inputmodel.Input, prompt string, focused bool, width int) string {
 	avail := width - TextWidth(prompt)
-	if avail < 1 {
-		avail = 1
+	if avail <= 0 {
+		return ANSISliceStrict(prompt, 0, width)
 	}
 	value := m.Value()
 	before, after := splitAtByte(value, m.Cursor())
 	cursorCell, afterRest := cursorCell(after)
-	beforeW := TextWidth(before)
+	cursorWidth := max(1, TextWidth(cursorCell))
+	cursorCol := TextWidth(before)
+	totalWidth := TextWidth(value)
 	start := 0
-	if beforeW >= avail {
-		start = beforeW - avail + 1
+	if totalWidth >= avail {
+		scrollWidth := avail
+		if after == "" {
+			scrollWidth--
+		}
+		half := scrollWidth / 2
+		switch {
+		case cursorCol < half:
+		case cursorCol > totalWidth-half:
+			start = max(0, totalWidth-scrollWidth)
+		default:
+			start = max(0, cursorCol-half)
+		}
 	}
-	visibleBefore := ANSISliceStrict(before, start, beforeW)
+	visibleBefore := ANSISliceStrict(before, start, cursorCol)
 	used := TextWidth(visibleBefore)
-	remaining := avail - used - 1
-	if remaining < 0 {
-		remaining = 0
+	if used+cursorWidth > avail {
+		cursorCell = " "
+		cursorWidth = 1
 	}
+	remaining := max(0, avail-used-cursorWidth)
 	visibleAfter := ANSISliceStrict(afterRest, 0, remaining)
+
 	cursor := cursorCell
-	if c.Focused {
+	if focused {
 		cursor = cursorString(cursorCell, true)
 	}
 	line := prompt + visibleBefore + cursor + visibleAfter
 	visibleText := prompt + visibleBefore + cursorCell + visibleAfter
-	return []string{padRightVisible(line, visibleText, width)}
+	return padRightVisible(line, visibleText, width)
 }
 
 func padRightVisible(rendered, visible string, width int) string {
@@ -122,7 +141,7 @@ func (c *InputComponent) Handle(e Event, _ *Ctx) bool {
 	m := c.ensure()
 	switch ke.Key {
 	case KeyRune:
-		if r, ok := ke.TextRune(); ok {
+		if r, ok := ansi.TextRune(ke); ok {
 			m.Insert(string(r))
 			return true
 		}

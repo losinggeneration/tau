@@ -766,15 +766,16 @@ func (m *Message) ToAssistantMessage() (AssistantMessage, bool) {
 	}
 
 	return AssistantMessage{
-		Role:        m.Role,
-		Content:     m.ContentBlocks(),
-		Provider:    m.Provider,
-		API:         m.API,
-		Model:       m.Model,
-		StopReason:  StopReason(m.StopReason),
-		Timestamp:   m.Timestamp,
-		DurationMs:  m.DurationMs,
-		Diagnostics: m.Diagnostics,
+		Role:                  m.Role,
+		Content:               m.ContentBlocks(),
+		Provider:              m.Provider,
+		API:                   m.API,
+		Model:                 m.Model,
+		StopReason:            StopReason(m.StopReason),
+		Timestamp:             m.Timestamp,
+		DurationMs:            m.DurationMs,
+		Diagnostics:           m.Diagnostics,
+		ProviderThinkingLevel: m.ProviderThinkingLevel,
 	}, true
 }
 

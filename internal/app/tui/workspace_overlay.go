@@ -6,6 +6,10 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/losinggeneration/rovel/text"
+
+	"github.com/losinggeneration/tau/tui/ansi"
+
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
 )
@@ -117,8 +121,7 @@ func (o *workspaceOverlay) HandleKey(ke tauui.KeyEvent) {
 		o.move(10)
 	case tauui.KeyBackspace:
 		if o.filter != "" {
-			runes := []rune(o.filter)
-			o.filter = string(runes[:len(runes)-1])
+			o.filter = o.filter[:text.PrevCluster(o.filter, len(o.filter))]
 			o.clamp()
 		}
 	case tauui.KeyEnter:
@@ -136,7 +139,7 @@ func (o *workspaceOverlay) HandleKey(ke tauui.KeyEvent) {
 		case 'd':
 			o.startDelete()
 		default:
-			if r, ok := ke.TextRune(); ok {
+			if r, ok := ansi.TextRune(ke); ok {
 				o.filter += string(r)
 				o.clamp()
 			}
@@ -150,13 +153,12 @@ func (o *workspaceOverlay) handleRenameKey(ke tauui.KeyEvent) {
 		o.rename = false
 	case tauui.KeyBackspace:
 		if o.name != "" {
-			runes := []rune(o.name)
-			o.name = string(runes[:len(runes)-1])
+			o.name = o.name[:text.PrevCluster(o.name, len(o.name))]
 		}
 	case tauui.KeyEnter:
 		o.commitRename()
 	case tauui.KeyRune:
-		if r, ok := ke.TextRune(); ok {
+		if r, ok := ansi.TextRune(ke); ok {
 			o.name += string(r)
 		}
 	}

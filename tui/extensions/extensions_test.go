@@ -441,3 +441,23 @@ func TestShortcutForShiftedProducedSymbol(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "plugin.plus", shortcut.ID)
 }
+
+func TestInsertEditorTextClampsToGraphemeBoundary(t *testing.T) {
+	for _, value := range []string{"界", "e\u0301", "👩\u200d💻"} {
+		for pos := 1; pos < len(value); pos++ {
+			r := New()
+			r.SetEditorText(value)
+			var notified string
+			var insertedAt int
+			r.OnEditorTextChanged(func(s string) { notified = s })
+			r.OnInsertEditorTextChanged(func(pos int, _ string) { insertedAt = pos })
+			r.InsertEditorText(pos, "X")
+			if got := r.EditorText(); got != "X"+value {
+				t.Fatalf("insert %d in %q = %q", pos, value, got)
+			}
+			if notified != r.EditorText() || insertedAt != 0 {
+				t.Fatalf("callbacks = %q at %d", notified, insertedAt)
+			}
+		}
+	}
+}

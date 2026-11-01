@@ -232,29 +232,21 @@ func TestExtensions_WidgetsByID(t *testing.T) {
 func TestPluginExtensionWiring_EditorTextExercisesLiveEditor(t *testing.T) {
 	app := newAppWithSelector(t)
 	app.extensions = extensions.New()
-
+	app.extensions.OnEditorTextChanged(app.applyEditorTextFromExtension)
 	app.extensions.SetEditorText("plugin wrote this")
-	app.applyEditorTextFromExtension(app.extensions.EditorText())
 	if got := app.editor.Text(); got != "plugin wrote this" {
-		t.Errorf("editor text after SetEditorText = %q, want 'plugin wrote this'", got)
+		t.Fatalf("replacement=%q", got)
 	}
-
-	// Insert at position 0 should prepend; insert at end appends.
 	app.extensions.SetEditorText("base")
-	app.applyInsertEditorTextFromExtension(0, "X-")
-	if got := app.editor.Text(); got != "X-base" {
-		t.Errorf("editor text after Insert(0) = %q, want 'X-base'", got)
+	app.extensions.InsertEditorText(0, "X-")
+	app.extensions.InsertEditorText(len(app.editor.Text()), "-Y")
+	app.extensions.InsertEditorText(-3, "!")
+	app.extensions.InsertEditorText(1000, "!")
+	if got := app.editor.Text(); got != "!X-base-Y!" {
+		t.Fatalf("insertions=%q", got)
 	}
-	app.applyInsertEditorTextFromExtension(len(app.editor.Text()), "-Y")
-	if got := app.editor.Text(); got != "X-base-Y" {
-		t.Errorf("editor text after Insert(end) = %q, want 'X-base-Y'", got)
-	}
-
-	// Negative positions clamp to start; out-of-range positions
-	// clamp to end.
-	app.applyInsertEditorTextFromExtension(-3, "!")
-	if got := app.editor.Text(); !strings.HasPrefix(got, "!") {
-		t.Errorf("editor text after Insert(-3) = %q, want leading '!'", got)
+	if app.extensions.EditorText() != app.editor.Text() {
+		t.Fatal("registry and editor differ")
 	}
 }
 

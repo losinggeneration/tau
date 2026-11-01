@@ -1,6 +1,7 @@
 package input
 
 import (
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -66,11 +67,7 @@ func (i *Input) Insert(s string) {
 	}
 	i.text = i.text[:i.cursor] + s + i.text[i.cursor:]
 	i.cursor += len(s)
-	if isCoalescableTyping(s) {
-		i.last = "insert"
-	} else {
-		i.last = ""
-	}
+	i.last = "insert"
 	i.yankStart = -1
 }
 func (i *Input) Submit() { i.submitted = i.text }
@@ -136,29 +133,25 @@ func (i *Input) CutSelection() string {
 }
 
 func (i *Input) DeleteBackward() {
+	i.last = ""
 	if i.cursor == 0 {
 		return
 	}
 	i.pushUndo()
 	old := i.cursor
 	i.MoveLeftNoBreak()
-	deleted := i.text[i.cursor:old]
 	i.text = i.text[:i.cursor] + i.text[old:]
-	i.kill.Push(deleted, killring.PushOptions{Prepend: true, Accumulate: i.last == "kill"})
-	i.last = "kill"
 	i.yankStart = -1
 }
 
 func (i *Input) DeleteForward() {
+	i.last = ""
 	if i.cursor >= len(i.text) {
 		return
 	}
 	i.pushUndo()
 	next := text.NextCluster(i.text, i.cursor)
-	deleted := i.text[i.cursor:next]
 	i.text = i.text[:i.cursor] + i.text[next:]
-	i.kill.Push(deleted, killring.PushOptions{Accumulate: i.last == "kill"})
-	i.last = "kill"
 	i.yankStart = -1
 }
 
@@ -353,21 +346,14 @@ func (i *Input) MoveLeftNoBreak() {
 }
 func (i *Input) pushUndo() { i.undo.Push(State{i.text, i.cursor}) }
 func (i *Input) breakChains() {
-	if i.last != "kill" {
-		i.last = ""
-	}
+	i.last = ""
 	i.yankStart = -1
 	i.yankEnd = -1
 	i.clearSelection()
 }
 
 func (i *Input) shouldPushInsertUndo(s string) bool {
-	return i.last != "insert" || !isCoalescableTyping(s)
-}
-
-func isCoalescableTyping(s string) bool {
-	r, sz := utf8.DecodeRuneInString(s)
-	return r != utf8.RuneError && sz == len(s) && !unicode.IsSpace(r)
+	return i.last != "insert" || strings.ContainsFunc(s, func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
 }
 
 func (i *Input) clampByte(pos int) int {

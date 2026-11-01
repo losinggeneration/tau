@@ -40,3 +40,45 @@ func TestInputPaintResolvesCursorWithoutLeakingMarkers(t *testing.T) {
 		assert.Equal(t, 'b', r.At(6, 1).R)
 	}
 }
+
+func TestInputComponentTypingPreservesUnicodeFormatCharacters(t *testing.T) {
+	c := NewInputComponent()
+	value := "👩\u200d💻ش\u200cم\u00a0\u2028\U000e0100"
+	for _, r := range value {
+		assert.True(t, c.Handle(KeyEvent{Key: KeyRune, Rune: r}, nil), "U+%04X", r)
+	}
+	assert.Equal(t, value, c.Value())
+}
+
+func TestInputComponentRenderBoundsPromptAndWideCursor(t *testing.T) {
+	for _, tc := range []struct {
+		prompt, value string
+		width, cursor int
+		want          string
+	}{
+		{"> ", "abc", 1, 0, ">"}, {"> ", "abc", 2, 0, "> "}, {"> ", "界x", 3, 0, ">  "}, {"> ", "界x", 4, 0, "> 界"},
+	} {
+		c := NewInputComponent()
+		c.Prompt = tc.prompt
+		c.SetValue(tc.value)
+		c.Model.SetCursor(tc.cursor)
+		rows := c.Render(tc.width)
+		assert.Len(t, rows, 1)
+		assert.LessOrEqual(t, TextWidth(rows[0]), tc.width)
+		assert.Equal(t, tc.want, StripANSI(rows[0]))
+	}
+}
+
+func TestInputComponentRenderCentersScrollingAroundCursor(t *testing.T) {
+	c := NewInputComponent()
+	c.SetValue("abcdefghijklmnop")
+	c.Model.SetCursor(8)
+	assert.Equal(t, "> fghijk", StripANSI(c.Render(8)[0]))
+	c.Model.SetCursor(0)
+	assert.Equal(t, "> abcdef", StripANSI(c.Render(8)[0]))
+	c.Model.End()
+	assert.Equal(t, "> lmnop ", StripANSI(c.Render(8)[0]))
+	c.SetValue("界abcdefghij")
+	c.Model.SetCursor(len("界abcd"))
+	assert.Equal(t, "> bcdefg", StripANSI(c.Render(8)[0]))
+}

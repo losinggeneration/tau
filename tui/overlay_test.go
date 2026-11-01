@@ -72,7 +72,7 @@ func TestEditorPrimitiveWrapsScrollsAndMovesVisualLines(t *testing.T) {
 		t.Fatalf("rows=%#v", rows)
 	}
 	ed.HandleInput("\x1b[A")
-	if got := ed.ensureModel().Position(); got.Line != 0 || got.Col != 3 {
+	if got := ed.ensureModel().Position(); got.Line != 0 || got.Col != 2 {
 		t.Fatalf("visual up pos=%+v", got)
 	}
 }

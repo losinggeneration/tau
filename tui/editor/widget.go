@@ -11,6 +11,20 @@ import (
 	"github.com/losinggeneration/rovel/style"
 	"github.com/losinggeneration/rovel/text"
 	"github.com/losinggeneration/rovel/ui"
+	"github.com/losinggeneration/tau/tui/ansi"
+)
+
+// Editor actions extend the toolkit's navigation and character-edit actions.
+const (
+	ActionDeleteToLineEnd ui.Action = 2000 + iota
+	ActionDeleteToLineStart
+	ActionDeleteWordBackward
+	ActionDeleteWordForward
+	ActionUndo
+	ActionYank
+	ActionYankPop
+	ActionMoveWordLeft
+	ActionMoveWordRight
 )
 
 // CursorMoveReason describes what caused an OnCursorMove notification.
@@ -88,7 +102,16 @@ func (w *Widget) SetOnCursorMove(fn func(CursorMoveEvent, *rovel.Ctx)) {
 
 func (w *Widget) SetText(ctx *rovel.Ctx, s string) {
 	old := w.Model().Cursor()
-	w.Model().SetText(text.Sanitize(s))
+	w.Model().SetText(s)
+	w.invalidate(ctx)
+	w.notifyChange(ctx)
+	w.notifyCursorMoveIfChanged(old, CursorMoveSetText, ctx)
+}
+
+// Reset discards the draft and notifies the host of the empty editor.
+func (w *Widget) Reset(ctx *rovel.Ctx) {
+	old := w.Model().Cursor()
+	w.Model().Reset()
 	w.invalidate(ctx)
 	w.notifyChange(ctx)
 	w.notifyCursorMoveIfChanged(old, CursorMoveSetText, ctx)
@@ -302,11 +325,16 @@ func (w *Widget) Handle(e rovel.Event, ctx *rovel.Ctx) bool {
 	if !ok || ctx.FocusedID != w.id || w.readOnly {
 		return false
 	}
-	r, printable := ke.TextRune()
+	old := w.Model().Cursor()
+	if w.Model().HandleJumpKey(ke) {
+		w.invalidate(ctx)
+		w.notifyCursorMoveIfChanged(old, CursorMoveNavigate, ctx)
+		return true
+	}
+	r, printable := ansi.TextRune(ke)
 	if !printable {
 		return false
 	}
-	old := w.Model().Cursor()
 	w.Model().Insert(string(r))
 	w.invalidate(ctx)
 	w.notifyChange(ctx)
@@ -458,6 +486,7 @@ func (w *Widget) HandleAction(act ui.Action, ctx *rovel.Ctx) bool {
 		return false
 	}
 	m := w.Model()
+	m.CancelJump()
 	old := m.Cursor()
 	oldText := m.Text()
 	reason := CursorMoveNavigate
@@ -496,10 +525,10 @@ func (w *Widget) HandleAction(act ui.Action, ctx *rovel.Ctx) bool {
 		m.MoveLineEnd()
 		changed = true
 	case ui.ActionPageUp:
-		m.PageUp(max(1, w.rect.H))
+		m.MoveVisual(max(1, w.rect.W), -max(1, w.rect.H))
 		changed = true
 	case ui.ActionPageDown:
-		m.PageDown(max(1, w.rect.H))
+		m.MoveVisual(max(1, w.rect.W), max(1, w.rect.H))
 		changed = true
 	case ui.ActionDeleteBackward:
 		if w.readOnly {
@@ -517,6 +546,36 @@ func (w *Widget) HandleAction(act ui.Action, ctx *rovel.Ctx) bool {
 		changed = true
 		textChanged = true
 		reason = CursorMoveEdit
+	case ActionMoveWordLeft:
+		m.MoveWordLeft()
+		changed = true
+	case ActionMoveWordRight:
+		m.MoveWordRight()
+		changed = true
+	case ActionDeleteToLineEnd, ActionDeleteToLineStart, ActionDeleteWordBackward, ActionDeleteWordForward, ActionUndo, ActionYank, ActionYankPop:
+		if w.readOnly {
+			return false
+		}
+		switch act {
+		case ActionDeleteToLineEnd:
+			m.DeleteToLineEnd()
+		case ActionDeleteToLineStart:
+			m.DeleteToLineStart()
+		case ActionDeleteWordBackward:
+			m.DeleteWordBackward()
+		case ActionDeleteWordForward:
+			m.DeleteWordForward()
+		case ActionUndo:
+			m.Undo()
+		case ActionYank:
+			m.Yank()
+		case ActionYankPop:
+			m.YankPop()
+		}
+		changed = true
+		textChanged = m.Text() != oldText
+		reason = CursorMoveEdit
+
 	case ui.ActionSubmit:
 		if w.readOnly {
 			return false
@@ -613,7 +672,7 @@ func visualCursor(rows []visualRow, cursor int, width int) (int, int) {
 		return 0, 0
 	}
 	for i, row := range rows {
-		if cursor >= row.start && cursor <= row.end {
+		if cursor >= row.start && (cursor < row.end || cursor == row.end && (i == len(rows)-1 || rows[i+1].start != row.end)) {
 			return i, text.ColumnOf(row.text, cursor-row.start)
 		}
 	}

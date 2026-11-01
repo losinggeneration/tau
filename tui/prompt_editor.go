@@ -205,6 +205,12 @@ func (p *PromptEditor) SetText(ctx *Ctx, s string) {
 	p.pruneInlineImagePreviews()
 }
 
+// Reset discards the draft, undo state and inline image previews.
+func (p *PromptEditor) Reset(ctx *Ctx) {
+	p.ensure().Reset(ctx)
+	p.pruneInlineImagePreviews()
+}
+
 func (p *PromptEditor) ClearInlineImagePreviews() {
 	if p == nil {
 		return

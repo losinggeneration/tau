@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/losinggeneration/rovel/render"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/losinggeneration/rovel"
 	"github.com/losinggeneration/rovel/event"
@@ -317,4 +318,177 @@ func TestWidgetPaintUsesPhysicalCursorAndPreservesSelection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWidgetSetTextPreservesUnicodeGraphemes(t *testing.T) {
+	for _, value := range []string{"e\u0301", "👩\u200d💻", "✈\ufe0f", "ش\u200cم", "字\U000e0100"} {
+		t.Run(value, func(t *testing.T) {
+			w := NewWidget()
+			var notified string
+			w.SetOnChange(func(s string, _ *rovel.Ctx) { notified = s })
+			w.SetText(nil, value)
+			if got := w.Model().Text(); got != value {
+				t.Fatalf("stored %q, want %q", got, value)
+			}
+			if notified != value {
+				t.Fatalf("notified %q, want %q", notified, value)
+			}
+			w.Model().Undo()
+			if got := w.Model().Text(); got != "" {
+				t.Fatalf("undo = %q", got)
+			}
+		})
+	}
+}
+
+func TestWidgetEditorActionsRespectFocusReadOnlyAndNotify(t *testing.T) {
+	for _, act := range []ui.Action{ActionDeleteToLineEnd, ActionDeleteToLineStart, ActionDeleteWordBackward, ActionDeleteWordForward, ActionUndo, ActionYank, ActionYankPop} {
+		w := NewWidget()
+		m := w.Model()
+		m.SetText("saved")
+		m.DeleteToLineStart()
+		m.SetText("one two")
+		m.SetCursor(4)
+		ctx := &rovel.Ctx{FocusedID: w.ID()}
+		before, cursor := m.Text(), m.Cursor()
+		w.SetReadOnly(true)
+		if w.HandleAction(act, ctx) || m.Text() != before || m.Cursor() != cursor {
+			t.Fatalf("read-only action %v edited text", act)
+		}
+		w.SetReadOnly(false)
+		ctx.FocusedID = 0
+		if w.HandleAction(act, ctx) || m.Text() != before || m.Cursor() != cursor {
+			t.Fatalf("unfocused action %v edited text", act)
+		}
+	}
+	w := NewWidget()
+	w.Model().SetText("one two")
+	ctx := &rovel.Ctx{FocusedID: w.ID()}
+	var changes []string
+	var moves []CursorMoveEvent
+	w.SetOnChange(func(s string, _ *rovel.Ctx) { changes = append(changes, s) })
+	w.SetOnCursorMove(func(e CursorMoveEvent, _ *rovel.Ctx) { moves = append(moves, e) })
+	w.HandleAction(ActionMoveWordLeft, ctx)
+	w.HandleAction(ActionDeleteWordForward, ctx)
+	if len(changes) != 1 || changes[0] != "one " {
+		t.Fatalf("changes=%v", changes)
+	}
+	if len(moves) != 1 || moves[0].Cursor != 4 || moves[0].Reason != CursorMoveNavigate {
+		t.Fatalf("moves=%v", moves)
+	}
+	w.HandleAction(ActionUndo, ctx)
+	if len(changes) != 2 || changes[1] != "one two" {
+		t.Fatalf("undo changes=%v", changes)
+	}
+}
+
+func TestWidgetResetNotifiesOnceAndDiscardsUndo(t *testing.T) {
+	w := NewWidget()
+	w.Model().SetText("draft")
+	var changed []string
+	var moved []CursorMoveEvent
+	w.SetOnChange(func(value string, _ *rovel.Ctx) { changed = append(changed, value) })
+	w.SetOnCursorMove(func(move CursorMoveEvent, _ *rovel.Ctx) { moved = append(moved, move) })
+	w.Reset(nil)
+	if len(changed) != 1 || changed[0] != "" {
+		t.Fatalf("changes=%v", changed)
+	}
+	if len(moved) != 1 || moved[0].Cursor != 0 || moved[0].Reason != CursorMoveSetText {
+		t.Fatalf("cursor events=%v", moved)
+	}
+	w.Model().Undo()
+	if w.Text() != "" {
+		t.Fatalf("undo restored submitted draft %q", w.Text())
+	}
+}
+
+func TestWidgetTypingPreservesUnicodeFormatCharacters(t *testing.T) {
+	value := "👩\u200d💻ش\u200cم\u00a0\u2028\U000e0100"
+	w := NewWidget()
+	ctx := &rovel.Ctx{FocusedID: w.ID()}
+	for _, r := range value {
+		if !w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: r}, ctx) {
+			t.Fatalf("rejected U+%04X", r)
+		}
+	}
+	if w.Text() != value {
+		t.Fatalf("typed=%q want %q", w.Text(), value)
+	}
+	for _, r := range []rune{0, 7, 27, 127, 128, 159} {
+		if w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: r}, ctx) {
+			t.Fatalf("accepted control U+%04X", r)
+		}
+	}
+}
+
+func TestVisualCursorUsesFollowingRowAtWrappedBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		value            string
+		cursor, row, col int
+	}{
+		{"abcdef", 3, 1, 0}, {"abcdef", 6, 1, 3}, {"abc\ndef", 3, 0, 3}, {"abc\ndef", 4, 1, 0}, {"界ab界c", len("界a"), 1, 0},
+	} {
+		row, col := visualCursor(editorVisualRows(tc.value, 3), tc.cursor, 3)
+		if row != tc.row || col != tc.col {
+			t.Fatalf("%q cursor %d = %d,%d want %d,%d", tc.value, tc.cursor, row, col, tc.row, tc.col)
+		}
+	}
+}
+
+func TestWidgetPageActionsMoveAcrossVisualRows(t *testing.T) {
+	w := NewWidget()
+	w.Layout(rovel.Rect{W: 3, H: 2})
+	m := w.Model()
+	m.SetText("abcdefghijklmnopqr")
+	m.SetCursor(1)
+	ctx := &rovel.Ctx{FocusedID: w.ID()}
+	var moves []CursorMoveEvent
+	w.SetOnCursorMove(func(ev CursorMoveEvent, _ *rovel.Ctx) { moves = append(moves, ev) })
+	if !w.HandleAction(ui.ActionPageDown, ctx) {
+		t.Fatal("page down unhandled")
+	}
+	if m.Cursor() != 7 {
+		t.Fatalf("page down cursor=%d", m.Cursor())
+	}
+	w.HandleAction(ui.ActionPageDown, ctx)
+	if m.Cursor() != 13 {
+		t.Fatalf("second page cursor=%d", m.Cursor())
+	}
+	w.HandleAction(ui.ActionPageDown, ctx)
+	if m.Cursor() != 16 {
+		t.Fatalf("clamped page cursor=%d", m.Cursor())
+	}
+	w.HandleAction(ui.ActionPageUp, ctx)
+	if m.Cursor() != 10 {
+		t.Fatalf("page up cursor=%d", m.Cursor())
+	}
+	if len(moves) != 4 {
+		t.Fatalf("cursor notifications=%+v", moves)
+	}
+	if m.Text() != "abcdefghijklmnopqr" {
+		t.Fatalf("text changed=%q", m.Text())
+	}
+}
+
+func TestWidgetCharacterJumpConsumesNextTextAndCancelsOnAction(t *testing.T) {
+	w := NewWidget()
+	m := w.Model()
+	m.SetText("aba")
+	m.SetCursor(0)
+	ctx := &rovel.Ctx{FocusedID: w.ID()}
+	var changes int
+	var moves []CursorMoveEvent
+	w.SetOnChange(func(string, *rovel.Ctx) { changes++ })
+	w.SetOnCursorMove(func(ev CursorMoveEvent, _ *rovel.Ctx) { moves = append(moves, ev) })
+	assert.True(t, w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: ']', Mod: event.ModCtrl}, ctx))
+	assert.True(t, w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: 'a'}, ctx))
+	assert.Equal(t, 2, m.Cursor())
+	assert.Equal(t, "aba", m.Text())
+	assert.Zero(t, changes)
+	assert.Len(t, moves, 1)
+	assert.True(t, w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: ']', Mod: event.ModCtrl}, ctx))
+	assert.True(t, w.HandleAction(ui.ActionMoveLeft, ctx))
+	assert.True(t, w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: 'X'}, ctx))
+	assert.Equal(t, "aXba", m.Text())
+	assert.Equal(t, 1, changes)
 }

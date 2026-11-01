@@ -3,18 +3,19 @@ package keymap
 import (
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/ui"
+	"github.com/losinggeneration/tau/tui/editor"
 )
 
 const (
-	ActionDeleteToLineEnd ui.Action = 2000 + iota
-	ActionDeleteToLineStart
-	ActionDeleteWordBackward
-	ActionDeleteWordForward
-	ActionUndo
-	ActionYank
-	ActionYankPop
-	ActionMoveWordLeft
-	ActionMoveWordRight
+	ActionDeleteToLineEnd    = editor.ActionDeleteToLineEnd
+	ActionDeleteToLineStart  = editor.ActionDeleteToLineStart
+	ActionDeleteWordBackward = editor.ActionDeleteWordBackward
+	ActionDeleteWordForward  = editor.ActionDeleteWordForward
+	ActionUndo               = editor.ActionUndo
+	ActionYank               = editor.ActionYank
+	ActionYankPop            = editor.ActionYankPop
+	ActionMoveWordLeft       = editor.ActionMoveWordLeft
+	ActionMoveWordRight      = editor.ActionMoveWordRight
 )
 
 // DefaultBindings returns the standard editor/global key bindings.

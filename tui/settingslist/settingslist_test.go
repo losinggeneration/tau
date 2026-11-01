@@ -374,3 +374,79 @@ func TestSearchInsertsShiftedCharacter(t *testing.T) {
 		t.Fatalf("search=%q", l.search)
 	}
 }
+
+func TestListSearchPreservesUnicodeFormatCharacters(t *testing.T) {
+	value := "👩\u200d💻ش\u200cم\u00a0\U000e0100"
+	l := New([]Item{{ID: "joined", Label: value}, {ID: "plain", Label: "other"}}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	for _, r := range value {
+		l.HandleKey(event.KeyEvent{Key: event.KeyRune, Rune: r})
+	}
+	if l.Search() != value {
+		t.Fatalf("search=%q want %q", l.Search(), value)
+	}
+	items := l.FilteredItems()
+	if len(items) != 1 || items[0].ID != "joined" {
+		t.Fatalf("filtered=%+v", items)
+	}
+	for _, key := range []event.KeyEvent{{Key: event.KeyRune, Rune: 27}, {Key: event.KeyRune, Rune: 128}, {Key: event.KeyRune, Rune: '\u200d', Mod: event.ModCtrl}, {Key: event.KeyRune, Rune: '\u200d', Mod: event.ModAlt}} {
+		l.HandleKey(key)
+	}
+	if l.Search() != value {
+		t.Fatalf("control/shortcut changed search=%q", l.Search())
+	}
+}
+
+func TestListSpaceEditsActiveSearchWithoutChangingValue(t *testing.T) {
+	var changes int
+	l := New([]Item{{ID: "match", Label: "Auto compact", CurrentValue: "off", Values: []string{"off", "on"}}, {ID: "other", Label: "Autocomplete"}}, 5, DefaultTheme(), func(string, string) { changes++ }, nil, Options{EnableSearch: true})
+	l.HandleInput(" ")
+	if changes != 1 {
+		t.Fatalf("empty search Space changes=%d", changes)
+	}
+	for _, r := range "Auto compact" {
+		l.HandleKey(event.KeyEvent{Key: event.KeyRune, Rune: r})
+	}
+	if l.Search() != "Auto compact" || changes != 1 {
+		t.Fatalf("search=%q changes=%d", l.Search(), changes)
+	}
+	items := l.FilteredItems()
+	if len(items) != 1 || items[0].ID != "match" {
+		t.Fatalf("filtered=%+v", items)
+	}
+}
+
+func TestListSearchBackspaceRemovesWholeGrapheme(t *testing.T) {
+	for _, value := range []string{"e\u0301", "👩\u200d💻", "🇬🇧", "👍🏽"} {
+		l := New(nil, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+		for _, r := range "x" + value {
+			l.HandleKey(event.KeyEvent{Key: event.KeyRune, Rune: r})
+		}
+		l.HandleKey(event.KeyEvent{Key: event.KeyBackspace})
+		if l.Search() != "x" {
+			t.Fatalf("backspace %q = %q", value, l.Search())
+		}
+	}
+}
+
+func TestListStringInputDecodesChunksAndModifiedText(t *testing.T) {
+	l := New([]Item{{ID: "symbol", Label: "+界e\u0301"}}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	l.HandleInput("\x1b[43u界e\u0301")
+	if l.Search() != "+界e\u0301" {
+		t.Fatalf("search=%q", l.Search())
+	}
+	l.HandleInput("\x1b[")
+	l.HandleInput("127u")
+	if l.Search() != "+界" {
+		t.Fatalf("decoded backspace search=%q", l.Search())
+	}
+	l.HandleInput("\x1b]10;rgb:00/00/00\x07")
+	if l.Search() != "+界" {
+		t.Fatalf("reply changed search=%q", l.Search())
+	}
+	for _, b := range []byte("👩\u200d💻") {
+		l.HandleInput(string([]byte{b}))
+	}
+	if l.Search() != "+界👩\u200d💻" {
+		t.Fatalf("split UTF-8 search=%q", l.Search())
+	}
+}

@@ -267,3 +267,18 @@ func TestPromptEditorPhysicalCursorThroughToolkit(t *testing.T) {
 		})
 	}
 }
+
+func TestPromptEditorResetDropsInlinePreviewAndUndo(t *testing.T) {
+	ed := NewPromptEditor()
+	png, err := base64.StdEncoding.DecodeString(promptEditorTestPNGBase64)
+	require.NoError(t, err)
+	ed.SetInlineImagePreview("@pasted-image.png", png, "image/png")
+	ed.SetText(nil, "@pasted-image.png")
+	id := ed.inlineImages["@pasted-image.png"].ImageID()
+	ed.Reset(nil)
+	assert.Empty(t, ed.Text())
+	assert.Empty(t, ed.inlineImages)
+	assert.Contains(t, ed.deletedImageIDs, id)
+	ed.Model().Undo()
+	assert.Empty(t, ed.Text())
+}

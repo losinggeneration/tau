@@ -1,6 +1,12 @@
 package ansi
 
-import "github.com/losinggeneration/rovel/text"
+import (
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/losinggeneration/rovel/event"
+	"github.com/losinggeneration/rovel/text"
+)
 
 // Strip removes terminal control sequences from s. It is a thin tau adapter
 // over rovel's ANSI-aware text primitives.
@@ -24,3 +30,15 @@ func WrapWords(s string, width int) []string { return text.ANSIWrapWords(s, widt
 // SliceStrict slices s by visible-cell interval, omitting wide graphemes that
 // cross either boundary.
 func SliceStrict(s string, start, end int) string { return text.ANSISliceStrict(s, start, end) }
+
+// TextRune admits text keys without dropping Unicode joiners and format marks.
+func TextRune(key event.KeyEvent) (rune, bool) {
+	if key.Key != event.KeyRune || key.Mod & ^event.ModShift != 0 {
+		return 0, false
+	}
+	r := key.Rune
+	if key.Mod&event.ModShift != 0 && key.ShiftedRune != 0 {
+		r = key.ShiftedRune
+	}
+	return r, utf8.ValidRune(r) && !unicode.IsControl(r)
+}

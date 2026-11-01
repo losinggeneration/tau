@@ -14,6 +14,8 @@ import (
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/extensions"
+	"github.com/losinggeneration/tau/tui/keybindings"
+	"github.com/losinggeneration/tau/tui/keymap"
 	"github.com/losinggeneration/tau/tui/widgets"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1175,4 +1177,146 @@ func TestReloadCleanupFailureAppliesAdmittedSessionSettings(t *testing.T) {
 	hidden := app.chat.hideThinkingBlock
 	app.chat.mu.Unlock()
 	require.False(t, hidden)
+}
+
+func TestNativeEditorKeysReachModelOperations(t *testing.T) {
+	cases := []struct {
+		key    string
+		want   string
+		cursor int
+	}{
+		{"ctrl+k", "one ", 4},
+		{"ctrl+u", "two", 0},
+		{"ctrl+w", "two", 0},
+		{"alt+d", "one ", 4},
+		{"alt+delete", "one ", 4},
+		{"ctrl+-", "", 0},
+		{"alt+b", "one two", 0},
+		{"alt+left", "one two", 0},
+		{"ctrl+left", "one two", 0},
+		{"alt+f", "one two", 7},
+		{"alt+right", "one two", 7},
+		{"ctrl+right", "one two", 7},
+		{"ctrl+a", "one two", 0},
+		{"ctrl+e", "one two", 7},
+		{"ctrl+b", "one two", 3},
+		{"ctrl+f", "one two", 5},
+		{"ctrl+d", "one wo", 4},
+		{"ctrl+y", "one savedtwo", 9},
+		{"alt+y", "one oldertwo", 9},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			a := newAppWithSelector(t)
+			m := a.editor.Model()
+			m.SetText("older")
+			m.DeleteToLineStart()
+			m.MoveLeft()
+			m.SetText("saved")
+			m.DeleteToLineStart()
+			m.SetText("one two")
+			m.SetCursor(4)
+			if tc.key == "alt+y" {
+				m.Yank()
+			}
+			ks, err := keybindings.CompileKey(tc.key)
+			require.NoError(t, err)
+			act, ok := (appKeymap{app: a}).Resolve(tauui.KeyCtxTextInput, ks)
+			require.True(t, ok, "key must resolve")
+			require.True(t, a.editor.HandleAction(act, &tauui.Ctx{FocusedID: a.editor.ID()}), "editor must handle action %v", act)
+			assert.Equal(t, tc.want, m.Text())
+			assert.Equal(t, tc.cursor, m.Cursor())
+		})
+	}
+}
+
+func TestNativeExtensionInsertAppliesOnce(t *testing.T) {
+	a, err := New(Options{Session: &fakeSession{}})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, a.chat.Close()) })
+	a.extensions.SetEditorText("base")
+	var changes []string
+	a.editor.SetOnChange(func(s string, _ *tauui.Ctx) { changes = append(changes, s) })
+	a.extensions.InsertEditorText(0, "X-")
+	assert.Equal(t, "X-base", a.editor.Text())
+	assert.Equal(t, a.editor.Text(), a.extensions.EditorText())
+	assert.Equal(t, []string{"X-base"}, changes)
+	a.editor.Model().Undo()
+	assert.Equal(t, "base", a.editor.Text())
+}
+
+func TestNativeSubmitStoresExpandedHistoryAndDiscardsUndo(t *testing.T) {
+	app := newTestApp(t)
+	app.editor = newPromptEditorForTest()
+	app.footer = newFooterForTest()
+	ctx := testCtx()
+	ctx.FocusedID = app.editor.ID()
+	var handled string
+	app.cmds.Register(Command{Name: "capture", Handler: func(_ *App, args string) { handled = args }})
+	app.editor.Model().Insert(" /capture ")
+	body := strings.Repeat("pasted line\n", 20)
+	app.editor.Model().Paste(body)
+	var changes []string
+	app.editor.SetOnChange(func(text string, _ *tauui.Ctx) { changes = append(changes, text) })
+	require.True(t, app.trySubmit(ctx))
+	want := "/capture " + strings.TrimSpace(body)
+	assert.Equal(t, strings.TrimSpace(body), handled)
+	assert.Equal(t, []string{want}, app.editor.Model().HistoryEntries())
+	assert.Empty(t, app.editor.Text())
+	assert.Empty(t, app.editor.Model().LargePastes())
+	assert.Equal(t, []string{""}, changes)
+	app.editor.Model().Undo()
+	assert.Empty(t, app.editor.Text())
+	app.editor.Model().HistoryPrev()
+	assert.Equal(t, want, app.editor.Text())
+}
+
+func TestNativeSubmitWhitespaceClearsWithoutRoutingOrHistory(t *testing.T) {
+	app := newTestApp(t)
+	app.editor = newPromptEditorForTest()
+	ctx := testCtx()
+	ctx.FocusedID = app.editor.ID()
+	app.editor.Model().Paste(strings.Repeat(" \n", 20))
+	require.True(t, app.trySubmit(ctx))
+	assert.Empty(t, app.editor.Text())
+	assert.Empty(t, app.editor.Model().HistoryEntries())
+	assert.Empty(t, app.editor.Model().LargePastes())
+	app.editor.Model().Undo()
+	assert.Empty(t, app.editor.Text())
+	fs := app.sess.(*fakeSession)
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	assert.Empty(t, fs.sentTexts)
+}
+
+func TestNativeEditorCharacterJumpUsesDecodedTextWithoutEditing(t *testing.T) {
+	a := newAppWithSelector(t)
+	m := a.editor.Model()
+	m.SetText("o+界o\nend+")
+	m.SetCursor(0)
+	ctx := &tauui.Ctx{FocusedID: a.editor.ID()}
+	var changes int
+	a.editor.SetOnChange(func(string, *tauui.Ctx) { changes++ })
+	handle := func(key tauui.KeyEvent) {
+		act, ok := (appKeymap{app: a}).Resolve(tauui.KeyCtxTextInput, keymap.KeystrokeOf(key))
+		if ok {
+			require.True(t, a.editor.HandleAction(act, ctx))
+			return
+		}
+		require.True(t, a.editor.Handle(key, ctx))
+	}
+	handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: ']', Mod: tauui.ModCtrl})
+	handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'o'})
+	assert.Equal(t, len("o+界"), m.Cursor())
+	assert.Zero(t, changes)
+	handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: ']', Mod: tauui.ModCtrl | tauui.ModAlt})
+	handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: '+', Mod: tauui.ModShift})
+	assert.Equal(t, 1, m.Cursor())
+	assert.Zero(t, changes)
+	assert.Equal(t, "o+界o\nend+", m.Text())
+	handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: ']', Mod: tauui.ModCtrl})
+	handle(tauui.KeyEvent{Key: tauui.KeyLeft})
+	handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'X'})
+	assert.Equal(t, "Xo+界o\nend+", m.Text())
+	assert.Equal(t, 1, changes)
 }

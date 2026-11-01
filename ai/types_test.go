@@ -585,13 +585,15 @@ func TestToAssistantMessagePreservesSourceMetadata(t *testing.T) {
 		Role: "assistant", Content: []ContentBlock{{Type: ContentBlockText, Text: "ok"}},
 		Provider: ProviderAnthropic, API: APIAnthropicMessages, Model: "claude-sonnet-4",
 		StopReason: string(StopReasonStop), Timestamp: 1740000000000, DurationMs: new(12.5),
-		Diagnostics: []AssistantDiagnostic{{Type: "strict_fallback"}},
+		Diagnostics:           []AssistantDiagnostic{{Type: "strict_fallback"}},
+		ProviderThinkingLevel: "high",
 	}
 	got, ok := msg.ToAssistantMessage()
 	want := AssistantMessage{
 		Role: msg.Role, Content: msg.ContentBlocks(), Provider: msg.Provider, API: msg.API,
 		Model: msg.Model, StopReason: StopReasonStop, Timestamp: msg.Timestamp,
 		DurationMs: msg.DurationMs, Diagnostics: msg.Diagnostics,
+		ProviderThinkingLevel: msg.ProviderThinkingLevel,
 	}
 	if !ok || !reflect.DeepEqual(got, want) {
 		t.Fatalf("ToAssistantMessage = %#v, %v; want %#v, true", got, ok, want)

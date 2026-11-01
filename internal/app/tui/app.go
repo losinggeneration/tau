@@ -19,6 +19,7 @@ import (
 	"github.com/losinggeneration/tau/tui/autocomplete"
 	"github.com/losinggeneration/tau/tui/extensions"
 	"github.com/losinggeneration/tau/tui/keybindings"
+	"github.com/losinggeneration/tau/tui/keymap"
 	"github.com/losinggeneration/tau/tui/widgets"
 )
 
@@ -734,9 +735,6 @@ func New(opts Options) (*App, error) {
 		})
 		a.extensions.OnEditorTextChanged(func(text string) {
 			a.applyEditorTextFromExtension(text)
-		})
-		a.extensions.OnInsertEditorTextChanged(func(pos int, text string) {
-			a.applyInsertEditorTextFromExtension(pos, text)
 		})
 		a.extensions.OnToolExpandedChanged(func(id string, expanded bool) {
 			a.refreshPluginToolExpansion(id)
@@ -1700,7 +1698,7 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 		if k.app == nil || k.app.editor == nil || k.app.editor.Text() == "" {
 			return AppActionQuitNow, true
 		}
-		return tauui.ActionNone, false
+		return tauui.ActionDeleteFwd, true
 	}
 	// Scoped-model bindings are checked first so the dialog's Ctrl+P wins over
 	// the global model cycle while it is open.
@@ -1811,6 +1809,11 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 	// names that as Alt+Enter, and leaving it unhandled lets the prompt
 	// editor's ActionSubmit path insert a newline. Alt+Backspace
 	// (app.message.dequeue) is resolved through the registry above.
+	if ctx == tauui.KeyCtxTextInput {
+		if act, ok := (keymap.EditorKeymap{}).Resolve(ctx, ks); ok {
+			return act, true
+		}
+	}
 	return tauui.StandardKeymap{}.Resolve(ctx, ks)
 }
 
@@ -2282,14 +2285,16 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 	if ctx == nil || ctx.FocusedID != a.editor.ID() {
 		return false
 	}
-	text := a.editor.Text()
+	text := a.editorTextForSubmit()
 	if text == "" {
+		a.editor.Reset(ctx)
+		a.clearPendingAttachments(ctx)
+		a.dismissSelector()
 		return true
 	}
-	sendText := a.editorTextForSubmit()
 
 	// Slash command: dispatch to the registered handler.
-	if name, args, ok := parseCommandLine(sendText); ok {
+	if name, args, ok := parseCommandLine(text); ok {
 		// `/model` is special-cased. With no args it transitions into
 		// the in-layout model picker; with args the args are the model
 		// id the user typed (or pre-filled by Tab), and we resolve the
@@ -2335,7 +2340,7 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 					a.pendingModelKey = ""
 					a.editor.Model().AddHistory(text)
 					a.applyModelFromKey(key)
-					a.editor.SetText(ctx, "")
+					a.editor.Reset(ctx)
 					a.clearPendingAttachments(ctx)
 					a.dismissSelector()
 					return true
@@ -2347,7 +2352,7 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 			}
 			if a.applyModelFromArgs(args) {
 				a.editor.Model().AddHistory(text)
-				a.editor.SetText(ctx, "")
+				a.editor.Reset(ctx)
 				a.clearPendingAttachments(ctx)
 				a.dismissSelector()
 				return true
@@ -2361,7 +2366,7 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 			// confusing and never helps. Clear the editor and surface
 			// a chat-log error so the user knows the id didn't resolve.
 			a.editor.Model().AddHistory(text)
-			a.editor.SetText(ctx, "")
+			a.editor.Reset(ctx)
 			a.clearPendingAttachments(ctx)
 			a.dismissSelector()
 			a.conv.AddError("model: unknown id \"" + args + "\"")
@@ -2374,7 +2379,7 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 			return true
 		}
 		a.editor.Model().AddHistory(text)
-		a.editor.SetText(ctx, "")
+		a.editor.Reset(ctx)
 		a.clearPendingAttachments(ctx)
 		a.dismissSelector()
 		if cmd, found := a.cmds.Lookup(name); found {
@@ -2386,13 +2391,13 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 			// the session owns this command (for example a plugin command
 			// registered for completion only). Forward it to the session
 			// command pipeline, not to local handlers.
-			a.routePrompt(sendText, ctx)
+			a.routePrompt(text, ctx)
 			return true
 		}
 		if a.sessionSlashCommandExists(name) {
 			// The session advertises this slash command, so it is safe to
 			// forward the raw line to the session's command dispatcher.
-			a.routePrompt(sendText, ctx)
+			a.routePrompt(text, ctx)
 			return true
 		}
 		// Unknown slash commands must not fall through to the model. A
@@ -2404,14 +2409,14 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 		return true
 	}
 
-	if command, excluded, ok := parseUserBash(sendText); ok {
+	if command, excluded, ok := parseUserBash(text); ok {
 		if a.userBashCancel != nil {
 			a.conv.AddError("a bash command is already running; press Esc to cancel it first")
 			a.refreshChat()
 			return true
 		}
 		a.editor.Model().AddHistory(text)
-		a.editor.SetText(ctx, "")
+		a.editor.Reset(ctx)
 		a.dismissSelector()
 		a.runUserBash(command, excluded)
 		return true
@@ -2420,10 +2425,10 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 	// Clear the editor first, then send. The send runs on a goroutine so the
 	// loop stays responsive; results land via App.Post.
 	a.editor.Model().AddHistory(text)
-	a.editor.SetText(ctx, "")
+	a.editor.Reset(ctx)
 	a.clearPendingAttachments(ctx)
 	a.dismissSelector()
-	a.routePrompt(sendText, ctx)
+	a.routePrompt(text, ctx)
 	return true
 }
 

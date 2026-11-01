@@ -4,6 +4,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/losinggeneration/tau/tui/ansi"
+
+	rovelansi "github.com/losinggeneration/rovel/backend/ansi"
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/text"
 	"github.com/losinggeneration/tau/tui/fuzzy"
@@ -55,6 +58,7 @@ type List struct {
 	appliedQuery  string
 	submenu       KeyComponent
 	submenuIndex  int
+	input         rovelansi.DecodeInput
 }
 
 func New(items []Item, maxVisible int, theme Theme, onChange func(string, string), onCancel func(), opts Options) *List {
@@ -155,8 +159,10 @@ func (l *List) renderMain(width int) []string {
 }
 
 func (l *List) HandleInput(data string) {
-	if ke, ok := keyEventFromTestInput(data); ok {
-		l.HandleKey(ke)
+	for _, ev := range l.input.FlushPending(l.input.Push(nil, []byte(data))) {
+		if key, ok := ev.(event.KeyEvent); ok {
+			l.HandleKey(key)
+		}
 	}
 }
 
@@ -186,14 +192,11 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 	case event.KeyEnter:
 		l.activate()
 	case event.KeyRune:
-		if ke.Mod == 0 && ke.Rune == ' ' {
+		if ke.Mod == 0 && ke.Rune == ' ' && (!l.searchEnabled || l.search == "") {
 			l.activate()
 			return
 		}
-		if r, ok := ke.TextRune(); ok && l.searchEnabled {
-			if r == ' ' {
-				return
-			}
+		if r, ok := ansi.TextRune(ke); ok && l.searchEnabled {
 			l.search += string(r)
 			l.applyFilter(l.search)
 		}
@@ -203,37 +206,10 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 		}
 	case event.KeyBackspace:
 		if l.searchEnabled && l.search != "" {
-			_, sz := lastRune(l.search)
-			l.search = l.search[:len(l.search)-sz]
+			l.search = l.search[:text.PrevCluster(l.search, len(l.search))]
 			l.applyFilter(l.search)
 		}
 	}
-}
-
-func keyEventFromTestInput(data string) (event.KeyEvent, bool) {
-	switch data {
-	case "\x1b[A":
-		return event.KeyEvent{Key: event.KeyUp}, true
-	case "\x1b[B":
-		return event.KeyEvent{Key: event.KeyDown}, true
-	case "\r", "\n":
-		return event.KeyEvent{Key: event.KeyEnter}, true
-	case " ":
-		return event.KeyEvent{Key: event.KeyRune, Rune: ' '}, true
-	case "\x1b":
-		return event.KeyEvent{Key: event.KeyEsc}, true
-	case "\x03":
-		return event.KeyEvent{Key: event.KeyCtrlC}, true
-	case "\x7f", "\b":
-		return event.KeyEvent{Key: event.KeyBackspace}, true
-	}
-	if len([]rune(data)) == 1 {
-		r := []rune(data)[0]
-		if r >= 32 {
-			return event.KeyEvent{Key: event.KeyRune, Rune: r}, true
-		}
-	}
-	return event.KeyEvent{}, false
 }
 
 func (l *List) activate() {
@@ -339,12 +315,4 @@ func wrap(s string, w int) []string {
 		out = append(out, s[line.StartByte:line.EndByte])
 	}
 	return out
-}
-
-func lastRune(s string) (rune, int) {
-	r := []rune(s)
-	if len(r) == 0 {
-		return 0, 0
-	}
-	return r[len(r)-1], len(string(r[len(r)-1]))
 }

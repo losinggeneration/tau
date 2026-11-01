@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/losinggeneration/rovel/text"
 	"github.com/losinggeneration/rovel/ui"
 
 	"github.com/losinggeneration/tau/tui/keybindings"
@@ -353,12 +354,7 @@ func (r *Registry) SetEditorText(s string) {
 }
 func (r *Registry) EditorText() string { return r.editorText }
 func (r *Registry) InsertEditorText(pos int, s string) {
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > len(r.editorText) {
-		pos = len(r.editorText)
-	}
+	pos = text.ClampCluster(r.editorText, pos)
 	r.editorText = r.editorText[:pos] + s + r.editorText[pos:]
 	if r.onInsertEditorText != nil {
 		r.onInsertEditorText(pos, s)

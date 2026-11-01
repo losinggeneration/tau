@@ -973,15 +973,13 @@ func TestAppKeymapCtrlDQuitsImmediatelyWhenEditorEmpty(t *testing.T) {
 	}
 }
 
-// TestAppKeymapCtrlDFallsThroughWhenEditorHasText verifies Ctrl+D does not
-// exit while a draft prompt is present.
-func TestAppKeymapCtrlDFallsThroughWhenEditorHasText(t *testing.T) {
+// Ctrl+D deletes forward in a nonempty prompt instead of quitting.
+func TestAppKeymapCtrlDDeletesForwardWhenEditorHasText(t *testing.T) {
 	a := newAppWithSelector(t)
-	a.editor.SetText(stubCtx(), "draft")
-	km := appKeymap{app: a}
-
-	if act, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyRune, Rune: 'd', Mod: tauui.ModCtrl}); ok {
-		t.Errorf("Ctrl+D with draft prompt = (%v, true), want fall-through", act)
+	a.editor.SetText(nil, "draft prompt")
+	act, ok := (appKeymap{app: a}).Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyRune, Rune: 'd', Mod: tauui.ModCtrl})
+	if !ok || act != tauui.ActionDeleteFwd {
+		t.Fatalf("Ctrl+D with draft prompt = (%v, %v), want forward deletion", act, ok)
 	}
 }
 

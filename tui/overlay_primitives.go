@@ -3,8 +3,10 @@ package tui
 import (
 	"strings"
 
+	rovelansi "github.com/losinggeneration/rovel/backend/ansi"
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/text"
+	"github.com/losinggeneration/tau/tui/ansi"
 	editormodel "github.com/losinggeneration/tau/tui/editor"
 	inputmodel "github.com/losinggeneration/tau/tui/input"
 )
@@ -20,7 +22,7 @@ type InputPrimitive struct {
 
 	model       *inputmodel.Input
 	initialized bool
-	scroll      int
+	input       rovelansi.DecodeInput
 }
 
 func (p *InputPrimitive) ensureModel() *inputmodel.Input {
@@ -45,28 +47,20 @@ func (p *InputPrimitive) Render(width int) []string {
 	if p == nil || width <= 0 {
 		return nil
 	}
-	m := p.ensureModel()
-	available := width - TextWidth(p.Prompt)
-	if available < 1 {
-		available = 1
-	}
-	before, after := splitAtByte(m.Value(), m.Cursor())
-	beforeVisible := suffixByWidth(before, max(0, available-1), &p.scroll)
-	usedBefore := TextWidth(beforeVisible)
-	remaining := available - usedBefore - 1
-	if remaining < 0 {
-		remaining = 0
-	}
-	cursor, rest := cursorCell(after)
-	afterVisible := prefixByWidth(rest, remaining)
-	visibleText := p.Prompt + beforeVisible + cursor + afterVisible
-	visible := p.Prompt + beforeVisible + cursorString(cursor, true) + afterVisible
-	return []string{visible + repeatSpace(width-TextWidth(visibleText))}
+	return []string{renderInputRow(p.ensureModel(), p.Prompt, true, width)}
 }
 
 func (p *InputPrimitive) HandleInput(data string) {
-	if ke, ok := primitiveKeyFromInput(data); ok {
-		p.HandleKey(ke)
+	if p == nil {
+		return
+	}
+	for _, ev := range p.input.FlushPending(p.input.Push(nil, []byte(data))) {
+		switch ev := ev.(type) {
+		case event.KeyEvent:
+			p.HandleKey(ev)
+		case event.PasteEvent:
+			p.Paste(ev.Text)
+		}
 	}
 }
 
@@ -144,7 +138,7 @@ func (p *InputPrimitive) HandleKey(ke event.KeyEvent) {
 		case ke.Mod == event.ModCtrl && ke.Rune == '-':
 			m.Undo()
 		default:
-			if r, ok := ke.TextRune(); ok {
+			if r, ok := ansi.TextRune(ke); ok {
 				m.Insert(string(r))
 			}
 		}
@@ -196,17 +190,6 @@ func splitAtByte(s string, pos int) (string, string) {
 	return s[:pos], s[pos:]
 }
 
-func suffixByWidth(s string, width int, _ *int) string {
-	if TextWidth(s) <= width {
-		return s
-	}
-	return ANSISliceStrict(s, max(0, TextWidth(s)-width), TextWidth(s))
-}
-
-func prefixByWidth(s string, width int) string {
-	return ANSISliceStrict(s, 0, width)
-}
-
 // EditorPrimitive renders and routes keys for the multiline editor model used
 // by prompt-style overlays and app prompt integration.
 type EditorPrimitive struct {
@@ -216,6 +199,7 @@ type EditorPrimitive struct {
 	MaxRows     int
 	SubmitSlash bool
 	renderWidth int
+	input       rovelansi.DecodeInput
 }
 
 func (p *EditorPrimitive) ensureModel() *editormodel.Editor {
@@ -243,9 +227,9 @@ func (p *EditorPrimitive) Render(width int) []string {
 			visual = []string{""}
 		}
 		segmentStartCol := 0
-		for _, vline := range visual {
+		for j, vline := range visual {
 			lineWidth := TextWidth(vline)
-			if i == pos.Line && pos.Col >= segmentStartCol && pos.Col <= segmentStartCol+lineWidth {
+			if i == pos.Line && pos.Col >= segmentStartCol && (pos.Col < segmentStartCol+lineWidth || j == len(visual)-1 && pos.Col == segmentStartCol+lineWidth) {
 				col := pos.Col - segmentStartCol
 				before := ANSISliceStrict(vline, 0, col)
 				after := strings.TrimPrefix(vline, before)
@@ -282,9 +266,24 @@ func (p *EditorPrimitive) lastRenderWidth() int {
 	return p.renderWidth
 }
 
+func (p *EditorPrimitive) pageRows() int {
+	if p.MaxRows > 0 {
+		return p.MaxRows
+	}
+	return 10
+}
+
 func (p *EditorPrimitive) HandleInput(data string) {
-	if ke, ok := primitiveKeyFromInput(data); ok {
-		p.HandleKey(ke)
+	if p == nil {
+		return
+	}
+	for _, ev := range p.input.FlushPending(p.input.Push(nil, []byte(data))) {
+		switch ev := ev.(type) {
+		case event.KeyEvent:
+			p.HandleKey(ev)
+		case event.PasteEvent:
+			p.ensureModel().Paste(ev.Text)
+		}
 	}
 }
 
@@ -293,6 +292,9 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 		return
 	}
 	m := p.ensureModel()
+	if m.HandleJumpKey(ke) {
+		return
+	}
 	switch ke.Key {
 	case event.KeyEnter:
 		if ke.Mod == event.ModShift {
@@ -349,9 +351,9 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 		}
 		m.MoveVisualDown(max(1, p.lastRenderWidth()))
 	case event.KeyPageUp:
-		m.PageUp(10)
+		m.MoveVisual(max(1, p.lastRenderWidth()), -p.pageRows())
 	case event.KeyPageDown:
-		m.PageDown(10)
+		m.MoveVisual(max(1, p.lastRenderWidth()), p.pageRows())
 	case event.KeyHome:
 		m.MoveLineStart()
 	case event.KeyEnd:
@@ -399,41 +401,11 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 		case ke.Mod == event.ModAlt && ke.Rune == 'f':
 			m.MoveWordRight()
 		default:
-			if r, ok := ke.TextRune(); ok {
+			if r, ok := ansi.TextRune(ke); ok {
 				m.Insert(string(r))
 			}
 		}
 	}
-}
-
-func primitiveKeyFromInput(data string) (event.KeyEvent, bool) {
-	switch data {
-	case "\r", "\n":
-		return event.KeyEvent{Key: event.KeyEnter}, true
-	case "\x1b":
-		return event.KeyEvent{Key: event.KeyEsc}, true
-	case "\x03":
-		return event.KeyEvent{Key: event.KeyCtrlC}, true
-	case "\t":
-		return event.KeyEvent{Key: event.KeyTab}, true
-	case "\x7f", "\b":
-		return event.KeyEvent{Key: event.KeyBackspace}, true
-	case "\x1b[A":
-		return event.KeyEvent{Key: event.KeyUp}, true
-	case "\x1b[B":
-		return event.KeyEvent{Key: event.KeyDown}, true
-	case "\x1b[C":
-		return event.KeyEvent{Key: event.KeyRight}, true
-	case "\x1b[D":
-		return event.KeyEvent{Key: event.KeyLeft}, true
-	}
-	if len([]rune(data)) == 1 {
-		r := []rune(data)[0]
-		if r >= 32 {
-			return event.KeyEvent{Key: event.KeyRune, Rune: r}, true
-		}
-	}
-	return event.KeyEvent{}, false
 }
 
 func (p *EditorPrimitive) SetSelection(start, end int) {

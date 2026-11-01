@@ -383,3 +383,49 @@ func TestWorkspaceOverlayRenameInsertsShiftedSymbol(t *testing.T) {
 	o.HandleKey(tauui.KeyEvent{Key: tauui.KeyRune, Rune: '=', ShiftedRune: '+', Mod: tauui.ModShift})
 	assert.Equal(t, "+", o.name)
 }
+
+func TestWorkspaceTextPreservesUnicodeFormatCharacters(t *testing.T) {
+	value := "👩\u200d💻ش\u200cم\u00a0\U000e0100"
+	for _, rename := range []bool{false, true} {
+		o := newWorkspaceOverlay(nil, []sdkpkg.SessionInfo{{ID: "joined", Name: value}, {ID: "other", Name: "other"}})
+		o.rename = rename
+		for _, r := range value {
+			o.HandleKey(tauui.KeyEvent{Key: tauui.KeyRune, Rune: r})
+		}
+		if rename {
+			assert.Equal(t, value, o.name)
+		} else {
+			assert.Equal(t, value, o.filter)
+			assert.Len(t, o.items(), 1)
+			if len(o.items()) == 1 {
+				assert.Equal(t, "joined", o.items()[0].ID)
+			}
+		}
+		for _, key := range []tauui.KeyEvent{{Key: tauui.KeyRune, Rune: 27}, {Key: tauui.KeyRune, Rune: 128}, {Key: tauui.KeyRune, Rune: '\u200d', Mod: tauui.ModAlt}, {Key: tauui.KeyRune, Rune: '\u200d', Mod: tauui.ModCtrl}} {
+			o.HandleKey(key)
+		}
+		if rename {
+			assert.Equal(t, value, o.name)
+		} else {
+			assert.Equal(t, value, o.filter)
+		}
+	}
+}
+
+func TestWorkspaceBackspaceRemovesWholeGrapheme(t *testing.T) {
+	for _, value := range []string{"e\u0301", "👩\u200d💻", "🇬🇧", "👍🏽"} {
+		for _, rename := range []bool{false, true} {
+			o := newWorkspaceOverlay(nil, nil)
+			o.rename = rename
+			for _, r := range "x" + value {
+				o.HandleKey(tauui.KeyEvent{Key: tauui.KeyRune, Rune: r})
+			}
+			o.HandleKey(tauui.KeyEvent{Key: tauui.KeyBackspace})
+			if rename {
+				assert.Equal(t, "x", o.name, value)
+			} else {
+				assert.Equal(t, "x", o.filter, value)
+			}
+		}
+	}
+}

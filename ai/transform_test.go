@@ -1065,3 +1065,20 @@ func TestTransformSignedToolCallsKeepNamespaceAcrossModels(t *testing.T) {
 		}
 	}
 }
+
+func TestTransformNormalizerReceivesNativeEffort(t *testing.T) {
+	source := Message{Role: "assistant", Provider: ProviderAnthropic, API: APIAnthropicMessages, Model: "source", ProviderThinkingLevel: "high", StopReason: string(StopReasonToolUse), Content: []ContentBlock{{Type: ContentBlockToolCall, ID: "call", Name: "read", Arguments: json.RawMessage(`{}`)}}}
+	target := &Model{Provider: ProviderOpenAI, API: APIOpenAICompletions, ID: "target"}
+	var calls int
+	normalized, err := TransformContext(&Context{Messages: []Message{source, {Role: "toolResult", ToolCallID: "call", Content: []ContentBlock{{Type: ContentBlockText, Text: "ok"}}}}}, target, func(id string, _ *Model, msg *AssistantMessage) string {
+		calls++
+		assert.Equal(t, "high", msg.ProviderThinkingLevel)
+		return id + "_normalized"
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls)
+	require.Len(t, normalized.Messages, 2)
+	assert.Equal(t, "high", normalized.Messages[0].ProviderThinkingLevel)
+	assert.Equal(t, "call_normalized", normalized.Messages[1].ToolCallID)
+	assert.Equal(t, "high", source.ProviderThinkingLevel)
+}

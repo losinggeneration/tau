@@ -112,55 +112,12 @@ func (a *App) savePastedImage(img clipboard.Image) (string, error) {
 // its own editorText field; this is the bridge that keeps the
 // editor in sync when a plugin calls SetEditorText.
 //
-// Safe to call from any goroutine; SetText is goroutine-safe on the
-// prompt editor widget.
+// The caller must run on the app loop.
 func (a *App) applyEditorTextFromExtension(text string) {
 	if a == nil || a.editor == nil {
 		return
 	}
 	a.editor.SetText(a.loopContext(), text)
-}
-
-// applyInsertEditorTextFromExtension inserts text at a given offset
-// in the live editor. Negative or out-of-range positions are
-// clamped to the existing text boundary.
-//
-// The editor's text is reconciled with the registry's stored text
-// before the insert so plugin calls that follow a SetEditorText
-// operate on the latest stored state (the registry is the source of
-// truth for plugin-supplied editor text; the editor is the live
-// projection plugins see and mutate). After the insert, the new
-// editor text is mirrored back to the registry so a subsequent
-// insert that doesn't re-call SetEditorText still operates on the
-// latest concatenated string.
-func (a *App) applyInsertEditorTextFromExtension(pos int, text string) {
-	if a == nil || a.editor == nil {
-		return
-	}
-	ctx := a.loopContext()
-	// Reconcile with the registry so consecutive SetEditorText +
-	// applyInsertEditorTextFromExtension calls compose against the
-	// stored text rather than stale editor text from an earlier push.
-	if a.extensions != nil {
-		base := a.extensions.EditorText()
-		if a.editor.Text() != base {
-			a.editor.SetText(ctx, base)
-		}
-	}
-	current := a.editor.Text()
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > len(current) {
-		pos = len(current)
-	}
-	newText := current[:pos] + text + current[pos:]
-	a.editor.SetText(ctx, newText)
-	// Mirror back to the registry so the next insert that threads
-	// through this helper sees the latest concatenated text.
-	if a.extensions != nil {
-		a.extensions.SetEditorText(newText)
-	}
 }
 
 // applyThemeFromExtension is called when a plugin calls SetTheme on
