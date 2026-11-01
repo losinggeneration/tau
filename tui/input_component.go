@@ -1,10 +1,7 @@
 package tui
 
 import (
-	"unicode"
-
 	"github.com/losinggeneration/rovel/text"
-	"github.com/losinggeneration/tau/tui/ansi"
 	inputmodel "github.com/losinggeneration/tau/tui/input"
 )
 
@@ -115,56 +112,18 @@ func cursorCell(s string) (string, string) {
 	return s[:next], s[next:]
 }
 
-func NormalizeSingleLinePastePi(s string) string {
-	out := make([]rune, 0, len(s))
-	for _, r := range s {
-		switch r {
-		case '\r', '\n':
-			continue
-		case '\t':
-			out = append(out, ' ', ' ', ' ', ' ')
-			continue
-		}
-		if unicode.IsControl(r) {
-			continue
-		}
-		out = append(out, r)
-	}
-	return string(out)
-}
+func NormalizeSingleLinePastePi(s string) string { return inputmodel.NormalizePaste(s) }
 
 func (c *InputComponent) Handle(e Event, _ *Ctx) bool {
-	ke, ok := e.(KeyEvent)
-	if !ok {
+	switch e := e.(type) {
+	case KeyEvent:
+		return c.ensure().HandleKey(e)
+	case PasteEvent:
+		c.ensure().Paste(e.Text)
+		return true
+	default:
 		return false
 	}
-	m := c.ensure()
-	switch ke.Key {
-	case KeyRune:
-		if r, ok := ansi.TextRune(ke); ok {
-			m.Insert(string(r))
-			return true
-		}
-	case KeyLeft:
-		m.MoveLeft()
-		return true
-	case KeyRight:
-		m.MoveRight()
-		return true
-	case KeyHome:
-		m.Home()
-		return true
-	case KeyEnd:
-		m.End()
-		return true
-	case KeyBackspace:
-		m.DeleteBackward()
-		return true
-	case KeyDelete:
-		m.DeleteForward()
-		return true
-	}
-	return false
 }
 
 func (c *InputComponent) ID() ID {

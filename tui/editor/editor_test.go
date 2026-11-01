@@ -8,6 +8,7 @@ import (
 
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/tau/tui/autocomplete"
+	"github.com/losinggeneration/tau/tui/keybindings"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -425,13 +426,32 @@ func TestPiEditorSubmitClears(t *testing.T) {
 	}
 }
 
-func TestPiEditorSubmitEmptyDoesNothing(t *testing.T) {
-	called := false
-	e := New()
-	e.SetOnSubmit(func(string) { called = true })
-	e.Submit()
-	if called {
-		t.Fatal("submit on empty should not call callback")
+func TestEditorSubmitEmptyResetsBeforeCallingBack(t *testing.T) {
+	for _, draft := range []string{"", " \t\n", "[paste #1 4 chars]"} {
+		t.Run(draft, func(t *testing.T) {
+			e := New()
+			e.SetText(draft)
+			e.largePastes["[paste #1 4 chars]"] = " \n\t "
+			e.nextPaste = 1
+			e.SetAutocomplete(&autocomplete.Suggestions{Items: []autocomplete.Item{{Value: "completion"}}})
+			e.SetScrollOffset(10)
+			calls := 0
+			e.SetOnSubmit(func(value string) {
+				calls++
+				assert.Empty(t, value)
+				assert.Empty(t, e.Text())
+				assert.Zero(t, e.Cursor())
+				assert.Empty(t, e.LargePastes())
+				assert.Zero(t, e.nextPaste)
+				assert.False(t, e.AutocompleteVisible())
+				assert.Zero(t, e.ScrollOffset())
+				assert.Zero(t, e.undo.Len())
+			})
+			e.Submit()
+			assert.Equal(t, 1, calls)
+			e.Undo()
+			assert.Empty(t, e.Text())
+		})
 	}
 }
 
@@ -1364,4 +1384,122 @@ func TestEditorJumpKeyCancellationAndReset(t *testing.T) {
 	e.HandleJumpKey(forward)
 	assert.True(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyRune, Rune: '=', ShiftedRune: '+', Mod: event.ModShift}))
 	assert.Equal(t, 1, e.Cursor())
+}
+
+func TestEditorJumpUsesConfiguredBindings(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{
+		"tui.editor.jumpForward": {"f2"}, "tui.editor.jumpBackward": {"f3"},
+	}))
+	e := New()
+	e.SetText("x界x界")
+	e.SetCursor(0)
+	assert.False(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyRune, Rune: ']', Mod: event.ModCtrl}))
+	assert.True(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyF2}))
+	assert.True(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyRune, Rune: '界'}))
+	assert.Equal(t, 1, e.Cursor())
+	e.SetCursor(len("x界x"))
+	assert.True(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyF3}))
+	assert.True(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyRune, Rune: '界'}))
+	assert.Equal(t, 1, e.Cursor())
+	assert.True(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyF2}))
+	assert.True(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyF3}))
+	assert.False(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyRune, Rune: 'x'}))
+	assert.Equal(t, 1, e.Cursor())
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.editor.jumpForward": {}}))
+	assert.False(t, e.HandleJumpKey(event.KeyEvent{Key: event.KeyRune, Rune: ']', Mod: event.ModCtrl}))
+}
+
+type suggestionFunc func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error)
+
+func (f suggestionFunc) GetSuggestions(ctx context.Context, lines []string, line, col int, force bool) (*autocomplete.Suggestions, error) {
+	return f(ctx, lines, line, col, force)
+}
+
+func TestEditorAutocompleteRejectsInvalidatedRequest(t *testing.T) {
+	for _, mode := range []string{"text", "cursor", "cancel", "paste", "provider", "context", "nested"} {
+		t.Run(mode, func(t *testing.T) {
+			e := New()
+			e.SetText("/he")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			e.SetAutocompleteProvider(suggestionFunc(func(_ context.Context, _ []string, _, _ int, _ bool) (*autocomplete.Suggestions, error) {
+				switch mode {
+				case "text":
+					e.SetText("/other")
+				case "cursor":
+					e.SetCursor(0)
+				case "cancel":
+					e.CancelAutocomplete()
+				case "paste":
+					e.Paste("new")
+				case "provider":
+					e.SetAutocompleteProvider(nil)
+				case "context":
+					cancel()
+				case "nested":
+					e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+						return &autocomplete.Suggestions{Prefix: "/he", Items: []autocomplete.Item{{Value: "latest"}}}, nil
+					}))
+					require.NoError(t, e.UpdateAutocomplete(ctx, false))
+				}
+				return &autocomplete.Suggestions{Prefix: "/he", Items: []autocomplete.Item{{Value: "stale"}}}, nil
+			}))
+			err := e.UpdateAutocomplete(ctx, false)
+			if mode == "context" {
+				require.ErrorIs(t, err, context.Canceled)
+			} else {
+				require.NoError(t, err)
+			}
+			if mode == "nested" {
+				require.True(t, e.AutocompleteVisible())
+				assert.Equal(t, "latest", e.VisibleAutocompleteItems()[0].Value)
+			} else {
+				assert.False(t, e.AutocompleteVisible())
+			}
+		})
+	}
+}
+
+func TestEditorAutocompleteDoesNotCallProviderAfterCancellation(t *testing.T) {
+	e := New()
+	e.SetText("/he")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	e.SetAutocompleteProvider(suggestionFunc(func(context.Context, []string, int, int, bool) (*autocomplete.Suggestions, error) {
+		called = true
+		return nil, nil
+	}))
+	require.ErrorIs(t, e.UpdateAutocomplete(ctx, false), context.Canceled)
+	assert.False(t, called)
+	assert.False(t, e.AutocompleteVisible())
+}
+
+func TestEditorEmptyPasteCancelsCompletionAndBreaksTyping(t *testing.T) {
+	for _, payload := range []string{"", "\x00\x07"} {
+		t.Run(payload, func(t *testing.T) {
+			e := New()
+			e.Insert("first")
+			e.SetAutocomplete(&autocomplete.Suggestions{Items: []autocomplete.Item{{Value: "completion"}}})
+			e.Paste(payload)
+			assert.False(t, e.AutocompleteVisible())
+			assert.Equal(t, "first", e.Text())
+			e.Insert("second")
+			e.Undo()
+			assert.Equal(t, "first", e.Text())
+			e.Undo()
+			assert.Equal(t, "first", e.Text())
+			e.Undo()
+			assert.Empty(t, e.Text())
+		})
+	}
+	e := New()
+	e.AddHistory("history")
+	e.SetText("draft")
+	e.HistoryPrev()
+	e.Paste("")
+	assert.False(t, e.historyBrowsing)
+	assert.Equal(t, "history", e.Text())
 }

@@ -25,6 +25,8 @@ const (
 	ActionYankPop
 	ActionMoveWordLeft
 	ActionMoveWordRight
+	ActionHistoryPrevious
+	ActionHistoryNext
 )
 
 // CursorMoveReason describes what caused an OnCursorMove notification.
@@ -494,28 +496,42 @@ func (w *Widget) HandleAction(act ui.Action, ctx *rovel.Ctx) bool {
 	textChanged := false
 
 	switch act {
+	case ActionHistoryPrevious, ActionHistoryNext:
+		if w.readOnly {
+			return false
+		}
+		m.CancelAutocomplete()
+		if act == ActionHistoryPrevious {
+			m.HistoryPrev()
+		} else {
+			m.HistoryNext()
+		}
+		changed = true
+		textChanged = m.Text() != oldText
+		reason = CursorMoveSetText
 	case ui.ActionMoveLeft:
 		m.MoveLeft()
 		changed = true
 	case ui.ActionMoveRight:
 		m.MoveRight()
 		changed = true
-	case ui.ActionMoveUp:
-		if m.AtVisualTop(max(1, w.rect.W)) {
-			m.HistoryPrev()
-			textChanged = m.Text() != oldText
-			reason = CursorMoveSetText
+	case ui.ActionMoveUp, ui.ActionMoveDown:
+		if act == ui.ActionMoveUp {
+			if w.readOnly {
+				m.MoveVisualUp(max(1, w.rect.W))
+			} else {
+				m.CursorUp(max(1, w.rect.W))
+			}
 		} else {
-			m.MoveVisualUp(max(1, w.rect.W))
+			if w.readOnly {
+				m.MoveVisualDown(max(1, w.rect.W))
+			} else {
+				m.CursorDown(max(1, w.rect.W))
+			}
 		}
-		changed = true
-	case ui.ActionMoveDown:
-		if m.AtVisualBottom(max(1, w.rect.W)) {
-			m.HistoryNext()
-			textChanged = m.Text() != oldText
+		textChanged = m.Text() != oldText
+		if textChanged {
 			reason = CursorMoveSetText
-		} else {
-			m.MoveVisualDown(max(1, w.rect.W))
 		}
 		changed = true
 	case ui.ActionHome:

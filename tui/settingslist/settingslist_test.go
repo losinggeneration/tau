@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/losinggeneration/rovel/event"
+	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 func TestListCyclesValuesAndReportsChange(t *testing.T) {
@@ -52,21 +54,6 @@ func TestListSearchFiltersAndResetsSelection(t *testing.T) {
 	}
 	if l.Search() != "g" || l.SelectedIndex() != 0 {
 		t.Fatalf("search=%q selected=%d", l.Search(), l.SelectedIndex())
-	}
-}
-
-// The settings rows render through cell-based drawing where a zero-width
-// ESC rune is overwritten by the next cell, leaving literal "[7m" text on
-// screen. The search input must therefore not embed ANSI escapes.
-func TestListRenderSearchInputHasNoANSIEscapes(t *testing.T) {
-	l := New([]Item{{ID: "a", Label: "Alpha"}}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
-	l.HandleInput("g")
-	rows := l.Render(80)
-	if !strings.HasPrefix(rows[0], "> g") {
-		t.Fatalf("search row = %q", rows[0])
-	}
-	if strings.ContainsRune(rows[0], '\x1b') {
-		t.Fatalf("search row embeds ANSI escapes: %q", rows[0])
 	}
 }
 
@@ -448,5 +435,111 @@ func TestListStringInputDecodesChunksAndModifiedText(t *testing.T) {
 	}
 	if l.Search() != "+界👩\u200d💻" {
 		t.Fatalf("split UTF-8 search=%q", l.Search())
+	}
+}
+
+func TestListSearchUsesSingleLineEditingModel(t *testing.T) {
+	l := New([]Item{{ID: "a", Label: "alpha beta"}, {ID: "b", Label: "beta alpha"}}, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	l.HandleInput("alpha beta")
+	l.HandleInput("\x01")
+	l.HandleInput("X")
+	if l.Search() != "Xalpha beta" {
+		t.Fatalf("home insert=%q", l.Search())
+	}
+	l.HandleInput("\x1b[45;5u")
+	if l.Search() != "alpha beta" {
+		t.Fatalf("undo=%q", l.Search())
+	}
+	l.HandleInput("\x05")
+	l.HandleInput("\x17")
+	if l.Search() != "alpha " {
+		t.Fatalf("word kill=%q", l.Search())
+	}
+	l.HandleInput("\x19")
+	if l.Search() != "alpha beta" {
+		t.Fatalf("yank=%q", l.Search())
+	}
+	l.HandleInput("\x01")
+	l.HandleInput("\x1b[200~new\nquery\x1b[201~")
+	if l.Search() != "newqueryalpha beta" {
+		t.Fatalf("paste=%q", l.Search())
+	}
+	l.HandleInput("\x1b[45;5u")
+	if l.Search() != "alpha beta" {
+		t.Fatalf("paste undo=%q", l.Search())
+	}
+	if len(l.FilteredItems()) != 2 {
+		t.Fatalf("filtered=%+v", l.FilteredItems())
+	}
+}
+
+func TestListSearchRendersScrollingCursor(t *testing.T) {
+	l := New(nil, 5, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	l.Paste("abcdefghijklmnop")
+	for _, tc := range []struct {
+		key, want, before string
+		width             int
+	}{
+		{"", "> lmnop ", "> lmnop", 8},
+		{"\x01", "> abcdef", "> ", 8},
+		{"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C", "> fghijk", "> fgh", 8},
+	} {
+		l.HandleInput(tc.key)
+		row := l.Render(tc.width)[0]
+		if got := tauui.StripANSI(row); got != tc.want {
+			t.Fatalf("row=%q want %q", got, tc.want)
+		}
+		if !strings.HasPrefix(row, tc.before+tauui.CursorMarker) {
+			t.Fatalf("cursor in %q, want after %q", row, tc.before)
+		}
+	}
+	if l.Search() != "abcdefghijklmnop" {
+		t.Fatalf("render changed search=%q", l.Search())
+	}
+	l.HandleInput("\x15\x0b")
+	l.Paste("界x")
+	l.HandleInput("\x01")
+	for _, width := range []int{1, 2, 3, 4, 8} {
+		row := l.Render(width)[0]
+		if tauui.TextWidth(row) > width {
+			t.Fatalf("width %d row=%q", width, row)
+		}
+	}
+}
+
+func TestListUsesConfiguredNavigationAndSearchBindings(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{
+		"tui.select.up": {"ctrl+p"}, "tui.select.down": {"ctrl+n"},
+		"tui.select.confirm": {"ctrl+s"}, "tui.select.cancel": {"ctrl+q"},
+		"tui.editor.cursorLineStart": {"ctrl+o"},
+	}))
+	var changes, cancels int
+	l := New([]Item{{ID: "a", Label: "Alpha", Values: []string{"off", "on"}}, {ID: "b", Label: "Beta", Values: []string{"off", "on"}}}, 5, DefaultTheme(), func(string, string) { changes++ }, func() { cancels++ }, Options{EnableSearch: true})
+	l.HandleInput("\x0e")
+	if l.SelectedIndex() != 1 {
+		t.Fatal("configured down ignored")
+	}
+	l.HandleInput("\x1b[B\r\x1b")
+	if l.SelectedIndex() != 1 || changes != 0 || cancels != 0 {
+		t.Fatal("replaced defaults still active")
+	}
+	l.HandleInput("\x13")
+	if changes != 1 || l.Items()[1].CurrentValue != "off" {
+		t.Fatalf("confirm changes=%d items=%+v", changes, l.Items())
+	}
+	l.HandleInput("\x10")
+	if l.SelectedIndex() != 0 {
+		t.Fatal("configured up ignored")
+	}
+	l.Paste("Beta")
+	l.HandleInput("\x0fX")
+	if l.Search() != "XBeta" {
+		t.Fatalf("search=%q", l.Search())
+	}
+	l.HandleInput("\x11")
+	if cancels != 1 {
+		t.Fatalf("cancels=%d", cancels)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/ui"
 	"github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 // KeyContext re-exports the library's KeyContext.
@@ -63,7 +64,15 @@ const (
 type EditorKeymap struct{}
 
 func (EditorKeymap) Resolve(ctx ui.KeyContext, k ui.Keystroke) (ui.Action, bool) {
-	if k.Key == event.KeyEnter {
+	kb := keybindings.DefaultManager()
+	switch {
+	case kb.Matches(k, "tui.editor.historyPrevious"):
+		return ActionHistoryPrevious, true
+	case kb.Matches(k, "tui.editor.historyNext"):
+		return ActionHistoryNext, true
+	}
+	if kb.Matches(k, "tui.input.newLine") || kb.Matches(k, "tui.input.submit") ||
+		k.Key == event.KeyEnter && k.Mod == event.ModAlt && kb.Matches(ui.Keystroke{Key: event.KeyEnter, Mod: event.ModShift}, "tui.input.newLine") {
 		return ui.ActionSubmit, true
 	}
 

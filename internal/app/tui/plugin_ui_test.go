@@ -179,7 +179,7 @@ func TestExtensionDialogNativeInputRoutingAndPermissionStatus(t *testing.T) {
 					}
 				} else {
 					value, err := a.Input(ctx, "input", "hint")
-					if err != nil || value != "a b paste text" {
+					if err != nil || value != "a b pastetext" {
 						t.Errorf("input=%q,%v", value, err)
 					}
 				}

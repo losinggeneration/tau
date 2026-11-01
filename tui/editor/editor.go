@@ -13,8 +13,10 @@ import (
 
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/text"
+	"github.com/losinggeneration/rovel/ui"
 	"github.com/losinggeneration/tau/tui/ansi"
 	"github.com/losinggeneration/tau/tui/autocomplete"
+	"github.com/losinggeneration/tau/tui/keybindings"
 	"github.com/losinggeneration/tau/tui/killring"
 	"github.com/losinggeneration/tau/tui/undostack"
 )
@@ -181,10 +183,14 @@ func (e *Editor) SetAutocomplete(s *autocomplete.Suggestions) {
 }
 
 func (e *Editor) SetAutocompleteProvider(provider SuggestionProvider) {
+	e.CancelAutocomplete()
 	e.autocompleteProvider = provider
 }
 
 func (e *Editor) UpdateAutocomplete(ctx context.Context, force bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if e.autocompleteProvider == nil {
 		e.autocomplete = nil
 		return nil
@@ -192,16 +198,29 @@ func (e *Editor) UpdateAutocomplete(ctx context.Context, force bool) error {
 	e.autocompleteSeq++
 	seq := e.autocompleteSeq
 	pos := e.completionPosition()
+	value, cursor := e.text, e.cursor
 	suggestions, err := e.autocompleteProvider.GetSuggestions(ctx, e.Lines(), pos.Line, pos.Col, force)
-	if seq != e.autocompleteSeq {
-		return nil
-	}
 	if err != nil {
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if seq != e.autocompleteSeq || e.text != value || e.cursor != cursor {
+		return nil
 	}
 	e.SetAutocomplete(suggestions)
 	return nil
 }
+
+// AutocompletePrefix returns the prefix replaced by the active completion.
+func (e *Editor) AutocompletePrefix() string {
+	if e.autocomplete == nil {
+		return ""
+	}
+	return e.autocomplete.Prefix
+}
+
 func (e *Editor) AutocompleteIndex() int { return e.autocompleteIndex }
 func (e *Editor) AutocompleteVisible() bool {
 	return e.autocomplete != nil && len(e.autocomplete.Items) > 0
@@ -242,7 +261,7 @@ func (e *Editor) VisibleAutocompleteItems() []autocomplete.Item {
 	}
 	return append([]autocomplete.Item(nil), e.autocomplete.Items[start:end]...)
 }
-func (e *Editor) CancelAutocomplete() { e.autocomplete = nil }
+func (e *Editor) CancelAutocomplete() { e.autocompleteSeq++; e.autocomplete = nil }
 func (e *Editor) AutocompleteNext() {
 	if e.autocomplete != nil && len(e.autocomplete.Items) > 0 {
 		e.autocompleteIndex = (e.autocompleteIndex + 1) % len(e.autocomplete.Items)
@@ -296,13 +315,12 @@ func (e *Editor) Insert(s string) {
 }
 
 func (e *Editor) Paste(s string) {
-	if s == "" {
-		return
-	}
 	e.CancelAutocomplete()
 	e.resetHistoryBrowse()
 	s = normalizePasteText(s)
 	if s == "" {
+		e.pushUndo()
+		e.last = ""
 		return
 	}
 	if needsLeadingPasteSpace(e.text, e.cursor, s) {
@@ -321,9 +339,6 @@ func (e *Editor) Paste(s string) {
 func (e *Editor) Newline() { e.insertAtomic("\n", "") }
 func (e *Editor) Submit() {
 	text := strings.TrimSpace(e.ExpandedText())
-	if text == "" {
-		return
-	}
 	e.Reset()
 	if e.submit != nil {
 		e.submit(text)
@@ -406,6 +421,32 @@ func (e *Editor) MoveDown() {
 	e.SetPosition(Position{p.Line + 1, desired})
 	e.desiredCol = desired
 	e.desiredColValid = true
+}
+
+// CursorUp moves by a visual row or browses history from the top-left edge.
+func (e *Editor) CursorUp(width int) {
+	if !e.AtVisualTop(width) {
+		e.MoveVisualUp(width)
+		return
+	}
+	if e.text == "" || e.historyBrowsing || e.Position().Col == 0 {
+		e.HistoryPrev()
+		return
+	}
+	e.MoveLineStart()
+}
+
+// CursorDown moves by a visual row or returns from history at the bottom edge.
+func (e *Editor) CursorDown(width int) {
+	if !e.AtVisualBottom(width) {
+		e.MoveVisualDown(width)
+		return
+	}
+	if e.historyBrowsing {
+		e.HistoryNext()
+		return
+	}
+	e.MoveLineEnd()
 }
 
 func (e *Editor) MoveVisualUp(width int) {
@@ -648,13 +689,13 @@ func (e *Editor) moveWordRightNoBreak() {
 // HandleJumpKey consumes jump hotkeys and the next printable target.
 func (e *Editor) HandleJumpKey(key event.KeyEvent) bool {
 	direction := 0
-	if key.Key == event.KeyRune && key.Rune == ']' {
-		switch key.Mod {
-		case event.ModCtrl:
-			direction = 1
-		case event.ModCtrl | event.ModAlt:
-			direction = -1
-		}
+	kb := keybindings.DefaultManager()
+	stroke := ui.KeystrokeOf(key)
+	switch {
+	case kb.Matches(stroke, "tui.editor.jumpForward"):
+		direction = 1
+	case kb.Matches(stroke, "tui.editor.jumpBackward"):
+		direction = -1
 	}
 	pending := e.jumpDirection
 	e.jumpDirection = 0

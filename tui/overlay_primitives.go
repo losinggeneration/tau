@@ -6,9 +6,11 @@ import (
 	rovelansi "github.com/losinggeneration/rovel/backend/ansi"
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/text"
+	"github.com/losinggeneration/rovel/ui"
 	"github.com/losinggeneration/tau/tui/ansi"
 	editormodel "github.com/losinggeneration/tau/tui/editor"
 	inputmodel "github.com/losinggeneration/tau/tui/input"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 // InputPrimitive is a minimal single-line input overlay primitive. It composes
@@ -69,80 +71,24 @@ func (p *InputPrimitive) HandleKey(ke event.KeyEvent) {
 		return
 	}
 	m := p.ensureModel()
-	switch ke.Key {
-	case event.KeyEnter:
+	kb := keybindings.DefaultManager()
+	key := ui.KeystrokeOf(ke)
+	switch {
+	case kb.Matches(key, "tui.select.cancel"):
+		if p.OnCancel != nil {
+			p.OnCancel()
+		}
+	case kb.Matches(key, "tui.editor.undo"):
+		m.Undo()
+	case kb.Matches(key, "tui.input.submit"):
 		p.syncValue()
 		if p.OnSubmit != nil {
 			p.OnSubmit(p.Value)
 		}
-	case event.KeyEsc, event.KeyCtrlC:
-		if p.OnCancel != nil {
-			p.OnCancel()
-		}
-	case event.KeyLeft:
-		if ke.Mod == event.ModAlt || ke.Mod == event.ModCtrl {
-			m.MoveWordLeft()
-		} else {
-			m.MoveLeft()
-		}
-	case event.KeyRight:
-		if ke.Mod == event.ModAlt || ke.Mod == event.ModCtrl {
-			m.MoveWordRight()
-		} else {
-			m.MoveRight()
-		}
-	case event.KeyHome:
-		m.Home()
-	case event.KeyEnd:
-		m.End()
-	case event.KeyBackspace:
-		if ke.Mod == event.ModAlt {
-			m.DeleteWordBackward()
-		} else {
-			m.DeleteBackward()
-		}
-	case event.KeyDelete:
-		if ke.Mod == event.ModAlt {
-			m.DeleteWordForward()
-		} else {
-			m.DeleteForward()
-		}
-	case event.KeyRune:
-		switch {
-		case ke.Mod == event.ModCtrl && ke.Rune == 'b':
-			m.MoveLeft()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'f':
-			m.MoveRight()
-		case ke.Mod == event.ModAlt && ke.Rune == 'b':
-			m.MoveWordLeft()
-		case ke.Mod == event.ModAlt && ke.Rune == 'f':
-			m.MoveWordRight()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'a':
-			m.Home()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'e':
-			m.End()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'd':
-			m.DeleteForward()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'w':
-			m.DeleteWordBackward()
-		case ke.Mod == event.ModAlt && ke.Rune == 'd':
-			m.DeleteWordForward()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'u':
-			m.DeleteToStart()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'k':
-			m.DeleteToEnd()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'y':
-			m.Yank()
-		case ke.Mod == event.ModAlt && ke.Rune == 'y':
-			m.YankPop()
-		case ke.Mod == event.ModCtrl && ke.Rune == '-':
-			m.Undo()
-		default:
-			if r, ok := ansi.TextRune(ke); ok {
-				m.Insert(string(r))
-			}
-		}
+	default:
+		m.HandleKey(ke)
 	}
+
 	p.syncValue()
 }
 
@@ -295,115 +241,106 @@ func (p *EditorPrimitive) HandleKey(ke event.KeyEvent) {
 	if m.HandleJumpKey(ke) {
 		return
 	}
-	switch ke.Key {
-	case event.KeyEnter:
-		if ke.Mod == event.ModShift {
-			m.Newline()
+	kb := keybindings.DefaultManager()
+	key := ui.KeystrokeOf(ke)
+	switch {
+	case kb.Matches(key, "tui.input.copy"):
+		return
+	case kb.Matches(key, "tui.editor.undo"):
+		m.Undo()
+		return
+	}
+	if m.AutocompleteVisible() {
+		switch {
+		case kb.Matches(key, "tui.select.cancel"):
+			m.CancelAutocomplete()
 			return
-		}
-		if m.AutocompleteVisible() {
+		case kb.Matches(key, "tui.select.up"):
+			m.AutocompletePrev()
+			return
+		case kb.Matches(key, "tui.select.down"):
+			m.AutocompleteNext()
+			return
+		case kb.Matches(key, "tui.input.tab"):
 			m.ApplyAutocomplete()
 			return
+		case kb.Matches(key, "tui.select.confirm"):
+			slash := strings.HasPrefix(m.AutocompletePrefix(), "/")
+			m.ApplyAutocomplete()
+			if !slash {
+				return
+			}
 		}
-		if strings.HasSuffix(m.Text(), "\\") {
-			m.SetText(strings.TrimSuffix(m.Text(), "\\"))
+	}
+	switch {
+	case kb.Matches(key, "tui.input.tab"):
+		return
+	case kb.Matches(key, "tui.editor.deleteToLineEnd"):
+		m.DeleteToLineEnd()
+	case kb.Matches(key, "tui.editor.deleteToLineStart"):
+		m.DeleteToLineStart()
+	case kb.Matches(key, "tui.editor.deleteWordBackward"):
+		m.DeleteWordBackward()
+	case kb.Matches(key, "tui.editor.deleteWordForward"):
+		m.DeleteWordForward()
+	case kb.Matches(key, "tui.editor.deleteCharBackward"):
+		m.DeleteBackward()
+	case kb.Matches(key, "tui.editor.deleteCharForward"):
+		m.DeleteForward()
+	case kb.Matches(key, "tui.editor.yank"):
+		m.Yank()
+	case kb.Matches(key, "tui.editor.yankPop"):
+		m.YankPop()
+	case kb.Matches(key, "tui.editor.historyPrevious"):
+		m.CancelAutocomplete()
+		m.HistoryPrev()
+	case kb.Matches(key, "tui.editor.historyNext"):
+		m.CancelAutocomplete()
+		m.HistoryNext()
+	case kb.Matches(key, "tui.editor.cursorLineStart"):
+		m.MoveLineStart()
+	case kb.Matches(key, "tui.editor.cursorLineEnd"):
+		m.MoveLineEnd()
+	case kb.Matches(key, "tui.editor.cursorWordLeft"):
+		m.MoveWordLeft()
+	case kb.Matches(key, "tui.editor.cursorWordRight"):
+		m.MoveWordRight()
+	case kb.Matches(key, "tui.input.newLine"):
+		if ke.Key == event.KeyEnter && ke.Mod == 0 &&
+			kb.Matches(ui.Keystroke{Key: event.KeyEnter, Mod: event.ModShift}, "tui.input.submit") &&
+			m.Cursor() > 0 && m.Text()[m.Cursor()-1] == '\\' {
+			m.DeleteBackward()
+			m.Submit()
+			return
+		}
+		m.Newline()
+	case kb.Matches(key, "tui.input.submit"):
+		if m.Cursor() > 0 && m.Text()[m.Cursor()-1] == '\\' {
+			m.DeleteBackward()
 			m.Newline()
 			return
 		}
 		m.Submit()
-	case event.KeyTab:
-		if m.AutocompleteVisible() {
-			m.ApplyAutocomplete()
-		}
-	case event.KeyEsc:
-		if m.AutocompleteVisible() {
-			m.CancelAutocomplete()
-			return
-		}
+	case kb.Matches(key, "tui.editor.cursorUp"):
+		m.CursorUp(max(1, p.lastRenderWidth()))
+	case kb.Matches(key, "tui.editor.cursorDown"):
+		m.CursorDown(max(1, p.lastRenderWidth()))
+	case kb.Matches(key, "tui.editor.cursorRight"):
+		m.MoveRight()
+	case kb.Matches(key, "tui.editor.cursorLeft"):
+		m.MoveLeft()
+	case kb.Matches(key, "tui.editor.pageUp"):
+		m.MoveVisual(max(1, p.lastRenderWidth()), -p.pageRows())
+	case kb.Matches(key, "tui.editor.pageDown"):
+		m.MoveVisual(max(1, p.lastRenderWidth()), p.pageRows())
+	case kb.Matches(key, "tui.select.cancel"):
 		m.Cancel()
 		if p.OnCancel != nil {
 			p.OnCancel()
 		}
-	case event.KeyCtrlC:
-		return
-	case event.KeyLeft:
-		if ke.Mod == event.ModAlt || ke.Mod == event.ModCtrl {
-			m.MoveWordLeft()
-		} else {
-			m.MoveLeft()
-		}
-	case event.KeyRight:
-		if ke.Mod == event.ModAlt || ke.Mod == event.ModCtrl {
-			m.MoveWordRight()
-		} else {
-			m.MoveRight()
-		}
-	case event.KeyUp:
-		if m.AutocompleteVisible() {
-			m.AutocompletePrev()
-			return
-		}
-		m.MoveVisualUp(max(1, p.lastRenderWidth()))
-	case event.KeyDown:
-		if m.AutocompleteVisible() {
-			m.AutocompleteNext()
-			return
-		}
-		m.MoveVisualDown(max(1, p.lastRenderWidth()))
-	case event.KeyPageUp:
-		m.MoveVisual(max(1, p.lastRenderWidth()), -p.pageRows())
-	case event.KeyPageDown:
-		m.MoveVisual(max(1, p.lastRenderWidth()), p.pageRows())
-	case event.KeyHome:
-		m.MoveLineStart()
-	case event.KeyEnd:
-		m.MoveLineEnd()
-	case event.KeyBackspace:
-		if ke.Mod == event.ModAlt {
-			m.DeleteWordBackward()
-		} else {
-			m.DeleteBackward()
-		}
-	case event.KeyDelete:
-		if ke.Mod == event.ModAlt {
-			m.DeleteWordForward()
-		} else {
-			m.DeleteForward()
-		}
-	case event.KeyRune:
-		switch {
-		case ke.Mod == event.ModCtrl && ke.Rune == 'b':
-			m.MoveLeft()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'f':
-			m.MoveRight()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'a':
-			m.MoveLineStart()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'e':
-			m.MoveLineEnd()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'd':
-			m.DeleteForward()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'w':
-			m.DeleteWordBackward()
-		case ke.Mod == event.ModAlt && ke.Rune == 'd':
-			m.DeleteWordForward()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'u':
-			m.DeleteToLineStart()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'k':
-			m.DeleteToLineEnd()
-		case ke.Mod == event.ModCtrl && ke.Rune == 'y':
-			m.Yank()
-		case ke.Mod == event.ModAlt && ke.Rune == 'y':
-			m.YankPop()
-		case ke.Mod == event.ModCtrl && ke.Rune == '-':
-			m.Undo()
-		case ke.Mod == event.ModAlt && ke.Rune == 'b':
-			m.MoveWordLeft()
-		case ke.Mod == event.ModAlt && ke.Rune == 'f':
-			m.MoveWordRight()
-		default:
-			if r, ok := ansi.TextRune(ke); ok {
-				m.Insert(string(r))
-			}
+	default:
+		if r, ok := ansi.TextRune(ke); ok {
+			m.Insert(string(r))
 		}
 	}
 }

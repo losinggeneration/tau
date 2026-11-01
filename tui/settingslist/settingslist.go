@@ -4,12 +4,14 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/losinggeneration/tau/tui/ansi"
-
 	rovelansi "github.com/losinggeneration/rovel/backend/ansi"
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/text"
+	"github.com/losinggeneration/rovel/ui"
+	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/fuzzy"
+	inputmodel "github.com/losinggeneration/tau/tui/input"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 type Item struct {
@@ -55,6 +57,7 @@ type List struct {
 	onCancel      func()
 	searchEnabled bool
 	search        string
+	searchInput   *inputmodel.Input
 	appliedQuery  string
 	submenu       KeyComponent
 	submenuIndex  int
@@ -69,7 +72,7 @@ func New(items []Item, maxVisible int, theme Theme, onChange func(string, string
 		theme = DefaultTheme()
 	}
 	cp := append([]Item(nil), items...)
-	return &List{items: cp, filtered: cp, theme: theme, maxVisible: maxVisible, onChange: onChange, onCancel: onCancel, searchEnabled: opts.EnableSearch, submenuIndex: -1}
+	return &List{items: cp, filtered: cp, theme: theme, maxVisible: maxVisible, onChange: onChange, onCancel: onCancel, searchEnabled: opts.EnableSearch, submenuIndex: -1, searchInput: inputmodel.New()}
 }
 
 // FilteredItems returns a copy of the items currently displayed after search filtering.
@@ -96,7 +99,8 @@ func (l *List) Render(width int) []string {
 func (l *List) renderMain(width int) []string {
 	var lines []string
 	if l.searchEnabled {
-		lines = append(lines, renderSearchInput(l.search, width))
+		search := tauui.InputComponent{Model: l.searchInput, Prompt: "> ", Focused: true}
+		lines = append(lines, search.Render(width)...)
 	}
 	if len(l.items) == 0 {
 		lines = append(lines, l.theme.Hint("  No settings available"))
@@ -160,8 +164,11 @@ func (l *List) renderMain(width int) []string {
 
 func (l *List) HandleInput(data string) {
 	for _, ev := range l.input.FlushPending(l.input.Push(nil, []byte(data))) {
-		if key, ok := ev.(event.KeyEvent); ok {
-			l.HandleKey(key)
+		switch ev := ev.(type) {
+		case event.KeyEvent:
+			l.HandleKey(ev)
+		case event.PasteEvent:
+			l.Paste(ev.Text)
 		}
 	}
 }
@@ -172,8 +179,10 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 		return
 	}
 	display := l.displayItems()
-	switch ke.Key {
-	case event.KeyUp:
+	kb := keybindings.DefaultManager()
+	key := ui.KeystrokeOf(ke)
+	switch {
+	case kb.Matches(key, "tui.select.up"):
 		if len(display) > 0 {
 			if l.selected == 0 {
 				l.selected = len(display) - 1
@@ -181,7 +190,7 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 				l.selected--
 			}
 		}
-	case event.KeyDown:
+	case kb.Matches(key, "tui.select.down"):
 		if len(display) > 0 {
 			if l.selected == len(display)-1 {
 				l.selected = 0
@@ -189,27 +198,41 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 				l.selected++
 			}
 		}
-	case event.KeyEnter:
+	case kb.Matches(key, "tui.select.confirm"):
 		l.activate()
-	case event.KeyRune:
-		if ke.Mod == 0 && ke.Rune == ' ' && (!l.searchEnabled || l.search == "") {
-			l.activate()
-			return
-		}
-		if r, ok := ansi.TextRune(ke); ok && l.searchEnabled {
-			l.search += string(r)
-			l.applyFilter(l.search)
-		}
-	case event.KeyEsc, event.KeyCtrlC:
+	case kb.Matches(key, "tui.select.cancel"):
 		if l.onCancel != nil {
 			l.onCancel()
 		}
-	case event.KeyBackspace:
-		if l.searchEnabled && l.search != "" {
-			l.search = l.search[:text.PrevCluster(l.search, len(l.search))]
-			l.applyFilter(l.search)
+	default:
+		if ke.Key == event.KeyRune && ke.Mod == 0 && ke.Rune == ' ' && (!l.searchEnabled || l.search == "") {
+			l.activate()
+			return
+		}
+		if l.searchEnabled && l.searchInput.HandleKey(ke) {
+			l.updateSearch()
 		}
 	}
+}
+
+// Paste edits the active search or delegates to a paste-capable submenu.
+func (l *List) Paste(value string) {
+	if l.submenu != nil {
+		if target, ok := l.submenu.(interface{ Paste(string) }); ok {
+			target.Paste(value)
+		}
+		return
+	}
+	if !l.searchEnabled {
+		return
+	}
+	l.searchInput.Paste(value)
+	l.updateSearch()
+}
+
+func (l *List) updateSearch() {
+	l.search = l.searchInput.Value()
+	l.applyFilter(l.search)
 }
 
 func (l *List) activate() {
@@ -286,15 +309,6 @@ func (l *List) displayItems() []Item {
 
 func (l *List) addHint(lines *[]string, width int) {
 	*lines = append(*lines, "", truncate(l.theme.Hint(map[bool]string{true: "  Type to search · Enter/Space to change · Esc to cancel", false: "  Enter/Space to change · Esc to cancel"}[l.searchEnabled]), width))
-}
-
-// renderSearchInput renders the search prompt row. It must not embed
-// ANSI escape sequences: the list renders through cell-based drawing
-// where a zero-width ESC rune is overwritten by the next cell, leaving
-// literal "[7m" text on screen.
-func renderSearchInput(value string, width int) string {
-	line := "> " + value
-	return truncate(line+strings.Repeat(" ", max(0, width-visibleWidth(line))), width)
 }
 
 func visibleWidth(s string) int { return text.Width(s) }

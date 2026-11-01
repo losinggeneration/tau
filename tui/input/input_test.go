@@ -1,6 +1,12 @@
 package input
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/losinggeneration/rovel/event"
+	"github.com/losinggeneration/tau/tui/keybindings"
+	"github.com/losinggeneration/tau/tui/killring"
+)
 
 func TestInputKillYankAndYankPop(t *testing.T) {
 	in := New()
@@ -517,6 +523,107 @@ func TestInputCharacterDeletesDoNotKillAndMovementBreaksKills(t *testing.T) {
 			i.DeleteWordBackward()
 			if got := i.kill.Entries(); len(got) != 2 || got[0] != "two" {
 				t.Fatalf("kill chain was retained: %v", got)
+			}
+		})
+	}
+}
+
+func TestInputEditingUsesConfiguredBindings(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	for _, tc := range []struct {
+		action, want string
+		cursor       int
+	}{
+		{"undo", "old", 3},
+		{"deleteCharBackward", "onetwo", 3},
+		{"deleteCharForward", "one wo", 4},
+		{"deleteWordBackward", "two", 0},
+		{"deleteWordForward", "one ", 4},
+		{"deleteToLineStart", "two", 0},
+		{"deleteToLineEnd", "one ", 4},
+		{"yank", "one Ytwo", 5},
+		{"yankPop", "one two", 4},
+		{"cursorLeft", "one two", 3},
+		{"cursorRight", "one two", 5},
+		{"cursorLineStart", "one two", 0},
+		{"cursorLineEnd", "one two", 7},
+		{"cursorWordLeft", "one two", 0},
+		{"cursorWordRight", "one two", 7},
+	} {
+		t.Run(tc.action, func(t *testing.T) {
+			keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.editor." + tc.action: {"f2"}}))
+			in := New()
+			in.SetValue("one two")
+			in.undo.Push(State{"old", 3})
+			in.SetCursor(4)
+			in.kill.Push("Y", killring.PushOptions{})
+			if !in.HandleKey(event.KeyEvent{Key: event.KeyF2}) {
+				t.Fatal("configured key not handled")
+			}
+			if in.Value() != tc.want || in.Cursor() != tc.cursor {
+				t.Fatalf("value=%q cursor=%d want %q %d", in.Value(), in.Cursor(), tc.want, tc.cursor)
+			}
+		})
+	}
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.editor.cursorLineStart": {}}))
+	in := New()
+	in.SetValue("value")
+	if in.HandleKey(event.KeyEvent{Key: event.KeyRune, Rune: 'a', Mod: event.ModCtrl}) || in.Cursor() != 5 {
+		t.Fatal("disabled binding still active")
+	}
+	if in.HandleKey(event.KeyEvent{Key: event.KeyLeft, Mod: event.ModShift}) || in.Cursor() != 5 {
+		t.Fatal("unbound modified arrow moved cursor")
+	}
+}
+
+func TestInputPasteRemovesLineBreaksAndExpandsEachTab(t *testing.T) {
+	for _, tc := range []struct{ paste, want string }{
+		{"a\r\nb\rc\nd", "abcd"}, {"a\t\tb", "a        b"}, {" a \n\t b ", " a      b "}, {"界\n👩‍💻\t", "界👩‍💻    "},
+	} {
+		t.Run(tc.paste, func(t *testing.T) {
+			in := New()
+			in.SetValue("left:right")
+			in.SetCursor(5)
+			in.Paste(tc.paste)
+			if got := in.Value(); got != "left:"+tc.want+"right" {
+				t.Fatalf("paste=%q want=%q", got, "left:"+tc.want+"right")
+			}
+			if in.Cursor() != 5+len(tc.want) {
+				t.Fatalf("cursor=%d", in.Cursor())
+			}
+			in.Undo()
+			if in.Value() != "left:right" || in.Cursor() != 5 {
+				t.Fatalf("undo=%q cursor=%d", in.Value(), in.Cursor())
+			}
+		})
+	}
+}
+
+func TestInputEmptyNormalizedPasteBreaksTypingWithoutReplacingSelection(t *testing.T) {
+	for _, payload := range []string{"", "\r\n", "\x00\x07"} {
+		t.Run(payload, func(t *testing.T) {
+			in := New()
+			in.Insert("first")
+			in.Paste(payload)
+			in.Insert("second")
+			in.Undo()
+			if in.Value() != "first" {
+				t.Fatalf("undo typing=%q", in.Value())
+			}
+			in.Undo()
+			if in.Value() != "first" {
+				t.Fatalf("undo paste=%q", in.Value())
+			}
+			in.Undo()
+			if in.Value() != "" {
+				t.Fatalf("undo first=%q", in.Value())
+			}
+			in.SetValue("selected")
+			in.SetSelection(0, len(in.Value()))
+			in.Paste(payload)
+			if in.Value() != "selected" {
+				t.Fatalf("empty paste replaced selection: %q", in.Value())
 			}
 		})
 	}

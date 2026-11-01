@@ -82,3 +82,23 @@ func TestInputComponentRenderCentersScrollingAroundCursor(t *testing.T) {
 	c.Model.SetCursor(len("界abcd"))
 	assert.Equal(t, "> bcdefg", StripANSI(c.Render(8)[0]))
 }
+
+func TestInputComponentUsesModelEditingKeysAndPaste(t *testing.T) {
+	c := NewInputComponent()
+	c.SetValue("one two")
+	c.Model.SetCursor(4)
+	assert.True(t, c.Handle(KeyEvent{Key: KeyRune, Rune: 'k', Mod: ModCtrl}, nil))
+	assert.Equal(t, "one ", c.Value())
+	assert.True(t, c.Handle(KeyEvent{Key: KeyRune, Rune: 'y', Mod: ModCtrl}, nil))
+	assert.Equal(t, "one two", c.Value())
+	assert.True(t, c.Handle(KeyEvent{Key: KeyLeft, Mod: ModCtrl}, nil))
+	assert.Equal(t, 4, c.Model.Cursor())
+	assert.True(t, c.Handle(KeyEvent{Key: KeyRune, Rune: '-', Mod: ModCtrl}, nil))
+	assert.Equal(t, "one ", c.Value())
+	assert.True(t, c.Handle(PasteEvent{Text: "a\nb"}, nil))
+	assert.Equal(t, "one ab", c.Value())
+	assert.True(t, c.Handle(KeyEvent{Key: KeyRune, Rune: '-', Mod: ModCtrl}, nil))
+	assert.Equal(t, "one ", c.Value())
+	assert.False(t, c.Handle(KeyEvent{Key: KeyRune, Rune: 'q', Mod: ModCtrl}, nil))
+	assert.False(t, c.Handle(KeyEvent{Key: KeyUp}, nil))
+}

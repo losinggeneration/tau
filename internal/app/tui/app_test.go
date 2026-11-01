@@ -1320,3 +1320,118 @@ func TestNativeEditorCharacterJumpUsesDecodedTextWithoutEditing(t *testing.T) {
 	assert.Equal(t, "Xo+界o\nend+", m.Text())
 	assert.Equal(t, 1, changes)
 }
+
+func TestNativeSubmitReplacesBackslashAtCursorWithoutLosingPaste(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(nil))
+	a := newAppWithSelector(t)
+	ctx := stubCtx()
+	ctx.FocusedID = a.editor.ID()
+	m := a.editor.Model()
+	m.Paste(strings.Repeat("pasted body\n", 20))
+	m.Insert("\\tail")
+	before := m.Text()
+	m.SetCursor(len(before) - len("tail"))
+	var changes []string
+	a.editor.SetOnChange(func(s string, _ *tauui.Ctx) { changes = append(changes, s) })
+	action, ok := (appKeymap{app: a}).Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyEnter})
+	require.True(t, ok)
+	require.False(t, a.editor.HandleAction(action, ctx))
+	require.True(t, (&Root{app: a}).HandleAction(action, ctx))
+	assert.Equal(t, strings.Replace(before, "\\tail", "\ntail", 1), m.Text())
+	assert.Equal(t, strings.Repeat("pasted body\n", 20)+"\ntail", m.ExpandedText())
+	require.NotEmpty(t, changes)
+	assert.Equal(t, m.Text(), changes[len(changes)-1])
+	require.True(t, a.editor.HandleAction(keymap.ActionUndo, ctx))
+	require.True(t, a.editor.HandleAction(keymap.ActionUndo, ctx))
+	assert.Equal(t, before, m.Text())
+	assert.Equal(t, strings.Repeat("pasted body\n", 20)+"\\tail", m.ExpandedText())
+}
+
+func TestNativeBackslashEnterWithSwappedBindings(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{
+		"tui.input.submit": {"shift+enter"}, "tui.input.newLine": {"enter"},
+	}))
+	a := newAppWithSelector(t)
+	ctx := stubCtx()
+	ctx.FocusedID = a.editor.ID()
+	var called []string
+	a.cmds.Register(Command{Name: "check", Handler: func(_ *App, args string) { called = append(called, args) }})
+	a.editor.SetText(ctx, "/check \\argument")
+	a.editor.Model().SetCursor(len("/check \\"))
+	action, ok := (appKeymap{app: a}).Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyEnter})
+	require.True(t, ok)
+	if !a.editor.HandleAction(action, ctx) {
+		require.True(t, (&Root{app: a}).HandleAction(action, ctx))
+	}
+	assert.Equal(t, []string{"argument"}, called)
+	assert.Empty(t, a.editor.Text())
+	a.editor.SetText(ctx, "hello")
+	action, ok = (appKeymap{app: a}).Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyEnter})
+	require.True(t, ok)
+	require.True(t, a.editor.HandleAction(action, ctx))
+	assert.Equal(t, "hello\n", a.editor.Text())
+}
+
+func TestNativeExplicitHistoryBindingPrecedesModelCycle(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{
+		"tui.editor.historyPrevious": {"ctrl+p"}, "tui.editor.historyNext": {"ctrl+n"},
+	}))
+	a := newAppWithSelector(t)
+	ctx := stubCtx()
+	ctx.FocusedID = a.editor.ID()
+	m := a.editor.Model()
+	m.AddHistory("old\nentry")
+	m.AddHistory("new\nentry")
+	a.editor.SetText(ctx, "draft\nbody")
+	m.SetCursor(8)
+	var changes []string
+	a.editor.SetOnChange(func(s string, _ *tauui.Ctx) { changes = append(changes, s) })
+	km := appKeymap{app: a}
+	for _, step := range []struct {
+		key  rune
+		text string
+	}{{'p', "new\nentry"}, {'p', "old\nentry"}, {'n', "new\nentry"}, {'n', "draft\nbody"}} {
+		action, ok := km.Resolve(tauui.KeyCtxTextInput, ctrl(step.key))
+		require.True(t, ok)
+		require.True(t, a.editor.HandleAction(action, ctx), "history key must be consumed by editor, not model cycling")
+		assert.Equal(t, step.text, m.Text())
+	}
+	assert.Equal(t, 8, m.Cursor())
+	assert.Len(t, changes, 4)
+	keybindings.SetDefaultManager(keybindings.NewDefault(nil))
+	action, ok := km.Resolve(tauui.KeyCtxTextInput, ctrl('p'))
+	require.True(t, ok)
+	assert.Equal(t, AppActionModelCycleForward, action)
+}
+
+func TestNativeNonemptyCtrlDRespectsDeleteBinding(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.editor.deleteCharForward": {"f2"}}))
+	a := newAppWithSelector(t)
+	ctx := stubCtx()
+	ctx.FocusedID = a.editor.ID()
+	a.editor.SetText(ctx, "abc")
+	a.editor.Model().SetCursor(1)
+	km := appKeymap{app: a}
+	_, ok := km.Resolve(tauui.KeyCtxTextInput, ctrl('d'))
+	assert.False(t, ok, "disabled Ctrl+D must not delete from a nonempty draft")
+	action, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyF2})
+	require.True(t, ok)
+	require.True(t, a.editor.HandleAction(action, ctx))
+	assert.Equal(t, "ac", a.editor.Text())
+	keybindings.SetDefaultManager(keybindings.NewDefault(nil))
+	action, ok = km.Resolve(tauui.KeyCtxTextInput, ctrl('d'))
+	require.True(t, ok)
+	assert.Equal(t, tauui.ActionDeleteFwd, action)
+	a.editor.SetText(ctx, "")
+	action, ok = km.Resolve(tauui.KeyCtxTextInput, ctrl('d'))
+	require.True(t, ok)
+	assert.Equal(t, AppActionQuitNow, action)
+}

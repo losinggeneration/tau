@@ -16,6 +16,7 @@ func TestWidgetUpDownHistoryAtVisualBoundaries(t *testing.T) {
 	m.AddHistory("one")
 	m.AddHistory("two")
 	m.SetText("draft")
+	m.SetCursor(0)
 	w := NewWidgetOpts(WidgetOpts{Model: m})
 	w.Layout(rovel.Rect{W: 20, H: 5})
 	ctx := &rovel.Ctx{FocusedID: w.ID()}
@@ -491,4 +492,73 @@ func TestWidgetCharacterJumpConsumesNextTextAndCancelsOnAction(t *testing.T) {
 	assert.True(t, w.Handle(event.KeyEvent{Key: event.KeyRune, Rune: 'X'}, ctx))
 	assert.Equal(t, "aXba", m.Text())
 	assert.Equal(t, 1, changes)
+}
+
+func TestWidgetArrowHistoryRequiresStartAndMovesToLineEdges(t *testing.T) {
+	m := New()
+	m.AddHistory("history")
+	m.SetText("draft")
+	w := NewWidgetOpts(WidgetOpts{Model: m})
+	w.Layout(rovel.Rect{W: 20, H: 5})
+	ctx := &rovel.Ctx{FocusedID: w.ID()}
+	assert.True(t, w.HandleAction(ui.ActionMoveUp, ctx))
+	assert.Equal(t, "draft", m.Text())
+	assert.Zero(t, m.Cursor())
+	assert.True(t, w.HandleAction(ui.ActionMoveUp, ctx))
+	assert.Equal(t, "history", m.Text())
+	assert.True(t, w.HandleAction(ui.ActionMoveDown, ctx))
+	assert.Equal(t, "draft", m.Text())
+	assert.Zero(t, m.Cursor())
+	assert.True(t, w.HandleAction(ui.ActionMoveDown, ctx))
+	assert.Equal(t, "draft", m.Text())
+	assert.Equal(t, 5, m.Cursor())
+	m.SetText("first\nsecond")
+	m.SetCursor(8)
+	assert.True(t, w.HandleAction(ui.ActionMoveDown, ctx))
+	assert.Equal(t, len(m.Text()), m.Cursor())
+	m.SetText("abcde")
+	m.SetCursor(3)
+	w.Layout(rovel.Rect{W: 2, H: 5})
+	assert.True(t, w.HandleAction(ui.ActionMoveUp, ctx))
+	assert.Equal(t, 1, m.Cursor())
+	assert.Equal(t, "abcde", m.Text())
+	assert.True(t, w.HandleAction(ui.ActionMoveUp, ctx))
+	assert.Zero(t, m.Cursor())
+	assert.Equal(t, "abcde", m.Text())
+}
+
+func TestWidgetReadOnlyNavigationDoesNotReplaceTextWithHistory(t *testing.T) {
+	for _, act := range []ui.Action{ui.ActionMoveUp, ui.ActionMoveDown, ActionHistoryPrevious, ActionHistoryNext} {
+		for _, browsing := range []bool{false, true} {
+			m := New()
+			m.AddHistory("older")
+			m.AddHistory("newer")
+			m.SetText("draft")
+			m.SetCursor(0)
+			if browsing {
+				m.HistoryPrev()
+			}
+			w := NewWidgetOpts(WidgetOpts{Model: m})
+			w.Layout(rovel.Rect{W: 20, H: 5})
+			w.SetReadOnly(true)
+			ctx := &rovel.Ctx{FocusedID: w.ID()}
+			var changes int
+			w.SetOnChange(func(string, *rovel.Ctx) { changes++ })
+			before := m.Text()
+			index := m.HistoryIndex()
+			w.HandleAction(act, ctx)
+			assert.Equal(t, before, m.Text(), "action %v browsing %t", act, browsing)
+			assert.Equal(t, index, m.HistoryIndex())
+			assert.Zero(t, changes)
+		}
+	}
+	m := New()
+	m.SetText("first\nsecond")
+	w := NewWidgetOpts(WidgetOpts{Model: m})
+	w.Layout(rovel.Rect{W: 20, H: 5})
+	w.SetReadOnly(true)
+	ctx := &rovel.Ctx{FocusedID: w.ID()}
+	assert.True(t, w.HandleAction(ui.ActionMoveUp, ctx))
+	assert.Equal(t, "first\nsecond", m.Text())
+	assert.Less(t, m.Cursor(), len(m.Text()))
 }

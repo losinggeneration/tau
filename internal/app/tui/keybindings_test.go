@@ -395,3 +395,85 @@ func TestAppKeymapRoutesShiftedProducedSymbol(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, AppActionModelCycleForward, got)
 }
+
+func TestNativeEditorHonorsToolkitRebindAndDisable(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.editor.deleteToLineEnd": {"f2"}, "tui.editor.deleteCharBackward": {}}))
+	a := newAppWithSelector(t)
+	m := a.editor.Model()
+	m.SetText("one two")
+	m.SetCursor(4)
+	km := appKeymap{app: a}
+	action, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyF2})
+	require.True(t, ok)
+	require.True(t, a.editor.HandleAction(action, &tauui.Ctx{FocusedID: a.editor.ID()}))
+	assert.Equal(t, "one ", m.Text())
+	_, ok = km.Resolve(tauui.KeyCtxTextInput, ctrl('k'))
+	assert.False(t, ok)
+	_, ok = km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyBackspace})
+	assert.False(t, ok, "disabled key must not fall back to standard keymap")
+}
+
+func TestNativeEditorUsesConfiguredSubmitAndNewline(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{
+		"tui.input.submit": {"f2"}, "tui.input.newLine": {"f3"},
+	}))
+	a := newAppWithSelector(t)
+	km := appKeymap{app: a}
+	action, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyF2})
+	assert.True(t, ok)
+	assert.Equal(t, AppActionEditorSubmit, action)
+	action, ok = km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyF3})
+	assert.True(t, ok)
+	assert.Equal(t, tauui.ActionSubmit, action)
+	require.True(t, a.editor.HandleAction(action, &tauui.Ctx{FocusedID: a.editor.ID()}))
+	assert.Equal(t, "\n", a.editor.Text())
+	for _, key := range []tauui.Keystroke{{Key: tauui.KeyEnter}, {Key: tauui.KeyEnter, Mod: tauui.ModShift}} {
+		_, ok = km.Resolve(tauui.KeyCtxTextInput, key)
+		assert.False(t, ok, "removed Enter binding %+v", key)
+	}
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.input.submit": {}, "tui.input.newLine": {}}))
+	_, ok = km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyEnter})
+	assert.False(t, ok)
+}
+
+func TestInlineSelectorUsesConfiguredToolkitKeys(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{
+		"tui.select.up": {"f2"}, "tui.select.down": {"f3"}, "tui.select.pageUp": {"f4"}, "tui.select.pageDown": {"f5"},
+		"tui.select.confirm": {"f6"}, "tui.select.cancel": {"f7"}, "tui.input.tab": {"f8"},
+		"tui.editor.cursorUp": {}, "tui.editor.cursorDown": {}, "tui.editor.pageUp": {}, "tui.editor.pageDown": {}, "tui.input.submit": {},
+	}))
+	a := newAppWithSelector(t)
+	a.refreshSelector("/", nil)
+	require.True(t, a.selectorVisible())
+	km := appKeymap{app: a}
+	for _, tc := range []struct {
+		key  tauui.Key
+		want tauui.Action
+	}{
+		{tauui.KeyF2, AppActionSelectorUp},
+		{tauui.KeyF3, AppActionSelectorDown},
+		{tauui.KeyF4, AppActionSelectorPageUp},
+		{tauui.KeyF5, AppActionSelectorPageDown},
+		{tauui.KeyF6, AppActionSelectorActivate},
+		{tauui.KeyF7, tauui.ActionCancel},
+		{tauui.KeyF8, AppActionEditorComplete},
+	} {
+		action, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tc.key})
+		assert.True(t, ok)
+		assert.Equal(t, tc.want, action)
+	}
+	for _, key := range []tauui.Key{tauui.KeyUp, tauui.KeyDown, tauui.KeyPageUp, tauui.KeyPageDown, tauui.KeyEnter, tauui.KeyTab} {
+		action, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: key})
+		assert.False(t, ok, "disabled selector key %v action %v", key, action)
+	}
+	require.True(t, a.routeSelectorDown(stubCtx()))
+	assert.Equal(t, 1, a.selector.Focused())
+	require.True(t, (&Root{app: a}).HandleAction(tauui.ActionCancel, stubCtx()))
+	assert.False(t, a.selectorVisible())
+}

@@ -5,6 +5,7 @@ import (
 
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/ui"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 // Binding pairs a key context and keystroke.
@@ -76,7 +77,7 @@ func (m *Manager) Resolve(ctx KeyContext, k Keystroke) (ui.Action, bool) {
 
 	for _, action := range m.actions() {
 		for _, binding := range m.Keys(action) {
-			if binding.Context == ctx && binding.Key == k {
+			if binding.Context == ctx && keybindings.KeystrokesMatch(k, binding.Key) {
 				return action, true
 			}
 		}

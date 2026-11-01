@@ -69,6 +69,13 @@ func (o *settingsOverlay) HandleKey(ke tauui.KeyEvent) {
 	o.list.HandleKey(ke)
 }
 
+// Paste inserts clipboard text into the settings search.
+func (o *settingsOverlay) Paste(value string) {
+	if o != nil && o.list != nil {
+		o.list.Paste(value)
+	}
+}
+
 // Render implements the settingslist.Component contract so it can be
 // hosted by the overlay picker.
 func (o *settingsOverlay) Render(width int) []string {

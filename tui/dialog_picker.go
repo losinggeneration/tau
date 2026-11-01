@@ -10,6 +10,7 @@ import (
 	"github.com/losinggeneration/rovel/style"
 	"github.com/losinggeneration/rovel/text"
 	"github.com/losinggeneration/rovel/ui"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 // DialogPickerItem is one entry in a DialogPicker's item list. Name
@@ -513,9 +514,8 @@ func (d *DialogPicker) Handle(e rovel.Event, ctx *rovel.Ctx) bool {
 		}
 	}
 	if ke, ok := e.(rovel.KeyEvent); ok {
-		// Esc always fires onCancel — the custom component is
-		// responsible for not swallowing it.
-		if ke.Key == rovel.KeyEsc {
+		// Keep the picker Escape shortcut only while it is bound to cancel.
+		if ke.Key == rovel.KeyEsc && keybindings.DefaultManager().Matches(ui.KeystrokeOf(ke), "tui.select.cancel") {
 			if d.onCancel != nil {
 				d.onCancel()
 			}

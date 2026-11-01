@@ -147,6 +147,9 @@ const (
 	AppActionHistorySearchBackward
 	AppActionHistorySearchForward
 
+	// AppActionEditorBackslashSubmit removes the escape before submitting when Enter inserts a newline.
+	AppActionEditorBackslashSubmit
+
 	// AppActionExit is Ctrl+C. The Root handler decides whether to
 	// clear the editor (when it has text), start a confirm-to-quit
 	// timer (when the editor is empty and no confirm is pending), or
@@ -869,6 +872,7 @@ func New(opts Options) (*App, error) {
 		a.conv.AddError(fmt.Sprintf("keybindings: using defaults: %v", keyErr))
 	}
 	a.keybindings = keyManager
+	keybindings.SetDefaultManager(keybindings.NewDefault(keyManager.UserBindings()))
 
 	initialTokens := chatLog.ThemeTokens()
 	app, err := tauui.New(tauui.Opts{
@@ -1358,7 +1362,7 @@ func (r *Root) Handle(e tauui.Event, ctx *tauui.Ctx) bool {
 }
 
 func (a *App) requestClipboardPaste(ctx *tauui.Ctx) bool {
-	if a != nil && (a.extensionDialog != nil || a.loginDialog != nil) && ctx != nil && ctx.ClipboardRead != nil {
+	if a != nil && a.dialogPicker != nil && a.dialogPicker.Shown() && ctx != nil && ctx.ClipboardRead != nil {
 		ctx.ClipboardRead()
 		return true
 	}
@@ -1378,6 +1382,9 @@ func (a *App) requestClipboardPaste(ctx *tauui.Ctx) bool {
 }
 
 func (a *App) handlePaste(e tauui.PasteEvent, ctx *tauui.Ctx) bool {
+	if a != nil && a.dialogPicker != nil && a.dialogPicker.Shown() && a.dialogPicker.Handle(e, ctx) {
+		return true
+	}
 	if a != nil && (a.extensionDialog != nil || a.loginDialog != nil) {
 		if input := a.hostedDialogInput(); input != nil {
 			input.Paste(e.Text)
@@ -1571,7 +1578,21 @@ func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
 			return true
 		}
 		return true
+	case AppActionEditorBackslashSubmit:
+		if !r.app.editor.HandleAction(tauui.ActionDeleteBack, ctx) {
+			return false
+		}
+		return r.app.trySubmit(ctx)
 	case AppActionEditorSubmit:
+		if ctx != nil && ctx.FocusedID == r.app.editor.ID() {
+			m := r.app.editor.Model()
+			if m.Cursor() > 0 && m.Text()[m.Cursor()-1] == '\\' {
+				if !r.app.editor.HandleAction(tauui.ActionDeleteBack, ctx) {
+					return false
+				}
+				return r.app.editor.HandleAction(tauui.ActionSubmit, ctx)
+			}
+		}
 		if r.app.trySubmit(ctx) {
 			return true
 		}
@@ -1675,6 +1696,14 @@ var scopedModelsActionIDs = map[string]struct{}{
 }
 
 func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Action, bool) {
+	if k.app != nil && k.app.dialogPicker != nil && k.app.dialogPicker.Shown() {
+		if _, settings := k.app.dialogPicker.Component().(*settingsOverlay); settings {
+			if action, ok := k.resolveAppAction(ks, func(id string) bool { return id == actionIDPaste }); ok {
+				return action, true
+			}
+			return tauui.ActionNone, false
+		}
+	}
 	// Hosted login and extension inputs own editing keys that the global
 	// keymap assigns to activation or quitting.
 	if k.app != nil && (k.app.extensionDialog != nil || k.app.loginDialog != nil) {
@@ -1698,7 +1727,6 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 		if k.app == nil || k.app.editor == nil || k.app.editor.Text() == "" {
 			return AppActionQuitNow, true
 		}
-		return tauui.ActionDeleteFwd, true
 	}
 	// Scoped-model bindings are checked first so the dialog's Ctrl+P wins over
 	// the global model cycle while it is open.
@@ -1714,6 +1742,12 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 	// keys the focused view already declined.
 	if act, ok := k.resolveExtensionShortcut(ks); ok {
 		return act, true
+	}
+	if ctx == tauui.KeyCtxTextInput && (k.app == nil || k.app.dialogPicker == nil || !k.app.dialogPicker.Shown()) {
+		kb := keybindings.DefaultManager()
+		if kb.Matches(ks, "tui.editor.historyPrevious") || kb.Matches(ks, "tui.editor.historyNext") {
+			return (keymap.EditorKeymap{}).Resolve(ctx, ks)
+		}
 	}
 	notScopedModels := func(id string) bool { _, ok := scopedModelsActionIDs[id]; return !ok }
 	if ctx != tauui.KeyCtxTextInput {
@@ -1770,22 +1804,26 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 	// route to AppActionEditorSubmit which only looks at the editor text —
 	// so for model mode it would just re-trigger the picker instead
 	// of picking the focused model.
-	if ctx == tauui.KeyCtxTextInput && k.app != nil && k.app.selectorVisible() && ks.Mod == 0 {
-		switch ks.Key {
-		case tauui.KeyTab:
-			return AppActionEditorComplete, true
-		case tauui.KeyEnter:
-			return AppActionSelectorActivate, true
-		case tauui.KeyUp:
+	if ctx == tauui.KeyCtxTextInput && k.app != nil && k.app.selectorVisible() {
+		kb := keybindings.DefaultManager()
+		switch {
+		case kb.Matches(ks, "tui.select.cancel"):
+			return tauui.ActionCancel, true
+		case kb.Matches(ks, "tui.select.up"):
 			return AppActionSelectorUp, true
-		case tauui.KeyDown:
+		case kb.Matches(ks, "tui.select.down"):
 			return AppActionSelectorDown, true
-		case tauui.KeyPageUp:
+		case kb.Matches(ks, "tui.input.tab"):
+			return AppActionEditorComplete, true
+		case kb.Matches(ks, "tui.select.confirm"):
+			return AppActionSelectorActivate, true
+		case kb.Matches(ks, "tui.select.pageUp"):
 			return AppActionSelectorPageUp, true
-		case tauui.KeyPageDown:
+		case kb.Matches(ks, "tui.select.pageDown"):
 			return AppActionSelectorPageDown, true
 		}
 	}
+
 	if ctx == tauui.KeyCtxTextInput && ks.Key == tauui.KeyRune && (ks.Rune == 'v' || ks.Rune == 'V') && ks.Mod&tauui.ModCtrl != 0 && ks.Mod&^(tauui.ModCtrl|tauui.ModShift) == 0 {
 		return AppActionPaste, true
 	}
@@ -1801,18 +1839,24 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 	if k.app != nil && k.app.dialogPicker != nil && k.app.dialogPicker.Shown() && ks.Mod == 0 && ks.Key == tauui.KeyTab {
 		return AppActionEditorComplete, true
 	}
-	if ctx == tauui.KeyCtxTextInput && ks.Key == tauui.KeyEnter && ks.Mod == 0 {
-		return AppActionEditorSubmit, true
-	}
-	// Alt+Enter is intentionally not bound. Many terminals encode Shift+Enter
-	// and Alt+Enter as the exact same ESC+Enter byte sequence; the decoder
-	// names that as Alt+Enter, and leaving it unhandled lets the prompt
-	// editor's ActionSubmit path insert a newline. Alt+Backspace
-	// (app.message.dequeue) is resolved through the registry above.
 	if ctx == tauui.KeyCtxTextInput {
-		if act, ok := (keymap.EditorKeymap{}).Resolve(ctx, ks); ok {
-			return act, true
+		kb := keybindings.DefaultManager()
+		if kb.Matches(ks, "tui.input.newLine") {
+			if k.app != nil && k.app.editor != nil && ks.Key == tauui.KeyEnter && ks.Mod == 0 &&
+				kb.Matches(tauui.Keystroke{Key: tauui.KeyEnter, Mod: tauui.ModShift}, "tui.input.submit") {
+				m := k.app.editor.Model()
+				if m.Cursor() > 0 && m.Text()[m.Cursor()-1] == '\\' {
+					return AppActionEditorBackslashSubmit, true
+				}
+			}
+			return tauui.ActionSubmit, true
 		}
+		if kb.Matches(ks, "tui.input.submit") {
+			return AppActionEditorSubmit, true
+		}
+	}
+	if ctx == tauui.KeyCtxTextInput {
+		return (keymap.EditorKeymap{}).Resolve(ctx, ks)
 	}
 	return tauui.StandardKeymap{}.Resolve(ctx, ks)
 }

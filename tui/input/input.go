@@ -5,7 +5,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/text"
+	"github.com/losinggeneration/rovel/ui"
+	"github.com/losinggeneration/tau/tui/ansi"
+	"github.com/losinggeneration/tau/tui/keybindings"
 	"github.com/losinggeneration/tau/tui/killring"
 	"github.com/losinggeneration/tau/tui/undostack"
 )
@@ -271,10 +275,12 @@ func (i *Input) YankPop() {
 
 func (i *Input) Paste(s string) {
 	s = NormalizePaste(s)
+	i.pushUndo()
+	i.last = "paste"
+	i.yankStart = -1
 	if s == "" {
 		return
 	}
-	i.pushUndo()
 	if i.hasSelection() {
 		i.deleteSelectionNoUndo()
 	}
@@ -322,21 +328,17 @@ func (i *Input) MoveWordRight() {
 
 func NormalizePaste(s string) string {
 	out := make([]rune, 0, len(s))
-	lastWasSpace := false
 	for _, r := range s {
 		switch r {
-		case '\r', '\n', '\t':
-			if !lastWasSpace {
-				out = append(out, ' ')
-				lastWasSpace = true
-			}
+		case '\r', '\n':
+			continue
+		case '\t':
+			out = append(out, ' ', ' ', ' ', ' ')
 			continue
 		}
-		if unicode.IsControl(r) {
-			continue
+		if !unicode.IsControl(r) {
+			out = append(out, r)
 		}
-		out = append(out, r)
-		lastWasSpace = r == ' '
 	}
 	return string(out)
 }
@@ -384,4 +386,49 @@ func (i *Input) deleteSelectionNoUndo() string {
 	i.cursor = i.selectionStart
 	i.clearSelection()
 	return deleted
+}
+
+// HandleKey applies configured single-line editing keys without submitting or canceling.
+func (i *Input) HandleKey(ke event.KeyEvent) bool {
+	kb := keybindings.DefaultManager()
+	key := ui.KeystrokeOf(ke)
+	switch {
+	case kb.Matches(key, "tui.editor.undo"):
+		i.Undo()
+	case kb.Matches(key, "tui.editor.deleteCharBackward"):
+		i.DeleteBackward()
+	case kb.Matches(key, "tui.editor.deleteCharForward"):
+		i.DeleteForward()
+	case kb.Matches(key, "tui.editor.deleteWordBackward"):
+		i.DeleteWordBackward()
+	case kb.Matches(key, "tui.editor.deleteWordForward"):
+		i.DeleteWordForward()
+	case kb.Matches(key, "tui.editor.deleteToLineStart"):
+		i.DeleteToStart()
+	case kb.Matches(key, "tui.editor.deleteToLineEnd"):
+		i.DeleteToEnd()
+	case kb.Matches(key, "tui.editor.yank"):
+		i.Yank()
+	case kb.Matches(key, "tui.editor.yankPop"):
+		i.YankPop()
+	case kb.Matches(key, "tui.editor.cursorLeft"):
+		i.MoveLeft()
+	case kb.Matches(key, "tui.editor.cursorRight"):
+		i.MoveRight()
+	case kb.Matches(key, "tui.editor.cursorLineStart"):
+		i.Home()
+	case kb.Matches(key, "tui.editor.cursorLineEnd"):
+		i.End()
+	case kb.Matches(key, "tui.editor.cursorWordLeft"):
+		i.MoveWordLeft()
+	case kb.Matches(key, "tui.editor.cursorWordRight"):
+		i.MoveWordRight()
+	default:
+		if r, ok := ansi.TextRune(ke); ok {
+			i.Insert(string(r))
+		} else {
+			return false
+		}
+	}
+	return true
 }

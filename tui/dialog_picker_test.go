@@ -646,7 +646,7 @@ func TestDialogPickerHostedInputReceivesPasteAndClipboard(t *testing.T) {
 			t.Fatalf("paste not handled: %T", e)
 		}
 	}
-	if input.Value != "a b c" {
+	if input.Value != "ab c" {
 		t.Fatalf("value=%q", input.Value)
 	}
 }

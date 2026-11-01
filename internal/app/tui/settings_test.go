@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/losinggeneration/tau/ai"
+	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/settingslist"
+	"github.com/stretchr/testify/assert"
 )
 
 // withTestFooter returns app after installing a minimal Footer bound to
@@ -563,4 +565,15 @@ func TestApplySettingsChange_ThinkingLevelReportsPersistError(t *testing.T) {
 		}
 	}
 	t.Fatalf("missing persist error in conversation: %#v", app.conv.Messages())
+}
+
+func TestSettingsOverlayAcceptsPasteThroughDialogPicker(t *testing.T) {
+	a := newAppWithSelector(t)
+	o := newSettingsOverlay(a)
+	a.dialogPicker.SetComponent(o)
+	a.dialogPicker.SetShown(true)
+	assert.True(t, a.dialogPicker.Handle(tauui.PasteEvent{Text: "thinking\nlevel"}, stubCtx()))
+	assert.Equal(t, "thinkinglevel", o.list.Search())
+	o.HandleKey(tauui.KeyEvent{Key: tauui.KeyRune, Rune: '-', Mod: tauui.ModCtrl})
+	assert.Empty(t, o.list.Search())
 }

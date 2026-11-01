@@ -1949,9 +1949,9 @@ func TestAppKeymapUpDownRoutesToSelector(t *testing.T) {
 		t.Errorf("Down with selector visible = (%v, %v), want (AppActionSelectorDown, true)", act, ok)
 	}
 
-	// Modified arrows fall through to the toolkit's default keymap.
-	if act, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyUp, Mod: tauui.ModShift}); !ok || act != tauui.ActionMoveUp {
-		t.Errorf("Shift+Up with selector visible = (%v, %v), want toolkit move-up", act, ok)
+	// Modified arrows need their own configured binding.
+	if act, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyUp, Mod: tauui.ModShift}); ok {
+		t.Errorf("unbound Shift+Up with selector visible = (%v, %v)", act, ok)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/rovel/ui"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 func TestEditorKeymap_Arrows(t *testing.T) {
@@ -256,5 +257,92 @@ func TestKeystrokeOf(t *testing.T) {
 func TestKeyContext_ConstantsDistinct(t *testing.T) {
 	if KeyCtxGlobal == KeyCtxTextInput || KeyCtxGlobal == KeyCtxOverlay || KeyCtxTextInput == KeyCtxOverlay {
 		t.Error("KeyContext constants should be distinct")
+	}
+}
+
+func TestEditorKeymapUsesConfiguredEditingKeys(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	for _, tc := range []struct {
+		id     string
+		action ui.Action
+		old    string
+	}{
+		{"cursorUp", ui.ActionMoveUp, "up"},
+		{"cursorDown", ui.ActionMoveDown, "down"},
+		{"cursorLeft", ui.ActionMoveLeft, "left"},
+		{"cursorRight", ui.ActionMoveRight, "right"},
+		{"cursorWordLeft", ActionMoveWordLeft, "alt+b"},
+		{"cursorWordRight", ActionMoveWordRight, "alt+f"},
+		{"cursorLineStart", ui.ActionHome, "home"},
+		{"cursorLineEnd", ui.ActionEnd, "end"},
+		{"pageUp", ui.ActionPageUp, "pageUp"},
+		{"pageDown", ui.ActionPageDown, "pageDown"},
+		{"deleteCharBackward", ui.ActionDeleteBackward, "backspace"},
+		{"deleteCharForward", ui.ActionDeleteForward, "delete"},
+		{"deleteWordBackward", ActionDeleteWordBackward, "ctrl+w"},
+		{"deleteWordForward", ActionDeleteWordForward, "alt+d"},
+		{"deleteToLineStart", ActionDeleteToLineStart, "ctrl+u"},
+		{"deleteToLineEnd", ActionDeleteToLineEnd, "ctrl+k"},
+		{"yank", ActionYank, "ctrl+y"},
+		{"yankPop", ActionYankPop, "alt+y"},
+		{"undo", ActionUndo, "ctrl+-"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.editor." + tc.id: {"f2"}}))
+			for _, ctx := range []KeyContext{KeyCtxGlobal, KeyCtxTextInput} {
+				action, ok := (EditorKeymap{}).Resolve(ctx, ui.Keystroke{Key: event.KeyF2})
+				if !ok || action != tc.action {
+					t.Fatalf("context %v action=%v ok=%t want %v", ctx, action, ok, tc.action)
+				}
+				old, err := keybindings.CompileKey(tc.old)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if action, ok := (EditorKeymap{}).Resolve(ctx, old); ok && action == tc.action {
+					t.Fatalf("old key still resolves %s", tc.old)
+				}
+			}
+			keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.editor." + tc.id: {}}))
+			old, err := keybindings.CompileKey(tc.old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if action, ok := (EditorKeymap{}).Resolve(KeyCtxTextInput, old); ok && action == tc.action {
+				t.Fatalf("disabled key still resolves %s", tc.old)
+			}
+		})
+	}
+}
+
+func TestEditorKeymapUsesConfiguredNewline(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{"tui.input.newLine": {"f2"}, "tui.input.submit": {}}))
+	action, ok := (EditorKeymap{}).Resolve(KeyCtxTextInput, ui.Keystroke{Key: event.KeyF2})
+	if !ok || action != ui.ActionSubmit {
+		t.Fatalf("newline action=%v ok=%t", action, ok)
+	}
+	for _, mod := range []ui.Keystroke{{Key: event.KeyEnter}, {Key: event.KeyEnter, Mod: event.ModShift}, {Key: event.KeyEnter, Mod: event.ModCtrl}, {Key: event.KeyEnter, Mod: event.ModAlt}} {
+		if action, ok := (EditorKeymap{}).Resolve(KeyCtxTextInput, mod); ok {
+			t.Fatalf("unbound Enter mod=%v action=%v", mod, action)
+		}
+	}
+}
+
+func TestEditorHistoryBindingsPrecedeCursorActions(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	keybindings.SetDefaultManager(keybindings.NewDefault(keybindings.Config{
+		"tui.editor.historyPrevious": {"left"}, "tui.editor.historyNext": {"right"},
+	}))
+	for _, tc := range []struct {
+		key  event.Key
+		want ui.Action
+	}{{event.KeyLeft, ActionHistoryPrevious}, {event.KeyRight, ActionHistoryNext}} {
+		action, ok := (EditorKeymap{}).Resolve(KeyCtxTextInput, ui.Keystroke{Key: tc.key})
+		if !ok || action != tc.want {
+			t.Fatalf("key=%v action=%v ok=%t want=%v", tc.key, action, ok, tc.want)
+		}
 	}
 }

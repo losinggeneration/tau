@@ -794,8 +794,8 @@ func TestEditorEnterKeymapSendsAndShiftEnterNewlines(t *testing.T) {
 	}
 
 	act, ok = km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyEnter, Mod: tauui.ModCtrl})
-	if !ok || act != tauui.ActionSubmit {
-		t.Fatalf("Ctrl+Enter in editor = (%v, %v), want ActionSubmit for prompt editor newline", act, ok)
+	if ok {
+		t.Fatalf("unbound Ctrl+Enter in editor = (%v, %v)", act, ok)
 	}
 
 	act, ok = km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyEnter, Mod: tauui.ModAlt})
