@@ -5544,7 +5544,8 @@ func (c *scriptedCompactionClient) Complete(ctx context.Context, model *ai.Model
 func TestAutoCompactionFiresMidTurnWhenToolResultsGrowContext(t *testing.T) {
 	cwd := t.TempDir()
 	bigFile := filepath.Join(cwd, "big.txt")
-	bigContent := strings.Repeat("A", 200_000)
+	bigContent := strings.Repeat("A", 100) + "\n"
+	bigContent = strings.Repeat(bigContent, 400)
 	require.NoError(t, os.WriteFile(bigFile, []byte(bigContent), 0o644))
 
 	ai.Clear()
@@ -5567,6 +5568,7 @@ func TestAutoCompactionFiresMidTurnWhenToolResultsGrowContext(t *testing.T) {
 		SessionsDir:     t.TempDir(),
 		ExplicitModel:   "test-auto-compaction/default/auto-compaction-model",
 		Compaction:      &CompactionSettings{TriggerPct: 50},
+		Settings:        &ai.Settings{Compaction: ai.CompactionSettings{KeepRecentTokens: 100}},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })

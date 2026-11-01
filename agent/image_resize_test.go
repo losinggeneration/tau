@@ -240,3 +240,52 @@ func TestResizeImageBlockUsesJPEGQuality(t *testing.T) {
 		t.Fatal("invalid JPEG quality accepted")
 	}
 }
+
+func TestResizeImageDataHeaderCheckDoesNotAllocatePixels(t *testing.T) {
+	data := makeTestPNG(t, 512, 512)
+	measured := testing.Benchmark(func(b *testing.B) {
+		for b.Loop() {
+			result := resizeImageData(data, "image/png", 512, 512)
+			if result.Data != nil || result.OrigW != 512 || result.OrigH != 512 {
+				b.Fatalf("resize = %+v", result)
+			}
+		}
+	})
+	if allocated := measured.AllocedBytesPerOp(); allocated > 64*1024 {
+		t.Errorf("header check allocated %d bytes, want <=64KiB", allocated)
+	}
+}
+
+func TestToNRGBAPreservesTranslucentColors(t *testing.T) {
+	source := image.NewRGBA(image.Rect(10, 20, 12, 21))
+	source.Set(10, 20, color.NRGBA{R: 240, G: 120, B: 60, A: 128})
+	source.Set(11, 20, color.NRGBA{R: 100, G: 200, B: 50, A: 64})
+	got := toNRGBA(source)
+	if got.Bounds() != image.Rect(0, 0, 2, 1) {
+		t.Fatalf("bounds = %v", got.Bounds())
+	}
+	for x := range 2 {
+		want := color.NRGBAModel.Convert(source.At(10+x, 20)).(color.NRGBA)
+		if pixel := got.NRGBAAt(x, 0); pixel != want {
+			t.Errorf("pixel %d = %+v, want %+v", x, pixel, want)
+		}
+	}
+	if toNRGBA(got) != got {
+		t.Error("NRGBA input unnecessarily copied")
+	}
+}
+
+func TestResizeNRGBAHandlesNonzeroSourceBounds(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	for y := range 4 {
+		for x := range 4 {
+			source.SetNRGBA(x, y, color.NRGBA{R: uint8(x * 50), G: uint8(y * 50), A: 255})
+		}
+	}
+	cropped := source.SubImage(image.Rect(2, 2, 4, 4)).(*image.NRGBA)
+	got := resizeNRGBA(cropped, 1, 1)
+	want := color.NRGBA{R: 125, G: 125, A: 255}
+	if pixel := got.NRGBAAt(0, 0); pixel != want {
+		t.Errorf("resized pixel = %+v, want %+v", pixel, want)
+	}
+}

@@ -775,7 +775,7 @@ type stubGrepOps struct {
 	err     error
 }
 
-func (s *stubGrepOps) Grep(pattern, path, glob string, _ bool, _, _ int) (*ToolResult, error) {
+func (s *stubGrepOps) Grep(_ context.Context, pattern, path, glob string, _ bool, _, _ int) (*ToolResult, error) {
 	s.called = true
 	s.pattern = pattern
 	s.path = path
@@ -820,7 +820,7 @@ type stubFindOps struct {
 	err     error
 }
 
-func (s *stubFindOps) Find(_, _ string, _ string, _ int, _, _ bool, _ int) ([]string, error) {
+func (s *stubFindOps) Find(_ context.Context, _, _ string, _ string, _ int, _, _ bool, _ int) ([]string, error) {
 	s.called = true
 	if s.err != nil {
 		return nil, s.err
@@ -829,19 +829,20 @@ func (s *stubFindOps) Find(_, _ string, _ string, _ int, _, _ bool, _ int) ([]st
 }
 
 func TestFindToolUsesInjectedFindOps(t *testing.T) {
-	stub := &stubFindOps{matches: []string{"/a/b/c.txt"}}
+	base := t.TempDir()
+	stub := &stubFindOps{matches: []string{filepath.Join(base, "a", "b", "c.txt")}}
 	cfg := ToolConfig{FindOps: stub}
 	tool := FindTool(cfg)
 
-	result, err := tool.Execute(ToolContext{Args: map[string]any{"query": "c.txt"}})
+	result, err := tool.Execute(ToolContext{SessionCWD: base, Args: map[string]any{"query": "c.txt"}})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 	if !stub.called {
 		t.Fatal("injected FindOps was not called")
 	}
-	if result.Content != "/a/b/c.txt" {
-		t.Errorf("Execute result = %q, want /a/b/c.txt", result.Content)
+	if result.Content != "a/b/c.txt" {
+		t.Errorf("Execute result = %q, want a/b/c.txt", result.Content)
 	}
 }
 

@@ -35,6 +35,9 @@ const (
 
 // TruncationResult contains details about truncation.
 type TruncationResult struct {
+	// FirstLineExceedsLimit reports an oversized first line in head truncation.
+	FirstLineExceedsLimit bool
+
 	// Content is the truncated content.
 	Content string
 	// Truncated indicates whether truncation occurred.

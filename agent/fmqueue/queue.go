@@ -3,8 +3,12 @@
 package fmqueue // import "github.com/losinggeneration/tau/agent/fmqueue"
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 // MutationQueue serializes file mutations per realpath. Only write and edit
@@ -16,21 +20,42 @@ type MutationQueue interface {
 	WithLock(realpath string, fn func() error) error
 }
 
-// defaultQueue is the per-realpath-mutex implementation.
-type defaultQueue struct {
-	mu sync.Map // map[string]*sync.Mutex
+type mutationLock struct {
+	mu    sync.Mutex
+	users int
 }
 
-// New returns the default MutationQueue implementation using per-realpath
-// mutexes cached in a sync.Map.
+// defaultQueue registers holders and waiters before acquiring their file lock.
+type defaultQueue struct {
+	mu    sync.Mutex
+	locks map[string]*mutationLock
+}
+
+// New returns a per-realpath mutation queue.
 func New() MutationQueue {
-	return &defaultQueue{}
+	return &defaultQueue{locks: make(map[string]*mutationLock)}
 }
 
 func (q *defaultQueue) WithLock(realpath string, fn func() error) error {
-	mu, _ := q.mu.LoadOrStore(realpath, &sync.Mutex{})
-	mu.(*sync.Mutex).Lock()
-	defer mu.(*sync.Mutex).Unlock()
+	q.mu.Lock()
+	lock := q.locks[realpath]
+	if lock == nil {
+		lock = &mutationLock{}
+		q.locks[realpath] = lock
+	}
+	lock.users++
+	q.mu.Unlock()
+
+	lock.mu.Lock()
+	defer func() {
+		lock.mu.Unlock()
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		lock.users--
+		if lock.users == 0 {
+			delete(q.locks, realpath)
+		}
+	}()
 	return fn()
 }
 
@@ -51,8 +76,10 @@ func Realpath(path string) (string, error) {
 
 	realpath, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
-		// File doesn't exist yet — use the resolved absolute path
-		return absPath, nil
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return absPath, nil
+		}
+		return "", fmt.Errorf("resolve realpath %s: %w", absPath, err)
 	}
 	return realpath, nil
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -215,4 +217,25 @@ func TestCodemodeToolPersistsStoreWritesOfSuccessfulScripts(t *testing.T) {
 	require.False(t, res.IsError)
 	assert.Equal(t, []string{`{"set":{"a":{"n":1},"b":2},"delete":[]}`, `{"set":{},"delete":["a"]}`}, saved)
 	assert.Equal(t, map[string]json.RawMessage{"b": json.RawMessage(`2`)}, values)
+}
+
+func TestCodemodeReadsStructuredBuiltinImages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.png")
+	data, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a/0YAAAAASUVORK5CYII=")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	code := fmt.Sprintf("const value = await tools.read({path: %q}); text(value.type); text(value.mimeType); image(value);", path)
+	args, err := json.Marshal(map[string]string{"code": code})
+	require.NoError(t, err)
+	current := &agent.AgentContext{Tools: []agent.Tool{NewTool(nil), agent.ReadTool(agent.ToolConfig{AutoResizeImagesSet: true})}, Capabilities: ai.Capabilities{Vision: true}}
+	result := agent.RunToolCall(t.Context(), current, nil, ai.ToolCall{ID: "read-image", Name: ToolName, Arguments: args}, agent.AgentLoopConfig{})
+	assert.False(t, result.IsError, result.Content)
+	blocks := result.NormalizedContent()
+	require.Len(t, blocks, 3)
+	assert.Contains(t, blocks[1].Text, "image")
+	assert.Contains(t, blocks[1].Text, "image/png")
+	assert.Equal(t, ai.ContentBlockImage, blocks[2].Type)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(data), blocks[2].Data)
+	require.Len(t, result.NestedCalls, 1)
+	assert.Equal(t, "ok", result.NestedCalls[0].Status)
 }

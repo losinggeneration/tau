@@ -5,22 +5,30 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/pmezard/go-difflib/difflib"
 
 	"github.com/losinggeneration/tau/agent/fmqueue"
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/internal/ignore"
+	textunicode "golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/unicode/norm"
 )
 
 // ============================================================================
@@ -67,19 +75,13 @@ const (
 	defaultBashTimeout    = 120 * time.Second
 	maxBashTimeout        = 600 * time.Second
 	defaultBashOutputCap  = 100 * 1024 // 100 KiB
-	defaultGrepMaxResults = 200
+	defaultGrepMaxResults = 100
 	maxGrepMaxResults     = 1000
 	defaultGrepOutputCap  = 100 * 1024 // 100 KiB
-	defaultFindMaxResults = 500
+	defaultFindMaxResults = 1000
 	maxFindMaxResults     = 5000
 	defaultLSMaxEntries   = 1000
 )
-
-// Default ignore list for find.
-var defaultFindIgnore = []string{
-	".git", "node_modules", "vendor", ".venv",
-	"__pycache__", ".pytest_cache", "target", "dist", "build",
-}
 
 // Image magic bytes.
 var (
@@ -139,6 +141,8 @@ func (d DefaultReadOperations) Stat(path string) (os.FileInfo, error) {
 // WriteOperations is the injection seam for file writing operations.
 // Default impl uses os.WriteFile; tests/extensions use a mock.
 type WriteOperations interface {
+	// Mkdir creates a directory and any missing parents.
+	Mkdir(path string) error
 	// WriteFile writes content to a file at the given absolute path.
 	WriteFile(path string, content []byte, perm fs.FileMode) error
 	// Access checks if a file is readable and writable.
@@ -151,6 +155,8 @@ type WriteOperations interface {
 
 // DefaultWriteOperations uses the local filesystem.
 type DefaultWriteOperations struct{}
+
+func (d DefaultWriteOperations) Mkdir(path string) error { return os.MkdirAll(path, 0o755) }
 
 func (d DefaultWriteOperations) WriteFile(path string, content []byte, perm fs.FileMode) error {
 	return os.WriteFile(path, content, perm)
@@ -204,7 +210,7 @@ type GrepOperations interface {
 	// error context (IsError) and truncation notes. A non-nil error is
 	// reserved for unexpected I/O failures; "no matches" and similar
 	// tool-level results stay inside the *ToolResult.
-	Grep(pattern, path, glob string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error)
+	Grep(ctx context.Context, pattern, path, glob string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error)
 }
 
 // FindOperations is the injection seam for find operations.
@@ -213,7 +219,7 @@ type FindOperations interface {
 	// Find searches for files matching the query pattern. The returned
 	// slice contains absolute or search-root-relative paths; an empty
 	// slice with a nil error means "no matches".
-	Find(query, path string, mode string, maxDepth int, includeHidden, noIgnore bool, maxResults int) ([]string, error)
+	Find(ctx context.Context, query, path string, mode string, maxDepth int, includeHidden, noIgnore bool, maxResults int) ([]string, error)
 }
 
 // LsOperations is the injection seam for ls operations.
@@ -242,11 +248,15 @@ func (d DefaultLsOperations) Stat(path string) (fs.FileInfo, error) {
 // has to reconstruct a result from a string.
 type DefaultGrepOperations struct{}
 
-func (d DefaultGrepOperations) Grep(pattern, path, glob string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error) {
-	if rgPath, err := exec.LookPath("rg"); err == nil {
-		return grepWithRG(rgPath, pattern, path, glob, caseInsensitive, maxResults, contextLines)
+func (d DefaultGrepOperations) Grep(ctx context.Context, pattern, path, glob string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return grepPureGo(pattern, path, glob, caseInsensitive, maxResults, contextLines)
+
+	if rgPath, err := exec.LookPath("rg"); err == nil {
+		return grepWithRG(ctx, rgPath, pattern, path, glob, caseInsensitive, maxResults, contextLines)
+	}
+	return grepPureGo(ctx, pattern, path, glob, caseInsensitive, maxResults, contextLines)
 }
 
 // DefaultFindOperations walks the filesystem with filepath.Walk, applying the
@@ -255,7 +265,11 @@ func (d DefaultGrepOperations) Grep(pattern, path, glob string, caseInsensitive 
 // tool does not carry the policy logic inline.
 type DefaultFindOperations struct{}
 
-func (d DefaultFindOperations) Find(query, searchPath, mode string, maxDepth int, includeHidden, noIgnore bool, maxResults int) ([]string, error) {
+func (d DefaultFindOperations) Find(ctx context.Context, query, searchPath, mode string, maxDepth int, includeHidden, noIgnore bool, maxResults int) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Build matcher
 	var matcher func(string) bool
 	switch mode {
@@ -277,19 +291,40 @@ func (d DefaultFindOperations) Find(query, searchPath, mode string, maxDepth int
 		}
 	}
 
-	ignoreSet := make(map[string]bool)
+	ignoreRoot := searchPath
 	if !noIgnore {
-		for _, d := range defaultFindIgnore {
-			ignoreSet[d] = true
+		for current := searchPath; ; current = filepath.Dir(current) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			ignoreRoot = current
+			if _, err := os.Stat(filepath.Join(current, ".git")); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("find repository root: %w", err)
+			}
+			if filepath.Dir(current) == current {
+				break
+			}
 		}
 	}
-
 	var matches []string
+	type directoryRules struct {
+		root    string
+		matcher *ignore.Matcher
+	}
+	rulesByDir := make(map[string]directoryRules)
 	rootDepth := len(strings.Split(filepath.ToSlash(searchPath), "/"))
 
 	walkErr := filepath.Walk(searchPath, func(current string, info os.FileInfo, err error) error {
+		if ctx.Err() != nil {
+			return errors.Join(err, ctx.Err())
+		}
 		if err != nil {
-			return nil // skip errors
+			if current == searchPath {
+				return err
+			}
+			return nil
 		}
 
 		if maxDepth > 0 {
@@ -303,24 +338,73 @@ func (d DefaultFindOperations) Find(query, searchPath, mode string, maxDepth int
 		}
 
 		name := info.Name()
-		if !includeHidden && strings.HasPrefix(name, ".") && name != "." && name != ".." {
+		if current != searchPath && !includeHidden && strings.HasPrefix(name, ".") && name != "." && name != ".." {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if info.IsDir() && ignoreSet[name] {
+		if current != searchPath && !noIgnore && name == ".git" {
 			return filepath.SkipDir
 		}
 
-		if matcher(name) {
-			matches = append(matches, current)
+		if !noIgnore {
+			parent := rulesByDir[filepath.Dir(current)]
+			if parent.matcher.Ignored(current, info.IsDir()) {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if info.IsDir() {
+				ruleRoot := parent.root
+				if current == searchPath {
+					ruleRoot = ignoreRoot
+				} else {
+					if _, err := os.Stat(filepath.Join(current, ".git")); err == nil {
+						ruleRoot = current
+					} else if !os.IsNotExist(err) {
+						return fmt.Errorf("check nested repository: %w", err)
+					}
+				}
+				rules, err := ignore.New(current, ruleRoot)
+				if err != nil {
+					return err
+				}
+				rulesByDir[current] = directoryRules{root: ruleRoot, matcher: rules}
+			}
+		}
+		if current == searchPath {
+			return nil
+		}
+
+		matched := matcher(name)
+		if mode != "regex" && mode != "substring" && strings.Contains(query, "/") {
+			pattern := query
+			if !strings.HasPrefix(pattern, "/") && !strings.HasPrefix(pattern, "**/") && !filepath.IsAbs(filepath.FromSlash(pattern)) {
+				pattern = "**/" + pattern
+			}
+			var matchErr error
+			matched, matchErr = matchFindPathGlob(pattern, filepath.ToSlash(current))
+			if matchErr != nil {
+				return matchErr
+			}
+		}
+		if matched {
+			resultPath := current
+			if info.IsDir() {
+				resultPath += string(filepath.Separator)
+			}
+			matches = append(matches, resultPath)
 			if len(matches) >= maxResults {
 				return errMaxResultsReached
 			}
 		}
 		return nil
 	})
+	if ctx.Err() != nil {
+		return nil, errors.Join(walkErr, ctx.Err())
+	}
 	if walkErr != nil && !errors.Is(walkErr, errMaxResultsReached) {
 		return matches, fmt.Errorf("search %s: %w", searchPath, walkErr)
 	}
@@ -340,7 +424,7 @@ var errMaxResultsReached = errors.New("max results reached")
 type ToolConfig struct {
 	// BashOps is the bash operations backend. If nil, DefaultBashOps is used.
 	BashOps BashOperations
-	// MutationQueue serializes file mutations. If nil, fmqueue.New() is used.
+	// MutationQueue serializes file mutations. If nil, tools share the process-wide queue.
 	MutationQueue fmqueue.MutationQueue
 
 	// ReadOps is the read operations backend. If nil, DefaultReadOperations is used.
@@ -415,11 +499,13 @@ func (c ToolConfig) BashOperations() BashOperations {
 	return ops
 }
 
+var defaultMutationQueue = fmqueue.New()
+
 func (c ToolConfig) mutationQueue() fmqueue.MutationQueue {
 	if c.MutationQueue != nil {
 		return c.MutationQueue
 	}
-	return fmqueue.New()
+	return defaultMutationQueue
 }
 
 func (c ToolConfig) readLineCap() int {
@@ -501,20 +587,107 @@ func (c ToolConfig) bashTempFile() bool {
 // Path Resolution
 // ============================================================================
 
-// resolvePath resolves a path relative to the session CWD, expanding ~.
-func resolvePath(sessionCWD, path string) string {
-	// Expand ~
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			path = filepath.Join(home, path[2:])
+// resolvePath resolves tool input paths against the session CWD.
+func resolvePath(sessionCWD, path string) (string, error) {
+	path = strings.Map(func(r rune) rune {
+		if r == '\u00a0' || r >= '\u2000' && r <= '\u200a' || r == '\u202f' || r == '\u205f' || r == '\u3000' {
+			return ' '
+		}
+		return r
+	}, strings.TrimPrefix(path, "@"))
+	path, err := normalizeToolPath(path)
+	if err != nil {
+		return "", err
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	base, err := normalizeToolPath(sessionCWD)
+	if err != nil {
+		return "", err
+	}
+	absolute, err := filepath.Abs(filepath.Join(base, path))
+	if err != nil {
+		return "", fmt.Errorf("resolve tool path: %w", err)
+	}
+	return absolute, nil
+}
+
+var windowsShellPath = regexp.MustCompile(`(?i)^/(?:mnt/|cygdrive/)?([a-z])(?:/(.*))?$`)
+
+func normalizeToolPath(path string) (string, error) {
+	if runtime.GOOS == "windows" && !strings.HasPrefix(path, "//") && !strings.Contains(path, `\`) {
+		if parts := windowsShellPath.FindStringSubmatch(path); parts != nil {
+			path = strings.ToUpper(parts[1]) + `:\` + strings.ReplaceAll(parts[2], "/", `\`)
 		}
 	}
-
-	if filepath.IsAbs(path) {
-		return path
+	if path == "~" || strings.HasPrefix(path, "~/") || runtime.GOOS == "windows" && strings.HasPrefix(path, "~\\") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
 	}
-	return filepath.Join(sessionCWD, path)
+	if !strings.HasPrefix(path, "file://") {
+		return path, nil
+	}
+	parsed, err := url.Parse(path)
+	if err != nil {
+		return "", fmt.Errorf("parse file URL: %w", err)
+	}
+	escaped := strings.ToLower(parsed.EscapedPath())
+	if parsed.User != nil || parsed.Port() != "" || strings.Contains(escaped, "%2f") || !utf8.ValidString(parsed.Path) {
+		return "", fmt.Errorf("invalid file URL %q", path)
+	}
+	host := parsed.Hostname()
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+	if runtime.GOOS == "windows" {
+		if strings.Contains(escaped, "%5c") {
+			return "", fmt.Errorf("encoded separator in file URL %q", path)
+		}
+		if host != "" && !strings.EqualFold(host, "localhost") {
+			return filepath.FromSlash("//" + host + parsed.Path), nil
+		}
+		if len(parsed.Path) < 3 || parsed.Path[0] != '/' || parsed.Path[2] != ':' || (parsed.Path[1] < 'a' || parsed.Path[1] > 'z') && (parsed.Path[1] < 'A' || parsed.Path[1] > 'Z') {
+			return "", fmt.Errorf("file URL must contain an absolute drive path: %q", path)
+		}
+		return filepath.FromSlash(parsed.Path[1:]), nil
+	}
+	if host != "" && !strings.EqualFold(host, "localhost") {
+		return "", fmt.Errorf("file URL host must be localhost: %q", path)
+	}
+	return parsed.Path, nil
+}
+
+var screenshotTimeSuffix = regexp.MustCompile(`(?i) (AM|PM)\.`)
+
+func resolveReadPath(sessionCWD, path string) (string, error) {
+	resolved, err := resolvePath(sessionCWD, path)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(resolved); err == nil {
+		return resolved, nil
+	}
+	decomposed := norm.NFD.String(resolved)
+	for _, candidate := range []string{
+		screenshotTimeSuffix.ReplaceAllString(resolved, "\u202f$1."),
+		decomposed,
+		strings.ReplaceAll(resolved, "'", "\u2019"),
+		strings.ReplaceAll(decomposed, "'", "\u2019"),
+	} {
+		if candidate != resolved {
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate, nil
+			}
+		}
+	}
+	return resolved, nil
 }
 
 // ============================================================================
@@ -528,17 +701,29 @@ func ReadTool(cfg ToolConfig) Tool {
 	autoResize := cfg.autoResizeImages()
 	maxWidth := cfg.maxImageWidth()
 	maxHeight := cfg.maxImageHeight()
-	_ = cfg.mutationQueue()
 
 	return Tool{
 		Name:        "read",
-		Description: "Read contents of a file or directory listing",
+		Description: fmt.Sprintf("Read contents of a file or directory listing. Text output is limited to %d lines or 50KB. Use offset/limit to continue large reads.", lineCap),
+		OutputSchema: map[string]any{"anyOf": []any{
+			map[string]any{"type": "string"},
+			map[string]any{"type": "object", "properties": map[string]any{
+				"type":     map[string]any{"const": "image"},
+				"data":     map[string]any{"type": "string"},
+				"mimeType": map[string]any{"type": "string"},
+				"note":     map[string]any{"type": "string"},
+			}, "required": []string{"type", "data", "mimeType", "note"}},
+		}},
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
 					"description": "Path to the file or directory",
+				},
+				"offset": map[string]any{
+					"type":        "integer",
+					"description": "Starting line number (1-indexed)",
 				},
 				"start_line": map[string]any{
 					"type":        "integer",
@@ -555,12 +740,35 @@ func ReadTool(cfg ToolConfig) Tool {
 			},
 			"required": []string{"path"},
 		},
-		Execute: func(ctx ToolContext) (*ToolResult, error) {
+		Execute: func(ctx ToolContext) (result *ToolResult, err error) {
+			defer func() {
+				if err != nil || result == nil || result.IsError {
+					return
+				}
+				var output any = result.Content
+				for _, block := range result.ContentBlocks {
+					if block.Type == ai.ContentBlockImage {
+						output = map[string]string{"type": "image", "data": block.Data, "mimeType": block.MimeType, "note": result.Content}
+						break
+					}
+				}
+				result.StructuredContent, err = json.Marshal(output)
+				if err != nil {
+					err = fmt.Errorf("encode read output: %w", err)
+				}
+			}()
+
+			if ctx.Context != nil && ctx.Context.Err() != nil {
+				return nil, ctx.Context.Err()
+			}
 			path, ok := ctx.Args["path"].(string)
 			if !ok {
 				return nil, ErrPathMustBeString
 			}
-			path = resolvePath(ctx.SessionCWD, path)
+			path, err = resolveReadPath(ctx.SessionCWD, path)
+			if err != nil {
+				return nil, err
+			}
 
 			// Use mutation queue for realpath resolution
 			realpath, err := fmqueue.Realpath(path)
@@ -572,6 +780,9 @@ func ReadTool(cfg ToolConfig) Tool {
 			}
 
 			info, err := ops.Access(realpath)
+			if ctx.Context != nil && ctx.Context.Err() != nil {
+				return nil, errors.Join(err, ctx.Context.Err())
+			}
 			if err != nil {
 				return &ToolResult{
 					Content: fmt.Sprintf("Error reading %s: %v", path, err),
@@ -582,6 +793,9 @@ func ReadTool(cfg ToolConfig) Tool {
 			// Directory: brief listing pointing at ls
 			if info.IsDir() {
 				entries, err := ops.Ls(realpath)
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return nil, errors.Join(err, ctx.Context.Err())
+				}
 				if err != nil {
 					return &ToolResult{
 						Content: fmt.Sprintf("Error reading directory %s: %v", path, err),
@@ -609,6 +823,9 @@ func ReadTool(cfg ToolConfig) Tool {
 
 			// Read file content
 			data, err := ops.ReadFile(realpath)
+			if ctx.Context != nil && ctx.Context.Err() != nil {
+				return nil, errors.Join(err, ctx.Context.Err())
+			}
 			if err != nil {
 				return &ToolResult{
 					Content: fmt.Sprintf("Error reading %s: %v", path, err),
@@ -621,56 +838,57 @@ func ReadTool(cfg ToolConfig) Tool {
 				if cfg.BlockImages {
 					return &ToolResult{Content: fmt.Sprintf("Image file %s (%d bytes, %s) omitted by image settings.", path, len(data), detectImageMIME(data))}, nil
 				}
-				if ctx.Capabilities.Vision {
-					mimeType := ops.DetectImageMimeType(realpath)
-					if mimeType == "" {
-						mimeType = detectImageMIME(data)
-					}
+				mimeType := ops.DetectImageMimeType(realpath)
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return nil, ctx.Context.Err()
+				}
+				if mimeType == "" {
+					mimeType = detectImageMIME(data)
+				}
 
-					// Auto-resize image if enabled and needed
-					imageData := data
-					var resizeNote string
-					displayDims := fmt.Sprintf("%d bytes", len(imageData))
-					if autoResize {
-						r := resizeImageData(imageData, mimeType, maxWidth, maxHeight)
-						if r.Data != nil {
-							imageData = r.Data
-						}
-						if r.OrigW > 0 && r.OrigH > 0 {
-							displayDims = fmt.Sprintf("%dx%d", r.NewW, r.NewH)
-						}
-						resizeNote = r.Note
+				// Auto-resize image if enabled and needed
+				imageData := data
+				var resizeNote string
+				displayDims := fmt.Sprintf("%d bytes", len(imageData))
+				if autoResize {
+					r := resizeImageData(imageData, mimeType, maxWidth, maxHeight)
+					if r.Data != nil {
+						imageData = r.Data
 					}
-					if ctx.Model != nil && ctx.Model.InputLimits != nil && ctx.Model.InputLimits.Images != nil {
-						block, err := ResizeImageBlock(ai.ContentBlock{Type: ai.ContentBlockImage, Data: base64.StdEncoding.EncodeToString(imageData), MimeType: mimeType}, ctx.Model.InputLimits.Images.Resize)
-						if err != nil {
-							return &ToolResult{Content: err.Error(), IsError: true}, nil
-						}
-						imageData, err = base64.StdEncoding.DecodeString(block.Data)
-						if err != nil {
-							return nil, fmt.Errorf("decode resized image: %w", err)
-						}
+					if r.OrigW > 0 && r.OrigH > 0 {
+						displayDims = fmt.Sprintf("%dx%d", r.NewW, r.NewH)
 					}
-					encoded := base64.StdEncoding.EncodeToString(imageData)
-					content := resizeNote
-					if content != "" {
-						content += "\n"
+					resizeNote = r.Note
+				}
+				if ctx.Model != nil && ctx.Model.InputLimits != nil && ctx.Model.InputLimits.Images != nil {
+					block, err := ResizeImageBlock(ai.ContentBlock{Type: ai.ContentBlockImage, Data: base64.StdEncoding.EncodeToString(imageData), MimeType: mimeType}, ctx.Model.InputLimits.Images.Resize)
+					if err != nil {
+						return &ToolResult{Content: err.Error(), IsError: true}, nil
 					}
-					content += fmt.Sprintf("[Image file %s (%s)]", path, displayDims)
-					return &ToolResult{
-						ContentBlocks: []ai.ContentBlock{
-							{
-								Type:     ai.ContentBlockImage,
-								Data:     encoded,
-								MimeType: mimeType,
-							},
-						},
-						Content: content,
-					}, nil
+					imageData, err = base64.StdEncoding.DecodeString(block.Data)
+					if err != nil {
+						return nil, fmt.Errorf("decode resized image: %w", err)
+					}
+				}
+				encoded := base64.StdEncoding.EncodeToString(imageData)
+				content := resizeNote
+				if content != "" {
+					content += "\n"
+				}
+				content += fmt.Sprintf("[Image file %s (%s)]", path, displayDims)
+				if ctx.Model != nil && !ctx.Model.SupportsInput(ai.InputImage) {
+					content += "\n[Current model does not support images. The image will be omitted from this request.]"
 				}
 				return &ToolResult{
-					Content: fmt.Sprintf("Image file %s (%d bytes, %s). Switch to a vision-capable model to view images.", path, len(data), detectImageMIME(data)),
-					IsError: true,
+					ContentBlocks: []ai.ContentBlock{
+						{Type: ai.ContentBlockText, Text: content},
+						{
+							Type:     ai.ContentBlockImage,
+							Data:     encoded,
+							MimeType: mimeType,
+						},
+					},
+					Content: content,
 				}, nil
 			}
 
@@ -694,8 +912,11 @@ func ReadTool(cfg ToolConfig) Tool {
 				}, nil
 			}
 
-			content := string(data)
-			lines := splitLines(content)
+			content, decodeErr := textunicode.UTF8.NewDecoder().String(string(data))
+			if decodeErr != nil {
+				return nil, fmt.Errorf("decode file text: %w", decodeErr)
+			}
+			lines := strings.Split(content, "\n")
 			totalLines := len(lines)
 
 			// Handle line range (support both start_line/end_line and offset/limit)
@@ -703,70 +924,82 @@ func ReadTool(cfg ToolConfig) Tool {
 			endLine := totalLines
 
 			// Check for offset (1-indexed start)
-			if sl, ok := ctx.Args["start_line"].(float64); ok && int(sl) > 0 {
+			if sl, ok := toolNumber(ctx.Args["start_line"]); ok && int(sl) > 0 {
 				startLine = int(sl)
 			}
-			if sl, ok := ctx.Args["offset"].(float64); ok && int(sl) > 0 {
+			if sl, ok := toolNumber(ctx.Args["offset"]); ok && int(sl) > 0 {
 				startLine = int(sl)
 			}
 
-			// Check for end_line or limit (limit is count from start)
-			var limitValue int
-			if el, ok := ctx.Args["end_line"].(float64); ok && int(el) > 0 {
-				endLine = int(el)
-			}
-			if lim, ok := ctx.Args["limit"].(float64); ok && int(lim) > 0 {
-				limitValue = int(lim)
-				endLine = startLine + limitValue - 1
+			if startLine > totalLines {
+				return &ToolResult{Content: fmt.Sprintf("Offset %d is beyond end of file (%d lines total)", startLine, totalLines), IsError: true}, nil
 			}
 
-			// Apply line cap if no explicit range given
-			var hasStart, hasOffset, hasEnd bool
-			_, hasStart = ctx.Args["start_line"]
-			_, hasOffset = ctx.Args["offset"]
-			_, hasEnd = ctx.Args["end_line"]
-			hasLimit := limitValue > 0
-			if !hasStart && !hasOffset && !hasEnd && !hasLimit && totalLines > lineCap {
-				endLine = lineCap
+			if el, ok := toolNumber(ctx.Args["end_line"]); ok && int(el) > 0 {
+				endLine = min(int(el), totalLines)
 			}
-
-			start := startLine - 1
-			if start < 0 {
-				start = 0
-			}
-			if endLine > totalLines {
-				endLine = totalLines
-			}
-
-			var result string
-			if start < endLine {
-				result = joinLines(lines[start:endLine])
-			} else {
-				result = ""
-			}
-
-			// Truncation marker
-			_, hasStartVal := ctx.Args["start_line"]
-			_, hasOffsetVal := ctx.Args["offset"]
-			_, hasEndVal := ctx.Args["end_line"]
-			_, hasLimitVal := ctx.Args["limit"]
-			explicitRange := hasStartVal || hasOffsetVal || hasEndVal || hasLimitVal
-			if !explicitRange && totalLines > lineCap {
-				result += fmt.Sprintf("\n... [truncated, file has %d more lines; call again with start_line=%d for more]", totalLines-lineCap, lineCap+1)
-			}
-
-			// Add "more lines" note if user-specified limit stopped early
+			limit, hasLimit := toolNumber(ctx.Args["limit"])
 			if hasLimit {
-				limitLineEnd := startLine + limitValue - 1
-				if limitLineEnd < totalLines {
-					remaining := totalLines - limitLineEnd
-					result += fmt.Sprintf("\n\n[%d more lines in file. Use start_line=%d to continue.]", remaining, limitLineEnd+1)
-				}
+				endLine = startLine - 1 + min(max(0, int(limit)), totalLines-startLine+1)
 			}
-
-			return &ToolResult{Content: result}, nil
+			start := startLine - 1
+			var selected string
+			if start < endLine {
+				selected = joinLines(lines[start:endLine])
+			}
+			truncation := truncateReadHead(selected, lineCap)
+			text := truncation.Content
+			var details map[string]any
+			switch {
+			case truncation.FirstLineExceedsLimit:
+				text = fmt.Sprintf("[Line %d is %.1fKB, exceeds 50.0KB limit. Use bash: sed -n '%dp' %s | head -c %d]", startLine, float64(len(lines[start]))/1024, startLine, path, DefaultMaxBytes)
+			case truncation.Truncated:
+				end := startLine + truncation.OutputLines - 1
+				var byteNote string
+				if truncation.TruncatedBy == "bytes" {
+					byteNote = " (50.0KB limit)"
+				}
+				text += fmt.Sprintf("\n\n[Showing lines %d-%d of %d%s. Use offset=%d to continue.]", startLine, end, totalLines, byteNote, end+1)
+			case hasLimit && endLine < totalLines:
+				text += fmt.Sprintf("\n\n[%d more lines in file. Use offset=%d to continue.]", totalLines-endLine, endLine+1)
+			}
+			if truncation.Truncated {
+				details = map[string]any{"truncation": truncation}
+			}
+			return &ToolResult{Content: text, Details: details}, nil
 		},
 	}
+}
+
+func truncateReadHead(content string, maxLines int) *TruncationResult {
+	lines := splitLines(content)
+	result := &TruncationResult{Content: content, TotalLines: len(lines), TotalBytes: len(content), OutputLines: len(lines), OutputBytes: len(content), MaxLines: maxLines, MaxBytes: DefaultMaxBytes}
+	if len(lines) <= maxLines && len(content) <= DefaultMaxBytes {
+		return result
+	}
+	result.Truncated = true
+	result.TruncatedBy = "lines"
+	result.OutputLines = 0
+	result.OutputBytes = 0
+	if len(lines) > 0 && len(lines[0]) > DefaultMaxBytes {
+		result.FirstLineExceedsLimit = true
+		result.TruncatedBy = "bytes"
+	} else {
+		for _, line := range lines[:min(len(lines), maxLines)] {
+			bytes := len(line)
+			if result.OutputLines > 0 {
+				bytes++
+			}
+			if result.OutputBytes+bytes > DefaultMaxBytes {
+				result.TruncatedBy = "bytes"
+				break
+			}
+			result.OutputBytes += bytes
+			result.OutputLines++
+		}
+	}
+	result.Content = joinLines(lines[:result.OutputLines])
+	return result
 }
 
 // ============================================================================
@@ -779,7 +1012,7 @@ func WriteTool(cfg ToolConfig) Tool {
 	ops := cfg.writeOps()
 	return Tool{
 		Name:        "write",
-		Description: "Write content to a file, creating it or replacing existing content",
+		Description: "Write content to a file, creating missing parent directories and replacing existing content",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -793,7 +1026,7 @@ func WriteTool(cfg ToolConfig) Tool {
 				},
 				"create_parents": map[string]any{
 					"type":        "boolean",
-					"description": "Create missing parent directories (default false)",
+					"description": "Create missing parent directories (default true)",
 				},
 			},
 			"required": []string{"path", "content"},
@@ -807,9 +1040,16 @@ func WriteTool(cfg ToolConfig) Tool {
 			if !ok {
 				return nil, ErrContentMustBeString
 			}
-			path = resolvePath(ctx.SessionCWD, path)
+			var err error
+			path, err = resolvePath(ctx.SessionCWD, path)
+			if err != nil {
+				return nil, err
+			}
 
-			createParents, _ := ctx.Args["create_parents"].(bool)
+			createParents := true
+			if requested, ok := ctx.Args["create_parents"].(bool); ok {
+				createParents = requested
+			}
 
 			// Resolve realpath for the mutation queue
 			realpath, err := fmqueue.Realpath(path)
@@ -819,9 +1059,21 @@ func WriteTool(cfg ToolConfig) Tool {
 
 			var result *ToolResult
 			writeErr := mq.WithLock(realpath, func() error {
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return ctx.Context.Err()
+				}
 				// Check parent exists
 				dir := filepath.Dir(path)
-				if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+				parentInfo, statErr := ops.Stat(dir)
+				if statErr != nil && !os.IsNotExist(statErr) {
+					result = &ToolResult{Content: fmt.Sprintf("Error checking parent directory %s: %v", dir, statErr), IsError: true}
+					return nil
+				}
+				if statErr == nil && !parentInfo.IsDir() {
+					result = &ToolResult{Content: fmt.Sprintf("Error: parent path %s is not a directory", dir), IsError: true}
+					return nil
+				}
+				if os.IsNotExist(statErr) {
 					if !createParents {
 						result = &ToolResult{
 							Content: fmt.Sprintf("Error: parent directory %s does not exist. Use create_parents=true to create it.", dir),
@@ -829,7 +1081,7 @@ func WriteTool(cfg ToolConfig) Tool {
 						}
 						return nil
 					}
-					if mkdirErr := os.MkdirAll(dir, 0o755); mkdirErr != nil {
+					if mkdirErr := ops.Mkdir(dir); mkdirErr != nil {
 						result = &ToolResult{
 							Content: fmt.Sprintf("Error creating directories: %v", mkdirErr),
 							IsError: true,
@@ -840,10 +1092,19 @@ func WriteTool(cfg ToolConfig) Tool {
 
 				// Preserve file mode on existing files, use 0644 for new
 				perm := fs.FileMode(0o644)
-				if info, statErr := os.Stat(path); statErr == nil {
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return ctx.Context.Err()
+				}
+				if info, statErr := ops.Stat(path); statErr == nil {
 					perm = info.Mode().Perm()
+				} else if !os.IsNotExist(statErr) {
+					result = &ToolResult{Content: fmt.Sprintf("Error checking file %s: %v", path, statErr), IsError: true}
+					return nil
 				}
 
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return ctx.Context.Err()
+				}
 				if writeErr := ops.WriteFile(realpath, []byte(content), perm); writeErr != nil {
 					result = &ToolResult{
 						Content: fmt.Sprintf("Error writing %s: %v", path, writeErr),
@@ -852,6 +1113,9 @@ func WriteTool(cfg ToolConfig) Tool {
 					return nil
 				}
 
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return ctx.Context.Err()
+				}
 				result = &ToolResult{Content: fmt.Sprintf("Wrote %d bytes to %s", len(content), path)}
 				return nil
 			})
@@ -884,8 +1148,40 @@ type EditEdit struct {
 type EditToolDetails struct {
 	// Diff is the unified diff of the changes made.
 	Diff string
+	// Patch is a standard unified patch.
+	Patch string
 	// FirstChangedLine is the line number of the first change.
 	FirstChangedLine int
+}
+
+func prepareEditArguments(args map[string]any) map[string]any {
+	prepared := maps.Clone(args)
+	edits := prepared["edits"]
+	if text, ok := edits.(string); ok {
+		var parsed any
+		if err := json.Unmarshal([]byte(text), &parsed); err == nil {
+			edits = parsed
+		}
+	}
+	if edit, ok := edits.(map[string]any); ok {
+		_, hasOld := edit["oldText"].(string)
+		_, hasNew := edit["newText"].(string)
+		if hasOld && hasNew {
+			edits = []any{edit}
+		}
+	}
+	if array, ok := edits.([]any); ok {
+		prepared["edits"] = array
+	}
+	oldText, hasOld := prepared["oldText"].(string)
+	newText, hasNew := prepared["newText"].(string)
+	if hasOld && hasNew {
+		array, _ := prepared["edits"].([]any)
+		prepared["edits"] = append(slices.Clone(array), map[string]any{"oldText": oldText, "newText": newText})
+		delete(prepared, "oldText")
+		delete(prepared, "newText")
+	}
+	return prepared
 }
 
 // EditTool returns a tool for editing files with multi-edit support.
@@ -894,8 +1190,9 @@ func EditTool(cfg ToolConfig) Tool {
 	ops := cfg.editOps()
 
 	return Tool{
-		Name:        "edit",
-		Description: "Edit a file using exact text replacement. Supports multiple edits via edits[] array.",
+		Name:             "edit",
+		PrepareArguments: prepareEditArguments,
+		Description:      "Edit a file using exact text replacement. Supports multiple edits via edits[] array.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -912,6 +1209,7 @@ func EditTool(cfg ToolConfig) Tool {
 								"type":        "string",
 								"description": "Exact text to replace",
 							},
+							"replaceAll": map[string]any{"type": "boolean", "description": "Replace every occurrence of this edit's oldText (default false)"},
 							"newText": map[string]any{
 								"type":        "string",
 								"description": "Replacement text",
@@ -942,7 +1240,11 @@ func EditTool(cfg ToolConfig) Tool {
 			if !ok {
 				return nil, ErrPathMustBeString
 			}
-			path = resolvePath(ctx.SessionCWD, path)
+			var err error
+			path, err = resolvePath(ctx.SessionCWD, path)
+			if err != nil {
+				return nil, err
+			}
 
 			// Parse edits from args
 			var edits []EditEdit
@@ -1005,7 +1307,21 @@ func EditTool(cfg ToolConfig) Tool {
 			var details *EditToolDetails
 
 			writeErr := mq.WithLock(realpath, func() error {
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return ctx.Context.Err()
+				}
+				accessErr := ops.Access(realpath)
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return errors.Join(accessErr, ctx.Context.Err())
+				}
+				if accessErr != nil {
+					result = &ToolResult{Content: fmt.Sprintf("Could not edit file %s: %v", path, accessErr), IsError: true}
+					return nil
+				}
 				data, err := ops.ReadFile(realpath)
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return errors.Join(err, ctx.Context.Err())
+				}
 				if err != nil {
 					result = &ToolResult{
 						Content: fmt.Sprintf("Error reading %s: %v", path, err),
@@ -1047,6 +1363,9 @@ func EditTool(cfg ToolConfig) Tool {
 					perm = info.Mode().Perm()
 				}
 
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return ctx.Context.Err()
+				}
 				if writeErr := ops.WriteFile(realpath, []byte(finalContent), perm); writeErr != nil {
 					result = &ToolResult{
 						Content: fmt.Sprintf("Error writing %s: %v", path, writeErr),
@@ -1055,9 +1374,17 @@ func EditTool(cfg ToolConfig) Tool {
 					return nil
 				}
 
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return ctx.Context.Err()
+				}
 				// Generate diff
 				diff, firstLine := generateDiffString(baseContent, newContent)
+				patch, err := generateUnifiedPatch(path, baseContent, newContent)
+				if err != nil {
+					return fmt.Errorf("generate edit patch: %w", err)
+				}
 				details = &EditToolDetails{
+					Patch:            patch,
 					Diff:             diff,
 					FirstChangedLine: firstLine,
 				}
@@ -1074,6 +1401,7 @@ func EditTool(cfg ToolConfig) Tool {
 
 			if details != nil {
 				result.Details = map[string]any{
+					"patch":            details.Patch,
 					"diff":             details.Diff,
 					"firstChangedLine": details.FirstChangedLine,
 				}
@@ -1158,12 +1486,16 @@ func BashTool(cfg ToolConfig) Tool {
 			// Determine working directory
 			dir := ctx.SessionCWD
 			if cwd, ok := ctx.Args["cwd"].(string); ok && cwd != "" {
-				dir = resolvePath(ctx.SessionCWD, cwd)
+				var err error
+				dir, err = resolvePath(ctx.SessionCWD, cwd)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			// Determine timeout
 			timeout := defaultBashTimeout
-			if ts, ok := ctx.Args["timeout"].(float64); ok && ts > 0 {
+			if ts, ok := toolNumber(ctx.Args["timeout"]); ok && ts > 0 {
 				timeout = time.Duration(ts * float64(time.Second))
 				if timeout > maxBashTimeout {
 					timeout = maxBashTimeout
@@ -1240,13 +1572,16 @@ func GrepTool(cfg ToolConfig) Tool {
 					"type":        "string",
 					"description": "File include pattern (e.g. '*.go')",
 				},
+				"ignoreCase": map[string]any{"type": "boolean", "description": "Case-insensitive search (default false)"},
+				"literal":    map[string]any{"type": "boolean", "description": "Treat the pattern as literal text (default false)"},
+				"limit":      map[string]any{"type": "integer", "description": "Maximum matches (default 100)"},
 				"case_insensitive": map[string]any{
 					"type":        "boolean",
-					"description": "Case-insensitive search (default false)",
+					"description": "Legacy alias for ignoreCase",
 				},
 				"max_results": map[string]any{
 					"type":        "integer",
-					"description": "Maximum number of results (default 200, max 1000)",
+					"description": "Legacy alias for limit (max 1000)",
 				},
 				"context": map[string]any{
 					"type":        "integer",
@@ -1256,31 +1591,54 @@ func GrepTool(cfg ToolConfig) Tool {
 			"required": []string{"pattern"},
 		},
 		Execute: func(ctx ToolContext) (*ToolResult, error) {
+			searchCtx := ctx.Context
+			if searchCtx == nil {
+				searchCtx = context.Background()
+			}
+			if err := searchCtx.Err(); err != nil {
+				return nil, err
+			}
 			pattern, ok := ctx.Args["pattern"].(string)
 			if !ok {
 				return nil, ErrPatternMustBeString
 			}
 
-			searchPath := ctx.SessionCWD
+			searchDir := "."
 			if p, ok := ctx.Args["path"].(string); ok && p != "" {
-				searchPath = resolvePath(ctx.SessionCWD, p)
+				searchDir = p
 			}
-
+			searchPath, err := resolvePath(ctx.SessionCWD, searchDir)
+			if err != nil {
+				return nil, err
+			}
 			caseInsensitive, _ := ctx.Args["case_insensitive"].(bool)
+			if canonical, ok := ctx.Args["ignoreCase"].(bool); ok {
+				caseInsensitive = canonical
+			}
+			if literal, _ := ctx.Args["literal"].(bool); literal {
+				pattern = regexp.QuoteMeta(pattern)
+			}
 			maxResults := defaultGrepMaxResults
-			if mr, ok := ctx.Args["max_results"].(float64); ok && int(mr) > 0 {
+			if mr, ok := toolNumber(ctx.Args["max_results"]); ok && int(mr) > 0 {
 				maxResults = int(mr)
 				if maxResults > maxGrepMaxResults {
 					maxResults = maxGrepMaxResults
 				}
 			}
+			if limit, ok := toolNumber(ctx.Args["limit"]); ok {
+				maxResults = max(1, int(limit))
+			}
 			contextLines := 0
-			if cl, ok := ctx.Args["context"].(float64); ok && int(cl) > 0 {
+			if cl, ok := toolNumber(ctx.Args["context"]); ok && int(cl) > 0 {
 				contextLines = int(cl)
 			}
 			globPattern, _ := ctx.Args["glob"].(string)
 
-			return cfg.grepOps().Grep(pattern, searchPath, globPattern, caseInsensitive, maxResults, contextLines)
+			result, err := cfg.grepOps().Grep(searchCtx, pattern, searchPath, globPattern, caseInsensitive, maxResults, contextLines)
+			if searchCtx.Err() != nil {
+				return nil, errors.Join(err, searchCtx.Err())
+			}
+			return result, err
 		},
 	}
 }
@@ -1295,10 +1653,12 @@ func GrepTool(cfg ToolConfig) Tool {
 func FindTool(cfg ToolConfig) Tool {
 	return Tool{
 		Name:        "find",
-		Description: "Find files or directories by name pattern",
+		Description: "Find files or directories by name pattern. Returns paths relative to the search directory.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
+				"pattern": map[string]any{"type": "string", "description": "Glob pattern to match files"},
+				"limit":   map[string]any{"type": "integer", "description": "Maximum results (default 1000)"},
 				"query": map[string]any{
 					"type":        "string",
 					"description": "Search query",
@@ -1317,7 +1677,7 @@ func FindTool(cfg ToolConfig) Tool {
 				},
 				"include_hidden": map[string]any{
 					"type":        "boolean",
-					"description": "Include hidden files (default false)",
+					"description": "Include hidden files (default true)",
 				},
 				"no_ignore": map[string]any{
 					"type":        "boolean",
@@ -1325,20 +1685,35 @@ func FindTool(cfg ToolConfig) Tool {
 				},
 				"max_results": map[string]any{
 					"type":        "integer",
-					"description": "Maximum results (default 500, max 5000)",
+					"description": "Maximum results (legacy alias for limit, max 5000)",
 				},
 			},
-			"required": []string{"query"},
+			"anyOf": []any{map[string]any{"required": []string{"pattern"}}, map[string]any{"required": []string{"query"}}},
 		},
 		Execute: func(ctx ToolContext) (*ToolResult, error) {
-			query, ok := ctx.Args["query"].(string)
+			searchCtx := ctx.Context
+			if searchCtx == nil {
+				searchCtx = context.Background()
+			}
+			if err := searchCtx.Err(); err != nil {
+				return nil, err
+			}
+			queryArg, present := ctx.Args["pattern"]
+			if !present {
+				queryArg = ctx.Args["query"]
+			}
+			query, ok := queryArg.(string)
 			if !ok {
 				return nil, ErrPatternMustBeString
 			}
 
-			searchPath := ctx.SessionCWD
+			searchDir := "."
 			if p, ok := ctx.Args["path"].(string); ok && p != "" {
-				searchPath = resolvePath(ctx.SessionCWD, p)
+				searchDir = p
+			}
+			searchPath, err := resolvePath(ctx.SessionCWD, searchDir)
+			if err != nil {
+				return nil, err
 			}
 
 			mode := "glob"
@@ -1347,22 +1722,35 @@ func FindTool(cfg ToolConfig) Tool {
 			}
 
 			maxDepth := -1
-			if md, ok := ctx.Args["max_depth"].(float64); ok && int(md) > 0 {
+			if md, ok := toolNumber(ctx.Args["max_depth"]); ok && int(md) > 0 {
 				maxDepth = int(md)
 			}
 
-			includeHidden, _ := ctx.Args["include_hidden"].(bool)
+			includeHidden := true
+			if hidden, ok := ctx.Args["include_hidden"].(bool); ok {
+				includeHidden = hidden
+			}
 			noIgnore, _ := ctx.Args["no_ignore"].(bool)
 
 			maxResults := defaultFindMaxResults
-			if mr, ok := ctx.Args["max_results"].(float64); ok && int(mr) > 0 {
+			if mr, ok := toolNumber(ctx.Args["max_results"]); ok && int(mr) > 0 {
 				maxResults = int(mr)
 				if maxResults > maxFindMaxResults {
 					maxResults = maxFindMaxResults
 				}
 			}
 
-			matches, err := cfg.findOps().Find(query, searchPath, mode, maxDepth, includeHidden, noIgnore, maxResults)
+			if value, present := ctx.Args["limit"]; present {
+				maxResults = defaultFindMaxResults
+				if limit, ok := toolNumber(value); ok && limit > 0 {
+					maxResults = int(limit)
+				}
+			}
+
+			matches, err := cfg.findOps().Find(searchCtx, query, searchPath, mode, maxDepth, includeHidden, noIgnore, maxResults)
+			if searchCtx.Err() != nil {
+				return nil, errors.Join(err, searchCtx.Err())
+			}
 			if err != nil {
 				return &ToolResult{
 					Content: err.Error(),
@@ -1370,7 +1758,40 @@ func FindTool(cfg ToolConfig) Tool {
 				}, nil
 			}
 
-			return &ToolResult{Content: strings.Join(matches, "\n")}, nil
+			if len(matches) == 0 {
+				return &ToolResult{Content: "No files found matching pattern"}, nil
+			}
+			relative := make([]string, len(matches))
+			for i, match := range matches {
+				trailing := strings.HasSuffix(match, string(filepath.Separator)) || runtime.GOOS == "windows" && strings.HasSuffix(match, "/")
+				if filepath.IsAbs(match) {
+					match, err = filepath.Rel(searchPath, match)
+					if err != nil {
+						return nil, fmt.Errorf("relativize find result: %w", err)
+					}
+				}
+				relative[i] = filepath.ToSlash(match)
+				if trailing && !strings.HasSuffix(relative[i], "/") {
+					relative[i] += "/"
+				}
+			}
+			bounded := truncateReadHead(strings.Join(relative, "\n"), len(relative))
+			result := &ToolResult{Content: bounded.Content}
+			details := make(map[string]any)
+			var notices []string
+			if len(matches) >= maxResults {
+				details["resultLimitReached"] = maxResults
+				notices = append(notices, fmt.Sprintf("%d results limit reached", maxResults))
+			}
+			if bounded.Truncated {
+				details["truncation"] = bounded
+				notices = append(notices, "50.0KB limit reached")
+			}
+			if len(notices) > 0 {
+				result.Content += "\n\n[" + strings.Join(notices, ". ") + "]"
+				result.Details = details
+			}
+			return result, nil
 		},
 	}
 }
@@ -1408,9 +1829,16 @@ func LSTool(cfg ToolConfig) Tool {
 			},
 		},
 		Execute: func(ctx ToolContext) (*ToolResult, error) {
+			if ctx.Context != nil && ctx.Context.Err() != nil {
+				return nil, ctx.Context.Err()
+			}
 			dirPath := ctx.SessionCWD
 			if p, ok := ctx.Args["path"].(string); ok && p != "" {
-				dirPath = resolvePath(ctx.SessionCWD, p)
+				var err error
+				dirPath, err = resolvePath(ctx.SessionCWD, p)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			sortBy := "name"
@@ -1421,12 +1849,15 @@ func LSTool(cfg ToolConfig) Tool {
 
 			// Parse limit parameter
 			limit := defaultLSMaxEntries
-			if lim, ok := ctx.Args["limit"].(float64); ok && int(lim) > 0 {
+			if lim, ok := toolNumber(ctx.Args["limit"]); ok && int(lim) > 0 {
 				limit = int(lim)
 			}
 
 			ops := cfg.lsOps()
 			entries, err := ops.Ls(dirPath)
+			if ctx.Context != nil && ctx.Context.Err() != nil {
+				return nil, errors.Join(err, ctx.Context.Err())
+			}
 			if err != nil {
 				return &ToolResult{
 					Content: fmt.Sprintf("Error listing %s: %v", dirPath, err),
@@ -1445,11 +1876,14 @@ func LSTool(cfg ToolConfig) Tool {
 			infos := make([]entryInfo, 0, len(entries))
 			for _, entry := range entries {
 				info, err := ops.Stat(filepath.Join(dirPath, entry.Name()))
+				if ctx.Context != nil && ctx.Context.Err() != nil {
+					return nil, errors.Join(err, ctx.Context.Err())
+				}
 				if err != nil {
 					continue
 				}
 				typ := "f"
-				if entry.IsDir() {
+				if info.IsDir() {
 					typ = "d"
 				} else if info.Mode()&os.ModeSymlink != 0 {
 					typ = "l"
@@ -1462,24 +1896,25 @@ func LSTool(cfg ToolConfig) Tool {
 				})
 			}
 
+			if len(infos) == 0 {
+				return &ToolResult{Content: "(empty directory)"}, nil
+			}
+
 			// Sort
-			slices.SortFunc(infos, func(a, b entryInfo) int {
-				var less bool
+			slices.SortStableFunc(infos, func(a, b entryInfo) int {
+				var order int
 				switch sortBy {
 				case "mtime":
-					less = a.mtime.Before(b.mtime)
+					order = a.mtime.Compare(b.mtime)
 				case "size":
-					less = a.size < b.size
-				default: // name
-					less = a.name < b.name
+					order = cmp.Compare(a.size, b.size)
+				default:
+					order = strings.Compare(strings.ToLower(a.name), strings.ToLower(b.name))
 				}
 				if reverse {
-					less = !less
+					return -order
 				}
-				if less {
-					return -1
-				}
-				return 1
+				return order
 			})
 
 			// Apply limit and check for truncation
@@ -1495,11 +1930,22 @@ func LSTool(cfg ToolConfig) Tool {
 				lines = append(lines, fmt.Sprintf("%s %8d %s %s", info.typ, info.size, info.mtime.Format("Jan 02 15:04"), info.name))
 			}
 
-			result := strings.Join(lines, "\n")
+			bounded := truncateReadHead(strings.Join(lines, "\n"), len(lines))
+			result := bounded.Content
+			details := make(map[string]any)
 			if truncated {
 				result += fmt.Sprintf("\n... [truncated, showing first %d of %d entries]", limit, totalEntries)
+				details["entryLimitReached"] = limit
 			}
-			return &ToolResult{Content: result}, nil
+			if bounded.Truncated {
+				result += "\n\n[50.0KB limit reached]"
+				details["truncation"] = bounded
+			}
+			output := &ToolResult{Content: result}
+			if len(details) > 0 {
+				output.Details = details
+			}
+			return output, nil
 		},
 	}
 }
@@ -1666,7 +2112,7 @@ func restoreLineEndings(text string, ending string) string {
 // Returns (hasBOM, contentWithoutBOM).
 func stripBom(content string) (bool, string) {
 	if strings.HasPrefix(content, "\uFEFF") {
-		return true, content[1:]
+		return true, strings.TrimPrefix(content, "\uFEFF")
 	}
 	return false, content
 }
@@ -1797,11 +2243,54 @@ func applyEditsToNormalizedContent(content string, edits []EditEdit, path string
 	}
 
 	// Apply edits in reverse order so earlier offsets remain stable.
-	baseContent := basis
+	baseContent := content
 	newContent := basis
-	for i := len(matches) - 1; i >= 0; i-- {
-		m := matches[i]
-		newContent = newContent[:m.index] + m.newText + newContent[m.index+m.matchLen:]
+	if !usedFuzzy {
+		for i := len(matches) - 1; i >= 0; i-- {
+			m := matches[i]
+			newContent = newContent[:m.index] + m.newText + newContent[m.index+m.matchLen:]
+		}
+	} else {
+		// Fuzzy offsets refer to normalized bytes; only rewrite touched lines.
+
+		originalLines := strings.SplitAfter(content, "\n")
+		baseLines := strings.SplitAfter(basis, "\n")
+		offsets := make([]int, len(baseLines)+1)
+		for i, line := range baseLines {
+			offsets[i+1] = offsets[i] + len(line)
+		}
+		var preserved strings.Builder
+		var nextLine int
+		for i := 0; i < len(matches); {
+			startLine := strings.Count(basis[:matches[i].index], "\n")
+			endLine := strings.Count(basis[:matches[i].index+matches[i].matchLen-1], "\n") + 1
+			endMatch := i + 1
+			for endMatch < len(matches) {
+				m := matches[endMatch]
+				if strings.Count(basis[:m.index], "\n") >= endLine {
+					break
+				}
+				endLine = max(endLine, strings.Count(basis[:m.index+m.matchLen-1], "\n")+1)
+				endMatch++
+			}
+			for _, line := range originalLines[nextLine:startLine] {
+				preserved.WriteString(line)
+			}
+			startOffset := offsets[startLine]
+			changed := basis[startOffset:offsets[endLine]]
+			for j := endMatch - 1; j >= i; j-- {
+				m := matches[j]
+				index := m.index - startOffset
+				changed = changed[:index] + m.newText + changed[index+m.matchLen:]
+			}
+			preserved.WriteString(changed)
+			nextLine = endLine
+			i = endMatch
+		}
+		for _, line := range originalLines[nextLine:] {
+			preserved.WriteString(line)
+		}
+		newContent = preserved.String()
 	}
 
 	// Check for no-change.
@@ -1842,10 +2331,10 @@ func sampleLineNumbers(content string, occurrences []int, limit int) []int {
 // normalizeForFuzzyMatch normalizes text for fuzzy matching.
 // Strips trailing whitespace, normalizes smart quotes, etc.
 func normalizeForFuzzyMatch(text string) string {
-	lines := strings.Split(text, "\n")
+	lines := strings.Split(norm.NFKC.String(text), "\n")
 	for i := range lines {
 		lines[i] = strings.TrimRightFunc(lines[i], func(r rune) bool {
-			return r == ' ' || r == '\t'
+			return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff'
 		})
 	}
 	text = strings.Join(lines, "\n")
@@ -1897,6 +2386,21 @@ func normalizeForFuzzyMatch(text string) string {
 	return text
 }
 
+func generateUnifiedPatch(path, oldContent, newContent string) (string, error) {
+	lines := func(content string) []string {
+		if content == "" {
+			return nil
+		}
+		parts := strings.SplitAfter(content, "\n")
+		if parts[len(parts)-1] == "" {
+			return parts[:len(parts)-1]
+		}
+		parts[len(parts)-1] += "\n\\ No newline at end of file\n"
+		return parts
+	}
+	return difflib.GetUnifiedDiffString(difflib.UnifiedDiff{A: lines(oldContent), B: lines(newContent), FromFile: path, ToFile: path, Context: 4})
+}
+
 // generateDiffString generates a unified diff string with line numbers.
 func generateDiffString(oldContent, newContent string) (string, int) {
 	oldLines := strings.Split(oldContent, "\n")
@@ -1915,10 +2419,26 @@ func generateDiffString(oldContent, newContent string) (string, int) {
 	line := func(sign byte, num int, text string) {
 		output = append(output, fmt.Sprintf("%c%*d %s", sign, lineNumWidth, num, text))
 	}
-	for _, op := range difflib.NewMatcher(oldLines, newLines).GetOpCodes() {
+	split := func(content string) []string {
+		if content == "" {
+			return nil
+		}
+		return strings.Split(strings.TrimSuffix(content, "\n"), "\n")
+	}
+	oldLines, newLines = split(oldContent), split(newContent)
+	ops := difflib.NewMatcher(oldLines, newLines).GetOpCodes()
+	for index, op := range ops {
 		if op.Tag == 'e' {
-			for k := range op.J2 - op.J1 {
-				line(' ', op.J1+k+1, newLines[op.J1+k])
+			before, after := index > 0, index < len(ops)-1
+			omitted := false
+			for k := range op.I2 - op.I1 {
+				if before && k < 4 || after && k >= op.I2-op.I1-4 {
+					line(' ', op.I1+k+1, oldLines[op.I1+k])
+					omitted = false
+				} else if (before || after) && !omitted {
+					output = append(output, fmt.Sprintf(" %*s ...", lineNumWidth, ""))
+					omitted = true
+				}
 			}
 			continue
 		}
@@ -1946,7 +2466,11 @@ func generateDiffString(oldContent, newContent string) (string, int) {
 // Grep Implementation
 // ============================================================================
 
-func grepWithRG(rgPath, pattern, searchPath, globPattern string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error) {
+func grepWithRG(ctx context.Context, rgPath, pattern, searchPath, globPattern string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	args := []string{"--no-heading", "--with-filename", "--line-number"}
 	if caseInsensitive {
 		args = append(args, "-i")
@@ -1962,8 +2486,11 @@ func grepWithRG(rgPath, pattern, searchPath, globPattern string, caseInsensitive
 	}
 	args = append(args, "--", pattern, searchPath)
 
-	cmd := exec.Command(rgPath, args...)
+	cmd := exec.CommandContext(ctx, rgPath, args...)
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return nil, errors.Join(err, ctx.Err())
+	}
 	if err != nil {
 		// rg returns exit code 1 when no matches found
 		if cmd.ProcessState.ExitCode() == 1 {
@@ -1982,11 +2509,14 @@ func grepWithRG(rgPath, pattern, searchPath, globPattern string, caseInsensitive
 	return &ToolResult{Content: result}, nil
 }
 
-func grepPureGo(pattern, searchPath, globPattern string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error) {
+func grepPureGo(ctx context.Context, pattern, searchPath, globPattern string, caseInsensitive bool, maxResults, contextLines int) (*ToolResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		// Try as literal
-		re = regexp.MustCompile(regexp.QuoteMeta(pattern))
+		return &ToolResult{Content: fmt.Sprintf("Invalid regex: %v", err), IsError: true}, nil
 	}
 	if caseInsensitive {
 		re = regexp.MustCompile("(?i)" + re.String())
@@ -1996,7 +2526,13 @@ func grepPureGo(pattern, searchPath, globPattern string, caseInsensitive bool, m
 	matchCount := 0
 
 	walkErr := filepath.Walk(searchPath, func(current string, info os.FileInfo, err error) error {
+		if ctx.Err() != nil {
+			return errors.Join(err, ctx.Err())
+		}
 		if err != nil {
+			if current == searchPath {
+				return err
+			}
 			return nil
 		}
 		if info.IsDir() {
@@ -2012,6 +2548,9 @@ func grepPureGo(pattern, searchPath, globPattern string, caseInsensitive bool, m
 		}
 
 		data, err := os.ReadFile(current)
+		if ctx.Err() != nil {
+			return errors.Join(err, ctx.Err())
+		}
 		if err != nil {
 			return nil
 		}
@@ -2020,6 +2559,9 @@ func grepPureGo(pattern, searchPath, globPattern string, caseInsensitive bool, m
 		outputLines := make(map[int]bool) // Track which lines have been output
 
 		for i, line := range lines {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if re.MatchString(line) {
 				matchCount++
 				if matchCount > maxResults {
@@ -2046,6 +2588,9 @@ func grepPureGo(pattern, searchPath, globPattern string, caseInsensitive bool, m
 		}
 		return nil
 	})
+	if ctx.Err() != nil {
+		return nil, errors.Join(walkErr, ctx.Err())
+	}
 	if walkErr != nil && walkErr.Error() != "max results reached" {
 		return &ToolResult{
 			Content: fmt.Sprintf("Error searching %s: %v", searchPath, walkErr),
@@ -2147,4 +2692,40 @@ func GenerateTempFilePath() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return filepath.Join(os.TempDir(), fmt.Sprintf("tau-bash-%x.log", b))
+}
+
+func toolNumber(value any) (float64, bool) {
+	switch number := value.(type) {
+	case int:
+		return float64(number), true
+	case float64:
+		return number, true
+	default:
+		return 0, false
+	}
+}
+
+func matchFindPathGlob(pattern, candidate string) (bool, error) {
+	parts := strings.Split(candidate, "/")
+	matched := make([]bool, len(parts)+1)
+	matched[0] = true
+	for _, segment := range strings.Split(pattern, "/") {
+		next := make([]bool, len(matched))
+		if segment == "**" {
+			next[0] = matched[0]
+			for i := range parts {
+				next[i+1] = matched[i+1] || next[i]
+			}
+		} else {
+			for i, part := range parts {
+				matches, err := filepath.Match(segment, part)
+				if err != nil {
+					return false, fmt.Errorf("match find glob: %w", err)
+				}
+				next[i+1] = matched[i] && matches
+			}
+		}
+		matched = next
+	}
+	return matched[len(parts)], nil
 }

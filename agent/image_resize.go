@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
-	"image/color"
+	"image/draw"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
@@ -51,20 +51,6 @@ func isSupportedImageMime(mimeType string) bool {
 	default:
 		return false
 	}
-}
-
-// decodeImageConfig reads the image header without decoding pixels.
-// Returns the decoded image, its bounds, and any error. The caller is
-// responsible for closing the returned image (only needed for animated
-// GIFs; for the first-frame use case here, we ignore Close).
-func decodeImageConfig(data []byte, mimeType string) (image.Image, error) {
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	// Build a zero-sized image just to carry the dimensions; we don't
-	// need pixels for the cheap "already small?" check.
-	return image.NewNRGBA(image.Rect(0, 0, cfg.Width, cfg.Height)), nil
 }
 
 // decodeImagePixels decodes the full image at mimeType.
@@ -157,11 +143,11 @@ func resizeImageData(data []byte, mimeType string, maxW, maxH int, quality ...in
 
 	// Phase 1: read the header to learn original dimensions without
 	// paying the cost of full pixel decode.
-	cfgImg, err := decodeImageConfig(data, mimeType)
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return resizeResult{}
 	}
-	origW, origH := cfgImg.Bounds().Dx(), cfgImg.Bounds().Dy()
+	origW, origH := cfg.Width, cfg.Height
 	if origW == 0 || origH == 0 {
 		return resizeResult{}
 	}
@@ -212,20 +198,7 @@ func toNRGBA(src image.Image) *image.NRGBA {
 	}
 	b := src.Bounds()
 	dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-	for y := 0; y < b.Dy(); y++ {
-		for x := 0; x < b.Dx(); x++ {
-			r, g, bb, a := src.At(b.Min.X+x, b.Min.Y+y).RGBA()
-			// RGBA() returns 16-bit components; NRGBA stores 8-bit
-			// non-premultiplied. The high byte of each 16-bit value
-			// is the 8-bit value when the source is in [0, 1].
-			dst.SetNRGBA(x, y, color.NRGBA{
-				R: uint8(r >> 8),
-				G: uint8(g >> 8),
-				B: uint8(bb >> 8),
-				A: uint8(a >> 8),
-			})
-		}
-	}
+	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
 	return dst
 }
 
@@ -280,8 +253,8 @@ func resizeNRGBA(src *image.NRGBA, dstW, dstH int) *image.NRGBA {
 		}
 		wy := sy - float64(y0)
 
-		srcRow0 := src.PixOffset(0, y0)
-		srcRow1 := src.PixOffset(0, y1)
+		srcRow0 := src.PixOffset(srcBounds.Min.X, srcBounds.Min.Y+y0)
+		srcRow1 := src.PixOffset(srcBounds.Min.X, srcBounds.Min.Y+y1)
 		dstRow := dst.PixOffset(0, dy)
 
 		for dx := 0; dx < dstW; dx++ {
