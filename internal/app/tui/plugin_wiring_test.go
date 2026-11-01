@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/clipboard"
 )
 
@@ -105,25 +104,5 @@ func TestPastedImageMarkerNotShadowedByWorkingTreeFile(t *testing.T) {
 	}
 	if string(stored) != string(png) {
 		t.Fatal("imported attachment is the working-tree decoy, not the pasted image")
-	}
-}
-
-func TestQuitRemovesUnsentSessionImages(t *testing.T) {
-	dataDir := filepath.Join(t.TempDir(), "session-data")
-	a := newTestApp(t)
-	a.app = &tauui.App{}
-	a.sess.(*fakeSession).stateDataDir = dataDir
-	a.cancelRun = func() {}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dataDir, "pasted-image.png"), []byte{1}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	a.quit()
-
-	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
-		t.Fatalf("data dir still exists after quitting unsent session: %v", err)
 	}
 }

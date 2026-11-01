@@ -543,3 +543,85 @@ func TestListUsesConfiguredNavigationAndSearchBindings(t *testing.T) {
 		t.Fatalf("cancels=%d", cancels)
 	}
 }
+
+func TestListPreselectionAndNavigationCallback(t *testing.T) {
+	var selected []string
+	l := New([]Item{{ID: "a"}, {ID: "b"}, {ID: "c"}}, 3, DefaultTheme(), nil, nil, Options{SelectedID: "b", OnSelectionChange: func(item Item) { selected = append(selected, item.ID) }})
+	if l.SelectedIndex() != 1 || len(selected) != 0 {
+		t.Fatalf("initial selection=%d, callbacks=%v", l.SelectedIndex(), selected)
+	}
+	l.HandleInput("\x1b[B\x1b[B\x1b[A")
+	if strings.Join(selected, ",") != "c,a,c" {
+		t.Fatalf("navigation callbacks=%v", selected)
+	}
+	l.HandleInput("x\r")
+	if len(selected) != 3 {
+		t.Fatalf("non-navigation callbacks=%v", selected)
+	}
+}
+
+func TestListNavigationPreviewDoesNotFireForSearchOrEmptyList(t *testing.T) {
+	var calls int
+	l := New([]Item{{ID: "a", Label: "Alpha"}, {ID: "b", Label: "Beta"}}, 3, DefaultTheme(), nil, nil, Options{EnableSearch: true, OnSelectionChange: func(Item) { calls++ }})
+	l.HandleInput("\x1b[B")
+	if calls != 1 {
+		t.Fatalf("navigation callbacks=%d", calls)
+	}
+	l.HandleInput("missing\x1b[A\x1b[B")
+	if calls != 1 {
+		t.Fatalf("search/empty callbacks=%d", calls)
+	}
+}
+
+func TestListMeasuresAndTruncatesStyledLabelsByVisibleWidth(t *testing.T) {
+	l := New([]Item{{ID: "a", Label: "\x1b[31mAlpha\x1b[0m", CurrentValue: "one"}, {ID: "b", Label: "Beta", CurrentValue: "two"}}, 3, DefaultTheme(), nil, nil, Options{})
+	rows := l.Render(20)
+	want := []string{"> Alpha  one", "  Beta   two"}
+	for index, expected := range want {
+		if got := tauui.StripANSI(rows[index]); got != expected {
+			t.Errorf("row %d=%q, want %q", index, got, expected)
+		}
+	}
+	l = New([]Item{{ID: "a", Label: "\x1b[31mabcdefghij\x1b[0m", CurrentValue: "value"}}, 3, DefaultTheme(), nil, nil, Options{})
+	row := l.Render(6)[0]
+	if got := tauui.StripANSI(row); got != "> abcd" {
+		t.Fatalf("narrow row=%q, want %q", got, "> abcd")
+	}
+	if tauui.TextWidth(row) != 6 {
+		t.Fatalf("narrow width=%d", tauui.TextWidth(row))
+	}
+}
+
+func TestListStyledDescriptionsWrapLikePlainText(t *testing.T) {
+	plain := New([]Item{{ID: "a", Label: "Label", Description: "alpha beta gamma delta"}}, 3, DefaultTheme(), nil, nil, Options{}).Render(16)
+	styled := New([]Item{{ID: "a", Label: "Label", Description: "\x1b[31malpha beta gamma delta\x1b[0m"}}, 3, DefaultTheme(), nil, nil, Options{}).Render(16)
+	if len(plain) != len(styled) {
+		t.Fatalf("styled rows=%q, plain rows=%q", styled, plain)
+	}
+	for index, row := range styled {
+		if got := tauui.StripANSI(row); got != plain[index] {
+			t.Errorf("row %d=%q, want %q", index, got, plain[index])
+		}
+		if tauui.TextWidth(row) > 16 {
+			t.Errorf("row %d exceeds width: %q", index, row)
+		}
+	}
+}
+
+func TestListSearchDoesNotTreatNELAsWhitespace(t *testing.T) {
+	l := New([]Item{{ID: "a", Label: "Alpha"}, {ID: "b", Label: "Beta"}}, 3, DefaultTheme(), nil, nil, Options{EnableSearch: true})
+	l.Paste("\u0085")
+	if got := l.Search(); got != "" {
+		t.Fatalf("control paste=%q", got)
+	}
+	l.searchInput.SetValue("\u0085")
+	l.updateSearch()
+	if got := l.FilteredItems(); len(got) != 0 {
+		t.Fatalf("NEL matches=%v, want no items", got)
+	}
+	l.searchInput.SetValue("\ufeff")
+	l.updateSearch()
+	if got := l.FilteredItems(); len(got) != 2 {
+		t.Fatalf("BOM matches=%v, want all items", got)
+	}
+}

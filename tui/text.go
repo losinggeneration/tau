@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/losinggeneration/rovel/geom"
 	"github.com/losinggeneration/rovel/style"
 )
@@ -250,23 +252,26 @@ func expandTabs(s string, n int) string {
 		return s
 	}
 
-	pad := ""
-	for range n {
-		pad += " "
+	if !strings.Contains(s, "\t") {
+		return s
 	}
-
-	out := make([]rune, 0, len(s))
-	for _, r := range s {
-		if r == '\t' {
-			for _, p := range pad {
-				out = append(out, p)
-			}
-		} else {
-			out = append(out, r)
+	var out strings.Builder
+	pad := strings.Repeat(" ", n)
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case 0x1b:
+			end := ansiEscapeEnd(s, i)
+			out.WriteString(s[i:end])
+			i = end
+		case '\t':
+			out.WriteString(pad)
+			i++
+		default:
+			out.WriteByte(s[i])
+			i++
 		}
 	}
-
-	return string(out)
+	return out.String()
 }
 
 // padRight returns s padded with spaces to exactly w display cells. If s is

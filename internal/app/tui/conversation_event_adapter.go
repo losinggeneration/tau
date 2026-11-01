@@ -131,6 +131,9 @@ func (a *conversationEventAdapter) handle(ev sdk.Event) {
 		}
 		if command, _ := plString(ev.Payload, "command"); command == "reload" {
 			app.reapplySessionSettings()
+			if !isErr {
+				app.reloadKeybindings()
+			}
 		}
 	case "tool_cancelled", "tool_canceled":
 		app.resetEmptyAssistantResponses()

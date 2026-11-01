@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -438,6 +439,7 @@ type App struct {
 	// Nil means only the built-in token sets are available.
 	themeColors   ThemeColorLookup
 	themeLookup   ThemeLookup
+	themeNames    func() []string
 	refreshTheme  func(string) (bool, error)
 	terminalTheme terminalThemeState
 
@@ -619,6 +621,8 @@ type Options struct {
 	ThemeColors ThemeColorLookup
 	// ThemeLookup preserves file appearance metadata and takes precedence over ThemeColors.
 	ThemeLookup ThemeLookup
+	// ThemeNames lists discovered themes from the active resource registry.
+	ThemeNames func() []string
 	// RefreshTheme rereads the selected file, retaining the last valid registry entry on error.
 	RefreshTheme func(string) (bool, error)
 	// StartupMessages are shown under the startup header before the first turn.
@@ -696,6 +700,7 @@ func New(opts Options) (*App, error) {
 		settingsPath:    opts.SettingsPath,
 		themeColors:     opts.ThemeColors,
 		themeLookup:     opts.ThemeLookup,
+		themeNames:      opts.ThemeNames,
 		refreshTheme:    opts.RefreshTheme,
 		header:          header,
 		extensions:      extensions.New(),
@@ -959,12 +964,24 @@ func (a *App) SessionID() string {
 
 // Run enables the terminal, starts the event loop, and blocks until the user
 // quits. It restores the terminal on return.
-func (a *App) Run(ctx context.Context) error {
-	defer func() { a.stopExtensionDialogs(); a.stopLoginWorkers() }()
+func (a *App) Run(ctx context.Context) (err error) {
 	a.refreshProgramStatus()
 	a.ctx, a.cancelRun = context.WithCancel(ctx)
-	defer a.cancelRun()
-	defer func() { _ = a.chat.Close() }()
+	defer func() {
+		a.cancelRun()
+		a.stopExtensionDialogs()
+		a.stopLoginWorkers()
+		if a.sess != nil {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if closeErr := a.sess.Close(cleanup); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close interactive session: %w", closeErr))
+			}
+		}
+		if closeErr := a.chat.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close chat log: %w", closeErr))
+		}
+	}()
 
 	if err := a.app.Post(func(*tauui.UpdateCtx) { a.startTerminalTheme() }); err != nil {
 		return fmt.Errorf("initialize terminal theme: %w", err)
@@ -1871,9 +1888,6 @@ func (a *App) quit() {
 	// after we've already torn down state.
 	a.stopConfirmQuitTimer()
 	a.cancelRun()
-	if a.sess != nil {
-		_ = a.sess.Close(a.ctx)
-	}
 	a.app.Quit()
 }
 
@@ -4571,6 +4585,7 @@ func (a *App) closeDialogComponent() {
 	if a == nil || a.dialogPicker == nil {
 		return
 	}
+	a.cancelThemePreview()
 	a.dialogInputActive.Store(false)
 	if d := a.loginDialog; d != nil {
 		d.cancel()

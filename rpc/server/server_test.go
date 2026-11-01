@@ -381,3 +381,52 @@ func TestSendInterruptCancelsARunWithoutWaitingForInput(t *testing.T) {
 	}
 	close(run)
 }
+
+func TestReadCommandProcessesFinalRecordWithoutLF(t *testing.T) {
+	for _, end := range []string{"", "\n", "\r\n"} {
+		s := &Server{reader: bufio.NewReader(strings.NewReader("{\"id\":\"a\u2028b\u2029界\",\"type\":\"get_state\"}" + end))}
+		cmd, err := s.readCommand()
+		if err != nil {
+			t.Fatalf("end %q: %v", end, err)
+		}
+		if cmd.ID != "a\u2028b\u2029界" || cmd.Type != "get_state" {
+			t.Fatalf("command=%+v", cmd)
+		}
+		if _, err := s.readCommand(); !errors.Is(err, io.EOF) {
+			t.Fatalf("expected EOF, got %v", err)
+		}
+	}
+}
+
+func TestReadCommandReportsMalformedFinalRecord(t *testing.T) {
+	s := &Server{reader: bufio.NewReader(strings.NewReader("{\"type\":"))}
+	if _, err := s.readCommand(); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("expected JSON error, got %v", err)
+	}
+	if _, err := s.readCommand(); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected EOF, got %v", err)
+	}
+}
+
+func TestRunHandlesFinalCommandBeforeDisconnect(t *testing.T) {
+	var output bytes.Buffer
+	s := NewServer(&mockRuntime{}, nil, nil)
+	s.reader = bufio.NewReader(strings.NewReader(`{"id":"last","type":"unknown"}`))
+	s.writer = &output
+	if err := s.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var response Response
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		var r Response
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatal(err)
+		}
+		if r.ID == "last" {
+			response = r
+		}
+	}
+	if response.ID != "last" || response.OK || response.Error == nil || response.Error.Code != "unknown_command" {
+		t.Fatalf("response=%+v output=%s", response, output.String())
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"github.com/losinggeneration/tau/ai"
 	tauui "github.com/losinggeneration/tau/tui"
 	"github.com/losinggeneration/tau/tui/extensions"
+	"github.com/losinggeneration/tau/tui/keybindings"
 )
 
 // Handlers for the §12 application actions that are not tied to a dialog.
@@ -165,7 +166,7 @@ func (k appKeymap) resolveExtensionShortcut(ks tauui.Keystroke) (tauui.Action, b
 		manager = defaultAppKeybindings()
 	}
 	normalized := normalizeKeystrokeForRouting(ks)
-	if manager.ClaimsReservedKey(normalized) {
+	if manager.ClaimsReservedKey(normalized) || keybindings.DefaultManager().ClaimsReservedKey(normalized) {
 		return tauui.ActionNone, false
 	}
 	shortcut, ok := k.app.extensions.ShortcutForKeystroke(normalized)

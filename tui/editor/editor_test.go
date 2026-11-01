@@ -260,7 +260,7 @@ func TestEditorVisualMovementAndScrollOffset(t *testing.T) {
 	}
 	e.SetScrollOffset(2)
 	e.EnsureCursorVisible(2, 3)
-	if e.ScrollOffset() != 2 {
+	if e.ScrollOffset() != 1 {
 		t.Fatalf("scroll offset=%d", e.ScrollOffset())
 	}
 }
@@ -1941,4 +1941,94 @@ func TestEditorEmptyProgrammaticInsertionLeavesStateAlone(t *testing.T) {
 	e.Insert("b")
 	e.Undo()
 	assert.Empty(t, e.Text())
+}
+
+func TestEditorAutocompleteItemsOwnsReturnedSlice(t *testing.T) {
+	e := New()
+	assert.Nil(t, e.AutocompleteItems())
+	e.SetAutocomplete(&autocomplete.Suggestions{Items: []autocomplete.Item{{Value: "one"}, {Value: "two"}}})
+	items := e.AutocompleteItems()
+	items[0].Value = "changed"
+	assert.Equal(t, "one", e.AutocompleteItems()[0].Value)
+	e.CancelAutocomplete()
+	assert.Nil(t, e.AutocompleteItems())
+}
+
+func TestEditorAutocompleteVisibleLimitMatchesUpstream(t *testing.T) {
+	for _, tc := range []struct{ input, want int }{{-1, 3}, {0, 3}, {1, 3}, {3, 3}, {10, 10}, {20, 20}, {21, 20}, {100, 20}} {
+		t.Run(strconv.Itoa(tc.input), func(t *testing.T) {
+			e := New()
+			e.SetAutocompleteMaxVisible(tc.input)
+			assert.Equal(t, tc.want, e.AutocompleteMaxVisible())
+			items := make([]autocomplete.Item, 25)
+			for i := range items {
+				items[i].Value = strconv.Itoa(i)
+			}
+			e.SetAutocomplete(&autocomplete.Suggestions{Items: items})
+			for range 24 {
+				e.AutocompleteNext()
+			}
+			require.Len(t, e.VisibleAutocompleteItems(), tc.want)
+			assert.Equal(t, "24", e.VisibleAutocompleteItems()[tc.want-1].Value)
+		})
+	}
+	assert.Equal(t, 5, New().AutocompleteMaxVisible())
+}
+
+func TestEditorWordActionsRecognizeBOMWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		cursor, wantCursor int
+		want, deleted      string
+	}{
+		{"left", len("one\ufefftwo"), len("one\ufeff"), "one\ufefftwo", ""},
+		{"right", 0, len("one"), "one\ufefftwo", ""},
+		{"backward", len("one\ufefftwo"), len("one\ufeff"), "one\ufeff", "two"},
+		{"forward", 0, 0, "\ufefftwo", "one"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+			e.SetText("one\ufefftwo")
+			e.SetCursor(tc.cursor)
+			var killed string
+			switch tc.name {
+			case "left":
+				e.MoveWordLeft()
+			case "right":
+				e.MoveWordRight()
+			case "backward":
+				killed = e.DeleteWordBackward()
+			case "forward":
+				killed = e.DeleteWordForward()
+			}
+			assert.Equal(t, tc.want, e.Text())
+			assert.Equal(t, tc.wantCursor, e.Cursor())
+			assert.Equal(t, tc.deleted, killed)
+			if tc.deleted != "" {
+				e.Yank()
+				assert.Equal(t, "one\ufefftwo", e.Text())
+				e.Undo()
+				e.Undo()
+				assert.Equal(t, "one\ufefftwo", e.Text())
+				assert.Equal(t, tc.cursor, e.Cursor())
+			}
+		})
+	}
+}
+
+func TestEditorViewportRefillsAfterResize(t *testing.T) {
+	e := New()
+	e.SetText("abcdefghijkl")
+	e.SetCursor(len(e.Text()))
+	e.EnsureCursorVisible(2, 3)
+	assert.Equal(t, 2, e.ScrollOffset())
+	e.EnsureCursorVisible(3, 3)
+	assert.Equal(t, 1, e.ScrollOffset())
+	e.EnsureCursorVisible(3, 6)
+	assert.Zero(t, e.ScrollOffset())
+	e.SetScrollOffset(100)
+	e.EnsureCursorVisible(5, 6)
+	assert.Zero(t, e.ScrollOffset())
+	assert.Equal(t, "abcdefghijkl", e.Text())
+	assert.Equal(t, len(e.Text()), e.Cursor())
 }

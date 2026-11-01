@@ -40,26 +40,50 @@ func DrawANSIText(d Drawer, pos geom.Point, s string, base style.Style) {
 			continue
 		}
 
-		if s[i] != 0x1b || i+1 >= len(s) || s[i+1] != '[' {
+		if s[i] != 0x1b {
 			i++
 			continue
 		}
-
-		end := i + 2
-		for end < len(s) && s[end] != 'm' {
-			end++
-		}
-		if end >= len(s) {
-			i++
-			continue
-		}
-
 		flush(i)
-		current = applySGR(current, base, s[i+2:end])
-		i = end + 1
+		end := ansiEscapeEnd(s, i)
+		if i+1 < len(s) && s[i+1] == '[' && s[end-1] == 'm' {
+			current = applySGR(current, base, s[i+2:end-1])
+		}
+		i = end
 		start = i
 	}
 	flush(len(s))
+}
+
+// ansiEscapeEnd consumes one control sequence, including an incomplete suffix.
+func ansiEscapeEnd(s string, start int) int {
+	if start+1 >= len(s) {
+		return len(s)
+	}
+	switch s[start+1] {
+	case '[':
+		for i := start + 2; i < len(s); i++ {
+			if s[i] >= 0x40 && s[i] <= 0x7e {
+				return i + 1
+			}
+		}
+	case ']', '_', 'P', '^':
+		for i := start + 2; i < len(s); i++ {
+			if s[i] == '\a' && (s[start+1] == ']' || s[start+1] == '_') {
+				return i + 1
+			}
+			if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+				return i + 2
+			}
+		}
+	default:
+		i := start + 1
+		for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+			i++
+		}
+		return min(i+1, len(s))
+	}
+	return len(s)
 }
 
 func applySGR(current, base style.Style, params string) style.Style {

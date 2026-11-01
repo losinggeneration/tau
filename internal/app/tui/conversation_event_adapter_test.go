@@ -3,9 +3,16 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/keybindings"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/sdk"
@@ -169,4 +176,48 @@ func TestMessageEndTagsItemsWithSessionEntry(t *testing.T) {
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("tags = %v, want %v", got, want)
 	}
+}
+
+func TestSuccessfulReloadUpdatesLiveKeybindings(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keybindings.json")
+	write := func(body string) { t.Helper(); require.NoError(t, os.WriteFile(path, []byte(body), 0o600)) }
+	write(`{"app.model.cycleForward":"ctrl+g","tui.select.cancel":"ctrl+q"}`)
+	app, err := New(Options{Session: &fakeSession{}, SettingsPath: filepath.Join(dir, "settings.json")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, app.chat.Close()) })
+	km := appKeymap{app: app, manager: app.keybindings}
+	write(`{"cycleModelForward":"ctrl+j","selectCancel":"ctrl+l"}`)
+	app.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "is_error": true, "output": "rejected"}})
+	act, ok := km.Resolve(tauui.KeyCtxTextInput, ctrl('g'))
+	require.True(t, ok)
+	assert.Equal(t, AppActionModelCycleForward, act)
+	assert.True(t, keybindings.DefaultManager().Matches(ctrl('q'), "tui.select.cancel"))
+	app.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload"}})
+	act, ok = km.Resolve(tauui.KeyCtxTextInput, ctrl('j'))
+	assert.True(t, ok)
+	assert.Equal(t, AppActionModelCycleForward, act)
+	act, ok = km.Resolve(tauui.KeyCtxTextInput, ctrl('g'))
+	assert.False(t, ok && act == AppActionModelCycleForward)
+	assert.Contains(t, strings.Join(app.keybindingHints(), "\n"), "ctrl+j")
+	cmdSettingsOverlay(app, "")
+	app.dialogPicker.Handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'q', Mod: tauui.ModCtrl}, stubCtx())
+	assert.True(t, app.dialogPicker.Shown())
+	app.dialogPicker.Handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'l', Mod: tauui.ModCtrl}, stubCtx())
+	assert.False(t, app.dialogPicker.Shown())
+	for _, invalid := range []bool{true, false} {
+		if invalid {
+			write(`{`)
+		} else {
+			require.NoError(t, os.Remove(path))
+		}
+		app.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload"}})
+		act, ok = km.Resolve(tauui.KeyCtxTextInput, ctrl('p'))
+		assert.True(t, ok)
+		assert.Equal(t, AppActionModelCycleForward, act)
+		assert.True(t, keybindings.DefaultManager().Matches(tauui.Keystroke{Key: tauui.KeyEsc}, "tui.select.cancel"))
+	}
+	assert.Contains(t, fmt.Sprint(app.conv.Messages()), "keybindings: using defaults")
 }

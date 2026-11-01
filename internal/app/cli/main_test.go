@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -791,7 +792,7 @@ func TestBuildPromptSequence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("buildPromptSequence: %v", err)
 		}
-		want := []string{"forced stdin", "message"}
+		want := []string{"forced stdinmessage"}
 		for i := range want {
 			if prompts[i] != want[i] {
 				t.Fatalf("prompts[%d] = %q, want %q", i, prompts[i], want[i])
@@ -3477,4 +3478,62 @@ func TestBuildRuntimeOptionsInstallsMissingConfiguredSources(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestThemeNamesTracksResourceReload(t *testing.T) {
+	loader, err := artifacts.NewLoader(artifacts.LoaderOptions{CWD: t.TempDir(), DisableSkills: true, DisablePrompts: true})
+	require.NoError(t, err)
+	names := themeNames(loader)
+	require.NotNil(t, names)
+	assert.Nil(t, themeNames(nil))
+	register := func(name string) {
+		entry := artifacts.BuiltinThemes()[0]
+		var file map[string]any
+		require.NoError(t, json.Unmarshal(entry.Raw, &file))
+		file["name"] = name
+		raw, err := json.Marshal(file)
+		require.NoError(t, err)
+		require.NoError(t, loader.ThemeRegistry().Reload([]artifacts.Entry{{Kind: artifacts.KindTheme, Tier: artifacts.TierProject, SourcePath: filepath.Join(t.TempDir(), name+".json"), Raw: raw}}))
+	}
+	register("project-theme")
+	assert.Equal(t, []string{"system", "project-theme"}, names())
+	returned := names()
+	returned[1] = "changed"
+	assert.Contains(t, names(), "project-theme")
+	register("reloaded-theme")
+	assert.Equal(t, []string{"system", "reloaded-theme"}, names())
+}
+
+func TestForwardRPCSignalsSettlesOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signals := make(chan os.Signal, 3)
+	signals <- syscall.SIGTERM
+	signals <- syscall.SIGINT
+	notified := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() { forwardRPCSignals(ctx, signals, func() { notified <- struct{}{} }); close(done) }()
+	defer close(signals)
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("SIGINT did not reach RPC")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RPC signal forwarding outlived its server")
+	}
+	select {
+	case <-notified:
+		t.Fatal("non-interrupt signal was forwarded")
+	default:
+	}
+}
+
+func TestForwardRPCSignalsSettlesOnClosedChannel(t *testing.T) {
+	signals := make(chan os.Signal)
+	close(signals)
+	forwardRPCSignals(context.Background(), signals, func() { t.Fatal("closed signal channel produced an interrupt") })
 }

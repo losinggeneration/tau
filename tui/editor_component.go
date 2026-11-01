@@ -104,10 +104,10 @@ func editorContentRows(m *editormodel.Editor, layoutW, contentW, padX int, focus
 			visual = []string{""}
 		}
 		segmentStart := 0
-		for _, vline := range visual {
+		for j, vline := range visual {
 			lineWidth := TextWidth(vline)
 			cell := vline
-			if i == pos.Line && pos.Col >= segmentStart && pos.Col <= segmentStart+lineWidth {
+			if i == pos.Line && pos.Col >= segmentStart && (pos.Col < segmentStart+lineWidth || j == len(visual)-1 && pos.Col == segmentStart+lineWidth) {
 				col := pos.Col - segmentStart
 				before := ANSISliceStrict(vline, 0, col)
 				after := strings.TrimPrefix(vline, before)
@@ -133,25 +133,28 @@ func cursorString(cell string, focused bool) string {
 }
 
 func scrollRule(width int, arrow string, count int) string {
+	width = max(0, width)
 	label := " " + arrow + " " + strconv.Itoa(count) + " more "
-	if TextWidth(label) >= width {
-		return ANSITruncate(label, width, false)
+	if labelWidth := TextWidth(label); labelWidth+2 <= width {
+		left := (width - labelWidth) / 2
+		return strings.Repeat("─", left) + label + strings.Repeat("─", width-left-labelWidth)
 	}
-	left := strings.Repeat("─", 3)
-	line := left + label
-	return line + strings.Repeat("─", max(0, width-TextWidth(line)))
+	indicator := "───" + label
+	if remaining := width - TextWidth(indicator); remaining >= 0 {
+		return indicator + strings.Repeat("─", remaining)
+	}
+	ellipsis := "..."[:min(3, width)]
+	return ANSISliceStrict(indicator, 0, width-len(ellipsis)) + ellipsis
 }
 
 func renderAutocomplete(m *editormodel.Editor, contentW, padX int) []string {
-	items := m.VisibleAutocompleteItems()
+	items := m.AutocompleteItems()
 	selectItems := make([]SelectItem, 0, len(items))
 	for _, item := range items {
 		selectItems = append(selectItems, SelectItem{Value: item.Value, Label: autocompleteLabel(item), Description: item.Description})
 	}
-	list := NewSelectList(selectItems, SelectListLayoutOptions{MaxVisible: len(selectItems)}, SelectListTheme{})
-	for i := 0; i < m.AutocompleteIndex(); i++ {
-		list.Handle(KeyEvent{Key: KeyDown}, nil)
-	}
+	list := NewSelectList(selectItems, SelectListLayoutOptions{MaxVisible: m.AutocompleteMaxVisible()}, SelectListTheme{})
+	list.SetSelectedIndex(m.AutocompleteIndex())
 	rows := list.Render(contentW)
 	prefix := repeatSpace(padX)
 	for i, row := range rows {

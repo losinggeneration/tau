@@ -3,6 +3,9 @@ package tui
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/losinggeneration/rovel/geom"
 	"github.com/losinggeneration/rovel/style"
 )
@@ -103,5 +106,40 @@ func TestDrawANSITextBackgroundColors(t *testing.T) {
 				t.Fatalf("ops=%+v", d.ops)
 			}
 		})
+	}
+}
+
+func TestDrawANSITextSkipsControlsWithoutSwallowingText(t *testing.T) {
+	for _, seq := range []string{"\x1b[2K", "\x1b[4G", "\x1b]8;;https://example.test\x1b\\", "\x1b]title\a", "\x1b_marker\a", "\x1bPpayload\x1b\\", "\x1b^payload\x1b\\", "\x1b(B"} {
+		t.Run(seq, func(t *testing.T) {
+			d := &ansiRecordingDrawer{}
+			DrawANSIText(d, Point{X: 3, Y: 2}, "a"+seq+"b\x1b[31mc", Style{FG: ColorWhite})
+			var text string
+			for _, op := range d.ops {
+				text += op.text
+				assert.NotContains(t, op.text, "\x1b")
+			}
+			assert.Equal(t, "abc", text)
+			require.NotEmpty(t, d.ops)
+			assert.Equal(t, Point{X: 5, Y: 2}, d.ops[len(d.ops)-1].pos)
+			assert.Equal(t, ColorRed, d.ops[len(d.ops)-1].st.FG)
+		})
+	}
+}
+
+func TestDrawANSITextTreatsControlPayloadsAsOpaque(t *testing.T) {
+	for _, seq := range []string{"\x1b]title\x1b[31mhidden\a", "\x1b_hidden\x1b[31m\a", "\x1bP\x1b[31mhidden\x1b\\", "\x1b]title\x1b\\"} {
+		d := &ansiRecordingDrawer{}
+		DrawANSIText(d, Point{}, seq+"visible\a", Style{FG: ColorWhite})
+		require.Len(t, d.ops, 1)
+		assert.Equal(t, "visible\a", d.ops[0].text)
+		assert.Equal(t, ColorWhite, d.ops[0].st.FG)
+		assert.Equal(t, Point{}, d.ops[0].pos)
+	}
+	for _, suffix := range []string{"\x1b", "\x1b[31", "\x1b]title", "\x1b_payload", "\x1bPpayload", "\x1b("} {
+		d := &ansiRecordingDrawer{}
+		DrawANSIText(d, Point{}, "visible"+suffix, Style{})
+		require.Len(t, d.ops, 1)
+		assert.Equal(t, "visible", d.ops[0].text)
 	}
 }

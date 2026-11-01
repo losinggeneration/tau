@@ -3,6 +3,12 @@ package tui
 import (
 	"strconv"
 	"strings"
+	"unicode"
+
+	"github.com/losinggeneration/rovel/ui"
+	"github.com/losinggeneration/tau/tui/keybindings"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 type SelectItem struct {
@@ -16,35 +22,46 @@ type SelectListTheme struct {
 	StyleSelected func(string) string
 }
 
+type SelectListTruncateContext struct {
+	Text        string
+	MaxWidth    int
+	ColumnWidth int
+	Item        SelectItem
+	IsSelected  bool
+}
+
 type SelectListLayoutOptions struct {
 	MinPrimaryWidth int
 	MaxPrimaryWidth int
 	MaxVisible      int
+	TruncatePrimary func(SelectListTruncateContext) string
 }
 
 type SelectList struct {
-	items     []SelectItem
-	filtered  []SelectItem
-	selected  int
-	filter    string
-	layout    SelectListLayoutOptions
-	theme     SelectListTheme
-	OnConfirm func(SelectItem)
-	OnCancel  func()
+	items             []SelectItem
+	filtered          []SelectItem
+	selected          int
+	filter            string
+	layout            SelectListLayoutOptions
+	theme             SelectListTheme
+	OnConfirm         func(SelectItem)
+	OnCancel          func()
+	OnSelectionChange func(SelectItem)
 }
 
 func NewSelectList(items []SelectItem, opts SelectListLayoutOptions, theme SelectListTheme) *SelectList {
-	if opts.MinPrimaryWidth <= 0 {
-		opts.MinPrimaryWidth = 32
+	if opts.MinPrimaryWidth == 0 {
+		opts.MinPrimaryWidth = opts.MaxPrimaryWidth
 	}
-	if opts.MaxPrimaryWidth <= 0 {
-		opts.MaxPrimaryWidth = 32
+	if opts.MaxPrimaryWidth == 0 {
+		opts.MaxPrimaryWidth = opts.MinPrimaryWidth
 	}
+	if opts.MinPrimaryWidth == 0 {
+		opts.MinPrimaryWidth, opts.MaxPrimaryWidth = 32, 32
+	}
+	opts.MinPrimaryWidth, opts.MaxPrimaryWidth = max(1, min(opts.MinPrimaryWidth, opts.MaxPrimaryWidth)), max(1, max(opts.MinPrimaryWidth, opts.MaxPrimaryWidth))
 	if opts.MaxVisible <= 0 {
-		opts.MaxVisible = len(items)
-	}
-	if opts.MaxVisible <= 0 {
-		opts.MaxVisible = 1
+		opts.MaxVisible = 5
 	}
 	if theme.Cursor == "" {
 		theme.Cursor = "→ "
@@ -61,15 +78,23 @@ func (l *SelectList) SetFilter(filter string) {
 	if filter == "" {
 		l.filtered = append([]SelectItem(nil), l.items...)
 	} else {
-		l.filtered = l.filtered[:0]
-		f := strings.ToLower(filter)
+		l.filtered = nil
+		lower := cases.Lower(language.Und)
+		f := lower.String(filter)
 		for _, item := range l.items {
-			if strings.HasPrefix(strings.ToLower(item.Value), f) {
+			if strings.HasPrefix(lower.String(item.Value), f) {
 				l.filtered = append(l.filtered, item)
 			}
 		}
 	}
 	l.selected = 0
+}
+
+// SetSelectedIndex clamps the selection without firing navigation callbacks.
+func (l *SelectList) SetSelectedIndex(index int) {
+	if l != nil {
+		l.selected = max(0, min(index, len(l.filtered)-1))
+	}
 }
 
 func (l *SelectList) SelectedIndex() int {
@@ -126,12 +151,24 @@ func (l *SelectList) Render(width int) []string {
 		if i == l.selected {
 			prefix = l.theme.Cursor
 		}
-		label := ANSITruncate(displayLabel(item), primary, true)
-		line := prefix + padRightNoEllipsis(label, primary)
-		remaining := width - TextWidth(line)
-		if width > 40 && item.Description != "" && remaining > 10 {
-			line += ANSITruncate(item.Description, remaining, true)
+		prefixWidth := TextWidth(prefix)
+		var line string
+		if width > 40 && item.Description != "" {
+			description := strings.Join(strings.FieldsFunc(item.Description, func(r rune) bool { return r == '\r' || r == '\n' }), " ")
+			description = strings.TrimFunc(description, func(r rune) bool { return r == '\ufeff' || r != '\u0085' && unicode.IsSpace(r) })
+			column := max(1, min(primary, width-prefixWidth-4))
+			label := l.truncatePrimary(item, i == l.selected, max(1, column-2), column)
+			spacing := strings.Repeat(" ", max(1, column-TextWidth(label)))
+			remaining := width - prefixWidth - TextWidth(label) - len(spacing) - 2
+			if description != "" && remaining > 10 {
+				line = prefix + label + spacing + ANSITruncate(description, remaining, false)
+			}
 		}
+		if line == "" {
+			limit := max(0, width-prefixWidth-2)
+			line = prefix + l.truncatePrimary(item, i == l.selected, limit, limit)
+		}
+
 		line = padRightNoEllipsis(line, width)
 		if i == l.selected && l.theme.StyleSelected != nil {
 			line = l.theme.StyleSelected(line)
@@ -139,9 +176,17 @@ func (l *SelectList) Render(width int) []string {
 		out = append(out, line)
 	}
 	if start > 0 || end < len(items) {
-		out = append(out, padRightNoEllipsis("  ("+strconv.Itoa(l.selected+1)+"/"+strconv.Itoa(len(items))+")", width))
+		out = append(out, padRightNoEllipsis(ANSITruncate("  ("+strconv.Itoa(l.selected+1)+"/"+strconv.Itoa(len(items))+")", max(0, width-2), false), width))
 	}
 	return out
+}
+
+func (l *SelectList) truncatePrimary(item SelectItem, selected bool, width, column int) string {
+	text := displayLabel(item)
+	if l.layout.TruncatePrimary != nil {
+		text = l.layout.TruncatePrimary(SelectListTruncateContext{Text: text, MaxWidth: width, ColumnWidth: column, Item: item, IsSelected: selected})
+	}
+	return ANSITruncate(text, width, false)
 }
 
 func displayLabel(item SelectItem) string {
@@ -156,23 +201,31 @@ func (l *SelectList) Handle(e Event, _ *Ctx) bool {
 	if !ok {
 		return false
 	}
-	switch ke.Key {
-	case KeyUp:
+	kb := keybindings.DefaultManager()
+	key := ui.KeystrokeOf(ke)
+	switch {
+	case kb.Matches(key, "tui.select.up"):
 		if len(l.filtered) > 0 {
 			l.selected = (l.selected + len(l.filtered) - 1) % len(l.filtered)
+			if l.OnSelectionChange != nil {
+				l.OnSelectionChange(l.filtered[l.selected])
+			}
 		}
 		return true
-	case KeyDown:
+	case kb.Matches(key, "tui.select.down"):
 		if len(l.filtered) > 0 {
 			l.selected = (l.selected + 1) % len(l.filtered)
+			if l.OnSelectionChange != nil {
+				l.OnSelectionChange(l.filtered[l.selected])
+			}
 		}
 		return true
-	case KeyEnter:
+	case kb.Matches(key, "tui.select.confirm"):
 		if len(l.filtered) > 0 && l.OnConfirm != nil {
 			l.OnConfirm(l.filtered[l.selected])
 		}
 		return true
-	case KeyEsc, KeyCtrlC:
+	case kb.Matches(key, "tui.select.cancel"):
 		if l.OnCancel != nil {
 			l.OnCancel()
 		}

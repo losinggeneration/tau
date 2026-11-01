@@ -6,6 +6,7 @@ import (
 	"github.com/losinggeneration/rovel/event"
 	"github.com/losinggeneration/tau/tui/keybindings"
 	"github.com/losinggeneration/tau/tui/killring"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestInputKillYankAndYankPop(t *testing.T) {
@@ -624,6 +625,45 @@ func TestInputEmptyNormalizedPasteBreaksTypingWithoutReplacingSelection(t *testi
 			in.Paste(payload)
 			if in.Value() != "selected" {
 				t.Fatalf("empty paste replaced selection: %q", in.Value())
+			}
+		})
+	}
+}
+
+func TestInputWordActionsRecognizeBOMWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		cursor, wantCursor int
+		want               string
+	}{
+		{"left", len("one\ufefftwo"), len("one\ufeff"), "one\ufefftwo"},
+		{"right", 0, len("one"), "one\ufefftwo"},
+		{"backward", len("one\ufefftwo"), len("one\ufeff"), "one\ufeff"},
+		{"forward", 0, 0, "\ufefftwo"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i := New()
+			i.SetValue("one\ufefftwo")
+			i.SetCursor(tc.cursor)
+			switch tc.name {
+			case "left":
+				i.MoveWordLeft()
+			case "right":
+				i.MoveWordRight()
+			case "backward":
+				i.DeleteWordBackward()
+			case "forward":
+				i.DeleteWordForward()
+			}
+			assert.Equal(t, tc.want, i.Value())
+			assert.Equal(t, tc.wantCursor, i.Cursor())
+			if tc.want != "one\ufefftwo" {
+				i.Yank()
+				assert.Equal(t, "one\ufefftwo", i.Value())
+				i.Undo()
+				i.Undo()
+				assert.Equal(t, "one\ufefftwo", i.Value())
+				assert.Equal(t, tc.cursor, i.Cursor())
 			}
 		})
 	}

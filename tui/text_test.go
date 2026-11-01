@@ -3,6 +3,8 @@ package tui
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/losinggeneration/rovel"
 )
 
@@ -222,3 +224,14 @@ func runeWidth(s string) int {
 
 // ensure tui import is used
 var _ rovel.Style
+
+func TestExpandTabsPreservesTerminalControlPayloads(t *testing.T) {
+	for _, seq := range []string{"\x1b]8;;https://example.test/a\tb\a", "\x1b]0;window\ttitle\x1b\\", "\x1b_payload\tdata\x1b\\", "\x1b_payload\tdata\a", "\x1bPpayload\tdata\x1b\\", "\x1b^payload\tdata\x1b\\", "\x1b[1\t;31m"} {
+		assert.Equal(t, seq+"label   text", expandTabs(seq+"label\ttext", 3))
+	}
+	for _, seq := range []string{"\x1b]unfinished\tpayload", "\x1b_unfinished\tpayload", "\x1b[1\t"} {
+		assert.Equal(t, "before   "+seq, expandTabs("before\t"+seq, 3))
+	}
+	assert.Equal(t, "x  界  \xff", expandTabs("x\t界\t\xff", 2))
+	assert.Equal(t, "x\t", expandTabs("x\t", 0))
+}

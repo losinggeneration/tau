@@ -157,7 +157,7 @@ func (s *Server) Run(ctx context.Context) error {
 // readCommand reads and parses a command from stdin.
 func (s *Server) readCommand() (*Command, error) {
 	line, err := s.reader.ReadString('\n')
-	if err != nil {
+	if err != nil && (!errors.Is(err, io.EOF) || len(line) == 0) {
 		return nil, err
 	}
 

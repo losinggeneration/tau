@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 
@@ -49,38 +50,111 @@ func (r *ActionRouter) Resolve(k ui.Keystroke) (string, bool) {
 }
 
 // LoadConfig reads user keybindings from JSON. The accepted shape is either a
-// raw object mapping action ids to string arrays, or {"keybindings": {...}}.
+// raw object mapping action ids to strings or string arrays, or {"keybindings": {...}}.
 func LoadConfig(r io.Reader) (Config, error) {
 	if r == nil {
 		return Config{}, nil
 	}
 
-	var raw json.RawMessage
-	if err := json.NewDecoder(r).Decode(&raw); err != nil {
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("keybindings: read config: %w", err)
+	}
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(string(raw), "\ufeff")), &entries); err != nil {
 		return nil, fmt.Errorf("keybindings: decode config: %w", err)
 	}
-
-	var direct Config
-	if err := json.Unmarshal(raw, &direct); err == nil && direct != nil {
-		return normalizeConfig(direct), nil
+	if wrapped, ok := entries["keybindings"]; ok {
+		if err := json.Unmarshal(wrapped, &entries); err != nil {
+			return nil, fmt.Errorf("keybindings: parse config: %w", err)
+		}
 	}
-
-	var wrapped struct {
-		Keybindings Config `json:"keybindings"`
-	}
-	if err := json.Unmarshal(raw, &wrapped); err != nil {
-		return nil, fmt.Errorf("keybindings: parse config: %w", err)
-	}
-
-	return normalizeConfig(wrapped.Keybindings), nil
-}
-
-func normalizeConfig(in Config) Config {
 	out := Config{}
-	for id, keys := range in {
+	for id, value := range entries {
+		if canonical, ok := legacyActionNames[id]; ok {
+			if _, present := entries[canonical]; present {
+				continue
+			}
+			id = canonical
+		}
+		if id == "$schema" || string(value) == "null" {
+			continue
+		}
+		var keys []string
+		var key string
+		if err := json.Unmarshal(value, &key); err == nil {
+			keys = []string{key}
+		} else if err := json.Unmarshal(value, &keys); err != nil {
+			continue
+		}
+		if slices.ContainsFunc(keys, func(key string) bool { _, err := CompileKey(key); return err != nil }) {
+			continue
+		}
 		out[id] = dedupe(keys)
 	}
-	return out
+	return out, nil
+}
+
+var legacyActionNames = map[string]string{
+	"cursorUp":                 "tui.editor.cursorUp",
+	"cursorDown":               "tui.editor.cursorDown",
+	"cursorLeft":               "tui.editor.cursorLeft",
+	"cursorRight":              "tui.editor.cursorRight",
+	"cursorWordLeft":           "tui.editor.cursorWordLeft",
+	"cursorWordRight":          "tui.editor.cursorWordRight",
+	"cursorLineStart":          "tui.editor.cursorLineStart",
+	"cursorLineEnd":            "tui.editor.cursorLineEnd",
+	"jumpForward":              "tui.editor.jumpForward",
+	"jumpBackward":             "tui.editor.jumpBackward",
+	"pageUp":                   "tui.editor.pageUp",
+	"pageDown":                 "tui.editor.pageDown",
+	"deleteCharBackward":       "tui.editor.deleteCharBackward",
+	"deleteCharForward":        "tui.editor.deleteCharForward",
+	"deleteWordBackward":       "tui.editor.deleteWordBackward",
+	"deleteWordForward":        "tui.editor.deleteWordForward",
+	"deleteToLineStart":        "tui.editor.deleteToLineStart",
+	"deleteToLineEnd":          "tui.editor.deleteToLineEnd",
+	"yank":                     "tui.editor.yank",
+	"yankPop":                  "tui.editor.yankPop",
+	"undo":                     "tui.editor.undo",
+	"newLine":                  "tui.input.newLine",
+	"submit":                   "tui.input.submit",
+	"tab":                      "tui.input.tab",
+	"copy":                     "tui.input.copy",
+	"selectUp":                 "tui.select.up",
+	"selectDown":               "tui.select.down",
+	"selectPageUp":             "tui.select.pageUp",
+	"selectPageDown":           "tui.select.pageDown",
+	"selectConfirm":            "tui.select.confirm",
+	"selectCancel":             "tui.select.cancel",
+	"interrupt":                "app.interrupt",
+	"clear":                    "app.clear",
+	"exit":                     "app.exit",
+	"suspend":                  "app.suspend",
+	"cycleThinkingLevel":       "app.thinking.cycle",
+	"cycleModelForward":        "app.model.cycleForward",
+	"cycleModelBackward":       "app.model.cycleBackward",
+	"selectModel":              "app.model.select",
+	"expandTools":              "app.tools.expand",
+	"toggleThinking":           "app.thinking.toggle",
+	"toggleSessionNamedFilter": "app.session.toggleNamedFilter",
+	"externalEditor":           "app.editor.external",
+	"followUp":                 "app.message.followUp",
+	"dequeue":                  "app.message.dequeue",
+	"pasteImage":               "app.clipboard.pasteImage",
+	"newSession":               "app.session.new",
+	"tree":                     "app.session.tree",
+	"fork":                     "app.session.fork",
+	"resume":                   "app.session.resume",
+	"treeFoldOrUp":             "app.tree.foldOrUp",
+	"treeUnfoldOrDown":         "app.tree.unfoldOrDown",
+	"treeEditLabel":            "app.tree.editLabel",
+	"treeToggleLabelTimestamp": "app.tree.toggleLabelTimestamp",
+	"toggleSessionPath":        "app.session.togglePath",
+	"toggleSessionSort":        "app.session.toggleSort",
+	"renameSession":            "app.session.rename",
+	"deleteSession":            "app.session.delete",
+	"deleteSessionNoninvasive": "app.session.deleteNoninvasive",
 }
 
 // ConflictDiagnostics returns stable human-readable conflict messages suitable
@@ -99,19 +173,7 @@ func (m *Manager) ConflictDiagnostics() []string {
 	return out
 }
 
-// reservedActions is the exact set app.md §12 protects from extension-shortcut
-// shadowing: twelve application actions plus five toolkit actions.
-//
-// It is a specific subset, not "everything the toolkit defines". Extension
-// shortcuts are checked *before* app keybindings in the editor, so an extension
-// binding ctrl+k would otherwise silently take over. But cursor movement,
-// selection paging and the rest are deliberately *not* protected — an extension
-// is allowed to rebind those, and reserving all 31 toolkit ids (which is what
-// this used to do) forbade shortcuts the spec permits while leaving every
-// app action, including app.exit, unprotected.
-//
-// The app.* ids live here rather than in internal/app/tui because this is where
-// the check runs; they are plain strings, and §12 fixes them as stable.
+// reservedActions protects editor-global keys from extension shortcuts.
 var reservedActions = map[string]struct{}{
 	// Application actions (§12).
 	"app.interrupt":           {},
@@ -126,6 +188,7 @@ var reservedActions = map[string]struct{}{
 	"app.tools.expand":        {},
 	"app.editor.external":     {},
 	"app.message.followUp":    {},
+	"app.message.copy":        {},
 
 	// Toolkit editor/select actions (§12).
 	"tui.input.submit":           {},

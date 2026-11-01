@@ -12,16 +12,17 @@ import (
 const systemThemeName = "system"
 
 type terminalThemeState struct {
-	fileError  string
-	setting    string
-	active     string
-	colors     tauui.TerminalColors
-	scheme     string
-	ready      bool
-	started    bool
-	autoSync   bool
-	inMemory   bool
-	publishing bool
+	restorePreview func()
+	fileError      string
+	setting        string
+	active         string
+	colors         tauui.TerminalColors
+	scheme         string
+	ready          bool
+	started        bool
+	autoSync       bool
+	inMemory       bool
+	publishing     bool
 }
 
 func (a *App) terminalThemeAppearance() string {
@@ -166,4 +167,11 @@ func (a *App) refreshNativeTheme() {
 	}
 	tokens := a.chat.ThemeTokens()
 	a.app.SetTheme(tokens.nativeTheme())
+}
+
+func (a *App) cancelThemePreview() {
+	if restore := a.terminalTheme.restorePreview; restore != nil {
+		a.terminalTheme.restorePreview = nil
+		restore()
+	}
 }

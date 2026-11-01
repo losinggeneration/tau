@@ -1,14 +1,15 @@
 package settingslist
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 
 	rovelansi "github.com/losinggeneration/rovel/backend/ansi"
 	"github.com/losinggeneration/rovel/event"
-	"github.com/losinggeneration/rovel/text"
 	"github.com/losinggeneration/rovel/ui"
 	tauui "github.com/losinggeneration/tau/tui"
+	"github.com/losinggeneration/tau/tui/ansi"
 	"github.com/losinggeneration/tau/tui/fuzzy"
 	inputmodel "github.com/losinggeneration/tau/tui/input"
 	"github.com/losinggeneration/tau/tui/keybindings"
@@ -45,23 +46,28 @@ func DefaultTheme() Theme {
 	return Theme{Label: func(s string, _ bool) string { return s }, Value: func(s string, _ bool) string { return s }, Description: func(s string) string { return s }, Cursor: "> ", Hint: func(s string) string { return s }}
 }
 
-type Options struct{ EnableSearch bool }
+type Options struct {
+	EnableSearch      bool
+	SelectedID        string
+	OnSelectionChange func(Item)
+}
 
 type List struct {
-	items         []Item
-	filtered      []Item
-	theme         Theme
-	selected      int
-	maxVisible    int
-	onChange      func(id, newValue string)
-	onCancel      func()
-	searchEnabled bool
-	search        string
-	searchInput   *inputmodel.Input
-	appliedQuery  string
-	submenu       KeyComponent
-	submenuIndex  int
-	input         rovelansi.DecodeInput
+	items             []Item
+	filtered          []Item
+	theme             Theme
+	selected          int
+	maxVisible        int
+	onChange          func(id, newValue string)
+	onCancel          func()
+	onSelectionChange func(Item)
+	searchEnabled     bool
+	search            string
+	searchInput       *inputmodel.Input
+	appliedQuery      string
+	submenu           KeyComponent
+	submenuIndex      int
+	input             rovelansi.DecodeInput
 }
 
 func New(items []Item, maxVisible int, theme Theme, onChange func(string, string), onCancel func(), opts Options) *List {
@@ -72,7 +78,8 @@ func New(items []Item, maxVisible int, theme Theme, onChange func(string, string
 		theme = DefaultTheme()
 	}
 	cp := append([]Item(nil), items...)
-	return &List{items: cp, filtered: cp, theme: theme, maxVisible: maxVisible, onChange: onChange, onCancel: onCancel, searchEnabled: opts.EnableSearch, submenuIndex: -1, searchInput: inputmodel.New()}
+	selected := max(0, slices.IndexFunc(cp, func(item Item) bool { return item.ID == opts.SelectedID }))
+	return &List{items: cp, filtered: cp, theme: theme, selected: selected, maxVisible: maxVisible, onChange: onChange, onCancel: onCancel, onSelectionChange: opts.OnSelectionChange, searchEnabled: opts.EnableSearch, submenuIndex: -1, searchInput: inputmodel.New()}
 }
 
 // FilteredItems returns a copy of the items currently displayed after search filtering.
@@ -179,10 +186,13 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 		return
 	}
 	display := l.displayItems()
+	previous := l.selected
+	var navigated bool
 	kb := keybindings.DefaultManager()
 	key := ui.KeystrokeOf(ke)
 	switch {
 	case kb.Matches(key, "tui.select.up"):
+		navigated = true
 		if len(display) > 0 {
 			if l.selected == 0 {
 				l.selected = len(display) - 1
@@ -191,6 +201,7 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 			}
 		}
 	case kb.Matches(key, "tui.select.down"):
+		navigated = true
 		if len(display) > 0 {
 			if l.selected == len(display)-1 {
 				l.selected = 0
@@ -212,6 +223,9 @@ func (l *List) HandleKey(ke event.KeyEvent) {
 		if l.searchEnabled && l.searchInput.HandleKey(ke) {
 			l.updateSearch()
 		}
+	}
+	if navigated && l.selected != previous && l.onSelectionChange != nil {
+		l.onSelectionChange(display[l.selected])
 	}
 }
 
@@ -282,7 +296,7 @@ func (l *List) setValue(id, v string) {
 }
 
 func (l *List) applyFilter(q string) {
-	if !l.searchEnabled || strings.TrimSpace(q) == "" {
+	if !l.searchEnabled {
 		l.filtered = append([]Item(nil), l.items...)
 	} else {
 		l.filtered = fuzzy.Filter(l.items, q, func(i Item) string { return i.Label })
@@ -311,22 +325,14 @@ func (l *List) addHint(lines *[]string, width int) {
 	*lines = append(*lines, "", truncate(l.theme.Hint(map[bool]string{true: "  Type to search · Enter/Space to change · Esc to cancel", false: "  Enter/Space to change · Esc to cancel"}[l.searchEnabled]), width))
 }
 
-func visibleWidth(s string) int { return text.Width(s) }
+func visibleWidth(s string) int { return tauui.TextWidth(s) }
 func truncate(s string, w int) string {
-	return text.Truncate(s, w, false)
+	return tauui.ANSITruncate(s, w, false)
 }
 
 func wrap(s string, w int) []string {
 	if w <= 0 {
 		return []string{""}
 	}
-	lines := text.WrapLines(s, text.WrapOptions{Width: w, Mode: text.WrapWord})
-	if len(lines) == 0 {
-		return []string{""}
-	}
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		out = append(out, s[line.StartByte:line.EndByte])
-	}
-	return out
+	return ansi.WrapWords(s, w)
 }

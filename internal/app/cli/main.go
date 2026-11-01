@@ -2566,13 +2566,10 @@ func runRPC(ctx context.Context, cmd *cli.Command) error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT)
 	defer signal.Stop(sigChan)
-	go func() {
-		for sig := range sigChan {
-			if sig == syscall.SIGINT {
-				srv.SendInterrupt()
-			}
-		}
-	}()
+	signalCtx, stopSignals := context.WithCancel(context.Background())
+	signalsDone := make(chan struct{})
+	go func() { defer close(signalsDone); forwardRPCSignals(signalCtx, sigChan, srv.SendInterrupt) }()
+	defer func() { stopSignals(); <-signalsDone }()
 
 	// Use a background context for the server so SIGINT is only handled by the
 	// goroutine above (which emits interrupt events). The parent ctx is for CLI
@@ -2582,6 +2579,22 @@ func runRPC(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	return nil
+}
+
+func forwardRPCSignals(ctx context.Context, signals <-chan os.Signal, interrupt func()) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sig, ok := <-signals:
+			if !ok {
+				return
+			}
+			if sig == syscall.SIGINT {
+				interrupt()
+			}
+		}
+	}
 }
 
 // choosePrintModeUI returns the appropriate UI for print mode.
@@ -3771,6 +3784,7 @@ func runInteractive(ctx context.Context, cmd *cli.Command, prompts []string) (co
 		SettingsPath:    filepath.Join(configDir(), "settings.json"),
 		ModelScope:      modelScopePatterns(sessionFlags.Models, rtOpts.Settings),
 		ThemeLookup:     themeLookup(loader),
+		ThemeNames:      themeNames(loader),
 		RefreshTheme:    themeRefresher(loader),
 		StartupMessages: diagnosticsFromContext(ctx),
 		SessionFactory: func(ctx context.Context, opts sdk.SessionOptions) (sdk.Session, error) {
@@ -4957,6 +4971,24 @@ func themeRefresher(loader *artifacts.Loader) func(string) (bool, error) {
 			return false, nil
 		}
 		return registry.Refresh(name)
+	}
+}
+
+func themeNames(loader *artifacts.Loader) func() []string {
+	if loader == nil {
+		return nil
+	}
+	return func() []string {
+		registry := loader.ThemeRegistry()
+		if registry == nil {
+			return nil
+		}
+		themes := registry.List()
+		names := make([]string, 0, len(themes))
+		for _, theme := range themes {
+			names = append(names, theme.Name)
+		}
+		return names
 	}
 }
 

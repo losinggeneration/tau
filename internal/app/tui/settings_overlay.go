@@ -125,7 +125,7 @@ func buildSettingsItems(app *App) []settingslist.Item {
 			ID:           "settings.theme",
 			Label:        "Theme",
 			Description:  "Color theme for the terminal UI.",
-			CurrentValue: data.theme,
+			CurrentValue: app.terminalTheme.setting,
 			Submenu:      app.themeSubmenuFactory(),
 		},
 		{
@@ -145,39 +145,122 @@ func buildSettingsItems(app *App) []settingslist.Item {
 	return items
 }
 
-// themeSubmenuFactory returns a Submenu factory that builds a
-// nested settings list of the available themes. The user can
-// pick one (Enter/Space) and the chosen theme is committed back
-// to the parent setting via the done callback. This is also the
-// "settings.theme" submenu the Pi settings list exposes for
-// theme selection.
+// themeSubmenuFactory previews navigation and restores the original on cancel.
 func (a *App) themeSubmenuFactory() func(current string, done func(selected string, ok bool)) settingslist.KeyComponent {
 	return func(current string, done func(selected string, ok bool)) settingslist.KeyComponent {
-		themes := a.availableThemes()
-		items := make([]settingslist.Item, 0, len(themes))
-		for _, name := range themes {
-			items = append(items, settingslist.Item{
-				ID:           "settings.theme." + name,
-				Label:        name,
-				Description:  "Switch to the " + name + " theme.",
-				CurrentValue: name,
-				Values:       []string{name},
-			})
+		original := current
+		if a != nil && a.terminalTheme.setting != "" {
+			original = a.terminalTheme.setting
 		}
-		return settingslist.New(
-			items,
-			8,
-			settingslist.DefaultTheme(),
-			func(id, newValue string) {
-				if a != nil {
-					applySettingsChange(a, "settings.theme", newValue)
-				}
-				done(newValue, true)
-			},
-			func() { done("", false) },
-			settingslist.Options{},
-		)
+		restore := func() { a.applyTheme(original) }
+		if a != nil && a.terminalTheme.inMemory && a.extensions != nil {
+			theme := a.extensions.Theme()
+			original = theme.Name
+			restore = func() { a.extensions.SetTheme(theme) }
+		}
+		if a != nil {
+			a.terminalTheme.restorePreview = restore
+		}
+		menu := &themeSettingsMenu{app: a, themes: a.availableThemes(), done: func(value string) {
+			a.terminalTheme.restorePreview = nil
+			done(value, true)
+		}, cancel: func() {
+			a.cancelThemePreview()
+			done("", false)
+		}}
+		menu.light, menu.dark, _ = strings.Cut(original, "/")
+		menu.light, menu.dark = strings.TrimSpace(menu.light), strings.TrimSpace(menu.dark)
+		if menu.light == "" || menu.dark == "" || strings.Contains(menu.dark, "/") {
+			menu.light = original
+			if !slices.Contains(menu.themes, original) {
+				menu.light = systemThemeName
+			}
+			menu.dark = menu.light
+			menu.showSingle(menu.light)
+		} else {
+			menu.showAutomatic()
+		}
+		return menu
 	}
+}
+
+type themeSettingsMenu struct {
+	*settingslist.List
+	app         *App
+	themes      []string
+	light, dark string
+	done        func(string)
+	cancel      func()
+}
+
+func (m *themeSettingsMenu) choices() []settingslist.Item {
+	items := make([]settingslist.Item, 0, len(m.themes))
+	for _, name := range m.themes {
+		items = append(items, settingslist.Item{ID: name, Label: name, CurrentValue: name, Values: []string{name}})
+	}
+	return items
+}
+
+func (m *themeSettingsMenu) showSingle(current string) {
+	items := m.choices()
+	automatic := settingslist.Item{ID: "/", Label: "automatic", Description: "Use separate themes for light and dark terminal appearance", Values: []string{"/"}}
+	index := 0
+	if len(items) > 0 && items[0].ID == systemThemeName {
+		index = 1
+	}
+	items = slices.Insert(items, index, automatic)
+	preview := func(value string) {
+		if value == "/" {
+			value = m.light + "/" + m.dark
+		}
+		m.app.applyTheme(value)
+	}
+	m.List = settingslist.New(items, 8, settingslist.DefaultTheme(), func(id, value string) {
+		if id == "/" {
+			preview(id)
+			m.showAutomatic()
+		} else {
+			m.done(value)
+		}
+	}, m.cancel, settingslist.Options{SelectedID: current, OnSelectionChange: func(item settingslist.Item) { preview(item.ID) }})
+}
+
+func (m *themeSettingsMenu) showAutomatic() {
+	picker := func(side string) func(string, func(string, bool)) settingslist.KeyComponent {
+		return func(current string, done func(string, bool)) settingslist.KeyComponent {
+			return settingslist.New(m.choices(), 8, settingslist.DefaultTheme(), func(_, value string) {
+				if side == "light" {
+					m.light = value
+				} else {
+					m.dark = value
+				}
+				m.app.applyTheme(m.light + "/" + m.dark)
+				done(value, true)
+			}, func() {
+				m.app.applyTheme(m.light + "/" + m.dark)
+				done("", false)
+			}, settingslist.Options{SelectedID: current, OnSelectionChange: func(item settingslist.Item) { m.app.applyTheme(item.ID) }})
+		}
+	}
+	items := []settingslist.Item{
+		{ID: "light", Label: "Light theme", Description: "Theme to use when the terminal is light", CurrentValue: m.light, Submenu: picker("light")},
+		{ID: "dark", Label: "Dark theme", Description: "Theme to use when the terminal is dark", CurrentValue: m.dark, Submenu: picker("dark")},
+		{ID: "apply", Label: "Apply", Description: "Save and go back", Values: []string{"save and go back"}},
+		{ID: "single", Label: "Change mode", Description: "Switch to one theme for light and dark", Values: []string{"switch to single theme"}},
+	}
+	m.List = settingslist.New(items, 8, settingslist.DefaultTheme(), func(id, _ string) {
+		switch id {
+		case "apply":
+			m.done(m.light + "/" + m.dark)
+		case "single":
+			current := m.dark
+			if m.app.terminalThemeAppearance() == "light" {
+				current = m.light
+			}
+			m.app.applyTheme(current)
+			m.showSingle(current)
+		}
+	}, m.cancel, settingslist.Options{})
 }
 
 // availableThemes returns the list of theme names the App can
@@ -189,6 +272,13 @@ func (a *App) availableThemes() []string {
 		return nil
 	}
 	names := []string{systemThemeName, "default", "tau", "dark", "light"}
+	if a.themeNames != nil {
+		for _, name := range a.themeNames() {
+			if name != "" && !slices.Contains(names, name) {
+				names = append(names, name)
+			}
+		}
+	}
 	if a.extensions != nil {
 		th := a.extensions.Theme()
 		if th.Name != "" && !slices.Contains(names, th.Name) {
@@ -404,6 +494,7 @@ func cmdSettingsOverlay(app *App, _ string) {
 	app.closeDialogComponent()
 	overlay := newSettingsOverlay(app)
 	app.dialogPicker.SetComponent(overlay)
+	app.dialogPicker.SetOnCancel(func() { overlay.HandleKey(tauui.KeyEvent{Key: tauui.KeyEsc}) })
 	app.dialogPicker.SetHeader("/settings")
 	app.dialogPicker.Reset()
 	app.dialogPicker.SetShown(true)

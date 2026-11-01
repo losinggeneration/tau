@@ -362,10 +362,7 @@ func (e *Editor) AutocompleteVisible() bool {
 }
 
 func (e *Editor) SetAutocompleteMaxVisible(n int) {
-	if n <= 0 {
-		n = 1
-	}
-	e.autocompleteVisible = n
+	e.autocompleteVisible = max(3, min(20, n))
 }
 
 func (e *Editor) AutocompleteMaxVisible() int {
@@ -373,6 +370,14 @@ func (e *Editor) AutocompleteMaxVisible() int {
 		return 5
 	}
 	return e.autocompleteVisible
+}
+
+// AutocompleteItems returns a copy of the active completion list.
+func (e *Editor) AutocompleteItems() []autocomplete.Item {
+	if e.autocomplete == nil {
+		return nil
+	}
+	return append([]autocomplete.Item(nil), e.autocomplete.Items...)
 }
 
 func (e *Editor) VisibleAutocompleteItems() []autocomplete.Item {
@@ -791,7 +796,7 @@ func (e *Editor) moveWordLeftNoBreak() {
 	}
 	for e.cursor > 0 && e.text[e.cursor-1] != '\n' {
 		r, _ := utf8.DecodeLastRuneInString(e.text[:e.cursor])
-		if !unicode.IsSpace(r) {
+		if !isWhitespace(r) {
 			break
 		}
 		e.moveLeftNoBreak()
@@ -805,7 +810,7 @@ func (e *Editor) moveWordLeftNoBreak() {
 			break
 		}
 		r, _ := utf8.DecodeLastRuneInString(e.text[:e.cursor])
-		if unicode.IsSpace(r) {
+		if isWhitespace(r) {
 			break
 		}
 		e.moveLeftNoBreak()
@@ -824,7 +829,7 @@ func (e *Editor) moveWordRightNoBreak() {
 	}
 	for e.cursor < len(e.text) && e.text[e.cursor] != '\n' {
 		r, sz := utf8.DecodeRuneInString(e.text[e.cursor:])
-		if !unicode.IsSpace(r) {
+		if !isWhitespace(r) {
 			break
 		}
 		e.cursor += sz
@@ -838,7 +843,7 @@ func (e *Editor) moveWordRightNoBreak() {
 			break
 		}
 		r, sz := utf8.DecodeRuneInString(e.text[e.cursor:])
-		if unicode.IsSpace(r) {
+		if isWhitespace(r) {
 			break
 		}
 		e.cursor += sz
@@ -921,16 +926,18 @@ func (e *Editor) EnsureCursorVisible(maxRows, wrapWidth int) {
 		e.scrollOffset = 0
 		return
 	}
-	idx := e.visualCursorIndex(wrapWidth)
+	line, visualLine, _, segments := e.visualPosition(wrapWidth)
+	idx := visualLine
+	for _, rows := range segments[:line] {
+		idx += len(rows)
+	}
 	if idx < e.scrollOffset {
 		e.scrollOffset = idx
 	}
 	if idx >= e.scrollOffset+maxRows {
 		e.scrollOffset = idx - maxRows + 1
 	}
-	if e.scrollOffset < 0 {
-		e.scrollOffset = 0
-	}
+	e.scrollOffset = max(0, min(e.scrollOffset, totalSegments(segments)-maxRows))
 }
 
 var pasteMarkerPattern = regexp.MustCompile(`\[paste #([0-9]+)(?: (?:[0-9]+ chars|\+[0-9]+ lines))?\]`)
@@ -1279,15 +1286,6 @@ func (e *Editor) visualPosition(width int) (line, visualLine, visualCol int, seg
 		visualCol = maxCol
 	}
 	return line, visualLine, visualCol, segments
-}
-
-func (e *Editor) visualCursorIndex(width int) int {
-	line, visualLine, _, segments := e.visualPosition(width)
-	idx := 0
-	for i := 0; i < line; i++ {
-		idx += len(segments[i])
-	}
-	return idx + visualLine
 }
 
 func (e *Editor) setVisualPosition(width, line, visualLine, visualCol int) {

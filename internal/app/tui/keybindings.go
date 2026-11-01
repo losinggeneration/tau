@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -137,19 +139,34 @@ func newAppKeybindingManager(path string) (*keybindings.Manager, error) {
 	if path == "" {
 		return keybindings.New(defs, nil), nil
 	}
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return keybindings.New(defs, nil), nil
 		}
-		return keybindings.New(defs, nil), err
+		return keybindings.New(defs, nil), fmt.Errorf("read keybindings: %w", err)
 	}
-	defer func() { _ = f.Close() }()
-	user, err := keybindings.LoadConfig(f)
+	user, err := keybindings.LoadConfig(bytes.NewReader(data))
 	if err != nil {
 		return keybindings.New(defs, nil), err
 	}
 	return keybindings.New(defs, user), nil
+}
+
+func (a *App) reloadKeybindings() {
+	if a.settingsPath == "" {
+		return
+	}
+	manager, err := newAppKeybindingManager(appKeybindingsPath(a.settingsPath))
+	if err != nil {
+		a.conv.AddError(fmt.Sprintf("keybindings: using defaults: %v", err))
+	}
+	if a.keybindings == nil {
+		a.keybindings = manager
+	} else {
+		a.keybindings.SetUserBindings(manager.UserBindings())
+	}
+	keybindings.SetDefaultManager(keybindings.NewDefault(manager.UserBindings()))
 }
 
 // normalizeKeystrokeForRouting folds a keystroke into the form CompileKey

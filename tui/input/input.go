@@ -167,14 +167,14 @@ func (i *Input) DeleteWordBackward() {
 	old := i.cursor
 	for i.cursor > 0 {
 		r, _ := utf8.DecodeLastRuneInString(i.text[:i.cursor])
-		if !unicode.IsSpace(r) {
+		if !isWhitespace(r) {
 			break
 		}
 		i.MoveLeftNoBreak()
 	}
 	for i.cursor > 0 {
 		r, _ := utf8.DecodeLastRuneInString(i.text[:i.cursor])
-		if unicode.IsSpace(r) {
+		if isWhitespace(r) {
 			break
 		}
 		i.MoveLeftNoBreak()
@@ -195,7 +195,7 @@ func (i *Input) DeleteWordForward() {
 	// Skip leading whitespace
 	for i.cursor < len(i.text) {
 		r, _ := utf8.DecodeRuneInString(i.text[i.cursor:])
-		if !unicode.IsSpace(r) {
+		if !isWhitespace(r) {
 			break
 		}
 		_, sz := utf8.DecodeRuneInString(i.text[i.cursor:])
@@ -204,7 +204,7 @@ func (i *Input) DeleteWordForward() {
 	// Walk forward through word chars
 	for i.cursor < len(i.text) {
 		r, _ := utf8.DecodeRuneInString(i.text[i.cursor:])
-		if unicode.IsSpace(r) {
+		if isWhitespace(r) {
 			break
 		}
 		_, sz := utf8.DecodeRuneInString(i.text[i.cursor:])
@@ -293,14 +293,14 @@ func (i *Input) Paste(s string) {
 func (i *Input) MoveWordLeft() {
 	for i.cursor > 0 {
 		r, _ := utf8.DecodeLastRuneInString(i.text[:i.cursor])
-		if !unicode.IsSpace(r) {
+		if !isWhitespace(r) {
 			break
 		}
 		i.MoveLeftNoBreak()
 	}
 	for i.cursor > 0 {
 		r, _ := utf8.DecodeLastRuneInString(i.text[:i.cursor])
-		if unicode.IsSpace(r) {
+		if isWhitespace(r) {
 			break
 		}
 		i.MoveLeftNoBreak()
@@ -311,14 +311,14 @@ func (i *Input) MoveWordLeft() {
 func (i *Input) MoveWordRight() {
 	for i.cursor < len(i.text) {
 		r, sz := utf8.DecodeRuneInString(i.text[i.cursor:])
-		if !unicode.IsSpace(r) {
+		if !isWhitespace(r) {
 			break
 		}
 		i.cursor += sz
 	}
 	for i.cursor < len(i.text) {
 		r, sz := utf8.DecodeRuneInString(i.text[i.cursor:])
-		if unicode.IsSpace(r) {
+		if isWhitespace(r) {
 			break
 		}
 		i.cursor += sz
@@ -354,8 +354,10 @@ func (i *Input) breakChains() {
 	i.clearSelection()
 }
 
+func isWhitespace(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' }
+
 func (i *Input) shouldPushInsertUndo(s string) bool {
-	return i.last != "insert" || strings.ContainsFunc(s, func(r rune) bool { return (unicode.IsSpace(r) && r != '\u0085') || r == '\ufeff' })
+	return i.last != "insert" || strings.ContainsFunc(s, isWhitespace)
 }
 
 func (i *Input) clampByte(pos int) int {

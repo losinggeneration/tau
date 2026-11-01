@@ -1956,3 +1956,60 @@ func TestNativeSubmissionTrimsJavaScriptWhitespace(t *testing.T) {
 	a.editor.Model().SetText("\u0085")
 	assert.Equal(t, "\u0085", a.editorTextForSubmit())
 }
+
+type shutdownSession struct {
+	*fakeSession
+	closeSession func(context.Context) error
+}
+
+func (s *shutdownSession) Close(ctx context.Context) error { return s.closeSession(ctx) }
+
+func TestRunRestoresTerminalBeforeClosingSessionWithLiveContext(t *testing.T) {
+	for _, cancelParent := range []bool{false, true} {
+		be := headless.New(tauui.Size{W: 40, H: 12})
+		type contextKey struct{}
+		ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "kept"))
+		closeErr := errors.New("session cleanup failed")
+		closed := 0
+		sess := &shutdownSession{fakeSession: &fakeSession{}, closeSession: func(cleanup context.Context) error {
+			closed++
+			assert.True(t, be.Restored(), "session shutdown ran while terminal was active")
+			assert.NoError(t, cleanup.Err())
+			assert.Equal(t, "kept", cleanup.Value(contextKey{}))
+			_, bounded := cleanup.Deadline()
+			assert.True(t, bounded)
+			return closeErr
+		}}
+		app, err := New(Options{Session: sess})
+		require.NoError(t, err)
+		app.app, err = tauui.New(tauui.Opts{Root: app.root, Backend: be, OnTerminalReply: func(tauui.TerminalReplyEvent) {
+			if cancelParent {
+				cancel()
+			} else {
+				app.quit()
+			}
+		}})
+		require.NoError(t, err)
+		be.SendEvent(tauui.TerminalReplyEvent{Sequence: "done"})
+		err = app.Run(ctx)
+		cancel()
+		assert.ErrorIs(t, err, closeErr)
+		assert.Equal(t, 1, closed)
+		assert.True(t, be.Restored())
+	}
+}
+
+func TestRunQuitRemovesUnsentSessionImages(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "session-data")
+	app, err := New(Options{Session: &fakeSession{stateDataDir: dataDir}})
+	require.NoError(t, err)
+	be := headless.New(tauui.Size{W: 40, H: 12})
+	app.app, err = tauui.New(tauui.Opts{Root: app.root, Backend: be, OnTerminalReply: func(tauui.TerminalReplyEvent) { app.quit() }})
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(dataDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "pasted-image.png"), []byte{1}, 0o600))
+	be.SendEvent(tauui.TerminalReplyEvent{Sequence: "done"})
+	require.NoError(t, app.Run(context.Background()))
+	_, err = os.Stat(dataDir)
+	assert.True(t, os.IsNotExist(err), "unsent session data remains: %v", err)
+}

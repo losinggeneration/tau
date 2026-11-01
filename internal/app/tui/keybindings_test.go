@@ -477,3 +477,27 @@ func TestInlineSelectorUsesConfiguredToolkitKeys(t *testing.T) {
 	require.True(t, (&Root{app: a}).HandleAction(tauui.ActionCancel, stubCtx()))
 	assert.False(t, a.selectorVisible())
 }
+
+func TestNativeStartupAppliesScalarAndLegacyBindings(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "keybindings.json"), []byte("\ufeff"+`{"cycleModelForward":"ctrl+j","app.model.cycleForward":"ctrl+g","cursorLineStart":"ctrl+o","selectCancel":"ctrl+q","tui.select.down":false}`), 0o600))
+	a, err := New(Options{Session: &fakeSession{}, SettingsPath: filepath.Join(dir, "settings.json")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, a.chat.Close()) })
+	act, ok := (appKeymap{app: a, manager: a.keybindings}).Resolve(tauui.KeyCtxTextInput, ctrl('g'))
+	assert.True(t, ok)
+	assert.Equal(t, AppActionModelCycleForward, act)
+	cmdSettingsOverlay(a, "")
+	o, ok := a.dialogPicker.Component().(*settingsOverlay)
+	require.True(t, ok)
+	o.Paste("level")
+	a.dialogPicker.Handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'o', Mod: tauui.ModCtrl}, stubCtx())
+	a.dialogPicker.Handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'X'}, stubCtx())
+	assert.Equal(t, "Xlevel", o.list.Search())
+	a.dialogPicker.Handle(tauui.KeyEvent{Key: tauui.KeyEsc}, stubCtx())
+	assert.True(t, a.dialogPicker.Shown())
+	a.dialogPicker.Handle(tauui.KeyEvent{Key: tauui.KeyRune, Rune: 'q', Mod: tauui.ModCtrl}, stubCtx())
+	assert.False(t, a.dialogPicker.Shown())
+}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/losinggeneration/tau/ai"
 	"github.com/urfave/cli/v3"
@@ -585,21 +586,19 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 	// extracted image content blocks are returned alongside.
 	messages := cmd.StringSlice("message")
 
-	prompts, fileImages, err := buildPromptSequenceWithFiles(args, messages, os.Stdin, stdinIsTTY, cmd.Bool("stdin"))
-	if err != nil {
-		return cli.Exit(fmt.Sprintf("read stdin: %v", err), ExitUserError)
-	}
-
-	// Resolve the run mode. Precedence:
-	//   --mode rpc   > --mode json > --print | non-TTY > interactive
 	mode := resolveAppMode(cmd, stdinIsTTY)
-
-	// RPC mode is a long-lived server; positional prompts have no meaning
-	// because there is no single-shot completion to deliver them to.
-	// @file attachments are also rejected because RPC clients send
-	// content via JSON-RPC commands, not CLI arguments.
-	if err := validateRpcInput(mode, prompts, fileImages); err != nil {
-		return cli.Exit(err.Error(), ExitUserError)
+	var prompts []string
+	var fileImages []ai.ContentBlock
+	if mode == "rpc" {
+		if err := validateRpcInput(mode, append(append([]string(nil), args...), messages...), nil); err != nil {
+			return cli.Exit(err.Error(), ExitUserError)
+		}
+	} else {
+		var err error
+		prompts, fileImages, err = buildPromptSequenceWithFiles(args, messages, os.Stdin, stdinIsTTY, cmd.Bool("stdin"))
+		if err != nil {
+			return cli.Exit(fmt.Sprintf("read stdin: %v", err), ExitUserError)
+		}
 	}
 
 	// --fork targets an existing session and is mutually exclusive with
@@ -760,7 +759,7 @@ func buildPromptSequenceWithFiles(args []string, messages []string, stdin io.Rea
 		if err != nil {
 			return nil, nil, err
 		}
-		stdinContent = string(data)
+		stdinContent = strings.TrimFunc(string(data), func(r rune) bool { return unicode.IsSpace(r) && r != '\u0085' || r == '\ufeff' })
 	}
 
 	// Split positionals into @file refs and plain text, preserving order.
@@ -784,32 +783,19 @@ func buildPromptSequenceWithFiles(args []string, messages []string, stdin io.Rea
 	// The first prompt is the concatenation of stdin, @file text, and the
 	// first plain positional/-m message. The remaining plain messages are
 	// sent sequentially as separate prompts.
-	var initial string
-	switch {
-	case stdinContent != "" && fileContent.Len() > 0 && len(plainArgs) > 0:
-		initial = stdinContent + fileContent.String() + plainArgs[0]
-	case stdinContent != "" && fileContent.Len() > 0:
-		initial = stdinContent + fileContent.String()
-	case stdinContent != "" && len(plainArgs) > 0:
-		initial = stdinContent + plainArgs[0]
-	case fileContent.Len() > 0 && len(plainArgs) > 0:
-		initial = fileContent.String() + plainArgs[0]
-	case stdinContent != "":
-		initial = stdinContent
-	case fileContent.Len() > 0:
-		initial = fileContent.String()
-	case len(plainArgs) > 0:
-		initial = plainArgs[0]
+	initial := stdinContent + fileContent.String()
+	allMessages := append(append([]string(nil), plainArgs...), messages...)
+	if len(allMessages) > 0 {
+		initial += allMessages[0]
 	}
-
 	var prompts []string
 	if initial != "" {
 		prompts = append(prompts, initial)
 	}
-	if len(plainArgs) > 1 {
-		prompts = append(prompts, plainArgs[1:]...)
+	if len(allMessages) > 1 {
+		prompts = append(prompts, allMessages[1:]...)
 	}
-	prompts = append(prompts, messages...)
+
 	return prompts, fileImages, nil
 }
 
