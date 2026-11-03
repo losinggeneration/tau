@@ -1065,23 +1065,23 @@ var usageLimitRetryBuffer = 5 * time.Second
 // pausePollInterval is how often a paused loop rechecks its pause flag.
 var pausePollInterval = 15 * time.Second
 
-// waitWhilePaused holds the next provider request while config.PausedBy
-// reports a pause flag.
-func waitWhilePaused(ctx context.Context, config AgentLoopConfig, emit EventSink) error {
+// waitWhilePaused holds the next provider request to model while
+// config.PausedBy reports a pause flag.
+func waitWhilePaused(ctx context.Context, config AgentLoopConfig, model *ai.Model, emit EventSink) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if config.PausedBy == nil {
 		return nil
 	}
-	target := config.PausedBy()
+	target := config.PausedBy(model)
 	if target == "" {
 		return nil
 	}
 	emit(Paused{Target: target})
 	ticker := time.NewTicker(pausePollInterval)
 	defer ticker.Stop()
-	for config.PausedBy() != "" {
+	for config.PausedBy(model) != "" {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1143,7 +1143,7 @@ func streamAssistantResponse(
 	opts []ai.Option,
 	emit EventSink,
 ) (*Message, error) {
-	if err := waitWhilePaused(ctx, config, emit); err != nil {
+	if err := waitWhilePaused(ctx, config, model, emit); err != nil {
 		return nil, err
 	}
 	// Apply context transform if configured

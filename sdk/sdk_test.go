@@ -11500,11 +11500,11 @@ func TestPausedBy(t *testing.T) {
 		return func() string { nameReads++; return n }
 	}
 
-	target, err := pausedBy(filepath.Join(dir, "missing"), "id-1", name("bot"))
+	target, err := pausedBy(filepath.Join(dir, "missing"), "id-1", name("bot"), nil)
 	if err != nil || target != "" {
 		t.Fatalf("missing dir: target=%q err=%v, want no pause", target, err)
 	}
-	target, err = pausedBy(dir, "id-1", name("bot"))
+	target, err = pausedBy(dir, "id-1", name("bot"), nil)
 	if err != nil || target != "" || nameReads != 0 {
 		t.Fatalf("empty dir: target=%q err=%v nameReads=%d, want no pause and no name read", target, err, nameReads)
 	}
@@ -11518,7 +11518,7 @@ func TestPausedBy(t *testing.T) {
 		{"id-1", "other", ""},
 		{"bot", "", "bot"},
 	} {
-		got, err := pausedBy(dir, tc.id, name(tc.name))
+		got, err := pausedBy(dir, tc.id, name(tc.name), nil)
 		if err != nil || got != tc.want {
 			t.Errorf("pausedBy(id=%q, name=%q) = %q, %v; want %q", tc.id, tc.name, got, err, tc.want)
 		}
@@ -11527,8 +11527,28 @@ func TestPausedBy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "id-1"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := pausedBy(dir, "id-1", name("bot")); err != nil || got != "id-1" {
+	if got, err := pausedBy(dir, "id-1", name("bot"), nil); err != nil || got != "id-1" {
 		t.Fatalf("id flag: got %q, %v; want id-1", got, err)
+	}
+
+	modelDir := t.TempDir()
+	for _, flag := range []string{"provider=anthropic", "model=gpt-5"} {
+		if err := os.WriteFile(filepath.Join(modelDir, flag), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		model *ai.Model
+		want  string
+	}{
+		{&ai.Model{Provider: "anthropic", ID: "claude-x"}, "provider=anthropic"},
+		{&ai.Model{Provider: "openai", ID: "gpt-5"}, "model=gpt-5"},
+		{&ai.Model{Provider: "openai", ID: "gpt-4"}, ""},
+		{nil, ""},
+	} {
+		if got, err := pausedBy(modelDir, "id-1", name("bot"), tc.model); err != nil || got != tc.want {
+			t.Errorf("pausedBy(model=%v) = %q, %v; want %q", tc.model, got, err, tc.want)
+		}
 	}
 }
 

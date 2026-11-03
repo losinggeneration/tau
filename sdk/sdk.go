@@ -4821,9 +4821,10 @@ func (s *agentSession) getLastAssistantText() string {
 }
 
 // pausedBy returns the flag file in dir that names the session by id or by
-// display name, or "" when none does. The name is only resolved when dir holds
-// flags, since it reads the session file. A missing dir means no flags.
-func pausedBy(dir, id string, name func() string) (string, error) {
+// display name, or the requested model as provider=<provider> or model=<id>,
+// or "" when none does. The name is only resolved when dir holds flags, since
+// it reads the session file. A missing dir means no flags.
+func pausedBy(dir, id string, name func() string, model *ai.Model) (string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -4843,6 +4844,13 @@ func pausedBy(dir, id string, name func() string) (string, error) {
 	}
 	if n := name(); n != "" && flags[n] {
 		return n, nil
+	}
+	if model != nil {
+		for _, flag := range []string{"provider=" + model.Provider, "model=" + model.ID} {
+			if flags[flag] {
+				return flag, nil
+			}
+		}
 	}
 	return "", nil
 }
@@ -5868,8 +5876,8 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		return hookSession.prepareVirtualRequest(ctx, request)
 	}
 	pauseDir := filepath.Join(paths.ConfigDir(), "paused")
-	agentCfg.PausedBy = func() string {
-		target, err := pausedBy(pauseDir, hookSession.id, hookSession.getSessionName)
+	agentCfg.PausedBy = func(model *ai.Model) string {
+		target, err := pausedBy(pauseDir, hookSession.id, hookSession.getSessionName, model)
 		if err != nil {
 			hookSession.logger.Error("check pause flags", "dir", pauseDir, "error", err)
 		}

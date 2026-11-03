@@ -6478,9 +6478,12 @@ func TestRunAgentLoopHoldsProviderRequestWhilePaused(t *testing.T) {
 		checks   int
 		streamed bool
 	)
-	pausedBy := func() string {
+	pausedBy := func(model *ai.Model) string {
 		mu.Lock()
 		defer mu.Unlock()
+		if model == nil || model.Provider != ai.ProviderOpenAI {
+			t.Errorf("PausedBy model = %v, want the requested openai model", model)
+		}
 		checks++
 		if checks == 3 {
 			paused = ""
@@ -6531,7 +6534,7 @@ func TestRunAgentLoopHoldsProviderRequestWhilePaused(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	config.PausedBy = func() string { cancel(); return "peak" }
+	config.PausedBy = func(*ai.Model) string { cancel(); return "peak" }
 	_, err = RunAgentLoop(ctx, []*Message{NewUserMessage("hi")},
 		&AgentContext{Model: config.Model}, config, func(Event) {})
 	if !errors.Is(err, context.Canceled) {

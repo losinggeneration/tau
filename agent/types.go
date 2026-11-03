@@ -184,9 +184,10 @@ type Config struct {
 	InitialState          *InitialState
 	PrepareNextTurn       PrepareNextTurnFunc
 	OnProviderStreamEvent func(context.Context, ai.StreamEvent)
-	// PausedBy reports the pause flag holding provider requests, or "" when
-	// requests may proceed. The loop polls it before every provider request.
-	PausedBy           func() string
+	// PausedBy reports the pause flag holding provider requests to model, or
+	// "" when requests may proceed. The loop polls it before every provider
+	// request.
+	PausedBy           func(model *ai.Model) string
 	FinishTurn         FinishTurnFunc
 	PrepareRequest     PrepareRequestFunc
 	Model              *ai.Model
@@ -665,9 +666,10 @@ type AgentLoopConfig struct {
 	FlushContextMessages  func()
 	PrepareNextTurn       PrepareNextTurnFunc
 	OnProviderStreamEvent func(context.Context, ai.StreamEvent)
-	// PausedBy reports the pause flag holding provider requests, or "" when
-	// requests may proceed. The loop polls it before every provider request.
-	PausedBy       func() string
+	// PausedBy reports the pause flag holding provider requests to model, or
+	// "" when requests may proceed. The loop polls it before every provider
+	// request.
+	PausedBy       func(model *ai.Model) string
 	FinishTurn     FinishTurnFunc
 	PrepareRequest PrepareRequestFunc
 	// Required configuration
