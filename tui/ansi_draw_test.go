@@ -6,7 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/losinggeneration/rovel"
 	"github.com/losinggeneration/rovel/geom"
+	"github.com/losinggeneration/rovel/render"
 	"github.com/losinggeneration/rovel/style"
 )
 
@@ -142,4 +144,32 @@ func TestDrawANSITextTreatsControlPayloadsAsOpaque(t *testing.T) {
 		require.Len(t, d.ops, 1)
 		assert.Equal(t, "visible", d.ops[0].text)
 	}
+}
+
+func TestDrawANSITextPreservesUnicodeGraphemes(t *testing.T) {
+	buf := render.NewBuffer(24, 1)
+	d := rovel.NewDrawer(rovel.NewPainter(render.NewPainter(buf, Rect{W: 24, H: 1}, Style{}), Style{}))
+	DrawANSIText(d, Point{}, "ASCII 日 \x1b[31m👩‍💻 ♥️ á\x1b[0m!", Style{})
+	for _, cell := range []struct {
+		x     int
+		value string
+	}{
+		{0, "A"},
+		{6, "日"},
+		{7, ""},
+		{8, " "},
+		{9, "👩‍💻"},
+		{10, ""},
+		{11, " "},
+		{12, "♥️"},
+		{13, ""},
+		{14, " "},
+		{15, "á"},
+		{16, "!"},
+	} {
+		assert.Equal(t, cell.value, buf.At(cell.x, 0).Text(), "column=%d", cell.x)
+	}
+	assert.Equal(t, ColorRed, buf.At(9, 0).Style.FG)
+	assert.Equal(t, ColorRed, buf.At(15, 0).Style.FG)
+	assert.Equal(t, Style{}, buf.At(16, 0).Style)
 }

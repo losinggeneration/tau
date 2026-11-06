@@ -166,7 +166,7 @@ func TestContainer_MinSize_Children(t *testing.T) {
 
 func TestContainer_MinSize_WithGap(t *testing.T) {
 	c := NewContainer()
-	c.SetGap(1)
+	c.SetGap(nil, 1)
 	a := &fakeView{id: NewID(), minSize: Size{W: 1, H: 2}}
 	b := &fakeView{id: NewID(), minSize: Size{W: 1, H: 3}}
 	c.AddChild(a)

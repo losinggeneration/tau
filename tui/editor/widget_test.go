@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/losinggeneration/rovel/render"
+	"github.com/losinggeneration/rovel/text"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/losinggeneration/rovel"
@@ -583,4 +584,50 @@ func TestWidgetProgrammaticInsertionNotifiesOnce(t *testing.T) {
 	m.Undo()
 	assert.Equal(t, "界 suffix", m.Text())
 	assert.Equal(t, len("界"), m.Cursor())
+}
+
+func TestWidgetPaintPreservesUnicodeGraphemes(t *testing.T) {
+	const value = "ASCII 日 👩‍💻 ♥️ á"
+	for _, width := range []int{24, 10, 2, 1} {
+		for _, selected := range []bool{false, true} {
+			w := NewWidget()
+			w.Layout(rovel.Rect{X: 2, Y: 1, W: width, H: 20})
+			w.Model().SetText(value)
+			if selected {
+				w.Model().SetSelection(0, len(value))
+			}
+			buf := render.NewBuffer(width+4, 22)
+			d := &editorCursorDrawer{CellDrawer: rovel.NewDrawer(rovel.NewPainter(render.NewPainter(buf, rovel.Rect{W: width + 4, H: 22}, rovel.Style{}), rovel.Style{})).(rovel.CellDrawer)}
+			ctx := &rovel.Ctx{Theme: rovel.DefaultTheme(), FocusedID: w.ID()}
+			w.Paint(d, ctx)
+			for y, row := range editorVisualRows(value, width) {
+				x := 0
+				for off := 0; off < len(row.text); {
+					next := text.NextCluster(row.text, off)
+					cluster := row.text[off:next]
+					cw := text.Width(cluster)
+					if cw > 0 && x+cw <= width {
+						cell := buf.At(2+x, 1+y)
+						assert.Equal(t, cluster, cell.Text(), "width=%d selected=%t column=%d", width, selected, x)
+						if selected {
+							assert.Equal(t, ctx.Theme.Palette.Selection, cell.Style)
+						}
+					}
+					x += cw
+					off = next
+				}
+			}
+			if width == 24 {
+				assert.Equal(t, "👩‍💻", buf.At(11, 1).Text())
+				assert.Equal(t, "♥️", buf.At(14, 1).Text())
+				assert.Equal(t, "á", buf.At(17, 1).Text())
+				assert.Equal(t, rovel.Point{X: 18, Y: 1}, d.pos)
+			}
+			for y := range 20 {
+				assert.Equal(t, " ", buf.At(1, y+1).Text())
+				assert.Equal(t, " ", buf.At(width+2, y+1).Text())
+			}
+			assert.Equal(t, value, w.Model().Text())
+		}
+	}
 }

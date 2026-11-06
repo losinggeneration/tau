@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"unicode"
 
+	"github.com/losinggeneration/rovel/text"
 	tauui "github.com/losinggeneration/tau/tui"
 )
 
@@ -1182,11 +1183,15 @@ func (c *ChatLog) positionFromMouseLocked(x, y int) chatLogPosition {
 	// Selection positions are stored in visible cells so the cursor lands
 	// where the user actually sees it, even when the rendered row carries
 	// embedded ANSI SGR sequences for inline-code, bold, or italic spans.
-	maxCol := tauui.TextWidth(c.lines[line].text)
-	if col > maxCol {
-		col = maxCol
-	}
-	return chatLogPosition{line: line, col: col}
+	return chatLogPosition{line: line, col: graphemeColumn(c.lines[line].text, col)}
+}
+
+// graphemeColumn moves col back to the first cell of the grapheme it lands
+// in and clamps it to the row width. A column inside a wide grapheme would
+// otherwise slice that grapheme away and shift the highlight left.
+func graphemeColumn(line string, col int) int {
+	visible := tauui.StripANSI(line)
+	return text.Width(visible[:text.OffsetAtColumnBias(visible, col, text.BiasLeft)])
 }
 
 func clampChatLogPosition(pos chatLogPosition, lines []renderLine) chatLogPosition {
@@ -1199,13 +1204,7 @@ func clampChatLogPosition(pos chatLogPosition, lines []renderLine) chatLogPositi
 	if pos.line >= len(lines) {
 		pos.line = len(lines) - 1
 	}
-	maxCol := tauui.TextWidth(lines[pos.line].text)
-	if pos.col < 0 {
-		pos.col = 0
-	}
-	if pos.col > maxCol {
-		pos.col = maxCol
-	}
+	pos.col = graphemeColumn(lines[pos.line].text, pos.col)
 	return pos
 }
 

@@ -84,12 +84,12 @@ func (c *Container) ChildAt(i int) View {
 
 // SetGap sets the inter-child gap in rows. Default is 0. Per spec, gap is
 // optional behavior; we expose it for parity with HStack/VStack.
-func (c *Container) SetGap(gap int) {
+func (c *Container) SetGap(ctx *Ctx, gap int) {
 	if gap < 0 {
 		gap = 0
 	}
 
-	c.stack.SetGap(gap)
+	c.stack.SetGap(ctx, gap)
 }
 
 // ID implements View.

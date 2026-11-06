@@ -274,20 +274,14 @@ func (w *Widget) Paint(d rovel.Drawer, ctx *rovel.Ctx) {
 				if rowSelStart >= 0 && col >= rowSelStart && col < rowSelEnd {
 					st = layerSelectionStyle(base, selectionStyle)
 				}
-				for _, r := range cluster {
-					rw := rovel.RuneWidth(r)
-					if rw <= 0 {
-						continue
-					}
-					if rw > remaining {
-						remaining = 0
-						break
-					}
-					cd.SetCell(x, w.rect.Y+y, r, st)
-					x += rw
-					remaining -= rw
-					col += rw
+				cw := text.Width(cluster)
+				if cw > remaining {
+					break
 				}
+				d.DrawText(geom.Point{X: x, Y: w.rect.Y + y}, cluster, st)
+				x += cw
+				remaining -= cw
+				col += cw
 				off = next
 			}
 		}

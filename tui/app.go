@@ -332,7 +332,7 @@ func (a *App) Quit() {
 	a.mu.Unlock()
 
 	if a.inner != nil {
-		if err := a.inner.Post(func(_ *rovel.UpdateCtx) {
+		if err := a.inner.Post(func(_ *rovel.Ctx) {
 			a.inner.Quit()
 		}); err != nil {
 			a.inner.Quit()
@@ -394,7 +394,7 @@ func (a *App) Errors() []error {
 }
 
 // UpdateCtx is passed to posted callbacks, providing app-loop-safe mutations.
-type UpdateCtx = rovel.UpdateCtx
+type UpdateCtx = rovel.Ctx
 
 // installQuitHandler walks the root view and installs a HandleAction that
 // calls Quit when ActionQuit is dispatched. We use a synthetic root wrapper

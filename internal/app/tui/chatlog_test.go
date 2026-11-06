@@ -291,6 +291,48 @@ func TestChatLogSelectionClampsToVisibleWidth(t *testing.T) {
 	}
 }
 
+// TestChatLogSelectionInsideWideGraphemeKeepsCells pins a drag that starts on
+// the second cell of a wide grapheme: the highlight must start at the
+// grapheme, not shift every following cell one column left.
+func TestChatLogSelectionInsideWideGraphemeKeepsCells(t *testing.T) {
+	const body = "ASCII 日 👩‍💻 ♥️ á"
+	conv := NewConversationModel()
+	conv.AddUserMessage("hi")
+	conv.AddAssistantMessage(body)
+
+	log := newTestChatLog(t, conv)
+	log.Layout(tauui.Rect{W: 40, H: 20})
+	waitForChatLog(t, log)
+
+	row, emoji := -1, 0
+	log.mu.Lock()
+	for i, line := range log.lines {
+		stripped := tauui.StripANSI(line.text)
+		if idx := strings.Index(stripped, "👩‍💻"); idx >= 0 {
+			row, emoji = i, tauui.TextWidth(stripped[:idx])
+		}
+	}
+	log.mu.Unlock()
+	require.GreaterOrEqual(t, row, 0)
+
+	var copied string
+	ctx := &tauui.Ctx{Invalidate: func(tauui.Rect) {}, ClipboardWrite: func(s string) { copied = s }}
+	end := emoji + 7
+	require.True(t, log.Handle(tauui.MouseEvent{X: emoji + 1, Y: row, Button: tauui.MouseButtonLeft, Action: tauui.MousePress}, ctx))
+	require.True(t, log.Handle(tauui.MouseEvent{X: end, Y: row, Button: tauui.MouseButtonLeft, Action: tauui.MouseDrag}, ctx))
+	require.True(t, log.Handle(tauui.MouseEvent{X: end, Y: row, Button: tauui.MouseButtonLeft, Action: tauui.MouseRelease}, ctx))
+	assert.Equal(t, "👩‍💻 ♥️ á", copied)
+
+	buf := tauui.NewBuffer(40, 20)
+	log.Paint(tauui.NewDrawer(tauui.NewPainter(tauui.NewRenderPainter(buf, tauui.Rect{W: 40, H: 20}, tauui.Style{}), tauui.Style{})), &tauui.Ctx{Theme: appTheme()})
+	for _, cell := range []struct {
+		x     int
+		value string
+	}{{emoji, "👩‍💻"}, {emoji + 2, " "}, {emoji + 3, "♥️"}, {emoji + 5, " "}, {emoji + 6, "á"}, {emoji + 7, " "}} {
+		assert.Equal(t, cell.value, buf.At(cell.x, row).Text(), "column=%d", cell.x)
+	}
+}
+
 func chatLogContentRowBounds(t *testing.T, log *ChatLog, component int) (first, last int) {
 	t.Helper()
 	log.mu.Lock()
