@@ -3,11 +3,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Server, ServerCredentials, type UntypedServiceImplementation } from "@grpc/grpc-js";
+import { Metadata, Server, ServerCredentials, status, type UntypedServiceImplementation } from "@grpc/grpc-js";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { HostClient } from "../src/host.ts";
+import { HostClient, resolvePluginName } from "../src/host.ts";
 import { loadProto } from "../src/grpc.ts";
 import type {
 	SessionAppendRequestP,
@@ -15,7 +15,7 @@ import type {
 	UINotifyRequestP,
 } from "../src/proto-types.ts";
 
-type FakeCallback = (err: null, value: unknown) => void;
+type FakeCallback = (err: { code: number; message: string } | null, value?: unknown) => void;
 
 interface RecordedCall {
 	method: string;
@@ -23,12 +23,12 @@ interface RecordedCall {
 }
 
 function startFakeHost(
-	onCall: (method: string, request: unknown, cb: FakeCallback) => void,
+	onCall: (method: string, request: unknown, cb: FakeCallback, metadata: Metadata) => void,
 ): Promise<{ server: Server; sockPath: string; calls: RecordedCall[] }> {
 	const calls: RecordedCall[] = [];
 	const sockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "fake-host-")), "host.sock");
 	const server = new Server();
-	const impl: Record<string, (call: { request: unknown }, cb: FakeCallback) => void> = {};
+	const impl: Record<string, (call: { request: unknown; metadata: Metadata }, cb: FakeCallback) => void> = {};
 	const methods = [
 		"UIConfirm",
 		"UISelect",
@@ -52,7 +52,7 @@ function startFakeHost(
 	for (const m of methods) {
 		impl[m] = (call, cb) => {
 			calls.push({ method: m, request: call.request });
-			onCall(m, call.request, cb);
+			onCall(m, call.request, cb, call.metadata);
 		};
 	}
 	const { HostService } = loadProto();
@@ -136,4 +136,44 @@ test("host: missing TAU_HOST_SOCKET rejects on first call", async () => {
 		() => client.uiNotify("x"),
 		/TAU_HOST_SOCKET not set/,
 	);
+});
+
+test("host: launch identity overrides the package working directory", async (t) => {
+	const previousName = process.env["TAU_PLUGIN_NAME"];
+	const previousSocket = process.env["TAU_HOST_SOCKET"];
+	t.after(() => {
+		if (previousName === undefined) delete process.env["TAU_PLUGIN_NAME"];
+		else process.env["TAU_PLUGIN_NAME"] = previousName;
+		if (previousSocket === undefined) delete process.env["TAU_HOST_SOCKET"];
+		else process.env["TAU_HOST_SOCKET"] = previousSocket;
+	});
+	process.env["TAU_PLUGIN_NAME"] = "extension";
+	const { server, sockPath } = await startFakeHost((_method, _request, cb, metadata) => {
+		const names = metadata.get("tau-plugin-name");
+		if (names.length !== 1 || names[0] !== "extension") {
+			cb({ code: status.PERMISSION_DENIED, message: "plugin identity does not match Host endpoint" });
+			return;
+		}
+		cb(null, { exists: true, value: '"ultra"' });
+	});
+	t.after(() => {
+		server.forceShutdown();
+		fs.rmSync(path.dirname(sockPath), { recursive: true, force: true });
+	});
+	process.env["TAU_HOST_SOCKET"] = sockPath;
+	const client = new HostClient(resolvePluginName("/packages/ponytail"));
+	t.after(() => client.close());
+	assert.deepEqual(await client.stateGet("mode"), { exists: true, value: '"ultra"' });
+});
+
+test("host: standalone identity falls back to the working directory", (t) => {
+	const previousName = process.env["TAU_PLUGIN_NAME"];
+	t.after(() => {
+		if (previousName === undefined) delete process.env["TAU_PLUGIN_NAME"];
+		else process.env["TAU_PLUGIN_NAME"] = previousName;
+	});
+	delete process.env["TAU_PLUGIN_NAME"];
+	assert.equal(resolvePluginName("/packages/ponytail"), "ponytail");
+	process.env["TAU_PLUGIN_NAME"] = "";
+	assert.equal(resolvePluginName("/packages/ponytail"), "ponytail");
 });

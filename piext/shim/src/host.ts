@@ -24,6 +24,7 @@ import type {
 } from "./proto-types.ts";
 import type { NotifyLevel, NestedToolCall } from "./pi-types.ts";
 import fs from "node:fs";
+import path from "node:path";
 
 // Per-call deadline (under tau's 5s on_event budget; leave headroom).
 const DEFAULT_DEADLINE_MS = 4000;
@@ -31,6 +32,10 @@ const DEFAULT_DEADLINE_MS = 4000;
 const UI_DEADLINE_MS = 30_000;
 
 const NOTIFY_LEVELS: ReadonlyArray<NotifyLevel> = ["info", "success", "warning", "error"];
+
+export function resolvePluginName(cwd: string): string {
+	return process.env["TAU_PLUGIN_NAME"] || path.basename(cwd);
+}
 
 export class HostClient {
 	private readonly pluginName: string;

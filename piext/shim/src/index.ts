@@ -1,9 +1,9 @@
 // Entry point for the pi-ext-shim.
 //
 // argv after the script name is a list of extension entry paths (relative to
-// cwd, which is the package dir set by tau's `sh -c` launch). The plugin name
-// (used for Host metadata + the mTLS cert CN) is taken from the last path
-// component of cwd.
+// cwd, which is the package dir set by tau's `sh -c` launch). Tau supplies the
+// plugin identity through TAU_PLUGIN_NAME. Standalone launches fall back to
+// the last path component of cwd.
 //
 // Lifecycle:
 //   1. Prepare the handshake (magic cookie, mTLS cert, socket path)
@@ -13,13 +13,13 @@
 //   4. Exit on the host's Shutdown RPC, SIGTERM/SIGINT, or host death —
 //      never wait for a SIGKILL that a fast-exiting host won't deliver.
 
-import path from "node:path";
+import { resolvePluginName } from "./host.ts";
 import { prepareHandshake, printHandshakeLine } from "./handshake.ts";
 import { exitWhenOrphaned } from "./lifecycle.ts";
 import { buildPluginService, startServer } from "./server.ts";
 
 const cwd = process.cwd();
-const pluginName = path.basename(cwd);
+const pluginName = resolvePluginName(cwd);
 
 const extensionEntries = process.argv.slice(2);
 if (extensionEntries.length === 0) {
