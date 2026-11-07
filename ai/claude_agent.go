@@ -660,26 +660,41 @@ func (e *ClaudeAgentUsageLimitError) Error() string {
 	return fmt.Sprintf("%s: %s. Available again at %s", ProviderClaudeAgent, e.Message, e.ResetsAt.Format(time.DateTime))
 }
 
-var claudeAgentResetPattern = regexp.MustCompile(`(?i)You've hit your (?:session|5-hour) limit\s*·\s*resets (\d{1,2}(?::\d{2})?[ap]m) \(([^()]+)\)`)
+var claudeAgentResetPattern = regexp.MustCompile(`(?i)You've hit your (?:session|5-hour|weekly) limit\s*·\s*resets (?:([a-z]{3} \d{1,2}), )?(\d{1,2}(?::\d{2})?[ap]m) \(([^()]+)\)`)
 
 func parseClaudeAgentUsageLimitError(message string, now time.Time) *ClaudeAgentUsageLimitError {
 	match := claudeAgentResetPattern.FindStringSubmatch(message)
 	if match == nil {
 		return nil
 	}
-	location, err := time.LoadLocation(match[2])
+	location, err := time.LoadLocation(match[3])
 	if err != nil {
 		return nil
 	}
 	layout := "3:04pm"
-	if !strings.Contains(match[1], ":") {
+	if !strings.Contains(match[2], ":") {
 		layout = "3pm"
 	}
-	clock, err := time.Parse(layout, strings.ToLower(match[1]))
+	clock, err := time.Parse(layout, strings.ToLower(match[2]))
 	if err != nil {
 		return nil
 	}
 	localNow := now.In(location)
+	if match[1] != "" {
+		layout = "2006 Jan 2 15:04"
+		dateAndTime := match[1] + " " + clock.Format("15:04")
+		resetAt, err := time.ParseInLocation(layout, fmt.Sprintf("%d %s", localNow.Year(), dateAndTime), location)
+		if err != nil {
+			return nil
+		}
+		if !resetAt.After(now) {
+			resetAt, err = time.ParseInLocation(layout, fmt.Sprintf("%d %s", localNow.Year()+1, dateAndTime), location)
+			if err != nil {
+				return nil
+			}
+		}
+		return &ClaudeAgentUsageLimitError{Message: match[0], ResetsAt: resetAt.In(time.Local)}
+	}
 	resetAt := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), clock.Hour(), clock.Minute(), 0, 0, location)
 	if !resetAt.After(now) {
 		// Build tomorrow's wall time so a DST change doesn't shift the reset hour.

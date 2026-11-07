@@ -43,6 +43,7 @@ type Agent struct {
 	pendingCustomMessages []*Message
 
 	// Control
+	modelChanged chan struct{}
 	activeRun    *activeRun
 	settlingRuns map[*activeRun]struct{}
 	steeringMode QueueMode
@@ -120,6 +121,7 @@ func New(config Config) (*Agent, error) {
 			SessionCWD:     config.SessionCWD,
 			Capabilities:   config.Capabilities,
 		},
+		modelChanged: make(chan struct{}),
 		handler:      config.StreamHandler,
 		steeringMode: config.SteeringMode,
 		followUpMode: config.FollowUpMode,
@@ -815,6 +817,7 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool, transform Transfo
 		FinishTurn:            a.config.FinishTurn,
 		PrepareRequest:        a.prepareRequest,
 		Model:                 a.state.Model,
+		modelSelection:        a.modelSelection,
 		ClientFactory:         a.config.ClientFactory,
 		StreamFn:              a.config.StreamFn,
 		ConvertToLlm:          a.convertToLlm,
@@ -991,11 +994,21 @@ func (a *Agent) AddTools(tools ...Tool) {
 	a.state.Tools = append(a.state.Tools, tools...)
 }
 
-// SetModel replaces the active model for future turns.
+// SetModel replaces the active model for future turns and wakes quota retries.
 func (a *Agent) SetModel(model *ai.Model) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if !sameModelSelection(a.state.Model, model) {
+		close(a.modelChanged)
+		a.modelChanged = make(chan struct{})
+	}
 	a.state.Model = model
+}
+
+func (a *Agent) modelSelection() (*ai.Model, <-chan struct{}) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.state.Model, a.modelChanged
 }
 
 // SetTools replaces the tool list for future turns.

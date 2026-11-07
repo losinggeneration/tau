@@ -22,15 +22,21 @@ type RetryPolicy struct {
 
 var (
 	nonRetryableProviderError = regexp.MustCompile(`(?i)GoUsageLimitError|FreeUsageLimitError|usage limit reached|limit exhausted|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing_usage_limit_exceeded|context.{0,20}(window|length|limit)|too many tokens`)
-	retryableProviderError    = regexp.MustCompile(`(?i)overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|429|500|502|503|504|520|524|service.?unavailable|server.?error|internal.?error|provider.?returned.?(an.?)?error|exceeded request buffer limit|network.?error|connection.?(error|refused|lost)|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?(closed|error)|ended without|stream ended before|http2 request did not get a response|pending stream has been canceled|retry delay|retry your request|try your request again|ResourceExhausted|subscription_sharing_(usage|user)_unavailable`)
+	retryableProviderError    = regexp.MustCompile(`(?i)overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|429|500|502|503|504|520|524|service.?unavailable|server.?error|internal.?error|provider.?returned.?(an.?)?error|exceeded request buffer limit|network.?error|connection.?(error|refused|lost|reset)|broken pipe|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?(closed|error)|ended without|stream ended before|http2 request did not get a response|pending stream has been canceled|retry delay|retry your request|try your request again|ResourceExhausted|subscription_sharing_(usage|user)_unavailable`)
+	// networkDownError means the provider can't be reached at all: our link,
+	// DNS or the provider's host is down. These retry until it comes back.
+	networkDownError = regexp.MustCompile(`(?i)i/o timeout|TLS handshake timeout|network is unreachable|no route to host|connection refused|temporary failure in name resolution|server misbehaving|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ECONNREFUSED`)
 )
 
 // IsRetryableAssistantError excludes quota, billing, context overflow and aborted outcomes.
 func IsRetryableAssistantError(message *AssistantMessage) bool {
-	return message != nil && message.StopReason == StopReasonError && !nonRetryableProviderError.MatchString(message.ErrorMessage) && retryableProviderError.MatchString(message.ErrorMessage)
+	return message != nil && message.StopReason == StopReasonError && !nonRetryableProviderError.MatchString(message.ErrorMessage) &&
+		(retryableProviderError.MatchString(message.ErrorMessage) || networkDownError.MatchString(message.ErrorMessage))
 }
 
-// RetryAssistantCall retries transient failures with cancellable exponential backoff.
+// RetryAssistantCall retries transient failures with cancellable exponential
+// backoff. Once MaxRetries is spent, failures that show the provider is
+// unreachable keep retrying at MaxDelay until the context ends.
 func RetryAssistantCall(ctx context.Context, produce func(context.Context) (*AssistantMessage, error), policy RetryPolicy, onRetry func(int, time.Duration, string)) (message *AssistantMessage, err error) {
 	defer func() {
 		if ctx.Err() != nil {
@@ -49,7 +55,8 @@ func RetryAssistantCall(ctx context.Context, produce func(context.Context) (*Ass
 		if err != nil {
 			failure = &AssistantMessage{StopReason: StopReasonError, ErrorMessage: err.Error()}
 		}
-		if attempt >= policy.MaxRetries || !IsRetryableAssistantError(failure) {
+		if policy.MaxRetries <= 0 || !IsRetryableAssistantError(failure) ||
+			attempt >= policy.MaxRetries && !networkDownError.MatchString(failure.ErrorMessage) {
 			return message, err
 		}
 		delay := max(time.Duration(0), min(policy.BaseDelay, policy.MaxDelay))

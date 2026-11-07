@@ -1414,6 +1414,73 @@ func TestSetModelUsesFuturePrompt(t *testing.T) {
 	}
 }
 
+func TestSetModelWakesUsageLimitRetry(t *testing.T) {
+	for _, provider := range []string{ai.ProviderOpenAI, ai.ProviderAnthropic} {
+		for _, timing := range []string{"waiting", "wait_event", "in_flight"} {
+			t.Run(provider+"/"+timing, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					before := &ai.Model{ID: "before", Provider: ai.ProviderOpenAI}
+					after := &ai.Model{ID: "after", Provider: provider}
+					var models, clients []*ai.Model
+					var waits int
+					var a *Agent
+					var err error
+					a, err = New(NewConfig(WithModel(before), WithClientFactory(func(model *ai.Model) (ai.Client, error) {
+						clients = append(clients, model)
+						return stubClient{stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+							models = append(models, model)
+							if len(models) == 1 {
+								if timing == "in_flight" {
+									a.SetModel(after)
+								}
+								return &ai.CodexUsageLimitError{StatusCode: 429, ResetsAt: time.Now().Add(time.Hour)}
+							}
+							for _, message := range prompt.Messages {
+								require.False(t, message.IsError)
+							}
+							handler(ctx, ai.Done{Message: ai.AssistantMessage{Role: "assistant", Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "ok"}}, StopReason: ai.StopReasonStop}})
+							return nil
+						}}, nil
+					})))
+					require.NoError(t, err)
+					a.Subscribe(func(event Event, _ <-chan struct{}) {
+						if _, ok := event.(UsageLimitWait); ok {
+							waits++
+							if timing == "wait_event" {
+								a.SetModel(after)
+							}
+						}
+					})
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					done := make(chan error, 1)
+					go func() { done <- a.Prompt(ctx, NewUserMessage("hi")) }()
+					synctest.Wait()
+					if timing == "waiting" {
+						a.SetModel(&ai.Model{ID: before.ID, Provider: before.Provider})
+						synctest.Wait()
+						require.Len(t, models, 1, "reselecting the same model must not retry")
+						a.SetModel(after)
+						synctest.Wait()
+					}
+					select {
+					case err := <-done:
+						require.NoError(t, err)
+					default:
+						cancel()
+						<-done
+						t.Fatal("model change left the quota countdown running")
+					}
+					require.Equal(t, []*ai.Model{before, after}, models)
+					require.Equal(t, models, clients)
+					require.Equal(t, 1, waits)
+					require.Equal(t, "ok", messageText(a.Messages()[len(a.Messages())-1]))
+				})
+			})
+		}
+	}
+}
+
 func TestWithStreamFnOverridesClientCreation(t *testing.T) {
 	var sawStreamFn bool
 

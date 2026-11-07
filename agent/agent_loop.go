@@ -756,6 +756,10 @@ func runLoop(
 			// reset time) is surfaced in the transcript and retried once the
 			// window passes instead of ending the run like Pi does. That's
 			// intentional, so keep it when porting upstream agent-loop changes.
+			var selectedModel *ai.Model
+			if config.modelSelection != nil {
+				selectedModel, _ = config.modelSelection()
+			}
 			message, err := streamAssistantResponse(ctx, currentCtx, config, client, model, systemPrompt, opts, emit)
 			for err != nil {
 				resetAt, ok := ai.UsageLimitResetAt(err)
@@ -781,8 +785,20 @@ func runLoop(
 
 				emit(UsageLimitWait{Provider: model.Provider, ResetsAt: resetAt})
 
-				if waitErr := sleepUntil(ctx, resetAt.Add(usageLimitRetryBuffer)); waitErr != nil {
+				nextModel, waitErr := waitUsageLimit(ctx, resetAt.Add(usageLimitRetryBuffer), selectedModel, config.modelSelection)
+				if waitErr != nil {
 					return newMessages, waitErr
+				}
+				if nextModel != nil {
+					selectedModel = nextModel
+					model = nextModel
+					config.Model = nextModel
+					opts = buildAIOptions(config, model)
+					client, err = getLoopClient(model, config)
+					if err != nil {
+						return newMessages, fmt.Errorf("create retry client: %w", err)
+					}
+					clientModel = model
 				}
 
 				message, err = streamAssistantResponse(ctx, currentCtx, config, client, model, systemPrompt, opts, emit)
@@ -1075,15 +1091,36 @@ func waitWhilePaused(ctx context.Context, config AgentLoopConfig, emit EventSink
 	return nil
 }
 
-func sleepUntil(ctx context.Context, until time.Time) error {
+func sameModelSelection(a, b *ai.Model) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.ID == b.ID && a.Provider == b.Provider
+}
+
+func waitUsageLimit(ctx context.Context, until time.Time, selected *ai.Model, selection func() (*ai.Model, <-chan struct{})) (*ai.Model, error) {
 	timer := time.NewTimer(time.Until(until))
 	defer timer.Stop()
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var changed <-chan struct{}
+		if selection != nil {
+			var current *ai.Model
+			current, changed = selection()
+			if current != nil && !sameModelSelection(current, selected) {
+				return current, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			return nil, nil
+		case <-changed:
+		}
 	}
 }
 

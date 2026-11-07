@@ -266,3 +266,59 @@ func TestRetryAssistantCallCancellationBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestRetryAssistantCallConnectionFailures(t *testing.T) {
+	reset := "openai: read stream: read SSE stream: read tcp 192.168.1.101:42730->47.251.169.173:443: read: connection reset by peer"
+	down := []string{
+		`openai: request: Post "https://api.openai.com/v1/responses": dial tcp 1.2.3.4:443: i/o timeout`,
+		"dial tcp 1.2.3.4:443: connect: network is unreachable",
+		"dial tcp 1.2.3.4:443: connect: no route to host",
+		"dial tcp 1.2.3.4:443: connect: connection refused",
+		"dial tcp: lookup api.openai.com: Temporary failure in name resolution",
+		"dial tcp: lookup api.openai.com on 192.168.1.1:53: server misbehaving",
+		"net/http: TLS handshake timeout",
+	}
+	run := func(failures []string) (int, []time.Duration) {
+		var (
+			calls  int
+			delays []time.Duration
+		)
+		_, err := RetryAssistantCall(t.Context(), func(context.Context) (*AssistantMessage, error) {
+			calls++
+			if calls > len(failures) {
+				return &AssistantMessage{StopReason: StopReasonStop}, nil
+			}
+			return nil, errors.New(failures[calls-1])
+		}, RetryPolicy{MaxRetries: 3, BaseDelay: time.Nanosecond, MaxDelay: 4 * time.Nanosecond}, func(_ int, delay time.Duration, _ string) {
+			delays = append(delays, delay)
+		})
+		require.NoError(t, err)
+		return calls, delays
+	}
+
+	calls, _ := run([]string{reset, reset})
+	require.Equal(t, 3, calls, "reset of an open stream retries")
+
+	_, err := RetryAssistantCall(t.Context(), func(context.Context) (*AssistantMessage, error) {
+		return nil, errors.New(reset)
+	}, RetryPolicy{MaxRetries: 2, BaseDelay: time.Nanosecond}, nil)
+	require.ErrorContains(t, err, "connection reset", "reset retries stay capped")
+
+	for _, message := range down {
+		failures := []string{reset, reset, reset}
+		for range 20 {
+			failures = append(failures, message)
+		}
+		calls, delays := run(failures)
+		require.Equal(t, len(failures)+1, calls, "network down retries past MaxRetries: %s", message)
+		require.Equal(t, 4*time.Nanosecond, delays[len(delays)-1], "backoff stays at MaxDelay")
+	}
+
+	var calls0 int
+	_, err = RetryAssistantCall(t.Context(), func(context.Context) (*AssistantMessage, error) {
+		calls0++
+		return nil, errors.New(down[0])
+	}, RetryPolicy{MaxRetries: 0}, nil)
+	require.Error(t, err)
+	require.Equal(t, 1, calls0, "disabled retries stay disabled")
+}

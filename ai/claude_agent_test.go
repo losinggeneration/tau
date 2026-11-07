@@ -677,8 +677,16 @@ func eventTypeNames(events []StreamEvent) []string {
 }
 
 func TestClaudeAgentStreamUsageLimit(t *testing.T) {
-	for _, limit := range []string{"session", "5-hour"} {
-		message := "You've hit your " + limit + " limit · resets 4:30pm (America/Los_Angeles)"
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, limit := range []string{"session", "5-hour", "weekly"} {
+		reset := "4:30pm"
+		if limit == "weekly" {
+			reset = time.Now().In(loc).AddDate(0, 0, 3).Format("Jan 2") + ", " + reset
+		}
+		message := "You've hit your " + limit + " limit · resets " + reset + " (America/Los_Angeles)"
 		for _, source := range []string{"text", "assistant", "errors", "result", "runner"} {
 			t.Run(limit+"/"+source, func(t *testing.T) {
 				client := &claudeAgentClient{runner: func(context.Context, any, claude.Options) (<-chan claude.Message, <-chan error) {
@@ -718,12 +726,15 @@ func TestClaudeAgentStreamUsageLimit(t *testing.T) {
 				if !ok {
 					t.Fatalf("missing reset time: %v", streamErr)
 				}
-				loc, err := time.LoadLocation("America/Los_Angeles")
-				if err != nil {
-					t.Fatal(err)
-				}
 				local := resetAt.In(loc)
-				if local.Hour() != 16 || local.Minute() != 30 || !resetAt.After(before) || resetAt.Sub(before) > 25*time.Hour {
+				maxWait := 25 * time.Hour
+				if limit == "weekly" {
+					maxWait = 4 * 24 * time.Hour
+					if local.Format("Jan 2") != strings.Split(reset, ",")[0] {
+						t.Fatalf("reset date = %v, want %s", resetAt, reset)
+					}
+				}
+				if local.Hour() != 16 || local.Minute() != 30 || !resetAt.After(before) || resetAt.Sub(before) > maxWait {
 					t.Fatalf("reset time = %v", resetAt)
 				}
 				if streamErr.Msg.StopReason != StopReasonError || !strings.Contains(streamErr.Msg.ErrorMessage, limit+" limit") {
@@ -737,6 +748,14 @@ func TestClaudeAgentStreamUsageLimit(t *testing.T) {
 func TestParseClaudeAgentUsageLimitError(t *testing.T) {
 	for _, tt := range []struct{ name, message, now, want string }{
 		{"5-hour", "You've hit your 5-hour limit · resets 4:30pm (America/Los_Angeles)", "2026-10-11T22:00:00Z", "2026-10-11T23:30:00Z"},
+		{"weekly reported", "You've hit your weekly limit · resets Nov 12, 6am (America/Los_Angeles)", "2026-11-07T22:00:00Z", "2026-11-12T14:00:00Z"},
+		{"weekly minutes", "You've hit your weekly limit · resets Nov 12, 6:30pm (America/Los_Angeles)", "2026-11-07T22:00:00Z", "2026-11-13T02:30:00Z"},
+		{"weekly DST", "You've hit your weekly limit · resets Nov 2, 6am (America/Los_Angeles)", "2026-10-31T22:00:00Z", "2026-11-02T14:00:00Z"},
+		{"weekly next year", "You've hit your weekly limit · resets Jan 2, 6am (America/Los_Angeles)", "2026-12-30T22:00:00Z", "2027-01-02T14:00:00Z"},
+		{"weekly local year", "You've hit your weekly limit · resets Jan 2, 6am (America/Los_Angeles)", "2027-01-01T01:00:00Z", "2027-01-02T14:00:00Z"},
+		{"weekly invalid date", "You've hit your weekly limit · resets Nov 31, 6am (America/Los_Angeles)", "2026-11-07T22:00:00Z", ""},
+		{"weekly invalid clock", "You've hit your weekly limit · resets Nov 12, 6:99am (America/Los_Angeles)", "2026-11-07T22:00:00Z", ""},
+		{"weekly invalid zone", "You've hit your weekly limit · resets Nov 12, 6am (Unknown/Zone)", "2026-11-07T22:00:00Z", ""},
 		{"recorded", "You've hit your session limit · resets 6:10am (America/Los_Angeles)", "2026-10-11T12:39:52Z", "2026-10-11T13:10:00Z"},
 		{"tomorrow", "You've hit your session limit · resets 6:10am (America/Los_Angeles)", "2026-10-11T14:00:00Z", "2026-10-12T13:10:00Z"},
 		{"no minutes", "You've hit your session limit · resets 12am (Asia/Tokyo)", "2026-10-11T12:00:00Z", "2026-10-11T15:00:00Z"},

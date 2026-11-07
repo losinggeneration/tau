@@ -659,6 +659,7 @@ type AgentLoopConfig struct {
 	forcedSystemPrompt *string
 	// Stateful Agent publishes the failure lifecycle after the loop returns.
 	deferFailureEnd    bool
+	modelSelection     func() (*ai.Model, <-chan struct{})
 	GetStartupMessages MessageSupplierFunc
 	// FlushContextMessages admits context-only messages after turn-end handlers.
 	FlushContextMessages  func()
