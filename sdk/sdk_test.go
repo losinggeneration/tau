@@ -8946,7 +8946,7 @@ func TestGetAvailableModelsKeepsOnlyCopilotAccountModels(t *testing.T) {
 	_, model := registerRecordingProvider(t, "reply")
 	credentials := store.NewMemoryBackend(store.Options{})
 	cred := ai.NewOAuthCredential("tid=1", "gho_github", time.Now().Add(time.Hour), "")
-	cred.Extra = map[string]any{oauth.CopilotAvailableModelsKey: []any{"gpt-5.5"}}
+	cred.Extra = map[string]any{oauth.CopilotAvailableModelsKey: []any{"gpt-5.6-sol"}}
 	require.NoError(t, credentials.Set(testContext(t), ai.ProviderGitHubCopilot, cred))
 	rt, err := NewRuntime(RuntimeOptions{ModelRegistry: ai.NewModelRegistry(), ExplicitModel: model, CredentialStore: credentials, IgnoreEnv: true})
 	require.NoError(t, err)
@@ -8962,7 +8962,7 @@ func TestGetAvailableModelsKeepsOnlyCopilotAccountModels(t *testing.T) {
 			copilot = append(copilot, listed.ID)
 		}
 	}
-	assert.Equal(t, []string{"gpt-5.5"}, copilot, "models the account cannot use were listed")
+	assert.Equal(t, []string{"gpt-5.6-sol"}, copilot, "models the account cannot use were listed")
 	assert.True(t, slices.ContainsFunc(models, func(m *ai.Model) bool { return m.Provider != ai.ProviderGitHubCopilot }), "other providers were dropped")
 }
 

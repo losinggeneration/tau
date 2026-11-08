@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -112,16 +114,30 @@ func TestLoadUpstreamCatalogKeepsOperationsAndRejectsDrift(t *testing.T) {
 	}
 }
 
-func TestMergeCatalogsKeepsTauOnlyProviders(t *testing.T) {
-	upstream := []*tauai.Model{{Provider: "openai", ID: "gpt", API: "openai-responses"}, {Provider: "openai", ID: "gpt", Type: "image", API: "openai-images"}}
-	legacy := []*tauai.Model{{Provider: "openai", ID: "old", API: "openai-responses"}, {Provider: "google-gemini-cli", ID: "gemini", API: tauai.APIGoogleGeminiCLI}}
+func TestMergeCatalogsSupplementsUpstream(t *testing.T) {
+	upstream := []*tauai.Model{{Provider: "openai", ID: "gpt", API: "openai-responses", Name: "upstream"}, {Provider: "openai", ID: "gpt", Type: "image", API: "openai-images"}}
+	legacy := []*tauai.Model{{Provider: "openai", ID: "gpt", API: "openai-responses", Name: "legacy"}, {Provider: "openai", ID: "new", API: "openai-responses"}, {Provider: "google-gemini-cli", ID: "gemini", API: tauai.APIGoogleGeminiCLI}}
 	merged := mergeCatalogs(upstream, legacy)
 	var keys []string
 	for _, model := range merged {
 		keys = append(keys, model.Type+":"+model.Provider+"/"+model.ID)
 	}
-	if strings.Join(keys, ",") != ":google-gemini-cli/gemini,:openai/gpt,image:openai/gpt" {
+	if strings.Join(keys, ",") != ":google-gemini-cli/gemini,:openai/gpt,image:openai/gpt,:openai/new" {
 		t.Fatalf("merged = %v", keys)
+	}
+	if merged[1].Name != "upstream" {
+		t.Fatalf("upstream entry replaced by %q", merged[1].Name)
+	}
+}
+
+func TestDropDeprecatedModelsDevModels(t *testing.T) {
+	payload := modelsDevResponse{"minimax": {Models: map[string]modelsDevModel{
+		"MiniMax-M2":         {ToolCall: true, Status: "deprecated"},
+		"MiniMax-M3.1-Flash": {ToolCall: true},
+	}}}
+	dropDeprecated(payload)
+	if got := slices.Sorted(maps.Keys(payload["minimax"].Models)); !slices.Equal(got, []string{"MiniMax-M3.1-Flash"}) {
+		t.Fatalf("models = %v", got)
 	}
 }
 

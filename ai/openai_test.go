@@ -2109,10 +2109,10 @@ func TestConvertResponsesMessagesForOpenAI(t *testing.T) {
 
 // TestGitHubCopilotOpenAIResponsesModels verifies Copilot OpenAI Responses models.
 func TestGitHubCopilotOpenAIResponsesModels(t *testing.T) {
-	// Verify gpt-5-mini is a Copilot model using OpenAI Responses API
-	model, err := GetAvailableModel("github-copilot", "gpt-5-mini")
+	// Verify gpt-5.4-nano is a Copilot model using OpenAI Responses API
+	model, err := GetAvailableModel("github-copilot", "gpt-5.4-nano")
 	if err != nil {
-		t.Fatalf("GetAvailableModel(github-copilot, gpt-5-mini): %v", err)
+		t.Fatalf("GetAvailableModel(github-copilot, gpt-5.4-nano): %v", err)
 	}
 
 	if model.Provider != ProviderGitHubCopilot {
@@ -2129,7 +2129,7 @@ func TestGitHubCopilotOpenAIResponsesModels(t *testing.T) {
 // reasoning is requested.
 func TestGitHubCopilotOpenAIResponsesOmitsReasoningNone(t *testing.T) {
 	model := &Model{
-		ID:        "gpt-5-mini",
+		ID:        "gpt-5.4-nano",
 		Provider:  ProviderGitHubCopilot,
 		API:       APIOpenAIResponses,
 		Reasoning: true,
@@ -2163,7 +2163,7 @@ func TestGitHubCopilotOpenAIResponsesOmitsReasoningNone(t *testing.T) {
 // OpenAI Responses models work correctly when reasoning effort is specified.
 func TestGitHubCopilotOpenAIResponsesWithReasoningEffort(t *testing.T) {
 	model := &Model{
-		ID:        "gpt-5-mini",
+		ID:        "gpt-5.4-nano",
 		Provider:  ProviderGitHubCopilot,
 		API:       APIOpenAIResponses,
 		Reasoning: true,
@@ -2256,7 +2256,7 @@ func TestNonCopilotOpenAIResponsesAddsReasoningNone(t *testing.T) {
 // handle cache retention correctly.
 func TestGitHubCopilotOpenAIResponsesCacheRetention(t *testing.T) {
 	model := &Model{
-		ID:        "gpt-5-mini",
+		ID:        "gpt-5.4-nano",
 		Provider:  ProviderGitHubCopilot,
 		API:       APIOpenAIResponses,
 		BaseURL:   "https://api.individual.githubcopilot.com",
@@ -2293,7 +2293,7 @@ func TestGitHubCopilotOpenAIResponsesCacheRetention(t *testing.T) {
 // disabled when cacheRetention is "none".
 func TestGitHubCopilotOpenAIResponsesCacheRetentionNone(t *testing.T) {
 	model := &Model{
-		ID:       "gpt-5-mini",
+		ID:       "gpt-5.4-nano",
 		Provider: ProviderGitHubCopilot,
 		API:      APIOpenAIResponses,
 	}

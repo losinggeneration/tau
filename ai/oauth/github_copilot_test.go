@@ -165,7 +165,7 @@ func TestGitHubCopilotModelPolicyFallbackAndRateLimits(t *testing.T) {
 				return copilotResponse(http.StatusOK, `{"data":[
 					{"id":"gpt-4o","policy":{"state":"enabled"}},
 					{"id":"claude-sonnet-4.6","policy":{"state":"unconfigured"}},
-					{"id":"gpt-5.5","policy":{"state":"unconfigured"}}]}`), nil
+					{"id":"gpt-5.6-sol","policy":{"state":"unconfigured"}}]}`), nil
 			}
 			policyCalls++
 			response := copilotResponse(http.StatusTooManyRequests, `{}`)
@@ -180,7 +180,7 @@ func TestGitHubCopilotModelPolicyFallbackAndRateLimits(t *testing.T) {
 	available, policy, err := provider.copilotModels(t.Context(), "tid=1", "", 0, 0)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"gpt-4o"}, available, "the Individual endpoint falls back to enabled policies")
-	assert.Equal(t, []string{"claude-sonnet-4.6", "gpt-5.5"}, policy)
+	assert.Equal(t, []string{"claude-sonnet-4.6", "gpt-5.6-sol"}, policy)
 
 	enabled, err := provider.enableModels(t.Context(), "tid=1", "", policy)
 	require.NoError(t, err)

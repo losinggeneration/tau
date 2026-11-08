@@ -42,7 +42,7 @@ const (
 	codexMaxTokens   = 128000
 	// upstreamCatalog is the published package whose shipped catalog Tau
 	// mirrors. Bump it together with the vendored sources.
-	upstreamCatalog = "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-1.2.0.tgz"
+	upstreamCatalog = "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-1.5.0.tgz"
 	upstreamDataDir = "package/dist/providers/data/"
 )
 
@@ -248,17 +248,19 @@ func generateLegacyModels(ctx context.Context, client *http.Client) ([]*tauai.Mo
 	return dedupeModels(allModels), nil
 }
 
-// mergeCatalogs keeps every upstream entry and adds Tau's entries for
-// providers upstream does not ship. Entries are keyed by operation, so a chat
-// and an image model with the same id coexist.
+// mergeCatalogs keeps every upstream entry and adds Tau's entries upstream
+// does not list, so models published after the pinned upstream release still
+// appear. Entries are keyed by operation, so a chat and an image model with
+// the same id coexist.
 func mergeCatalogs(upstream, legacy []*tauai.Model) []*tauai.Model {
-	providers := map[string]bool{}
+	type key struct{ provider, id, kind string }
+	seen := map[key]bool{}
 	for _, model := range upstream {
-		providers[model.Provider] = true
+		seen[key{model.Provider, model.ID, model.Type}] = true
 	}
 	models := slices.Clone(upstream)
 	for _, model := range legacy {
-		if !providers[model.Provider] {
+		if !seen[key{model.Provider, model.ID, model.Type}] {
 			models = append(models, model)
 		}
 	}
@@ -361,11 +363,22 @@ func loadUpstreamCatalog(r io.Reader) ([]*tauai.Model, error) {
 	return models, nil
 }
 
+// dropDeprecated removes models.dev entries the provider has retired, so
+// they don't fill gaps the upstream catalog leaves on purpose.
+func dropDeprecated(payload modelsDevResponse) {
+	for _, provider := range payload {
+		maps.DeleteFunc(provider.Models, func(_ string, model modelsDevModel) bool {
+			return model.Status == "deprecated"
+		})
+	}
+}
+
 func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, error) {
 	var payload modelsDevResponse
 	if err := fetchJSON(ctx, client, modelsDevURL, &payload); err != nil {
 		return nil, err
 	}
+	dropDeprecated(payload)
 
 	var result []*tauai.Model
 
@@ -437,7 +450,7 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 			continue
 		}
 		for id, model := range data.Models {
-			if !model.ToolCall || model.Status == "deprecated" {
+			if !model.ToolCall {
 				continue
 			}
 
@@ -482,7 +495,7 @@ func loadModelsDev(ctx context.Context, client *http.Client) ([]*tauai.Model, er
 
 	if data, ok := payload["github-copilot"]; ok {
 		for id, model := range data.Models {
-			if !model.ToolCall || model.Status == "deprecated" {
+			if !model.ToolCall {
 				continue
 			}
 

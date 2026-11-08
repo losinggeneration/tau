@@ -607,8 +607,8 @@ func TestDefaultModelPerProvider(t *testing.T) {
 	if DefaultModelPerProvider["anthropic"] != "claude-opus-4-8" {
 		t.Errorf("anthropic default: got %q, want %q", DefaultModelPerProvider["anthropic"], "claude-opus-4-8")
 	}
-	if DefaultModelPerProvider["openai"] != "gpt-5.5" {
-		t.Errorf("openai default: got %q, want %q", DefaultModelPerProvider["openai"], "gpt-5.5")
+	if DefaultModelPerProvider["openai"] != "gpt-6.1-sol" {
+		t.Errorf("openai default: got %q, want %q", DefaultModelPerProvider["openai"], "gpt-6.1-sol")
 	}
 	if DefaultModelPerProvider["google"] != "gemini-3.1-pro-preview" {
 		t.Errorf("google default: got %q, want %q", DefaultModelPerProvider["google"], "gemini-3.1-pro-preview")

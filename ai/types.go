@@ -213,17 +213,21 @@ type VercelGatewayRouting struct {
 // Pointer flags keep an explicit false from the catalog, which overrides
 // detection; plain flags are only ever set to true.
 type CompatibilitySettings struct {
-	SupportsStore                               *bool                 `json:"supportsStore,omitempty"`
-	SupportsDeveloperRole                       *bool                 `json:"supportsDeveloperRole,omitempty"`
-	SupportsReasoningEffort                     *bool                 `json:"supportsReasoningEffort,omitempty"`
-	SupportsUsageInStreaming                    *bool                 `json:"supportsUsageInStreaming,omitempty"`
-	SupportsFinishReason                        *bool                 `json:"supportsFinishReason,omitempty"`
-	SupportsStrictMode                          *bool                 `json:"supportsStrictMode,omitempty"`
-	SupportsMaxOutputTokens                     *bool                 `json:"supportsMaxOutputTokens,omitempty"`
-	SupportsLongCacheRetention                  *bool                 `json:"supportsLongCacheRetention,omitempty"`
-	SupportsTemperature                         *bool                 `json:"supportsTemperature,omitempty"`
-	SupportsEagerToolInputStreaming             *bool                 `json:"supportsEagerToolInputStreaming,omitempty"`
-	SupportsCacheControlOnTools                 *bool                 `json:"supportsCacheControlOnTools,omitempty"`
+	SupportsStore                   *bool `json:"supportsStore,omitempty"`
+	SupportsDeveloperRole           *bool `json:"supportsDeveloperRole,omitempty"`
+	SupportsReasoningEffort         *bool `json:"supportsReasoningEffort,omitempty"`
+	SupportsUsageInStreaming        *bool `json:"supportsUsageInStreaming,omitempty"`
+	SupportsFinishReason            *bool `json:"supportsFinishReason,omitempty"`
+	SupportsStrictMode              *bool `json:"supportsStrictMode,omitempty"`
+	SupportsMaxOutputTokens         *bool `json:"supportsMaxOutputTokens,omitempty"`
+	SupportsLongCacheRetention      *bool `json:"supportsLongCacheRetention,omitempty"`
+	SupportsTemperature             *bool `json:"supportsTemperature,omitempty"`
+	SupportsEagerToolInputStreaming *bool `json:"supportsEagerToolInputStreaming,omitempty"`
+	SupportsCacheControlOnTools     *bool `json:"supportsCacheControlOnTools,omitempty"`
+	// ImageInput is how a System One classifier takes images: "assets",
+	// "images" or "state-image-urls". Empty detects it from the provider.
+	ImageInput                                  string                `json:"imageInput,omitempty"`
+	SendImageOptInHeader                        *bool                 `json:"sendImageOptInHeader,omitempty"`
 	ReasoningEffortMap                          map[string]string     `json:"reasoningEffortMap,omitempty"`
 	OpenRouterRouting                           *OpenRouterRouting    `json:"openRouterRouting,omitempty"`
 	VercelGatewayRouting                        *VercelGatewayRouting `json:"vercelGatewayRouting,omitempty"`
@@ -426,6 +430,7 @@ type Model struct {
 	// Lab, Enabled, and Providers describe models of catalog services, such
 	// as Radius, that route each model to one of several providers.
 	Lab       string                 `json:"lab,omitempty"`
+	Free      bool                   `json:"free,omitempty"`
 	Enabled   *bool                  `json:"enabled,omitempty"`
 	Providers []ModelServingProvider `json:"providers,omitempty"`
 }

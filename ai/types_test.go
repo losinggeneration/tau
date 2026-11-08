@@ -616,11 +616,11 @@ func TestCatalogCompatExplicitFalseOverridesDetection(t *testing.T) {
 func TestModelDecodesShippedCatalogMetadata(t *testing.T) {
 	entry := `{"type":"chat","id":"claude-fable-5","name":"Claude Fable 5","api":"anthropic-messages","provider":"anthropic","baseUrl":"https://api.anthropic.com","reasoning":true,"input":["text","image"],
 	"cost":{"input":10,"output":50,"cacheRead":1,"cacheWrite":12.5,"tiers":[{"inputTokensAbove":200000,"input":20,"output":75,"cacheRead":2,"cacheWrite":25}]},"contextWindow":1000000,"maxTokens":128000,
-	"compat":{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true,"supportsMidConvoToolAdditions":true,"forceAdaptiveThinking":true,"supportsStrictTools":true,"allowEmptySignature":true,"supportsLongCacheRetention":false,"supportsTemperature":false,"supportsMidConvoEffort":true,"cacheControlFormat":"anthropic","sessionAffinityFormat":"openai-nosession","supportsOpenAIGrammarTools":true,"supportsAdditionalTools":true,"supportsToolSearch":true,"supportsExplicitPromptCacheMode":true,"supportsEagerToolInputStreaming":false,"supportsCacheControlOnTools":false,"requiresReasoningContentOnAssistantMessages":true,"chatTemplateArgs":{"enable_thinking":{"$var":"thinking.enabled"}},
+	"compat":{"supportsMidConvoSystemMessages":true,"supportsMidConvoToolChanges":true,"supportsMidConvoToolAdditions":true,"forceAdaptiveThinking":true,"supportsStrictTools":true,"allowEmptySignature":true,"supportsLongCacheRetention":false,"supportsTemperature":false,"supportsMidConvoEffort":true,"cacheControlFormat":"anthropic","sessionAffinityFormat":"openai-nosession","supportsOpenAIGrammarTools":true,"supportsAdditionalTools":true,"supportsToolSearch":true,"supportsExplicitPromptCacheMode":true,"supportsEagerToolInputStreaming":false,"supportsCacheControlOnTools":false,"imageInput":"assets","sendImageOptInHeader":false,"requiresReasoningContentOnAssistantMessages":true,"chatTemplateArgs":{"enable_thinking":{"$var":"thinking.enabled"}},
 	"allowedFallbackModels":[{"provider":"anthropic","model":"claude-opus-4-8","cost":{"input":5,"output":25,"cacheRead":0.5,"cacheWrite":6.25}}]},
 	"thinkingLevelMap":{"off":null,"xhigh":"xhigh"},"promptCache":{"short":300,"long":3600},
 	"inputLimits":{"maxRequestBytes":33554432,"images":{"maxPerRequest":600,"resize":{"maxWidth":2000,"maxHeight":2000,"maxBytes":4718592,"jpegQuality":80}}},
-	"lab":"Anthropic","enabled":true,"providers":[{"id":"fireworks","name":"Fireworks AI","credential":"radius","source":"radius"}]}`
+	"lab":"Anthropic","enabled":true,"free":true,"providers":[{"id":"fireworks","name":"Fireworks AI","credential":"radius","source":"radius"}]}`
 	decoder := json.NewDecoder(strings.NewReader(entry))
 	decoder.DisallowUnknownFields()
 	var model Model
@@ -628,10 +628,10 @@ func TestModelDecodesShippedCatalogMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	compat := model.Compat
-	if compat == nil || !compat.ForceAdaptiveThinking || compat.SupportsLongCacheRetention == nil || *compat.SupportsLongCacheRetention || compat.SupportsTemperature == nil || len(compat.AllowedFallbackModels) != 1 || compat.AllowedFallbackModels[0].Cost.Input != 5 || string(compat.ChatTemplateArgs) == "" {
+	if compat == nil || !compat.ForceAdaptiveThinking || compat.SupportsLongCacheRetention == nil || *compat.SupportsLongCacheRetention || compat.SupportsTemperature == nil || len(compat.AllowedFallbackModels) != 1 || compat.AllowedFallbackModels[0].Cost.Input != 5 || string(compat.ChatTemplateArgs) == "" || compat.ImageInput != "assets" || compat.SendImageOptInHeader == nil || *compat.SendImageOptInHeader {
 		t.Fatalf("compat = %+v", compat)
 	}
-	if model.PromptCache == nil || model.PromptCache.Long != 3600 || model.Lab != "Anthropic" || model.Enabled == nil || !*model.Enabled || len(model.Providers) != 1 || model.Providers[0].Credential != "radius" || len(model.Cost.Tiers) != 1 {
+	if model.PromptCache == nil || model.PromptCache.Long != 3600 || model.Lab != "Anthropic" || model.Enabled == nil || !*model.Enabled || len(model.Providers) != 1 || model.Providers[0].Credential != "radius" || len(model.Cost.Tiers) != 1 || !model.Free {
 		t.Fatalf("model = %+v", model)
 	}
 }

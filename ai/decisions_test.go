@@ -373,6 +373,93 @@ func TestSystemOneClassifiersShareProtocolAcrossTransports(t *testing.T) {
 	}
 }
 
+func TestSystemOneClassifierImageInput(t *testing.T) {
+	png := ContentBlock{Type: "image", MimeType: "image/png", Data: "AAAA"}
+	webp := ContentBlock{Type: "image", MimeType: "image/webp", Data: "BBBB"}
+	tests := []struct {
+		name, api, provider, id, imageInput string
+		images                              []ContentBlock
+		want                                string
+		header                              string
+		err                                 string
+	}{
+		{
+			name: "typesafe assets", api: APITypesafeSystemOne, provider: "typesafe", id: "jev", images: []ContentBlock{png},
+			want: `{"assets":{"<image-1>":{"data_base64":"AAAA","format":"png","type":"image"}},"state":["<image-1>",{"text":"x"}]}`, header: "true",
+		},
+		{
+			name: "openrouter image urls", api: APITypesafeSystemOne, provider: "openrouter", id: "jev", images: []ContentBlock{webp},
+			want: `{"state":[{"image_url":{"url":"data:image/webp;base64,BBBB"},"type":"image_url"},{"text":"x"}]}`,
+		},
+		{
+			name: "clef data urls", api: APICloudflareWorkersAISystemOne, provider: "cloudflare-workers-ai", id: "@cf/cloudflare/clef", images: []ContentBlock{png, webp},
+			want: `{"images":["data:image/png;base64,AAAA","data:image/webp;base64,BBBB"],"state":{"text":"x"}}`,
+		},
+		{
+			name: "catalog compat wins", api: APITypesafeSystemOne, provider: "typesafe", id: "jev", imageInput: "images", images: []ContentBlock{webp},
+			want: `{"images":["data:image/webp;base64,BBBB"],"state":{"text":"x"}}`, header: "true",
+		},
+		{
+			name: "assets reject webp", api: APITypesafeSystemOne, provider: "typesafe", id: "jev", images: []ContentBlock{webp},
+			err: "System One API accepts PNG and JPEG images for jev, got image/webp",
+		},
+		{
+			name: "clef caps images", api: APICloudflareWorkersAISystemOne, provider: "cloudflare-workers-ai", id: "@cf/cloudflare/clef", images: []ContentBlock{png, png, png, png, png},
+			err: "Cloudflare Workers AI accepts at most 4 images for @cf/cloudflare/clef, got 5",
+		},
+	}
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got, header string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				header = r.Header.Get("TypeSafe-Danger-Zone-Images")
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if input, ok := body["input"].(map[string]any); ok {
+					body = input
+				}
+				delete(body, "model")
+				delete(body, "questions")
+				var encoded strings.Builder
+				encoder := json.NewEncoder(&encoded)
+				encoder.SetEscapeHTML(false)
+				if err := encoder.Encode(body); err != nil {
+					t.Error(err)
+				}
+				got = strings.TrimSpace(encoded.String())
+				if _, err := io.WriteString(w, `{"success":true,"result":{"answers":{"safe":{"type":"noul","noul":0.9}}},"answers":{"safe":{"type":"noul","noul":0.9}}}`); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer server.Close()
+			model := &Model{Type: "classifier", ID: tt.id, API: tt.api, Provider: tt.provider, BaseURL: server.URL, Input: []InputType{"text", "image"}}
+			if tt.imageInput != "" {
+				model.Compat = &CompatibilitySettings{ImageInput: tt.imageInput}
+			}
+			_, err := Classify(t.Context(), model, ClassifierContext{
+				State:     map[string]any{"text": "x"},
+				Images:    tt.images,
+				Questions: map[string]ClassifierQuestion{"safe": {Type: "bool"}},
+			}, WithAPIKey("key"))
+			if tt.err != "" {
+				if err == nil || err.Error() != tt.err {
+					t.Fatalf("err = %v, want %s", err, tt.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want || header != tt.header {
+				t.Fatalf("body = %s header = %q, want %s %q", got, header, tt.want, tt.header)
+			}
+		})
+	}
+}
+
 func TestSystemOneClassifierErrorsKeepBilledUsage(t *testing.T) {
 	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
 	tests := []struct{ api, body, want string }{

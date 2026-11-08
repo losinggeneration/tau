@@ -48,9 +48,9 @@ func TestGitHubCopilotModelLookup(t *testing.T) {
 		wantErr  bool
 	}{
 		{"github-copilot", "claude-sonnet-4.6", false},
-		{"github-copilot", "claude-opus-4.7", false},
+		{"github-copilot", "claude-opus-4.8", false},
 		{"github-copilot", "claude-haiku-4.5", false},
-		{"github-copilot", "gpt-5-mini", false},
+		{"github-copilot", "gpt-5.4-nano", false},
 		{"github-copilot", "nonexistent", true},
 	}
 
@@ -141,7 +141,7 @@ func TestGitHubCopilotCanGetClient(t *testing.T) {
 
 // TestGitHubCopilotOpenAIResponses verifies Copilot also supports OpenAI Responses API.
 func TestGitHubCopilotOpenAIResponses(t *testing.T) {
-	model, err := GetAvailableModel("github-copilot", "gpt-5-mini")
+	model, err := GetAvailableModel("github-copilot", "gpt-5.4-nano")
 	if err != nil {
 		t.Fatalf("GetAvailableModel: %v", err)
 	}

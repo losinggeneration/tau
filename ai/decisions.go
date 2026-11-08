@@ -2,6 +2,7 @@ package ai
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -394,9 +395,6 @@ func classifySystemOne(ctx context.Context, model *Model, input ClassifierContex
 	if model.API == APICloudflareWorkersAISystemOne {
 		label = "Cloudflare Workers AI"
 	}
-	if len(input.Images) > 0 {
-		return nil, fmt.Errorf("%s does not support image input", label)
-	}
 	if key == "" {
 		return nil, fmt.Errorf("no API key for provider: %s", model.Provider)
 	}
@@ -409,6 +407,18 @@ func classifySystemOne(ctx context.Context, model *Model, input ClassifierContex
 		questions[id] = map[string]any{"type": kind, "instructions": question.Instructions, "criteria": question.Criteria}
 	}
 	request := map[string]any{"state": input.State, "questions": questions}
+	if len(input.Images) > 0 {
+		imageInput, optIn := systemOneImageCompat(model)
+		if err := addSystemOneImages(label, model.ID, imageInput, input.Images, request); err != nil {
+			return nil, err
+		}
+		if optIn {
+			withHeader := *cfg
+			withHeader.headers = map[string]string{"TypeSafe-Danger-Zone-Images": "true"}
+			maps.Copy(withHeader.headers, cfg.headers)
+			cfg = &withHeader
+		}
+	}
 	payload := map[string]any{"model": model.ID}
 	baseURL, err := expandBaseURLWithEnv(strings.TrimRight(model.BaseURL, "/"), cfg.providerEnvValue)
 	if err != nil {
@@ -480,6 +490,70 @@ func classifySystemOne(ctx context.Context, model *Model, input ClassifierContex
 		result.Answers[id] = encoded
 	}
 	return result, nil
+}
+
+// systemOneImageCompat returns how the model takes images and whether it needs
+// TypeSafe's image opt-in header. Catalog compat wins over detection.
+func systemOneImageCompat(model *Model) (imageInput string, optIn bool) {
+	switch {
+	case model.API == APICloudflareWorkersAISystemOne && strings.HasPrefix(model.ID, "@cf/cloudflare/clef"):
+		imageInput = "images"
+	case model.API == APICloudflareWorkersAISystemOne:
+		imageInput = "assets"
+	case model.Provider == "openrouter" || strings.Contains(model.BaseURL, "openrouter.ai"):
+		imageInput = "state-image-urls"
+	default:
+		imageInput, optIn = "assets", true
+	}
+	if model.Compat != nil {
+		imageInput = cmp.Or(model.Compat.ImageInput, imageInput)
+		if model.Compat.SendImageOptInHeader != nil {
+			optIn = *model.Compat.SendImageOptInHeader
+		}
+	}
+	return imageInput, optIn
+}
+
+// addSystemOneImages adds images in the service's form. Clef takes at most
+// four data URLs, OpenRouter takes image_url parts ahead of the state, and
+// TypeSafe takes an assets map whose names the state must reference.
+func addSystemOneImages(label, id, imageInput string, images []ContentBlock, request map[string]any) error {
+	dataURL := func(image ContentBlock) string { return "data:" + image.MimeType + ";base64," + image.Data }
+	switch imageInput {
+	case "images":
+		if len(images) > 4 {
+			return fmt.Errorf("%s accepts at most 4 images for %s, got %d", label, id, len(images))
+		}
+		urls := make([]string, len(images))
+		for i, image := range images {
+			if !slices.Contains([]string{"image/png", "image/jpeg", "image/webp"}, image.MimeType) {
+				return fmt.Errorf("%s accepts PNG, JPEG, and WebP images for %s, got %s", label, id, image.MimeType)
+			}
+			urls[i] = dataURL(image)
+		}
+		request["images"] = urls
+	case "state-image-urls":
+		state := make([]any, 0, len(images)+1)
+		for _, image := range images {
+			state = append(state, map[string]any{"type": "image_url", "image_url": map[string]string{"url": dataURL(image)}})
+		}
+		request["state"] = append(state, request["state"])
+	default:
+		assets := make(map[string]any, len(images))
+		state := make([]any, 0, len(images)+1)
+		for i, image := range images {
+			format, ok := map[string]string{"image/png": "png", "image/jpeg": "jpeg"}[image.MimeType]
+			if !ok {
+				return fmt.Errorf("%s accepts PNG and JPEG images for %s, got %s", label, id, image.MimeType)
+			}
+			name := fmt.Sprintf("<image-%d>", i+1)
+			assets[name] = map[string]string{"type": "image", "format": format, "data_base64": image.Data}
+			state = append(state, name)
+		}
+		request["assets"] = assets
+		request["state"] = append(state, request["state"])
+	}
+	return nil
 }
 
 type systemOneResult struct {
