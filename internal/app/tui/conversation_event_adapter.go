@@ -167,6 +167,31 @@ func (a *conversationEventAdapter) handleAgentEnd() {
 func (a *conversationEventAdapter) handleMessageEnd(ev sdk.Event) {
 	app := a.app
 	role, _ := plString(ev.Payload, "role")
+	if role == "custom" {
+		display, _ := plBool(ev.Payload, "display")
+		if !display {
+			return
+		}
+		id := payloadMessageID(ev.Payload)
+		if entry, _ := plString(ev.Payload, "entry_id"); entry != "" {
+			id = entry
+		}
+		if id != "" {
+			if _, seen := a.finalizedUserMessages[id]; seen {
+				return
+			}
+			if a.finalizedUserMessages == nil {
+				a.finalizedUserMessages = make(map[string]struct{})
+			}
+			a.finalizedUserMessages[id] = struct{}{}
+		}
+		content, _ := plString(ev.Payload, "content")
+		if content != "" {
+			app.conv.AddSystem(content)
+			app.noteNewMessage()
+		}
+		return
+	}
 	if role == "user" {
 		messageID := payloadMessageID(ev.Payload)
 		if messageID != "" {

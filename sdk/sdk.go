@@ -1044,7 +1044,13 @@ func (s *agentSession) SendCustomMessage(ctx context.Context, custom CustomMessa
 			return err
 		}
 		go func() {
-			for range events {
+			for event := range events {
+				s.mu.Lock()
+				observer := s.eventObserver
+				s.mu.Unlock()
+				if observer != nil {
+					observer(event)
+				}
 			}
 		}()
 		return nil
@@ -2687,6 +2693,10 @@ func (s *agentSession) IsPersisted() bool {
 }
 
 func pluginAgentTool(mgr *plugins.Manager, pt plugins.ToolHandlerDesc) agent.Tool {
+	return sessionPluginAgentTool(mgr, pt, func() string { return "" })
+}
+
+func sessionPluginAgentTool(mgr *plugins.Manager, pt plugins.ToolHandlerDesc, sessionID func() string) agent.Tool {
 	var outputSchema map[string]any
 	var namespace *agent.ToolNamespace
 	var namespaceErr error
@@ -2768,7 +2778,7 @@ func pluginAgentTool(mgr *plugins.Manager, pt plugins.ToolHandlerDesc) agent.Too
 			if err != nil {
 				return nil, fmt.Errorf("marshal plugin args: %w", err)
 			}
-			result, err := mgr.ExecutePluginToolResult(ctx.Context, pt.Name, ctx.ToolCallID, string(argsJSON))
+			result, err := mgr.ExecutePluginToolResultForSession(ctx.Context, sessionID(), pt.Name, ctx.ToolCallID, string(argsJSON))
 			if err != nil {
 				return nil, fmt.Errorf("plugin tool error: %w", err)
 			}
@@ -2844,7 +2854,7 @@ func (s *agentSession) reloadToolRegistryLocked() error {
 	var nextNames []string
 	for _, registered := range s.pluginManager.Tools() {
 		nextNames = append(nextNames, registered.Name)
-		candidate := pluginAgentTool(s.pluginManager, registered)
+		candidate := sessionPluginAgentTool(s.pluginManager, registered, func() string { return s.id })
 		selected := selectSessionTools([]agent.Tool{candidate}, s.toolAllowlist, s.toolDenylist)
 		for _, tool := range selected {
 			if index := slices.IndexFunc(tools, func(existing agent.Tool) bool { return existing.Name == tool.Name }); index >= 0 {
@@ -4642,6 +4652,8 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 					"finish_reason": string(e.Message.StopReason),
 					"error_message": e.Message.ErrorMessage,
 					"durationMs":    e.Message.DurationMs,
+					"custom_type":   e.Message.CustomType,
+					"display":       e.Message.Display,
 				},
 			})
 			if usage != nil {
@@ -5924,7 +5936,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		if !r.noTools {
 			pluginTools := mgr.Tools()
 			for _, pt := range pluginTools {
-				tool := pluginAgentTool(mgr, pt)
+				tool := sessionPluginAgentTool(mgr, pt, func() string { return hookSession.id })
 				agentCfg.Tools = append(agentCfg.Tools, tool)
 			}
 		}
@@ -6169,7 +6181,7 @@ agentCreation:
 			}
 			return discoverSessionTools(ctx, loadout, req)
 		})
-		r.pluginManager.SetCustomMessageSender(func(ctx context.Context, raw json.RawMessage, trigger *bool, deliverAs string) error {
+		sendCustom := func(ctx context.Context, origin string, raw json.RawMessage, trigger *bool, deliverAs string) error {
 			var wire struct {
 				CustomType string          `json:"customType"`
 				Content    json.RawMessage `json:"content"`
@@ -6191,13 +6203,21 @@ agentCreation:
 			}
 			r.mu.Lock()
 			sess := r.currentSession
+			if origin != "" && (sess == nil || sess.ID() != origin) {
+				r.mu.Unlock()
+				return errors.New("originating session is no longer active")
+			}
 			r.mu.Unlock()
 			sender, ok := sess.(CustomMessageSender)
 			if !ok {
 				return errors.New("no active custom message session")
 			}
 			return sender.SendCustomMessage(ctx, CustomMessage{CustomType: wire.CustomType, Content: content, Display: wire.Display, Details: wire.Details}, CustomMessageOptions{TriggerTurn: trigger, DeliverAs: deliverAs})
+		}
+		r.pluginManager.SetCustomMessageSender(func(ctx context.Context, raw json.RawMessage, trigger *bool, delivery string) error {
+			return sendCustom(ctx, "", raw, trigger, delivery)
 		})
+		r.pluginManager.SetSessionCustomMessageSender(sendCustom)
 		r.pluginManager.SetMessageSender(func(text, deliverAs string) error {
 			r.mu.Lock()
 			sess := r.currentSession

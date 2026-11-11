@@ -451,30 +451,31 @@ var Plugin_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	Host_UIConfirm_FullMethodName                = "/plugins.Host/UIConfirm"
-	Host_UISelect_FullMethodName                 = "/plugins.Host/UISelect"
-	Host_UIInput_FullMethodName                  = "/plugins.Host/UIInput"
-	Host_UINotify_FullMethodName                 = "/plugins.Host/UINotify"
-	Host_UISetStatus_FullMethodName              = "/plugins.Host/UISetStatus"
-	Host_UISetWidget_FullMethodName              = "/plugins.Host/UISetWidget"
-	Host_UISetTitle_FullMethodName               = "/plugins.Host/UISetTitle"
-	Host_UISetEditorText_FullMethodName          = "/plugins.Host/UISetEditorText"
-	Host_UISetToolsExpanded_FullMethodName       = "/plugins.Host/UISetToolsExpanded"
-	Host_Log_FullMethodName                      = "/plugins.Host/Log"
-	Host_GetConfig_FullMethodName                = "/plugins.Host/GetConfig"
-	Host_ToolProgress_FullMethodName             = "/plugins.Host/ToolProgress"
-	Host_StateGet_FullMethodName                 = "/plugins.Host/StateGet"
-	Host_StateSet_FullMethodName                 = "/plugins.Host/StateSet"
-	Host_StateAppend_FullMethodName              = "/plugins.Host/StateAppend"
-	Host_StateDelete_FullMethodName              = "/plugins.Host/StateDelete"
-	Host_SessionAppend_FullMethodName            = "/plugins.Host/SessionAppend"
-	Host_SessionScan_FullMethodName              = "/plugins.Host/SessionScan"
-	Host_SessionSetLabel_FullMethodName          = "/plugins.Host/SessionSetLabel"
-	Host_SessionGetLabel_FullMethodName          = "/plugins.Host/SessionGetLabel"
-	Host_SessionSendUserMessage_FullMethodName   = "/plugins.Host/SessionSendUserMessage"
-	Host_SessionSendCustomMessage_FullMethodName = "/plugins.Host/SessionSendCustomMessage"
-	Host_SessionCompact_FullMethodName           = "/plugins.Host/SessionCompact"
-	Host_ToolDiscovery_FullMethodName            = "/plugins.Host/ToolDiscovery"
+	Host_UIConfirm_FullMethodName                         = "/plugins.Host/UIConfirm"
+	Host_UISelect_FullMethodName                          = "/plugins.Host/UISelect"
+	Host_UIInput_FullMethodName                           = "/plugins.Host/UIInput"
+	Host_UINotify_FullMethodName                          = "/plugins.Host/UINotify"
+	Host_UISetStatus_FullMethodName                       = "/plugins.Host/UISetStatus"
+	Host_UISetWidget_FullMethodName                       = "/plugins.Host/UISetWidget"
+	Host_UISetTitle_FullMethodName                        = "/plugins.Host/UISetTitle"
+	Host_UISetEditorText_FullMethodName                   = "/plugins.Host/UISetEditorText"
+	Host_UISetToolsExpanded_FullMethodName                = "/plugins.Host/UISetToolsExpanded"
+	Host_Log_FullMethodName                               = "/plugins.Host/Log"
+	Host_GetConfig_FullMethodName                         = "/plugins.Host/GetConfig"
+	Host_ToolProgress_FullMethodName                      = "/plugins.Host/ToolProgress"
+	Host_StateGet_FullMethodName                          = "/plugins.Host/StateGet"
+	Host_StateSet_FullMethodName                          = "/plugins.Host/StateSet"
+	Host_StateAppend_FullMethodName                       = "/plugins.Host/StateAppend"
+	Host_StateDelete_FullMethodName                       = "/plugins.Host/StateDelete"
+	Host_SessionAppend_FullMethodName                     = "/plugins.Host/SessionAppend"
+	Host_SessionScan_FullMethodName                       = "/plugins.Host/SessionScan"
+	Host_SessionSetLabel_FullMethodName                   = "/plugins.Host/SessionSetLabel"
+	Host_SessionGetLabel_FullMethodName                   = "/plugins.Host/SessionGetLabel"
+	Host_SessionSendUserMessage_FullMethodName            = "/plugins.Host/SessionSendUserMessage"
+	Host_SessionSendCustomMessage_FullMethodName          = "/plugins.Host/SessionSendCustomMessage"
+	Host_SessionSendCustomMessageToSession_FullMethodName = "/plugins.Host/SessionSendCustomMessageToSession"
+	Host_SessionCompact_FullMethodName                    = "/plugins.Host/SessionCompact"
+	Host_ToolDiscovery_FullMethodName                     = "/plugins.Host/ToolDiscovery"
 )
 
 // HostClient is the client API for Host service.
@@ -518,6 +519,8 @@ type HostClient interface {
 	// Mirrors pi's pi.sendUserMessage semantics.
 	SessionSendUserMessage(ctx context.Context, in *SessionSendUserMessageRequest, opts ...grpc.CallOption) (*SessionSendUserMessageResponse, error)
 	SessionSendCustomMessage(ctx context.Context, in *SessionSendCustomMessageRequest, opts ...grpc.CallOption) (*SessionSendUserMessageResponse, error)
+	// Explicitly addressed delivery; older hosts return Unimplemented.
+	SessionSendCustomMessageToSession(ctx context.Context, in *SessionSendCustomMessageRequest, opts ...grpc.CallOption) (*SessionSendUserMessageResponse, error)
 	// Compact the active session (same path as auto-compaction and /compact).
 	SessionCompact(ctx context.Context, in *SessionCompactRequest, opts ...grpc.CallOption) (*SessionCompactResponse, error)
 	// Searches, describes, or activates tools in the active session's registry.
@@ -752,6 +755,16 @@ func (c *hostClient) SessionSendCustomMessage(ctx context.Context, in *SessionSe
 	return out, nil
 }
 
+func (c *hostClient) SessionSendCustomMessageToSession(ctx context.Context, in *SessionSendCustomMessageRequest, opts ...grpc.CallOption) (*SessionSendUserMessageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SessionSendUserMessageResponse)
+	err := c.cc.Invoke(ctx, Host_SessionSendCustomMessageToSession_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *hostClient) SessionCompact(ctx context.Context, in *SessionCompactRequest, opts ...grpc.CallOption) (*SessionCompactResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SessionCompactResponse)
@@ -813,6 +826,8 @@ type HostServer interface {
 	// Mirrors pi's pi.sendUserMessage semantics.
 	SessionSendUserMessage(context.Context, *SessionSendUserMessageRequest) (*SessionSendUserMessageResponse, error)
 	SessionSendCustomMessage(context.Context, *SessionSendCustomMessageRequest) (*SessionSendUserMessageResponse, error)
+	// Explicitly addressed delivery; older hosts return Unimplemented.
+	SessionSendCustomMessageToSession(context.Context, *SessionSendCustomMessageRequest) (*SessionSendUserMessageResponse, error)
 	// Compact the active session (same path as auto-compaction and /compact).
 	SessionCompact(context.Context, *SessionCompactRequest) (*SessionCompactResponse, error)
 	// Searches, describes, or activates tools in the active session's registry.
@@ -892,6 +907,9 @@ func (UnimplementedHostServer) SessionSendUserMessage(context.Context, *SessionS
 }
 func (UnimplementedHostServer) SessionSendCustomMessage(context.Context, *SessionSendCustomMessageRequest) (*SessionSendUserMessageResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SessionSendCustomMessage not implemented")
+}
+func (UnimplementedHostServer) SessionSendCustomMessageToSession(context.Context, *SessionSendCustomMessageRequest) (*SessionSendUserMessageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SessionSendCustomMessageToSession not implemented")
 }
 func (UnimplementedHostServer) SessionCompact(context.Context, *SessionCompactRequest) (*SessionCompactResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SessionCompact not implemented")
@@ -1316,6 +1334,24 @@ func _Host_SessionSendCustomMessage_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Host_SessionSendCustomMessageToSession_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SessionSendCustomMessageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostServer).SessionSendCustomMessageToSession(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Host_SessionSendCustomMessageToSession_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostServer).SessionSendCustomMessageToSession(ctx, req.(*SessionSendCustomMessageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Host_SessionCompact_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SessionCompactRequest)
 	if err := dec(in); err != nil {
@@ -1446,6 +1482,10 @@ var Host_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SessionSendCustomMessage",
 			Handler:    _Host_SessionSendCustomMessage_Handler,
+		},
+		{
+			MethodName: "SessionSendCustomMessageToSession",
+			Handler:    _Host_SessionSendCustomMessageToSession_Handler,
 		},
 		{
 			MethodName: "SessionCompact",

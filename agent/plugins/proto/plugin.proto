@@ -76,6 +76,8 @@ service Host {
     // Mirrors pi's pi.sendUserMessage semantics.
     rpc SessionSendUserMessage(SessionSendUserMessageRequest) returns (SessionSendUserMessageResponse);
     rpc SessionSendCustomMessage(SessionSendCustomMessageRequest) returns (SessionSendUserMessageResponse);
+    // Explicitly addressed delivery; older hosts return Unimplemented.
+    rpc SessionSendCustomMessageToSession(SessionSendCustomMessageRequest) returns (SessionSendUserMessageResponse);
     // Compact the active session (same path as auto-compaction and /compact).
     rpc SessionCompact(SessionCompactRequest) returns (SessionCompactResponse);
 
@@ -463,6 +465,8 @@ message SessionSendUserMessageResponse {
 }
 
 message SessionSendCustomMessageRequest {
+    // Optional origin. Hosts must reject scoped requests if routing is unavailable.
+    string session_id = 4;
     string message_json = 1;
     optional bool trigger_turn = 2;
     string deliver_as = 3;

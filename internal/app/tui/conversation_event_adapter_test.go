@@ -221,3 +221,22 @@ func TestSuccessfulReloadUpdatesLiveKeybindings(t *testing.T) {
 	}
 	assert.Contains(t, fmt.Sprint(app.conv.Messages()), "keybindings: using defaults")
 }
+
+func TestDisplayedCustomCompletionRendersOnce(t *testing.T) {
+	a := newTestApp(t)
+	event := sdk.Event{Type: "message_end", Payload: map[string]any{"role": "custom", "custom_type": "subagent_completion", "display": true, "content": "Subagent completion: ready", "entry_id": "completion-entry"}}
+	a.handleEvent(event)
+	a.handleEvent(event)
+	count := 0
+	for _, message := range a.conv.Messages() {
+		if strings.Contains(message.Text, "Subagent completion: ready") {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count)
+	event.Payload = map[string]any{"role": "custom", "display": false, "content": "hidden"}
+	a.handleEvent(event)
+	for _, message := range a.conv.Messages() {
+		assert.NotEqual(t, "hidden", message.Text)
+	}
+}

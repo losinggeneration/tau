@@ -630,6 +630,15 @@ func (m *Manager) SetCustomMessageSender(sender func(context.Context, json.RawMe
 	m.customMessageSender = sender
 }
 
+// SetSessionCustomMessageSender installs explicitly addressed custom delivery.
+// The callback must capture the target session or reject it without falling back
+// to the active conversation.
+func (m *Manager) SetSessionCustomMessageSender(sender func(context.Context, string, json.RawMessage, *bool, string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionCustomMessageSender = sender
+}
+
 // SessionSendCustomMessage implements extension custom-message delivery.
 func (h *HostService) SessionSendCustomMessage(ctx context.Context, req *proto.SessionSendCustomMessageRequest) (*proto.SessionSendUserMessageResponse, error) {
 	if err := ctx.Err(); err != nil {
@@ -645,7 +654,16 @@ func (h *HostService) SessionSendCustomMessage(ctx context.Context, req *proto.S
 	}
 	h.manager.mu.RLock()
 	sender := h.manager.customMessageSender
+	scoped := h.manager.sessionCustomMessageSender
 	h.manager.mu.RUnlock()
+	if req.SessionId != "" {
+		if scoped == nil {
+			return nil, status.Error(codes.Unavailable, "session-addressed custom message sender not configured")
+		}
+		sender = func(ctx context.Context, raw json.RawMessage, trigger *bool, delivery string) error {
+			return scoped(ctx, req.SessionId, raw, trigger, delivery)
+		}
+	}
 	if sender == nil {
 		return nil, status.Error(codes.Unavailable, "custom message sender not configured")
 	}
@@ -686,4 +704,13 @@ func (h *HostService) ToolDiscovery(ctx context.Context, req *proto.ToolDiscover
 		return nil, status.Errorf(codes.FailedPrecondition, "discover tools: %v", err)
 	}
 	return &proto.ToolDiscoveryResponse{ResultJson: string(result)}, nil
+}
+
+// SessionSendCustomMessageToSession requires an explicit originating session.
+// This separate method fails closed on hosts predating addressed delivery.
+func (h *HostService) SessionSendCustomMessageToSession(ctx context.Context, req *proto.SessionSendCustomMessageRequest) (*proto.SessionSendUserMessageResponse, error) {
+	if req.SessionId == "" {
+		return nil, status.Error(codes.InvalidArgument, "originating session is required")
+	}
+	return h.SessionSendCustomMessage(ctx, req)
 }

@@ -231,8 +231,9 @@ type Manager struct {
 	// messageSender routes plugin sendUserMessage calls to the active
 	// session's Send/Steer/FollowUp methods. May be nil.
 	// deliverAs: "" -> Send (normal); "steer" -> Steer; "followUp" -> FollowUp.
-	messageSender       func(text string, deliverAs string) error
-	customMessageSender func(context.Context, json.RawMessage, *bool, string) error
+	messageSender              func(text string, deliverAs string) error
+	customMessageSender        func(context.Context, json.RawMessage, *bool, string) error
+	sessionCustomMessageSender func(context.Context, string, json.RawMessage, *bool, string) error
 
 	// compactor routes plugin SessionCompact calls to the active session's
 	// Compact. May be nil.
@@ -1501,6 +1502,10 @@ func (m *Manager) executeTool(ctx context.Context, pluginName, toolName, toolCal
 }
 
 func (m *Manager) executeToolResult(ctx context.Context, pluginName, toolName, toolCallID, arguments string) (*proto.ToolResult, error) {
+	return m.executeSessionToolResult(ctx, "", pluginName, toolName, toolCallID, arguments)
+}
+
+func (m *Manager) executeSessionToolResult(ctx context.Context, sessionID, pluginName, toolName, toolCallID, arguments string) (*proto.ToolResult, error) {
 	m.mu.RLock()
 	info, ok := m.plugins[pluginName]
 	if !ok {
@@ -1515,7 +1520,7 @@ func (m *Manager) executeToolResult(ctx context.Context, pluginName, toolName, t
 	}
 	execCtx, cancel := context.WithTimeout(ctx, timeouts.ExecuteTool)
 	defer cancel()
-	result, err := client.ExecuteTool(execCtx, &proto.ToolCall{ToolName: toolName, ToolCallId: toolCallID, Arguments: arguments})
+	result, err := client.ExecuteTool(execCtx, &proto.ToolCall{ToolName: toolName, ToolCallId: toolCallID, Arguments: arguments, SessionId: sessionID})
 	if err != nil {
 		return nil, fmt.Errorf("execute tool: %w", err)
 	}
@@ -2204,6 +2209,12 @@ func (m *Manager) broadcastToolProgress(event ToolProgressEvent) {
 
 // ExecutePluginToolResult retains structured plugin output while supporting legacy handlers.
 func (m *Manager) ExecutePluginToolResult(ctx context.Context, toolName, toolCallID, arguments string) (*proto.ToolResult, error) {
+	return m.ExecutePluginToolResultForSession(ctx, "", toolName, toolCallID, arguments)
+}
+
+// ExecutePluginToolResultForSession dispatches with the originating session's
+// identity. Callers must capture it from the owning session, not the active UI.
+func (m *Manager) ExecutePluginToolResultForSession(ctx context.Context, sessionID, toolName, toolCallID, arguments string) (*proto.ToolResult, error) {
 	m.mu.RLock()
 	var pluginName, localName string
 	for name, info := range m.plugins {
@@ -2217,7 +2228,7 @@ func (m *Manager) ExecutePluginToolResult(ctx context.Context, toolName, toolCal
 	}
 	m.mu.RUnlock()
 	if pluginName != "" {
-		return m.executeToolResult(ctx, pluginName, localName, toolCallID, arguments)
+		return m.executeSessionToolResult(ctx, sessionID, pluginName, localName, toolCallID, arguments)
 	}
 	output, isError, err := m.ExecutePluginTool(ctx, toolName, toolCallID, arguments)
 	if err != nil {

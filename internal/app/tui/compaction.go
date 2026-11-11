@@ -42,7 +42,12 @@ func (a *App) wireSessionEvents() {
 // goroutine raised it, so it only schedules; applySessionEvent does the work on
 // the loop.
 func (a *App) onSessionEvent(e sdk.Event) {
-	a.post(func(_ *tauui.UpdateCtx) { a.applySessionEvent(e) })
+	a.post(func(_ *tauui.UpdateCtx) {
+		if e.SessionID != "" && (a.sess == nil || a.sess.ID() != e.SessionID) {
+			return
+		}
+		a.applySessionEvent(e)
+	})
 }
 
 // applySessionEvent applies an out-of-band session event. Runs on the app loop.
@@ -79,6 +84,8 @@ func (a *App) applySessionEvent(e sdk.Event) {
 		}
 		a.refreshChat()
 		a.refreshFooterStats(a.loopContext())
+	default:
+		a.handleEvent(e)
 	}
 }
 

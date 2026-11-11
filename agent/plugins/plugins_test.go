@@ -2568,3 +2568,26 @@ func TestReloadReplacesSlashCommandMetadataAndRemovesStaleCommands(t *testing.T)
 	require.NoError(t, manager.Reload(t.Context()))
 	require.Empty(t, registry.List())
 }
+
+func TestPluginToolOriginDoesNotFollowActiveSession(t *testing.T) {
+	manager := NewManager(t.TempDir(), nil, nil)
+	active := "replacement"
+	manager.SetSessionIDProvider(func() string { return active })
+	manager.plugins["test"] = &PluginInfo{Registrations: Registrations{Tools: []ToolRegistration{{Name: "lookup"}}}, grpcClient: &mockPluginClient{onExecuteTool: func(_ context.Context, call *proto.ToolCall) (*proto.ToolResult, error) {
+		return &proto.ToolResult{Output: call.SessionId}, nil
+	}}}
+	result, err := manager.ExecutePluginToolResult(t.Context(), "lookup", "unscoped", "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "" {
+		t.Fatalf("unscoped call guessed ownership: %q", result.Output)
+	}
+	result, err = manager.ExecutePluginToolResultForSession(t.Context(), "origin", "lookup", "scoped", "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "origin" {
+		t.Fatalf("call followed active session %q instead of origin: %q", active, result.Output)
+	}
+}

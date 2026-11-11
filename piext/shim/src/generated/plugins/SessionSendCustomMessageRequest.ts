@@ -5,6 +5,7 @@ export interface SessionSendCustomMessageRequest {
   'messageJson'?: (string);
   'triggerTurn'?: (boolean);
   'deliverAs'?: (string);
+  'sessionId'?: (string);
   '_triggerTurn'?: "triggerTurn";
 }
 
@@ -12,4 +13,5 @@ export interface SessionSendCustomMessageRequest__Output {
   'messageJson'?: (string);
   'triggerTurn'?: (boolean);
   'deliverAs'?: (string);
+  'sessionId'?: (string);
 }

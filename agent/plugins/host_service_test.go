@@ -188,3 +188,27 @@ func TestStateStoreInitializationSharesOneWriter(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, workers)
 }
+
+func TestScopedCustomMessageFailsClosed(t *testing.T) {
+	manager := NewManager(t.TempDir(), ui.NewNoOpUI(), nil)
+	host := NewHostService(manager)
+	var unscoped int
+	manager.SetCustomMessageSender(func(context.Context, json.RawMessage, *bool, string) error { unscoped++; return nil })
+	request := &proto.SessionSendCustomMessageRequest{SessionId: "origin", MessageJson: `{"customType":"notice","content":"completed"}`, TriggerTurn: new(true)}
+	_, err := host.SessionSendCustomMessage(t.Context(), request)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	assert.Zero(t, unscoped, "a scoped request must never fall back to active-session routing")
+	var calls int
+	manager.SetSessionCustomMessageSender(func(_ context.Context, id string, _ json.RawMessage, trigger *bool, _ string) error {
+		calls++
+		assert.Equal(t, "origin", id)
+		require.NotNil(t, trigger)
+		assert.True(t, *trigger)
+		return nil
+	})
+	response, err := host.SessionSendCustomMessage(t.Context(), request)
+	require.NoError(t, err)
+	assert.True(t, response.Ok)
+	assert.Equal(t, 1, calls)
+	assert.Zero(t, unscoped)
+}

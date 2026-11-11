@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -8651,6 +8652,7 @@ type loadoutPluginClient struct {
 	initialized   int
 	closed        int
 	localName     string
+	sessionID     string
 }
 
 func (c *loadoutPluginClient) Initialize(context.Context, *proto.InitRequest, ...grpc.CallOption) (*proto.InitResponse, error) {
@@ -8664,6 +8666,7 @@ func (c *loadoutPluginClient) ListRegistrations(context.Context, *proto.ListRegi
 
 func (c *loadoutPluginClient) ExecuteTool(_ context.Context, call *proto.ToolCall, _ ...grpc.CallOption) (*proto.ToolResult, error) {
 	c.localName = call.ToolName
+	c.sessionID = call.SessionId
 	return &proto.ToolResult{Output: "registered output", StructuredContent: `[1,null]`}, nil
 }
 
@@ -8736,6 +8739,7 @@ func TestPluginManagerSessionStartupAndReload(t *testing.T) {
 	result, err := lookup.Execute(agent.ToolContext{Context: t.Context(), ToolCallID: "initial", Args: map[string]any{}})
 	require.NoError(t, err)
 	require.Equal(t, "lookup", first.localName)
+	require.Equal(t, s.ID(), first.sessionID)
 	require.Equal(t, "registered output", result.Content)
 	require.JSONEq(t, `[1,null]`, string(result.StructuredContent))
 
@@ -8754,6 +8758,7 @@ func TestPluginManagerSessionStartupAndReload(t *testing.T) {
 	_, err = lookup.Execute(agent.ToolContext{Context: t.Context(), ToolCallID: "replacement", Args: map[string]any{}})
 	require.NoError(t, err)
 	require.Equal(t, "lookup", second.localName)
+	require.Equal(t, s.ID(), second.sessionID)
 	response, err = host.ToolDiscovery(t.Context(), &proto.ToolDiscoveryRequest{Operation: "registered"})
 	require.NoError(t, err)
 	require.Contains(t, response.ResultJson, "ext_added")
@@ -8766,10 +8771,51 @@ func TestPluginManagerSessionStartupAndReload(t *testing.T) {
 	require.Len(t, provider.LastPrompt().Tools, 1)
 	require.Equal(t, "ext_lookup", provider.LastPrompt().Tools[0].Name)
 
+	// Hold an old-session call before dispatch while a replacement is created.
+	preparing, release, returned := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	probe := pluginProgressMarshalProbe(func() ([]byte, error) {
+		close(preparing)
+		select {
+		case <-release:
+			return []byte(`"delayed"`), nil
+		case <-t.Context().Done():
+			return nil, t.Context().Err()
+		}
+	})
+	go func() {
+		_, err := lookup.Execute(agent.ToolContext{Context: t.Context(), ToolCallID: "switch-race", Args: map[string]any{"probe": probe}})
+		returned <- err
+	}()
+	select {
+	case <-preparing:
+	case <-t.Context().Done():
+		t.Fatal("old tool did not start preparation")
+	}
 	fresh, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true, ToolDenylist: []string{"ext_denied"}})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, fresh.Close(testContext(t))) })
 	require.ElementsMatch(t, []string{"ext_lookup", "ext_added"}, fresh.(ToolLoadout).ActiveTools())
+	close(release)
+	select {
+	case err := <-returned:
+		require.NoError(t, err)
+	case <-t.Context().Done():
+		t.Fatal("old tool did not settle")
+	}
+	require.Equal(t, s.ID(), second.sessionID)
+
+	// A retained descriptor and a refreshed descriptor still belong to the old
+	// session after another session becomes the runtime's active session.
+	_, err = lookup.Execute(agent.ToolContext{Context: t.Context(), ToolCallID: "old-after-switch", Args: map[string]any{}})
+	require.NoError(t, err)
+	require.Equal(t, s.ID(), second.sessionID)
+	require.NoError(t, s.ReloadToolRegistry(t.Context()))
+	_, err = s.DescribeTool("ext_lookup").Execute(agent.ToolContext{Context: t.Context(), ToolCallID: "old-refreshed", Args: map[string]any{}})
+	require.NoError(t, err)
+	require.Equal(t, s.ID(), second.sessionID)
+	_, err = fresh.(ToolLoadout).DescribeTool("ext_lookup").Execute(agent.ToolContext{Context: t.Context(), ToolCallID: "new", Args: map[string]any{}})
+	require.NoError(t, err)
+	require.Equal(t, fresh.ID(), second.sessionID)
 
 	for _, tc := range []struct {
 		name                          string
@@ -12108,4 +12154,167 @@ func TestResolvePromptInputWarnsAndKeepsUnreadablePathLiteral(t *testing.T) {
 	missing := filepath.Join(path, "missing.md")
 	assert.Equal(t, missing, r.resolvePromptInput(missing))
 	assert.Empty(t, logs.String())
+}
+
+func TestScopedHostCustomDeliveryRejectsReplacement(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	manager := agentplugins.NewManager(t.TempDir(), ui.NewNoOpUI(), nil)
+	rt, err := NewRuntime(RuntimeOptions{SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model, PluginManager: manager, Compaction: &CompactionSettings{Disabled: true}})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	origin, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	replacement, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	host := agentplugins.NewHostService(manager)
+	req := &proto.SessionSendCustomMessageRequest{SessionId: origin.ID(), MessageJson: `{"customType":"completion","content":"old result","display":true}`}
+	_, err = host.SessionSendCustomMessageToSession(t.Context(), req)
+	require.Error(t, err)
+	assert.Len(t, replacement.(*agentSession).agent.Messages(), 1)
+	req.SessionId = replacement.ID()
+	response, err := host.SessionSendCustomMessageToSession(t.Context(), req)
+	require.NoError(t, err)
+	assert.True(t, response.Ok)
+	messages := replacement.(*agentSession).agent.Messages()
+	require.Len(t, messages, 2)
+	assert.Equal(t, "completion", messages[1].CustomType)
+	assert.True(t, messages[1].Display)
+	assert.Len(t, origin.(*agentSession).agent.Messages(), 1)
+}
+
+func TestScopedHostCompletionStartsOrJoinsTurn(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		t.Run(strconv.FormatBool(busy), func(t *testing.T) {
+			_, model := registerRecordingProvider(t, "reply")
+			manager := agentplugins.NewManager(t.TempDir(), ui.NewNoOpUI(), nil)
+			rt, err := NewRuntime(RuntimeOptions{SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model, PluginManager: manager, Compaction: &CompactionSettings{Disabled: true}})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+			sess, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+			require.NoError(t, err)
+			s := sess.(*agentSession)
+			var observedMu sync.Mutex
+			var observed []Event
+			observedEnd := make(chan struct{})
+			s.SetEventObserver(func(event Event) {
+				observedMu.Lock()
+				defer observedMu.Unlock()
+				observed = append(observed, event)
+				if event.Type == "session_end" {
+					close(observedEnd)
+				}
+			})
+			host := agentplugins.NewHostService(manager)
+			send := func() {
+				response, err := host.SessionSendCustomMessageToSession(t.Context(), &proto.SessionSendCustomMessageRequest{SessionId: s.ID(), MessageJson: `{"customType":"completion","content":"completed","display":true}`, TriggerTurn: new(true), DeliverAs: "followUp"})
+				require.NoError(t, err)
+				assert.True(t, response.Ok)
+			}
+			if busy {
+				var once sync.Once
+				manager.RegisterEventHandler("turn_end", agentplugins.EventHandler{Handler: func(context.Context, string, json.RawMessage, string) agentplugins.EventResponse {
+					once.Do(send)
+					return agentplugins.EventResponse{}
+				}})
+				events, err := s.SendText(t.Context(), "start")
+				require.NoError(t, err)
+				collectSessionEvents(t, events)
+			} else {
+				send()
+				s.mu.Lock()
+				done := s.runDone
+				s.mu.Unlock()
+				require.NotNil(t, done)
+				select {
+				case <-done:
+				case <-t.Context().Done():
+					t.Fatal("completion turn did not settle")
+				}
+			}
+			if !busy {
+				select {
+				case <-observedEnd:
+				case <-t.Context().Done():
+					t.Fatal("observer did not settle")
+				}
+			}
+			observedMu.Lock()
+			events := slices.Clone(observed)
+			observedMu.Unlock()
+			if busy {
+				assert.Empty(t, events, "busy-run events belong only to Send")
+			} else {
+				notices := 0
+				settles := 0
+				for _, event := range events {
+					if event.Type == "message_end" {
+						payload, _ := event.Payload.(map[string]any)
+						if payload["role"] == "custom" {
+							notices++
+							assert.Equal(t, true, payload["display"])
+							assert.Equal(t, "completion", payload["custom_type"])
+						}
+					}
+					if event.Type == "session_end" {
+						settles++
+					}
+				}
+				assert.Equal(t, 1, notices)
+				assert.Equal(t, 1, settles)
+			}
+			count := 0
+			for _, message := range s.agent.Messages() {
+				if message.CustomType == "completion" {
+					count++
+					assert.True(t, message.Display)
+				}
+			}
+			assert.Equal(t, 1, count)
+			messages := s.agent.Messages()
+			assert.Equal(t, agent.RoleAssistant, messages[len(messages)-1].Role)
+		})
+	}
+}
+
+type capturedCustomSession struct {
+	Session
+	captured chan struct{}
+	release  chan struct{}
+}
+
+func (s *capturedCustomSession) SendCustomMessage(ctx context.Context, message CustomMessage, options CustomMessageOptions) error {
+	close(s.captured)
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.Session.(CustomMessageSender).SendCustomMessage(ctx, message, options)
+}
+
+func TestScopedCustomDeliveryCapturedBeforeSwitchKeepsOrigin(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	manager := agentplugins.NewManager(t.TempDir(), ui.NewNoOpUI(), nil)
+	rt, err := NewRuntime(RuntimeOptions{SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model, PluginManager: manager})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	origin, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	gate := &capturedCustomSession{Session: origin, captured: make(chan struct{}), release: make(chan struct{})}
+	runtime := rt.(*runtime)
+	runtime.mu.Lock()
+	runtime.currentSession = gate
+	runtime.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := agentplugins.NewHostService(manager).SessionSendCustomMessageToSession(t.Context(), &proto.SessionSendCustomMessageRequest{SessionId: origin.ID(), MessageJson: `{"customType":"completion","content":"origin only"}`})
+		done <- err
+	}()
+	<-gate.captured
+	replacement, err := rt.NewSession(t.Context(), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	close(gate.release)
+	require.NoError(t, <-done)
+	assert.Len(t, origin.(*agentSession).agent.Messages(), 2)
+	assert.Len(t, replacement.(*agentSession).agent.Messages(), 1)
 }

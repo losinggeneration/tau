@@ -3604,10 +3604,12 @@ func (x *SessionSendUserMessageResponse) GetError() string {
 }
 
 type SessionSendCustomMessageRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MessageJson   string                 `protobuf:"bytes,1,opt,name=message_json,json=messageJson,proto3" json:"message_json,omitempty"`
-	TriggerTurn   *bool                  `protobuf:"varint,2,opt,name=trigger_turn,json=triggerTurn,proto3,oneof" json:"trigger_turn,omitempty"`
-	DeliverAs     string                 `protobuf:"bytes,3,opt,name=deliver_as,json=deliverAs,proto3" json:"deliver_as,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional origin. Hosts must reject scoped requests if routing is unavailable.
+	SessionId     string `protobuf:"bytes,4,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	MessageJson   string `protobuf:"bytes,1,opt,name=message_json,json=messageJson,proto3" json:"message_json,omitempty"`
+	TriggerTurn   *bool  `protobuf:"varint,2,opt,name=trigger_turn,json=triggerTurn,proto3,oneof" json:"trigger_turn,omitempty"`
+	DeliverAs     string `protobuf:"bytes,3,opt,name=deliver_as,json=deliverAs,proto3" json:"deliver_as,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3640,6 +3642,13 @@ func (x *SessionSendCustomMessageRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use SessionSendCustomMessageRequest.ProtoReflect.Descriptor instead.
 func (*SessionSendCustomMessageRequest) Descriptor() ([]byte, []int) {
 	return file_plugin_proto_rawDescGZIP(), []int{65}
+}
+
+func (x *SessionSendCustomMessageRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
 }
 
 func (x *SessionSendCustomMessageRequest) GetMessageJson() string {
@@ -4172,8 +4181,10 @@ const file_plugin_proto_rawDesc = "" +
 	"deliver_as\x18\x02 \x01(\tR\tdeliverAs\"F\n" +
 	"\x1eSessionSendUserMessageResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"\x9c\x01\n" +
-	"\x1fSessionSendCustomMessageRequest\x12!\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"\xbb\x01\n" +
+	"\x1fSessionSendCustomMessageRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x04 \x01(\tR\tsessionId\x12!\n" +
 	"\fmessage_json\x18\x01 \x01(\tR\vmessageJson\x12&\n" +
 	"\ftrigger_turn\x18\x02 \x01(\bH\x00R\vtriggerTurn\x88\x01\x01\x12\x1d\n" +
 	"\n" +
@@ -4207,7 +4218,7 @@ const file_plugin_proto_rawDesc = "" +
 	"\n" +
 	"RouteModel\x12\x1a.plugins.ModelRouteRequest\x1a\x1b.plugins.ModelRouteResponse\x12<\n" +
 	"\n" +
-	"ReachTools\x12\x11.plugins.ToolCall\x1a\x1b.plugins.ReachToolsResponse2\xb4\x0e\n" +
+	"ReachTools\x12\x11.plugins.ToolCall\x1a\x1b.plugins.ReachToolsResponse2\xac\x0f\n" +
 	"\x04Host\x12B\n" +
 	"\tUIConfirm\x12\x19.plugins.UIConfirmRequest\x1a\x1a.plugins.UIConfirmResponse\x12?\n" +
 	"\bUISelect\x12\x18.plugins.UISelectRequest\x1a\x19.plugins.UISelectResponse\x12<\n" +
@@ -4231,7 +4242,8 @@ const file_plugin_proto_rawDesc = "" +
 	"\x0fSessionSetLabel\x12\x1f.plugins.SessionSetLabelRequest\x1a .plugins.SessionSetLabelResponse\x12T\n" +
 	"\x0fSessionGetLabel\x12\x1f.plugins.SessionGetLabelRequest\x1a .plugins.SessionGetLabelResponse\x12i\n" +
 	"\x16SessionSendUserMessage\x12&.plugins.SessionSendUserMessageRequest\x1a'.plugins.SessionSendUserMessageResponse\x12m\n" +
-	"\x18SessionSendCustomMessage\x12(.plugins.SessionSendCustomMessageRequest\x1a'.plugins.SessionSendUserMessageResponse\x12Q\n" +
+	"\x18SessionSendCustomMessage\x12(.plugins.SessionSendCustomMessageRequest\x1a'.plugins.SessionSendUserMessageResponse\x12v\n" +
+	"!SessionSendCustomMessageToSession\x12(.plugins.SessionSendCustomMessageRequest\x1a'.plugins.SessionSendUserMessageResponse\x12Q\n" +
 	"\x0eSessionCompact\x12\x1e.plugins.SessionCompactRequest\x1a\x1f.plugins.SessionCompactResponse\x12N\n" +
 	"\rToolDiscovery\x12\x1d.plugins.ToolDiscoveryRequest\x1a\x1e.plugins.ToolDiscoveryResponseB5Z3github.com/losinggeneration/tau/agent/plugins/protob\x06proto3"
 
@@ -4361,43 +4373,45 @@ var file_plugin_proto_depIdxs = []int32{
 	61, // 35: plugins.Host.SessionGetLabel:input_type -> plugins.SessionGetLabelRequest
 	63, // 36: plugins.Host.SessionSendUserMessage:input_type -> plugins.SessionSendUserMessageRequest
 	65, // 37: plugins.Host.SessionSendCustomMessage:input_type -> plugins.SessionSendCustomMessageRequest
-	66, // 38: plugins.Host.SessionCompact:input_type -> plugins.SessionCompactRequest
-	68, // 39: plugins.Host.ToolDiscovery:input_type -> plugins.ToolDiscoveryRequest
-	1,  // 40: plugins.Plugin.Initialize:output_type -> plugins.InitResponse
-	3,  // 41: plugins.Plugin.ListRegistrations:output_type -> plugins.Registrations
-	11, // 42: plugins.Plugin.OnEvent:output_type -> plugins.EventResponse
-	15, // 43: plugins.Plugin.ExecuteTool:output_type -> plugins.ToolResult
-	17, // 44: plugins.Plugin.ExecuteCommand:output_type -> plugins.CommandResult
-	19, // 45: plugins.Plugin.OnTerminalInput:output_type -> plugins.TerminalInputResponse
-	21, // 46: plugins.Plugin.Shutdown:output_type -> plugins.ShutdownResponse
-	6,  // 47: plugins.Plugin.RouteModel:output_type -> plugins.ModelRouteResponse
-	70, // 48: plugins.Plugin.ReachTools:output_type -> plugins.ReachToolsResponse
-	23, // 49: plugins.Host.UIConfirm:output_type -> plugins.UIConfirmResponse
-	25, // 50: plugins.Host.UISelect:output_type -> plugins.UISelectResponse
-	27, // 51: plugins.Host.UIInput:output_type -> plugins.UIInputResponse
-	29, // 52: plugins.Host.UINotify:output_type -> plugins.UINotifyResponse
-	31, // 53: plugins.Host.UISetStatus:output_type -> plugins.UISetStatusResponse
-	33, // 54: plugins.Host.UISetWidget:output_type -> plugins.UISetWidgetResponse
-	35, // 55: plugins.Host.UISetTitle:output_type -> plugins.UISetTitleResponse
-	37, // 56: plugins.Host.UISetEditorText:output_type -> plugins.UISetEditorTextResponse
-	39, // 57: plugins.Host.UISetToolsExpanded:output_type -> plugins.UISetToolsExpandedResponse
-	41, // 58: plugins.Host.Log:output_type -> plugins.LogResponse
-	43, // 59: plugins.Host.GetConfig:output_type -> plugins.GetConfigResponse
-	45, // 60: plugins.Host.ToolProgress:output_type -> plugins.ToolProgressResponse
-	47, // 61: plugins.Host.StateGet:output_type -> plugins.StateGetResponse
-	49, // 62: plugins.Host.StateSet:output_type -> plugins.StateSetResponse
-	51, // 63: plugins.Host.StateAppend:output_type -> plugins.StateAppendResponse
-	53, // 64: plugins.Host.StateDelete:output_type -> plugins.StateDeleteResponse
-	55, // 65: plugins.Host.SessionAppend:output_type -> plugins.SessionAppendResponse
-	57, // 66: plugins.Host.SessionScan:output_type -> plugins.SessionScanResponse
-	60, // 67: plugins.Host.SessionSetLabel:output_type -> plugins.SessionSetLabelResponse
-	62, // 68: plugins.Host.SessionGetLabel:output_type -> plugins.SessionGetLabelResponse
-	64, // 69: plugins.Host.SessionSendUserMessage:output_type -> plugins.SessionSendUserMessageResponse
-	64, // 70: plugins.Host.SessionSendCustomMessage:output_type -> plugins.SessionSendUserMessageResponse
-	67, // 71: plugins.Host.SessionCompact:output_type -> plugins.SessionCompactResponse
-	69, // 72: plugins.Host.ToolDiscovery:output_type -> plugins.ToolDiscoveryResponse
-	40, // [40:73] is the sub-list for method output_type
-	7,  // [7:40] is the sub-list for method input_type
+	65, // 38: plugins.Host.SessionSendCustomMessageToSession:input_type -> plugins.SessionSendCustomMessageRequest
+	66, // 39: plugins.Host.SessionCompact:input_type -> plugins.SessionCompactRequest
+	68, // 40: plugins.Host.ToolDiscovery:input_type -> plugins.ToolDiscoveryRequest
+	1,  // 41: plugins.Plugin.Initialize:output_type -> plugins.InitResponse
+	3,  // 42: plugins.Plugin.ListRegistrations:output_type -> plugins.Registrations
+	11, // 43: plugins.Plugin.OnEvent:output_type -> plugins.EventResponse
+	15, // 44: plugins.Plugin.ExecuteTool:output_type -> plugins.ToolResult
+	17, // 45: plugins.Plugin.ExecuteCommand:output_type -> plugins.CommandResult
+	19, // 46: plugins.Plugin.OnTerminalInput:output_type -> plugins.TerminalInputResponse
+	21, // 47: plugins.Plugin.Shutdown:output_type -> plugins.ShutdownResponse
+	6,  // 48: plugins.Plugin.RouteModel:output_type -> plugins.ModelRouteResponse
+	70, // 49: plugins.Plugin.ReachTools:output_type -> plugins.ReachToolsResponse
+	23, // 50: plugins.Host.UIConfirm:output_type -> plugins.UIConfirmResponse
+	25, // 51: plugins.Host.UISelect:output_type -> plugins.UISelectResponse
+	27, // 52: plugins.Host.UIInput:output_type -> plugins.UIInputResponse
+	29, // 53: plugins.Host.UINotify:output_type -> plugins.UINotifyResponse
+	31, // 54: plugins.Host.UISetStatus:output_type -> plugins.UISetStatusResponse
+	33, // 55: plugins.Host.UISetWidget:output_type -> plugins.UISetWidgetResponse
+	35, // 56: plugins.Host.UISetTitle:output_type -> plugins.UISetTitleResponse
+	37, // 57: plugins.Host.UISetEditorText:output_type -> plugins.UISetEditorTextResponse
+	39, // 58: plugins.Host.UISetToolsExpanded:output_type -> plugins.UISetToolsExpandedResponse
+	41, // 59: plugins.Host.Log:output_type -> plugins.LogResponse
+	43, // 60: plugins.Host.GetConfig:output_type -> plugins.GetConfigResponse
+	45, // 61: plugins.Host.ToolProgress:output_type -> plugins.ToolProgressResponse
+	47, // 62: plugins.Host.StateGet:output_type -> plugins.StateGetResponse
+	49, // 63: plugins.Host.StateSet:output_type -> plugins.StateSetResponse
+	51, // 64: plugins.Host.StateAppend:output_type -> plugins.StateAppendResponse
+	53, // 65: plugins.Host.StateDelete:output_type -> plugins.StateDeleteResponse
+	55, // 66: plugins.Host.SessionAppend:output_type -> plugins.SessionAppendResponse
+	57, // 67: plugins.Host.SessionScan:output_type -> plugins.SessionScanResponse
+	60, // 68: plugins.Host.SessionSetLabel:output_type -> plugins.SessionSetLabelResponse
+	62, // 69: plugins.Host.SessionGetLabel:output_type -> plugins.SessionGetLabelResponse
+	64, // 70: plugins.Host.SessionSendUserMessage:output_type -> plugins.SessionSendUserMessageResponse
+	64, // 71: plugins.Host.SessionSendCustomMessage:output_type -> plugins.SessionSendUserMessageResponse
+	64, // 72: plugins.Host.SessionSendCustomMessageToSession:output_type -> plugins.SessionSendUserMessageResponse
+	67, // 73: plugins.Host.SessionCompact:output_type -> plugins.SessionCompactResponse
+	69, // 74: plugins.Host.ToolDiscovery:output_type -> plugins.ToolDiscoveryResponse
+	41, // [41:75] is the sub-list for method output_type
+	7,  // [7:41] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
 	7,  // [7:7] is the sub-list for extension extendee
 	0,  // [0:7] is the sub-list for field type_name
