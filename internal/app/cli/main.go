@@ -2537,7 +2537,7 @@ func copyToClipboardWithXsel(text string) bool {
 func runRPC(ctx context.Context, cmd *cli.Command) error {
 	uiImpl := choosePrintModeUI()
 
-	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, nil)
+	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, rootCmdFromContext(ctx))
 	if err != nil {
 		return cli.Exit(err.Error(), ExitUserError)
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/losinggeneration/tau/agent"
+	"github.com/losinggeneration/tau/agent/artifacts"
 	"github.com/losinggeneration/tau/agent/plugins"
 	"github.com/losinggeneration/tau/agent/session"
 	"github.com/losinggeneration/tau/ai"
@@ -565,6 +566,21 @@ func (a *rpcCommandSession) Compact(ctx context.Context, customInstructions ...s
 		return fmt.Errorf("no active session")
 	}
 	return current.Compact(ctx, customInstructions...)
+}
+
+// ReloadResources forwards coordinated slash-command reload to the current session.
+func (a *rpcCommandSession) ReloadResources(ctx context.Context, settings *ai.Settings, resources *artifacts.PreparedReload, preparedPlugins *plugins.PreparedReload, name string) error {
+	a.server.sessionMu.Lock()
+	current := a.server.session
+	a.server.sessionMu.Unlock()
+	if current == nil {
+		return errors.New("no active session")
+	}
+	reloader, ok := current.(sdk.ResourceReloader)
+	if !ok {
+		return errors.New("session does not support coordinated resource reload")
+	}
+	return reloader.ReloadResources(ctx, settings, resources, preparedPlugins, name)
 }
 
 // handleGetState returns current session state.

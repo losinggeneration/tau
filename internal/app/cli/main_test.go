@@ -3537,3 +3537,26 @@ func TestForwardRPCSignalsSettlesOnClosedChannel(t *testing.T) {
 	close(signals)
 	forwardRPCSignals(context.Background(), signals, func() { t.Fatal("closed signal channel produced an interrupt") })
 }
+
+func TestRPCDiscoversExplicitExtension(t *testing.T) {
+	oldLoader, oldManager, oldCommands := sdk.GlobalArtifactLoader, GlobalPluginManager, GlobalCommandRegistry
+	t.Cleanup(func() {
+		sdk.GlobalArtifactLoader, GlobalPluginManager, GlobalCommandRegistry = oldLoader, oldManager, oldCommands
+	})
+	isolateBuildEnv(t)
+	extension := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(extension, "tau-package.toml"), []byte("not valid [toml"), 0o600))
+	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	require.NoError(t, cmd.Set("extension", extension))
+	input, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	previous := os.Stdin
+	os.Stdin = input
+	t.Cleanup(func() { os.Stdin = previous; require.NoError(t, input.Close()) })
+	ctx, diagnostics := withStartupDiagnostics(t.Context())
+	ctx = context.WithValue(ctx, rootCmdKey{}, cmd)
+	var result error
+	captureStdout(t, func() { result = runRPC(ctx, cmd) })
+	require.NoError(t, result)
+	require.Contains(t, strings.Join(diagnostics.Lines(), "\n"), "plugin discovery error", "RPC never inspected its explicit extension")
+}

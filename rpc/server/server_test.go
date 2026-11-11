@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/losinggeneration/tau/agent"
+	"github.com/losinggeneration/tau/agent/artifacts"
+	"github.com/losinggeneration/tau/agent/plugins"
+	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/sdk"
 )
 
@@ -428,5 +431,38 @@ func TestRunHandlesFinalCommandBeforeDisconnect(t *testing.T) {
 	}
 	if response.ID != "last" || response.OK || response.Error == nil || response.Error.Code != "unknown_command" {
 		t.Fatalf("response=%+v output=%s", response, output.String())
+	}
+}
+
+type reloadableRPCSession struct {
+	sdk.Session
+	called bool
+	cause  error
+}
+
+func (s *reloadableRPCSession) ReloadResources(context.Context, *ai.Settings, *artifacts.PreparedReload, *plugins.PreparedReload, string) error {
+	s.called = true
+	return s.cause
+}
+
+func TestRPCCommandSessionForwardsResourceReload(t *testing.T) {
+	cause := errors.New("reload failed")
+	session := &reloadableRPCSession{cause: cause}
+	server := &Server{session: session}
+	adapter := any(&rpcCommandSession{server: server})
+	reloader, ok := adapter.(sdk.ResourceReloader)
+	if !ok {
+		t.Fatal("RPC command adapter hides coordinated reload")
+	}
+	if err := reloader.ReloadResources(t.Context(), &ai.Settings{}, nil, nil, "worker"); !errors.Is(err, cause) || !session.called {
+		t.Fatalf("reload lost: %v", err)
+	}
+	server.session = nil
+	if err := reloader.ReloadResources(t.Context(), &ai.Settings{}, nil, nil, ""); err == nil {
+		t.Fatal("reload without session succeeded")
+	}
+	server.session = newMockSession("unsupported", "/")
+	if err := reloader.ReloadResources(t.Context(), &ai.Settings{}, nil, nil, ""); err == nil {
+		t.Fatal("unsupported reload succeeded")
 	}
 }
