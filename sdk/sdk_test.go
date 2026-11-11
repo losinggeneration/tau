@@ -12318,3 +12318,118 @@ func TestScopedCustomDeliveryCapturedBeforeSwitchKeepsOrigin(t *testing.T) {
 	assert.Len(t, origin.(*agentSession).agent.Messages(), 2)
 	assert.Len(t, replacement.(*agentSession).agent.Messages(), 1)
 }
+
+func TestContextFilesDirSeparatesInstructionsFromImplicitResources(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	private := t.TempDir()
+	global := t.TempDir()
+	cwd := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", private)
+	require.NoError(t, os.WriteFile(filepath.Join(global, "AGENTS.md"), []byte("GLOBAL_SAFETY_INSTRUCTIONS"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(global, "SYSTEM.md"), []byte("UNWANTED_SYSTEM_DISCOVERY"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(cwd, "AGENTS.md"), []byte("PROJECT_SAFETY_INSTRUCTIONS"), 0o600))
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, ContextFilesDir: global, SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{CWD: cwd, NoSession: true, SystemPrompt: "Child identity", AppendSystemPrompts: []string{}})
+	require.NoError(t, err)
+	system := ai.CurrentSystemPrompt(agent.ConvertMessagesToAI(sess.(*agentSession).agent.Messages()))
+	assert.Contains(t, system, "GLOBAL_SAFETY_INSTRUCTIONS")
+	assert.Contains(t, system, "PROJECT_SAFETY_INSTRUCTIONS")
+	assert.NotContains(t, system, "UNWANTED_SYSTEM_DISCOVERY")
+	require.NoError(t, os.WriteFile(filepath.Join(global, "AGENTS.md"), []byte("UPDATED_GLOBAL_SAFETY"), 0o600))
+	require.NoError(t, sess.(SystemPromptReloader).ReloadSystemPrompt(t.Context()))
+	assert.Contains(t, ai.CurrentSystemPrompt(agent.ConvertMessagesToAI(sess.(*agentSession).agent.Messages())), "UPDATED_GLOBAL_SAFETY")
+}
+
+func TestResumeActivatesNewPluginToolsWithoutRestoringRemovedTools(t *testing.T) {
+	provider, model := registerRecordingProvider(t, "reply")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "extensions", "loadout")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, []byte("not executed"), 0o700))
+	client := &loadoutPluginClient{registrations: &proto.Registrations{Tools: []*proto.ToolRegistration{{Name: "subagent"}, {Name: "disabled"}}}}
+	mgr := agentplugins.NewManager(dir, nil, nil, agentplugins.WithPluginConnector(func(context.Context, string, *agentplugins.Manifest, string, string) (proto.PluginClient, func(), error) {
+		return client, func() {}, nil
+	}))
+	_, err := mgr.Load(t.Context(), path)
+	require.NoError(t, err)
+	rt, err := NewRuntime(RuntimeOptions{PluginManager: mgr, NoBuiltinTools: true, NoContextFiles: true, ExplicitModel: model, CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, SessionsDir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{ToolDenylist: []string{"denied"}})
+	require.NoError(t, err)
+	s := sess.(*agentSession)
+	require.NoError(t, s.SetActiveTools(t.Context(), "subagent"))
+	events, err := sess.Send(t.Context(), Message{Text: "original"})
+	require.NoError(t, err)
+	collectSessionEvents(t, events)
+	id := sess.ID()
+	require.NoError(t, sess.Close(testContext(t)))
+	client.registrations.Tools = append(client.registrations.Tools,
+		&proto.ToolRegistration{Name: "subagent_run"}, &proto.ToolRegistration{Name: "subagent_parallel"},
+		&proto.ToolRegistration{Name: "denied"}, &proto.ToolRegistration{Name: "off", DefaultActive: new(false)},
+		&proto.ToolRegistration{Name: "deferred", Exposure: "deferred"}, &proto.ToolRegistration{Name: "hidden", Exposure: "hidden"})
+	require.NoError(t, mgr.ReloadNamed(t.Context(), "loadout"))
+	for attempt := range 2 {
+		resumed, err := rt.ResumeSession(t.Context(), id, SessionOptions{ToolDenylist: []string{"denied"}})
+		require.NoError(t, err)
+		events, err := resumed.Send(t.Context(), Message{Text: "resumed"})
+		require.NoError(t, err)
+		collectSessionEvents(t, events)
+		require.ElementsMatch(t, []string{"subagent", "subagent_run", "subagent_parallel"}, resumed.(ToolLoadout).ActiveTools(), "resume %d", attempt)
+		var names []string
+		for _, tool := range provider.LastPrompt().Tools {
+			names = append(names, tool.Name)
+		}
+		require.ElementsMatch(t, []string{"subagent", "subagent_run", "subagent_parallel"}, names)
+		if attempt == 0 {
+			require.NoError(t, resumed.Close(testContext(t)))
+			continue
+		}
+		// A settled explicit removal must survive later registry reloads.
+		loadout := resumed.(ToolLoadout)
+		require.NoError(t, loadout.SetActiveTools(t.Context(), "subagent", "subagent_run"))
+		events, err = resumed.Send(t.Context(), Message{Text: "disable parallel"})
+		require.NoError(t, err)
+		collectSessionEvents(t, events)
+		client.registrations.Tools = append(client.registrations.Tools, &proto.ToolRegistration{Name: "reload_added"})
+		require.NoError(t, mgr.ReloadNamed(t.Context(), "loadout"))
+		require.NoError(t, resumed.(ToolRegistryReloader).ReloadToolRegistry(t.Context()))
+		events, err = resumed.Send(t.Context(), Message{Text: "after reload"})
+		require.NoError(t, err)
+		collectSessionEvents(t, events)
+		require.Contains(t, loadout.ActiveTools(), "reload_added")
+		require.NotContains(t, loadout.ActiveTools(), "subagent_parallel")
+		require.NoError(t, resumed.Close(testContext(t)))
+	}
+}
+
+func TestSplitNewPluginToolsPreservesLoadoutBoundaries(t *testing.T) {
+	tools := []agent.Tool{{Name: "declared"}, {Name: "removed"}, {Name: "new"}, {Name: "builtin"}, {Name: "off", DefaultActive: new(false)}, {Name: "deferred", Exposure: agent.ToolDeferred}, {Name: "hidden", Exposure: agent.ToolHidden}}
+	pluginNames := []string{"declared", "removed", "new", "off", "deferred", "hidden"}
+	for _, tc := range []struct {
+		name     string
+		messages []*agent.Message
+		want     []string
+	}{
+		{name: "fresh"},
+		{name: "legacy", messages: []*agent.Message{agent.NewUserMessage("history")}},
+		{name: "empty canonical", messages: []*agent.Message{{Role: agent.RoleSystem, Timestamp: time.UnixMilli(0)}}, want: []string{"declared", "removed", "new"}},
+		{name: "removal and excluded entries", messages: []*agent.Message{
+			{Role: agent.RoleSystem, ToolsAdded: []ai.Tool{{Name: "declared"}}, ToolsRemoved: []ai.ToolReference{{Name: "removed"}}},
+			{Role: agent.RoleSystem, ExcludeFromContext: true, ToolsRemoved: []ai.ToolReference{{Name: "new"}}},
+		}, want: []string{"new"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			existing, added := splitNewPluginTools(tools, tc.messages, pluginNames)
+			var names []string
+			for _, tool := range added {
+				names = append(names, tool.Name)
+			}
+			require.Equal(t, tc.want, names)
+			require.Len(t, existing, len(tools)-len(added))
+			require.Len(t, tools, 7)
+		})
+	}
+}

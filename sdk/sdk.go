@@ -596,6 +596,9 @@ type RuntimeOptions struct {
 
 	// NoContextFiles disables AGENTS.md/CLAUDE.md discovery.
 	NoContextFiles bool
+	// ContextFilesDir overrides only the global context-file directory. Empty
+	// uses the Tau config directory. It does not enable other resource discovery.
+	ContextFilesDir string
 
 	// Provider forces a specific provider key (e.g. "anthropic", "openai")
 	// for credential resolution. When empty, the provider is derived from
@@ -4974,7 +4977,8 @@ type runtime struct {
 	// noBuiltinTools disables only built-in tools (grep, find, ls, read, write, edit, bash).
 	noBuiltinTools bool
 	// noContextFiles disables AGENTS.md/CLAUDE.md discovery.
-	noContextFiles bool
+	noContextFiles  bool
+	contextFilesDir string
 	// noEnvCredentials disables environment variable credential sources.
 	noEnvCredentials bool
 	// provider pins the provider key for credential resolution (CLI --provider).
@@ -5140,6 +5144,7 @@ func NewRuntime(opts RuntimeOptions) (Runtime, error) {
 		noTools:          opts.NoTools,
 		noBuiltinTools:   opts.NoBuiltinTools,
 		noContextFiles:   opts.NoContextFiles,
+		contextFilesDir:  opts.ContextFilesDir,
 		noEnvCredentials: opts.IgnoreEnv,
 		provider:         opts.Provider,
 		apiKey:           opts.APIKey,
@@ -6146,9 +6151,23 @@ agentCreation:
 		agentCfg.Tools = restoreDeclaredBuiltinTools(agentCfg.Tools, agentCfg.InitialMessages, settings, opts.ToolAllowlist, opts.ToolDenylist)
 	}
 
+	// Add previously unseen plugin defaults through the registry delta path so
+	// resumed declaration history keeps explicit removals and loaded tools.
+	var addedPluginTools []agent.Tool
+	if r.pluginManager != nil && !r.noTools {
+		var pluginNames []string
+		for _, tool := range r.pluginManager.Tools() {
+			pluginNames = append(pluginNames, tool.Name)
+		}
+		agentCfg.Tools, addedPluginTools = splitNewPluginTools(agentCfg.Tools, agentCfg.InitialMessages, pluginNames)
+	}
 	a, err := agent.New(agentCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create agent: %w", err)
+	}
+
+	if len(addedPluginTools) > 0 {
+		a.AddTools(addedPluginTools...)
 	}
 
 	// Update the runtime's current session ID so the plugin system
@@ -6378,6 +6397,35 @@ agentCreation:
 	}
 
 	return s, nil
+}
+
+func splitNewPluginTools(tools []agent.Tool, messages []*agent.Message, pluginNames []string) (existing, added []agent.Tool) {
+	mentioned := make(map[string]bool)
+	var hasHistory bool
+	for _, message := range messages {
+		if message == nil || message.Role != agent.RoleSystem || message.ExcludeFromContext {
+			continue
+		}
+		hasHistory = hasHistory || message.Timestamp.Equal(time.UnixMilli(0)) || len(message.ToolsAdded) > 0 || len(message.ToolsRemoved) > 0
+		for _, tool := range message.ToolsAdded {
+			mentioned[tool.Name] = true
+		}
+		for _, tool := range message.ToolsRemoved {
+			mentioned[tool.Name] = true
+		}
+	}
+	if !hasHistory {
+		return tools, nil
+	}
+	for _, tool := range tools {
+		defaultOn := (tool.DefaultActive == nil || *tool.DefaultActive) && (tool.Exposure == "" || tool.Exposure == agent.ToolDirect || tool.Exposure == agent.ToolModelOnly)
+		if defaultOn && !mentioned[tool.Name] && slices.Contains(pluginNames, tool.Name) {
+			added = append(added, tool)
+		} else {
+			existing = append(existing, tool)
+		}
+	}
+	return existing, added
 }
 
 func restoreDeclaredBuiltinTools(tools []agent.Tool, messages []*agent.Message, settings *ai.Settings, allow, deny []string) []agent.Tool {
@@ -6731,7 +6779,11 @@ func (r *runtime) buildSystemPromptWithSkills(cwd string, skills *artifacts.Skil
 func (r *runtime) buildSystemPromptWithPolicy(cwd string, skills *artifacts.SkillRegistry, override string, appends []string, settings *ai.Settings) (string, error) {
 	addendumParts := []string{fmt.Sprintf("Treat %s as the project root. Start project file discovery and searches there, and keep them scoped to it unless the user directs you elsewhere or the task explicitly requires external files.", cwd)}
 	if !r.noContextFiles {
-		contextAddendum, err := buildContextFileAddendum(paths.ConfigDir(), cwd)
+		contextDir := r.contextFilesDir
+		if contextDir == "" {
+			contextDir = paths.ConfigDir()
+		}
+		contextAddendum, err := buildContextFileAddendum(contextDir, cwd)
 		if err != nil {
 			return "", fmt.Errorf("load context files: %w", err)
 		}
