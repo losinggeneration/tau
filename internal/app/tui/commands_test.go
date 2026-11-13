@@ -35,7 +35,7 @@ func TestCommandsBuiltins(t *testing.T) {
 	want := []string{
 		"help", "model", "show-model", "quit",
 		"settings", "scoped-models", "export", "import",
-		"copy", "name", "session", "sessions", "mcp", "hotkeys", "layout", "fork", "forget",
+		"copy", "name", "session", "sessions", "mcp", "plugins", "hotkeys", "layout", "fork", "forget",
 		"tree", "login", "logout", "new", "compact", "retry", "resume", "history",
 	}
 	got := make([]string, 0, len(c.All()))
@@ -82,7 +82,7 @@ func TestCommandsFilter(t *testing.T) {
 		{"", []string{
 			"help", "model", "show-model", "quit",
 			"settings", "scoped-models", "export", "import",
-			"copy", "name", "session", "sessions", "mcp", "hotkeys", "layout", "fork", "forget",
+			"copy", "name", "session", "sessions", "mcp", "plugins", "hotkeys", "layout", "fork", "forget",
 			"tree", "login", "logout", "new", "compact", "retry", "resume", "history",
 		}},
 		{"h", []string{"help", "history", "hotkeys"}},
@@ -526,8 +526,8 @@ func TestCompletionItemsMergesExternal(t *testing.T) {
 	// entry. We don't assert the exact list ordering beyond the first
 	// five (the originals) so future stub additions don't break this
 	// test.
-	if len(items) != 26 {
-		t.Fatalf("completionItems = %d items, want 26 (25 local + 1 external)", len(items))
+	if len(items) != 27 {
+		t.Fatalf("completionItems = %d items, want 27 (26 local + 1 external)", len(items))
 	}
 	wantLocal := []string{"help", "model", "show-model", "quit", "settings"}
 	for i, name := range wantLocal {
@@ -574,9 +574,9 @@ func TestRegisterUnregisterAtRuntime(t *testing.T) {
 	// sessions, hotkeys, fork, tree, login, logout, new,
 	// compact, resume, history, layout, forget). /reload is not a TUI
 	// local — the session owns it. With 1 plugin registered, All()
-	// returns 26.
-	if got := len(c.All()); got != 26 {
-		t.Errorf("All() length = %d, want 26 (25 builtins + 1 plugin)", got)
+	// returns 27.
+	if got := len(c.All()); got != 27 {
+		t.Errorf("All() length = %d, want 27 (26 builtins + 1 plugin)", got)
 	}
 	if !c.Unregister("plugin-cmd") {
 		t.Error("Unregister(plugin-cmd) returned false")

@@ -18,6 +18,9 @@ const (
 	ToolCodemode  ToolExposure = "codemode"
 	ToolDeferred  ToolExposure = "deferred"
 	ToolHidden    ToolExposure = "hidden"
+	// ToolDisabled keeps a registered tool out of every loadout and rejects
+	// calls to it, so a stale call reports the tool as disabled.
+	ToolDisabled ToolExposure = "disabled"
 )
 
 type ToolNamespace struct {

@@ -292,6 +292,7 @@ type Settings struct {
 	resourceScopes map[string][2]settingsResourceScope
 	packageBase    string
 	packageScopes  *[2]PackageScope
+	toggleScopes   *[2]Toggles
 
 	// DefaultProjectTrust is global-only. Project settings cannot change it.
 	DefaultProjectTrust string `json:"defaultProjectTrust,omitempty"`
@@ -364,6 +365,8 @@ type Settings struct {
 	NPMCommand    []string        `json:"npmCommand,omitempty"`
 	EnabledModels []string        `json:"enabledModels,omitempty"`
 	DefaultTools  []string        `json:"defaultTools,omitzero"`
+	// Enabled is the project-over-global merge; see TogglesByScope for provenance.
+	Enabled Toggles `json:"enabled,omitzero"`
 
 	// Plugins holds arbitrary per-extension JSON, keyed by plugin/extension id.
 	// Round-trips unknown top-level keys so user extensions are preserved.
@@ -420,6 +423,105 @@ func (s *Settings) PackageSourcesByScope() (user, project PackageScope) {
 		return clonePackageScope(PackageScope{s.packageBase, s.Packages}), project
 	}
 	return clonePackageScope(s.packageScopes[0]), clonePackageScope(s.packageScopes[1])
+}
+
+// ToggleScope names where a plugin or tool toggle lives. Narrower scopes win.
+type ToggleScope string
+
+const (
+	ToggleSession ToggleScope = "session"
+	ToggleProject ToggleScope = "project"
+	ToggleGlobal  ToggleScope = "global"
+)
+
+// ToggleKind selects the entries a toggle names. It matches the JSON key.
+type ToggleKind string
+
+const (
+	TogglePlugin ToggleKind = "plugins"
+	ToggleTool   ToggleKind = "tools"
+)
+
+// Toggles enables or disables plugins and tools by name. false disables;
+// true re-enables something a broader scope disabled.
+type Toggles struct {
+	Plugins map[string]bool `json:"plugins,omitempty"`
+	Tools   map[string]bool `json:"tools,omitempty"`
+}
+
+func (t *Toggles) entries(kind ToggleKind) map[string]bool {
+	if kind == TogglePlugin {
+		return t.Plugins
+	}
+	return t.Tools
+}
+
+// Set records one entry.
+func (t *Toggles) Set(kind ToggleKind, name string, enabled bool) {
+	entries := &t.Tools
+	if kind == TogglePlugin {
+		entries = &t.Plugins
+	}
+	*entries = maps.Clone(*entries)
+	if *entries == nil {
+		*entries = make(map[string]bool)
+	}
+	(*entries)[name] = enabled
+}
+
+func mergeToggles(global, project Toggles) Toggles {
+	out := Toggles{Plugins: maps.Clone(global.Plugins), Tools: maps.Clone(global.Tools)}
+	for name, enabled := range project.Plugins {
+		out.Set(TogglePlugin, name, enabled)
+	}
+	for name, enabled := range project.Tools {
+		out.Set(ToggleTool, name, enabled)
+	}
+	return out
+}
+
+// TogglesByScope returns independent global and project snapshots. An
+// unmerged Settings value belongs to the global scope.
+func (s *Settings) TogglesByScope() (global, project Toggles) {
+	if s == nil {
+		return global, project
+	}
+	if s.toggleScopes == nil {
+		return mergeToggles(s.Enabled, Toggles{}), project
+	}
+	return mergeToggles(s.toggleScopes[0], Toggles{}), mergeToggles(s.toggleScopes[1], Toggles{})
+}
+
+// ResolveToggle checks session, project, then global and reports the first
+// scope naming the entry. Entries no scope names are enabled.
+func (s *Settings) ResolveToggle(session Toggles, kind ToggleKind, name string) (bool, ToggleScope) {
+	global, project := s.TogglesByScope()
+	for _, layer := range []struct {
+		scope   ToggleScope
+		toggles Toggles
+	}{{ToggleSession, session}, {ToggleProject, project}, {ToggleGlobal, global}} {
+		if enabled, ok := layer.toggles.entries(kind)[name]; ok {
+			return enabled, layer.scope
+		}
+	}
+	return true, ""
+}
+
+// WithToggle returns a copy with one entry set at the project or global scope.
+func (s *Settings) WithToggle(scope ToggleScope, kind ToggleKind, name string, enabled bool) *Settings {
+	var out Settings
+	if s != nil {
+		out = *s
+	}
+	global, project := s.TogglesByScope()
+	if scope == ToggleProject {
+		project.Set(kind, name, enabled)
+	} else {
+		global.Set(kind, name, enabled)
+	}
+	out.toggleScopes = &[2]Toggles{global, project}
+	out.Enabled = mergeToggles(global, project)
+	return &out
 }
 
 type settingsResourceScope struct {
@@ -865,6 +967,10 @@ func MergeSettings(user, project *Settings) *Settings {
 		projectPackages = clonePackageScope(PackageScope{project.packageBase, project.Packages})
 	}
 	out.packageScopes = &[2]PackageScope{userPackages, projectPackages}
+	userToggles, _ := user.TogglesByScope()
+	projectToggles, _ := project.TogglesByScope()
+	out.toggleScopes = &[2]Toggles{userToggles, projectToggles}
+	out.Enabled = mergeToggles(userToggles, projectToggles)
 
 	out.resourceBases = maps.Clone(user.resourceBases)
 	if out.resourceBases == nil {

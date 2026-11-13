@@ -2591,3 +2591,64 @@ func TestPluginToolOriginDoesNotFollowActiveSession(t *testing.T) {
 		t.Fatalf("call followed active session %q instead of origin: %q", active, result.Output)
 	}
 }
+
+type toggleClient struct {
+	mockPluginClient
+	mu     sync.Mutex
+	events []string
+}
+
+func (c *toggleClient) ListRegistrations(context.Context, *proto.ListRegistrationsRequest, ...grpc.CallOption) (*proto.Registrations, error) {
+	return &proto.Registrations{Tools: []*proto.ToolRegistration{{Name: "run"}}, EventSubscriptions: []string{"plugin_disabled"}}, nil
+}
+
+func (c *toggleClient) OnEvent(_ context.Context, req *proto.Event, _ ...grpc.CallOption) (*proto.EventResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, req.Name+":"+req.Payload)
+	return &proto.EventResponse{}, nil
+}
+
+func TestSettingsDisabledPluginNeverStarts(t *testing.T) {
+	cfg := t.TempDir()
+	dir := filepath.Join(cfg, "extensions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	for _, name := range []string{"on", "off"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(name), 0o700))
+	}
+	var mu sync.Mutex
+	started := map[string]*toggleClient{}
+	m := NewManager(cfg, nil, nil, WithPluginConnector(func(_ context.Context, path string, _ *Manifest, _, _ string) (proto.PluginClient, func(), error) {
+		mu.Lock()
+		defer mu.Unlock()
+		client := &toggleClient{mockPluginClient: mockPluginClient{gracefulResponse: true}}
+		started[filepath.Base(path)] = client
+		return client, func() {}, nil
+	}))
+	t.Cleanup(func() { require.NoError(t, m.Shutdown(t.Context())) })
+	m.SetSettings(&ai.Settings{Enabled: ai.Toggles{Plugins: map[string]bool{"off": false}}})
+	require.NoError(t, m.Discover(t.Context()))
+	require.Contains(t, started, "on")
+	require.NotContains(t, started, "off")
+	require.NoError(t, m.Reload(t.Context()))
+	require.NotContains(t, started, "off", "an unnamed reload must not start a disabled plugin")
+
+	statuses := m.PluginStatuses()
+	require.Equal(t, []PluginStatus{{Name: "off"}, {Name: "on", Loaded: true, Tools: []string{"run"}}}, statuses)
+	tools := m.Tools()
+	require.Len(t, tools, 1)
+	require.Equal(t, "on", tools[0].Plugin)
+
+	require.NoError(t, m.ReloadNamed(t.Context(), "off"))
+	require.Contains(t, started, "off", "a named reload starts a plugin the session enabled")
+
+	m.NotifyPlugin(t.Context(), "on", "plugin_disabled", json.RawMessage(`{"plugin":"on"}`), "s1")
+	m.NotifyPlugin(t.Context(), "on", "plugin_enabled", nil, "s1")
+	require.Equal(t, []string{`plugin_disabled:{"plugin":"on"}`}, started["on"].events, "only subscribed events reach the plugin")
+	require.Empty(t, started["off"].events)
+
+	// Trusting a project can turn off a plugin the global-only pass started.
+	m.SetSettings(&ai.Settings{Enabled: ai.Toggles{Plugins: map[string]bool{"on": false}}})
+	require.NoError(t, m.UnloadDisabled(t.Context()))
+	require.Equal(t, []PluginStatus{{Name: "off", Loaded: true, Tools: []string{"run"}}, {Name: "on"}}, m.PluginStatuses())
+}

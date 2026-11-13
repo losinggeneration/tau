@@ -823,8 +823,10 @@ type agentSession struct {
 	// appendSystemPrompts are appended after the resolved system prompt (CLI --append-system-prompt).
 	appendSystemPrompts []string
 	// toolAllowlist restricts the session's tool set (CLI --tools/-t). Empty means "no filter."
-	toolAllowlist    []string
-	pluginToolNames  []string
+	toolAllowlist   []string
+	pluginToolNames []string
+	// pluginToggles holds session-scoped /plugins choices.
+	pluginToggles    ai.Toggles
 	defaultToolNames []string
 	// toolDenylist removes tools from the session's tool set (CLI --exclude-tools/-xt).
 	toolDenylist []string
@@ -2857,7 +2859,7 @@ func (s *agentSession) reloadToolRegistryLocked() error {
 	var nextNames []string
 	for _, registered := range s.pluginManager.Tools() {
 		nextNames = append(nextNames, registered.Name)
-		candidate := sessionPluginAgentTool(s.pluginManager, registered, func() string { return s.id })
+		candidate := toggledPluginTool(sessionPluginAgentTool(s.pluginManager, registered, func() string { return s.id }), registered, s.settings, s.pluginToggles)
 		selected := selectSessionTools([]agent.Tool{candidate}, s.toolAllowlist, s.toolDenylist)
 		for _, tool := range selected {
 			if index := slices.IndexFunc(tools, func(existing agent.Tool) bool { return existing.Name == tool.Name }); index >= 0 {
@@ -5941,7 +5943,7 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 		if !r.noTools {
 			pluginTools := mgr.Tools()
 			for _, pt := range pluginTools {
-				tool := sessionPluginAgentTool(mgr, pt, func() string { return hookSession.id })
+				tool := toggledPluginTool(sessionPluginAgentTool(mgr, pt, func() string { return hookSession.id }), pt, settings, ai.Toggles{})
 				agentCfg.Tools = append(agentCfg.Tools, tool)
 			}
 		}

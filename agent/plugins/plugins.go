@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -989,7 +990,7 @@ func (m *Manager) autoLoadLocked(ctx context.Context) error {
 	var toLoad []pluginToLoad
 	// Skip plugins that are already loaded.
 	for path := range m.binaries {
-		if _, exists := m.plugins[filepath.Base(path)]; exists {
+		if _, exists := m.plugins[filepath.Base(path)]; exists || m.startupDisabledLocked(filepath.Base(path)) {
 			continue
 		}
 		toLoad = append(toLoad, pluginToLoad{path: path, manifestPath: m.manifestPaths[path]})
@@ -1720,7 +1721,7 @@ func (m *Manager) reloadCandidates(ctx context.Context, name string, changedConf
 		if _, exists := m.plugins[pluginName]; exists {
 			continue
 		}
-		if _, exists := newPlugins[pluginName]; exists {
+		if _, exists := newPlugins[pluginName]; exists || (name == "" && m.startupDisabledLocked(pluginName)) {
 			continue
 		}
 		candidate, err := m.stagePluginLocked(ctx, &PluginInfo{Name: pluginName, Path: path})
@@ -2086,6 +2087,72 @@ type ToolHandlerDesc struct {
 	Description         string
 	Parameters          map[string]any
 	Handler             ToolHandler
+	// Plugin names the plugin that registered the tool.
+	Plugin string
+}
+
+// startupDisabledLocked reports a plugin that project or global settings
+// turn off, so tau never starts it. Caller must hold m.mu.
+func (m *Manager) startupDisabledLocked(name string) bool {
+	if m.settings == nil {
+		return false
+	}
+	enabled, ok := m.settings.Enabled.Plugins[name]
+	return ok && !enabled
+}
+
+// PluginStatus describes a discovered plugin and the tools it registered.
+type PluginStatus struct {
+	Name   string
+	Tools  []string
+	Loaded bool
+}
+
+// PluginStatuses lists discovered and loaded plugins sorted by name.
+func (m *Manager) PluginStatuses() []PluginStatus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	byName := make(map[string]PluginStatus)
+	for path := range m.binaries {
+		byName[filepath.Base(path)] = PluginStatus{Name: filepath.Base(path)}
+	}
+	for name, info := range m.plugins {
+		status := PluginStatus{Name: name, Loaded: !info.deregistered}
+		for _, tool := range info.Registrations.Tools {
+			status.Tools = append(status.Tools, info.Registrations.ToolPrefix+tool.Name)
+		}
+		slices.Sort(status.Tools)
+		byName[name] = status
+	}
+	return slices.SortedFunc(maps.Values(byName), func(a, b PluginStatus) int { return strings.Compare(a.Name, b.Name) })
+}
+
+// UnloadDisabled stops loaded plugins that the current settings turn off.
+func (m *Manager) UnloadDisabled(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var errs error
+	for name, info := range m.plugins {
+		if !m.startupDisabledLocked(name) {
+			continue
+		}
+		errs = errors.Join(errs, m.shutdownPluginLocked(ctx, name, info, DefaultDrainTimeout))
+		m.unregisterPluginLocked(info)
+		delete(m.plugins, name)
+	}
+	return errs
+}
+
+// NotifyPlugin sends an event to one plugin when it subscribed to it.
+func (m *Manager) NotifyPlugin(ctx context.Context, plugin, event string, payload json.RawMessage, sessionID string) {
+	m.mu.RLock()
+	handlers := slices.Clone(m.eventHandlers[event])
+	m.mu.RUnlock()
+	for _, handler := range handlers {
+		if handler.PluginName == plugin {
+			handler.Handler(ctx, event, payload, sessionID)
+		}
+	}
 }
 
 // Tools returns all plugin tools as ToolHandlerDesc for agent registration.
@@ -2105,6 +2172,7 @@ func (m *Manager) Tools() []ToolHandlerDesc {
 			for _, tool := range info.Registrations.Tools {
 				fullName := info.Registrations.ToolPrefix + tool.Name
 				if fullName == name {
+					desc.Plugin = info.Name
 					desc.Description = tool.Description
 					desc.Parameters = parseToolParameters(tool.Parameters)
 					desc.Namespace = tool.Namespace

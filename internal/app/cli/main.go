@@ -253,7 +253,7 @@ func (p *pluginTrustPass) finish(ctx context.Context, settings *ai.Settings) err
 	if !settings.ProjectResourcesTrusted() && !p.installed {
 		return p.discoverErr
 	}
-	return errors.Join(p.discoverErr, p.mgr.Reload(ctx))
+	return errors.Join(p.discoverErr, p.mgr.UnloadDisabled(ctx), p.mgr.Reload(ctx))
 }
 
 // installConfiguredSources installs configured npm and git sources that

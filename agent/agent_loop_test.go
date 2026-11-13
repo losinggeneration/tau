@@ -409,6 +409,35 @@ func TestPrepareToolCallNotFound(t *testing.T) {
 	}
 }
 
+func TestPrepareToolCallDisabled(t *testing.T) {
+	executed := false
+	tool := Tool{Name: "subagent_parallel", Exposure: ToolDisabled, Execute: func(ToolContext) (*ToolResult, error) {
+		executed = true
+		return &ToolResult{}, nil
+	}}
+	removed := []*Message{
+		{Role: RoleSystem, ToolsAdded: []ai.Tool{{Name: "subagent_parallel"}}},
+		{Role: RoleSystem, ToolsRemoved: []ai.ToolReference{{Name: "subagent_parallel"}}},
+	}
+	for name, messages := range map[string][]*Message{"fresh": nil, "removed": removed} {
+		assistantMsg := &Message{Role: RoleAssistant}
+		prepared := prepareToolCall(t.Context(), &AgentContext{Tools: []Tool{tool}, Messages: messages}, assistantMsg, ai.ToolCall{ID: "1", Name: "subagent_parallel"}, AgentLoopConfig{})
+		if prepared.immediate == nil || !prepared.immediate.IsError || prepared.immediate.Content != "Tool subagent_parallel is disabled" {
+			t.Fatalf("%s: immediate = %+v, want disabled error", name, prepared.immediate)
+		}
+	}
+	if executed {
+		t.Fatal("disabled tool executed")
+	}
+	declarations, err := visibleToolDeclarations([]Tool{tool})
+	if err != nil || len(declarations) != 0 {
+		t.Fatalf("disabled tool declared: %v %v", declarations, err)
+	}
+	if callable := CallableTools(&AgentContext{Tools: []Tool{tool}}); len(callable) != 0 {
+		t.Fatalf("disabled tool callable: %v", callable)
+	}
+}
+
 func TestExecuteSequentialEmitsToolStartWithRawArgsBeforePrepare(t *testing.T) {
 	// Verify that ToolStart is emitted BEFORE prepareToolCall,
 	// and that Args in the event are the raw parsed args (not post-validated).

@@ -1885,6 +1885,10 @@ func prepareToolCall(ctx context.Context, agentCtx *AgentContext, assistantMsg *
 		}
 		return prepared
 	}
+	if prepared.tool.Exposure == ToolDisabled {
+		prepared.immediate = &ToolResult{Content: fmt.Sprintf("Tool %s is disabled", toolCall.Name), IsError: true}
+		return prepared
+	}
 
 	declared := true
 	var declarationHistory []*Message

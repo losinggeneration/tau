@@ -1425,3 +1425,44 @@ func TestCodemodeSettingsMergePerField(t *testing.T) {
 	assert.Equal(t, "only", merged.Codemode.Mode)
 	assert.Equal(t, 10, *merged.Codemode.InlineBudget)
 }
+
+func TestResolveToggleNarrowestScopeWins(t *testing.T) {
+	global, err := ParseSettings([]byte(`{"enabled":{"plugins":{"tau-subagent":false},"tools":{"subagent_parallel":false}}}`))
+	require.NoError(t, err)
+	project, err := ParseSettings([]byte(`{"enabled":{"tools":{"subagent_parallel":true}}}`))
+	require.NoError(t, err)
+	merged := MergeSettings(global, project)
+
+	enabled, scope := merged.ResolveToggle(Toggles{}, TogglePlugin, "tau-subagent")
+	assert.False(t, enabled)
+	assert.Equal(t, ToggleGlobal, scope)
+	enabled, scope = merged.ResolveToggle(Toggles{}, ToggleTool, "subagent_parallel")
+	assert.True(t, enabled)
+	assert.Equal(t, ToggleProject, scope)
+	enabled, scope = merged.ResolveToggle(Toggles{Plugins: map[string]bool{"tau-subagent": true}}, TogglePlugin, "tau-subagent")
+	assert.True(t, enabled)
+	assert.Equal(t, ToggleSession, scope)
+	enabled, scope = merged.ResolveToggle(Toggles{}, TogglePlugin, "other")
+	assert.True(t, enabled)
+	assert.Empty(t, scope)
+
+	updated := merged.WithToggle(ToggleProject, TogglePlugin, "tau-subagent", true)
+	enabled, scope = updated.ResolveToggle(Toggles{}, TogglePlugin, "tau-subagent")
+	assert.True(t, enabled)
+	assert.Equal(t, ToggleProject, scope)
+	assert.True(t, updated.Enabled.Plugins["tau-subagent"])
+	enabled, _ = merged.ResolveToggle(Toggles{}, TogglePlugin, "tau-subagent")
+	assert.False(t, enabled, "WithToggle must not mutate the original")
+	globalOnly, _ := global.TogglesByScope()
+	assert.False(t, globalOnly.Plugins["tau-subagent"])
+}
+
+func TestUpdateSettingsMergesToggleEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, UpdateSettings(t.Context(), path, map[string]any{"enabled": map[string]any{"plugins": map[string]bool{"a": false}}}))
+	require.NoError(t, UpdateSettings(t.Context(), path, map[string]any{"enabled": map[string]any{"tools": map[string]bool{"b": false}}}))
+	loaded, err := LoadSettings(path)
+	require.NoError(t, err)
+	assert.Equal(t, Toggles{Plugins: map[string]bool{"a": false}, Tools: map[string]bool{"b": false}}, loaded.Enabled)
+	assert.NotContains(t, loaded.Plugins, "enabled")
+}

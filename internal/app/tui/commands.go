@@ -133,6 +133,7 @@ func NewCommands() *Commands {
 	// shell" reply is useless inside the TUI.
 	c.Register(Command{Name: "sessions", Description: "Browse saved sessions (resume, fork, rename, pin)", Handler: cmdSessionWorkspace})
 	c.Register(Command{Name: "mcp", CompleteArgs: completeMCPArgs, Description: "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure", Handler: cmdMCP})
+	c.Register(Command{Name: "plugins", CompleteArgs: completePluginsArgs, Description: "List plugins and tools, or enable and disable them per session, project or globally", Handler: cmdPlugins})
 	c.Register(Command{Name: "hotkeys", Description: "Show keybinding hints", Handler: cmdHotkeys})
 	c.Register(Command{Name: "layout", Description: "Switch layout: fixed or document", Handler: cmdLayout})
 	c.Register(Command{Name: "fork", Description: "Fork session (space: pick point)", Handler: cmdForkOrStub})
