@@ -6571,6 +6571,27 @@ func TestQueuedImagesUseSendAdmission(t *testing.T) {
 	require.Error(t, s.FollowUp(Message{Text: "closed"}))
 }
 
+func TestClearQueueReturnsQueuedMessages(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
+	s := sess.(*agentSession)
+	require.NoError(t, s.Steer(Message{Text: "steer"}))
+	require.NoError(t, s.FollowUp(Message{Text: "follow"}))
+	steering, followUp := s.ClearQueue()
+	require.Len(t, steering, 1)
+	require.Len(t, followUp, 1)
+	assert.Equal(t, "steer", steering[0].Text)
+	assert.Equal(t, "follow", followUp[0].Text)
+	gotSteering, gotFollowUp := s.QueueSizes()
+	assert.Zero(t, gotSteering)
+	assert.Zero(t, gotFollowUp)
+}
+
 func TestReloadToolRegistryRemovesStaleExtensionTools(t *testing.T) {
 	_, model := registerRecordingProvider(t, "reply")
 	mgr := agentplugins.NewManager(t.TempDir(), ui.NewNoOpUI(), nil)

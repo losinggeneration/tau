@@ -75,7 +75,7 @@ func appKeybindingDefinitions() map[string]keybindings.Definition {
 		actionIDThinkingCycle:         {DefaultKeys: []string{"ctrl+t"}, Description: "Cycle the thinking level"},
 		actionIDThinkingToggle:        {DefaultKeys: []string{"alt+t"}, Description: "Toggle thinking off and back on"},
 		actionIDMessageFollowUp:       {DefaultKeys: nil, Description: "Queue a follow-up message"},
-		actionIDMessageDequeue:        {DefaultKeys: []string{"alt+backspace"}, Description: "Drop the first queued message"},
+		actionIDMessageDequeue:        {DefaultKeys: []string{"alt+up"}, Description: "Restore queued messages"},
 		actionIDHeaderExpand:          {DefaultKeys: []string{"ctrl+o"}, Description: "Expand or collapse startup help"},
 		actionIDChatScrollBottom:      {DefaultKeys: []string{"ctrl+end"}, Description: "Scroll the chat to the bottom"},
 		actionIDHistorySearchBackward: {DefaultKeys: []string{"ctrl+r"}, Description: "Search prompt history backward"},

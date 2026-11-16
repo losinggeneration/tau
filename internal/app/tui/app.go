@@ -38,7 +38,7 @@ import (
 //	AppActionSelectorDown         → tau.select.down
 //	AppActionSelectorActivate     → tau.select.activate (Enter w/ selector)
 //	AppActionMessageFollowUp      → app.message.followUp (internal/future explicit queue action)
-//	AppActionMessageDequeue       → app.message.dequeue  (Alt+Backspace: pop)
+//	AppActionMessageDequeue       → app.message.dequeue  (Alt+Up: restore queue)
 //	AppActionExit                 → app.exit            (Ctrl+C: confirm-then-quit)
 //	AppActionQuitNow              → (internal post-confirm quit)
 const (
@@ -88,13 +88,9 @@ const (
 	// and surfaces a chat-log error.
 	AppActionMessageFollowUp
 
-	// AppActionMessageDequeue is Alt+Backspace in the editor. Removes
-	// the first queued follow-up message. The agent's own queue
-	// doesn't expose a pop API yet (it drains strictly in FIFO order
-	// at the start of the next turn), so this is a UI-only operation
-	// for now: it pops the first entry from a mirror list and reports
-	// the change. Future SDK work will turn this into a real pop.
-	// External id "app.message.dequeue".
+	// AppActionMessageDequeue is Alt+Up in the editor. Moves every queued
+	// steering and follow-up message out of the session and back into the
+	// editor. External id "app.message.dequeue".
 	AppActionMessageDequeue
 
 	// AppActionHeaderExpand toggles the startup header between its compact and
@@ -1638,9 +1634,7 @@ func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
 		r.app.handleFollowUpAction(ctx)
 		return true
 	case AppActionMessageDequeue:
-		// Alt+Backspace binding for app.message.dequeue. Pops
-		// the first queued follow-up from the UI mirror.
-		r.app.dequeueFollowUp(ctx)
+		r.app.restoreQueuedMessages(ctx)
 		return true
 	case AppActionHeaderExpand:
 		r.app.ToggleHeaderExpanded()
@@ -1770,8 +1764,7 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 			return !scoped && id != actionIDHistorySearchBackward && id != actionIDHistorySearchForward
 		}
 	}
-	// Alt+Backspace (app.message.dequeue by default) only applies in the
-	// editor; elsewhere it stays a plain backspace-word.
+	// app.message.dequeue only applies in the editor.
 	if ks.Mod == tauui.ModAlt && ctx != tauui.KeyCtxTextInput {
 		notScopedModels = func(id string) bool {
 			_, scoped := scopedModelsActionIDs[id]
@@ -2840,22 +2833,34 @@ func (a *App) enqueueFollowUp(text string, ctx *tauui.Ctx) {
 	a.refreshPending(ctx)
 }
 
-// dequeueFollowUp removes the first entry from the App's mirror
-// queue. The agent's own queue doesn't expose a pop-by-index API,
-// so this is a UI-only operation today (the spec calls for
-// app.message.dequeue to remove a queued message). When the agent's
-// queue grows a Pop() method this will become a real pop against the
-// session.
-//
-// The action is a no-op (silently) when the queue is empty so the
-// keystroke doesn't surface an error every time the user happens to
-// press Alt+Backspace on an empty queue.
-func (a *App) dequeueFollowUp(ctx *tauui.Ctx) {
-	if len(a.pendingQueue) == 0 {
+// restoreQueuedMessages takes every queued steering and follow-up message out
+// of the session and puts their text back in the editor ahead of the current
+// draft, so the user can edit, resend, or drop them.
+func (a *App) restoreQueuedMessages(ctx *tauui.Ctx) {
+	var queued []string
+	if qc, ok := a.sess.(sdk.QueueClearer); ok {
+		steering, followUp := qc.ClearQueue()
+		for _, msg := range append(steering, followUp...) {
+			queued = append(queued, msg.Text)
+		}
+	} else {
+		queued = append(slices.Clone(a.steeringQueue), a.pendingQueue...)
+	}
+	a.steeringQueue, a.pendingQueue = nil, nil
+	a.refreshPending(ctx)
+	if len(queued) == 0 {
+		a.conv.AddSystem("No queued messages to restore")
+		a.refreshChat()
 		return
 	}
-	a.pendingQueue = a.pendingQueue[1:]
-	a.refreshPending(ctx)
+	parts := slices.DeleteFunc(append(queued, a.editor.Text()), func(s string) bool { return strings.TrimSpace(s) == "" })
+	a.editor.SetText(ctx, strings.Join(parts, "\n\n"))
+	noun := "message"
+	if len(queued) > 1 {
+		noun = "messages"
+	}
+	a.conv.AddSystem(fmt.Sprintf("Restored %d queued %s to editor", len(queued), noun))
+	a.refreshChat()
 }
 
 // refreshPending pushes the App's mirror queue into the pending view
@@ -2870,6 +2875,7 @@ func (a *App) refreshPending(ctx *tauui.Ctx) {
 		return
 	}
 	prevShown := a.pending.MinSize().H > 0
+	a.pending.hint = a.keyHint(actionIDMessageDequeue, "to edit all queued messages")
 	a.pending.SetQueues(a.steeringQueue, a.pendingQueue)
 	nowShown := a.pending.MinSize().H > 0
 	if ctx != nil && ctx.Invalidate != nil {

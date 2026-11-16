@@ -116,20 +116,18 @@ func TestSharedKeyResolvesByContext(t *testing.T) {
 	}
 }
 
-// Alt+Backspace is app.message.dequeue in the editor and a plain word-delete
-// anywhere else; claiming it globally would break editing in every other pane.
-func TestDequeueOnlyBindsInTheEditor(t *testing.T) {
+// Alt+Up is app.message.dequeue in the editor, matching Pi. It used to be
+// Alt+Backspace, which the editor also binds to delete-word-backward.
+func TestDequeueBindsAltUpInTheEditor(t *testing.T) {
 	a := newAppWithSelector(t)
 	km := appKeymap{app: a}
-	ks := tauui.Keystroke{Key: tauui.KeyBackspace, Mod: tauui.ModAlt}
 
-	got, ok := km.Resolve(tauui.KeyCtxTextInput, ks)
+	got, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyUp, Mod: tauui.ModAlt})
 	if !ok || got != AppActionMessageDequeue {
-		t.Errorf("alt+backspace in the editor = (%v, %v), want dequeue", got, ok)
+		t.Errorf("alt+up in the editor = (%v, %v), want dequeue", got, ok)
 	}
-
-	if got, ok := km.Resolve(tauui.KeyCtxGlobal, ks); ok && got == AppActionMessageDequeue {
-		t.Error("alt+backspace claimed dequeue outside the editor")
+	if got, ok := km.Resolve(tauui.KeyCtxTextInput, tauui.Keystroke{Key: tauui.KeyBackspace, Mod: tauui.ModAlt}); ok && got == AppActionMessageDequeue {
+		t.Error("alt+backspace still resolves to dequeue; it belongs to the editor's word delete")
 	}
 }
 
@@ -341,18 +339,6 @@ func TestCtrlHReachesTheEditor(t *testing.T) {
 	ks := tauui.Keystroke{Key: tauui.KeyRune, Rune: 'h', Mod: tauui.ModCtrl}
 	if act, ok := km.Resolve(tauui.KeyCtxTextInput, ks); ok && act == AppActionMessageDequeue {
 		t.Fatal("Ctrl+H resolves to dequeue; it is Backspace and belongs to the editor")
-	}
-}
-
-// The binding it was stealing from must still work.
-func TestAltBackspaceStillDequeues(t *testing.T) {
-	a := newAppWithSelector(t)
-	km := appKeymap{app: a}
-
-	ks := tauui.Keystroke{Key: tauui.KeyBackspace, Mod: tauui.ModAlt}
-	act, ok := km.Resolve(tauui.KeyCtxTextInput, ks)
-	if !ok || act != AppActionMessageDequeue {
-		t.Fatalf("alt+backspace = (%v, %v), want dequeue", act, ok)
 	}
 }
 

@@ -12,11 +12,12 @@ type pendingView struct {
 	rect     tauui.Rect
 	steering []string
 	followUp []string
+	hint     string
 	maxRows  int
 }
 
 func NewPendingView() *pendingView {
-	return &pendingView{id: tauui.NewID(), maxRows: 6}
+	return &pendingView{id: tauui.NewID(), hint: "to edit all queued messages", maxRows: 6}
 }
 
 func (p *pendingView) SetItems(items []string) { p.SetQueues(nil, items) }
@@ -56,7 +57,7 @@ func (p *pendingView) rows(width int) []string {
 	for _, s := range p.followUp {
 		rows = append(rows, " Follow-up: "+firstLineOf(s))
 	}
-	rows = append(rows, " ↳ alt+backspace to edit all queued messages")
+	rows = append(rows, " ↳ "+p.hint)
 	if p.maxRows > 0 && len(rows) > p.maxRows {
 		rows = rows[:p.maxRows]
 		rows[len(rows)-1] = " ... (pending truncated)"

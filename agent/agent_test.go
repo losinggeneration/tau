@@ -1892,6 +1892,22 @@ func TestPeekQueuedMessagesDoesNotConsumeQueues(t *testing.T) {
 	}
 }
 
+func TestClearAllQueuesReturnsQueuedMessages(t *testing.T) {
+	a, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Steer(NewUserMessage("steer"))
+	a.FollowUp(NewUserMessage("follow"))
+	steering, followUp := a.ClearAllQueues()
+	if len(steering) != 1 || steering[0].Content[0].Text != "steer" || len(followUp) != 1 || followUp[0].Content[0].Text != "follow" {
+		t.Fatalf("cleared = %v %v", steering, followUp)
+	}
+	if s, f := a.QueueSizes(); s != 0 || f != 0 {
+		t.Fatalf("queues not cleared: %d %d", s, f)
+	}
+}
+
 func TestSettledEventObservesIdleState(t *testing.T) {
 	var a *Agent
 	observed := false

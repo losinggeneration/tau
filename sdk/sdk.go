@@ -356,6 +356,12 @@ type Queuer interface {
 	QueueSizes() (steering, followUp int)
 }
 
+// QueueClearer removes every queued steering and follow-up message and
+// returns them, so a frontend can hand them back to the user for editing.
+type QueueClearer interface {
+	ClearQueue() (steering, followUp []Message)
+}
+
 // ModelCycler cycles the active model for future turns.
 type ModelCycler interface{ CycleModel() (*ai.Model, error) }
 
@@ -732,6 +738,7 @@ var (
 	_ Steerer                       = (*agentSession)(nil)
 	_ FollowUpper                   = (*agentSession)(nil)
 	_ Queuer                        = (*agentSession)(nil)
+	_ QueueClearer                  = (*agentSession)(nil)
 	_ ModelCycler                   = (*agentSession)(nil)
 	_ ThinkingCycler                = (*agentSession)(nil)
 	_ QueueModeSetter               = (*agentSession)(nil)
@@ -3286,6 +3293,20 @@ func (s *agentSession) recordQueueUpdate() {
 // boundaries) to keep the pending-messages region in sync. The agent
 // already serializes queue access internally so no extra lock is
 // needed here.
+func (s *agentSession) ClearQueue() (steering, followUp []Message) {
+	agentSteering, agentFollowUp := s.agent.ClearAllQueues()
+	for _, msg := range agentSteering {
+		steering = append(steering, sdkMessageFromAgent(msg))
+	}
+	for _, msg := range agentFollowUp {
+		followUp = append(followUp, sdkMessageFromAgent(msg))
+	}
+	if len(steering)+len(followUp) > 0 {
+		s.recordQueueUpdate()
+	}
+	return steering, followUp
+}
+
 func (s *agentSession) QueueSizes() (steering, followUp int) {
 	return s.agent.QueueSizes()
 }

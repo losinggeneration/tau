@@ -392,7 +392,7 @@ func cmdHelp(app *App, _ string) {
 	//   Tab          editor completion
 	//   Enter        submit, or steer while working
 	//   Shift+Enter  newline (Alt+Enter may be equivalent in some terminals)
-	//   Alt+Backspace pop the first queued follow-up
+	//   Alt+Up       restore queued messages to the editor
 	//   /            slash-command mode
 	b.WriteString("\nKeybindings:\n")
 	b.WriteString("  ctrl-c   exit (press twice to confirm)\n")

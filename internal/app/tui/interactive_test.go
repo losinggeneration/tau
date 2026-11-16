@@ -50,7 +50,7 @@ func TestInteractiveCommands_HotkeysContainsKeybindings(t *testing.T) {
 		"tab",
 		"enter",
 		"shift-enter",
-		"alt+backspace",
+		"alt+up",
 		"esc",
 	}
 	for _, want := range required {
@@ -188,33 +188,6 @@ func TestInteractiveCommands_QueueFollowUp(t *testing.T) {
 	app.enqueueFollowUp("task 2", nil)
 	if len(app.pendingQueue) != 2 {
 		t.Fatalf("pendingQueue len = %d, want 2", len(app.pendingQueue))
-	}
-}
-
-// TestInteractiveCommands_DequeueFollowUp verifies dequeuing removes
-// the first queued message.
-func TestInteractiveCommands_DequeueFollowUp(t *testing.T) {
-	app := newTestApp(t)
-	app.pending = NewPendingView()
-	app.pendingQueue = []string{"task 1", "task 2"}
-
-	app.dequeueFollowUp(nil)
-	if len(app.pendingQueue) != 1 {
-		t.Fatalf("pendingQueue len = %d, want 1", len(app.pendingQueue))
-	}
-	if app.pendingQueue[0] != "task 2" {
-		t.Errorf("pendingQueue[0] = %q, want 'task 2'", app.pendingQueue[0])
-	}
-
-	app.dequeueFollowUp(nil)
-	if len(app.pendingQueue) != 0 {
-		t.Fatalf("pendingQueue len = %d, want 0", len(app.pendingQueue))
-	}
-
-	// Dequeuing empty queue should be a no-op
-	app.dequeueFollowUp(nil)
-	if len(app.pendingQueue) != 0 {
-		t.Errorf("pendingQueue len = %d, want 0", len(app.pendingQueue))
 	}
 }
 

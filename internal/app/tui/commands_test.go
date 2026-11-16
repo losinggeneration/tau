@@ -645,7 +645,7 @@ func TestCmdHotkeysShowsKeybindingHints(t *testing.T) {
 		"tab",
 		"enter",
 		"shift-enter",
-		"alt+backspace",
+		"alt+up",
 		"esc",
 	} {
 		if !strings.Contains(got[0].Text, must) {

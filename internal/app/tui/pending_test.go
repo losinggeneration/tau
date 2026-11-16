@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -296,45 +297,50 @@ func TestEnqueueFollowUp_NoFollowUpper(t *testing.T) {
 	}
 }
 
-// TestDequeueFollowUp_PopsAndRefreshes covers the Alt+Backspace
-// binding: dequeueFollowUp drops the first entry from the App's
-// mirror, leaves the session's authoritative queue alone, and
-// updates the pending view.
-func TestDequeueFollowUp_PopsAndRefreshes(t *testing.T) {
+// Dequeue takes every queued message out of the session and puts it back in
+// the editor ahead of the current draft, so queued work can be edited or
+// held back instead of only dropping a row from the display.
+func TestRestoreQueuedMessagesMovesQueueIntoEditor(t *testing.T) {
 	a := newTestApp(t)
+	fs := &fakeSession{steers: []string{"steer one"}, followUps: []string{"follow one", "follow two"}}
+	a.sess = fs
 	a.pending = NewPendingView()
-	a.pendingQueue = []string{"first", "second", "third"}
-	a.pending.SetItems(a.pendingQueue)
-	startH := a.pending.MinSize().H
-	if startH == 0 {
-		t.Fatalf("setup: pending view should claim space with 3 items, got MinSize=%+v", a.pending.MinSize())
+	a.editor = newPromptEditorForTest()
+	ctx := testCtx()
+	a.editor.SetText(ctx, "draft")
+	a.steeringQueue = []string{"steer one"}
+	a.pendingQueue = []string{"follow one", "follow two"}
+	a.refreshPending(ctx)
+	if rows := a.pending.rows(80); !strings.Contains(rows[len(rows)-1], "alt+up to edit all queued messages") {
+		t.Fatalf("pending hint = %q, want the bound dequeue key", rows[len(rows)-1])
 	}
 
-	a.dequeueFollowUp(testCtx())
+	a.restoreQueuedMessages(ctx)
 
-	if got := a.pendingQueue; len(got) != 2 || got[0] != "second" || got[1] != "third" {
-		t.Errorf("expected pendingQueue=[second,third] after dequeue, got %v", got)
+	if got, want := a.editor.Text(), "steer one\n\nfollow one\n\nfollow two\n\ndraft"; got != want {
+		t.Errorf("editor = %q, want %q", got, want)
 	}
-	if len(a.pending.Items()) != 2 {
-		t.Errorf("pending view should reflect dequeue, got %d items", len(a.pending.Items()))
+	if steering, followUp := fs.QueueSizes(); steering+followUp != 0 {
+		t.Errorf("session queue = %d steering, %d follow-up; want empty", steering, followUp)
+	}
+	if len(a.steeringQueue)+len(a.pendingQueue) != 0 || a.pending.MinSize().H != 0 {
+		t.Errorf("pending mirror not cleared: %v %v", a.steeringQueue, a.pendingQueue)
 	}
 }
 
-// TestDequeueFollowUp_EmptyQueueIsNoop ensures dequeue is silent on
-// an empty queue so the keystroke doesn't surface an error every
-// time the user hits Alt+Backspace with nothing queued.
-func TestDequeueFollowUp_EmptyQueueIsNoop(t *testing.T) {
+func TestRestoreQueuedMessagesEmptyQueueSaysSo(t *testing.T) {
 	a := newTestApp(t)
 	a.pending = NewPendingView()
-	a.pendingQueue = nil
+	a.editor = newPromptEditorForTest()
 
-	// Should not panic, should not surface a chat-log error.
-	a.dequeueFollowUp(testCtx())
-	if len(a.pendingQueue) != 0 {
-		t.Errorf("dequeue on empty queue should leave it empty, got %v", a.pendingQueue)
+	a.restoreQueuedMessages(testCtx())
+
+	msgs := a.conv.Messages()
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Text, "No queued messages") {
+		t.Errorf("messages = %+v, want a no-queued-messages notice", msgs)
 	}
-	if len(a.conv.Messages()) != 0 {
-		t.Errorf("dequeue on empty queue should not surface an error, got %d messages", len(a.conv.Messages()))
+	if a.editor.Text() != "" {
+		t.Errorf("editor = %q, want unchanged", a.editor.Text())
 	}
 }
 

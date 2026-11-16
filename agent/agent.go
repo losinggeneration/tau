@@ -455,10 +455,13 @@ func (a *Agent) ClearFollowUpQueue() {
 	a.followUpQueue = nil
 }
 
-// ClearAllQueues removes all queued messages.
-func (a *Agent) ClearAllQueues() {
-	a.ClearSteeringQueue()
-	a.ClearFollowUpQueue()
+// ClearAllQueues removes all queued messages and returns what was queued.
+func (a *Agent) ClearAllQueues() (steering, followUp []*Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	steering, followUp = a.steeringQueue, a.followUpQueue
+	a.steeringQueue, a.followUpQueue = nil, nil
+	return steering, followUp
 }
 
 // HasQueuedMessages returns true when either queue contains pending messages.

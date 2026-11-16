@@ -272,6 +272,20 @@ func (f *fakeSession) DeleteAttachment(id string) error {
 	return nil
 }
 
+// ClearQueue hands back and forgets every recorded steer and follow-up.
+func (f *fakeSession) ClearQueue() (steering, followUp []sdkpkg.Message) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, text := range f.steers {
+		steering = append(steering, sdkpkg.Message{Role: "user", Text: text})
+	}
+	for _, text := range f.followUps {
+		followUp = append(followUp, sdkpkg.Message{Role: "user", Text: text})
+	}
+	f.steers, f.followUps = nil, nil
+	return steering, followUp
+}
+
 // QueueSizes returns the current follow-up count. When queueOverride
 // is set it shadows followUps so tests can simulate the agent
 // draining the queue without rewriting the followUps slice.
