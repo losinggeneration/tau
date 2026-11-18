@@ -768,7 +768,6 @@ func New(opts Options) (*App, error) {
 		if settings.Theme != "" {
 			initialTheme = settings.Theme
 		}
-		a.applyDisplaySettings(settings)
 	}
 	a.applyDefaultSteeringMode(loadedSettings)
 	if len(opts.ModelScope) > 0 {
@@ -892,6 +891,7 @@ func New(opts Options) (*App, error) {
 		return nil, err
 	}
 	a.app = app
+	a.applyDisplaySettings(loadedSettings)
 	app.AddInputListener(func(e tauui.Event) (tauui.Event, bool) {
 		if a.dialogInputActive.Load() {
 			return e, false

@@ -873,6 +873,43 @@ func TestSessionSettingsDriveStartupAndSuccessfulReload(t *testing.T) {
 	assert.False(t, hidden, "reload did not reapply thinking display")
 }
 
+func TestReloadPreservesSessionLayout(t *testing.T) {
+	original := keybindings.DefaultManager()
+	t.Cleanup(func() { keybindings.SetDefaultManager(original) })
+	for _, mode := range []string{"", "fixed", "document"} {
+		for _, newSession := range []bool{false, true} {
+			t.Run(fmt.Sprintf("layout=%s/new=%t", mode, newSession), func(t *testing.T) {
+				sess := &settingsSession{fakeSession: &fakeSession{stateCWD: t.TempDir()}, settings: &ai.Settings{LayoutMode: mode, QuietStartup: true}}
+				a, err := New(Options{
+					Session:      sess,
+					SettingsPath: filepath.Join(t.TempDir(), "settings.json"),
+					SessionFactory: func(context.Context, sdk.SessionOptions) (sdk.Session, error) {
+						return sess, nil
+					},
+				})
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, a.chat.Close()) })
+				if newSession {
+					cmdNew(a, "")
+				}
+				rect := tauui.Rect{W: 80, H: 24}
+				a.root.Layout(rect)
+				before := a.root.Editor.Rect()
+				beforeMode := a.LayoutMode()
+				wantMode, ok := ParseLayoutMode(mode)
+				require.True(t, ok)
+				assert.Equal(t, wantMode, beforeMode, "startup ignored the configured layout")
+				footerBefore := a.root.Footer.Rect()
+				a.conversationEvents.handle(sdk.Event{Type: "command_result", Payload: map[string]any{"command": "reload", "output": "reloaded settings, artifacts, and plugins"}})
+				a.root.Layout(rect)
+				assert.Equal(t, beforeMode, a.LayoutMode(), "reload switched layout models")
+				assert.Equal(t, before.Y, a.root.Editor.Rect().Y, "reload moved the editor vertically")
+				assert.Equal(t, footerBefore.Y, a.root.Footer.Rect().Y, "reload moved the footer vertically")
+			})
+		}
+	}
+}
+
 func TestReloadResetsRemovedDisplaySettingsAndAppliesTheme(t *testing.T) {
 	startup, err := ai.ParseSettings([]byte(`{"editorPaddingX":3,"autocompleteMaxVisible":9,"steeringMode":"one-at-a-time","theme":"light"}`))
 	require.NoError(t, err)
