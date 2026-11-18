@@ -30,6 +30,7 @@ require (
 	github.com/yuin/goldmark v1.8.5
 	golang.org/x/net v0.60.0
 	golang.org/x/oauth2 v0.36.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.46.0
 	golang.org/x/text v0.43.0
 	google.golang.org/genai v1.54.0
@@ -101,7 +102,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect

@@ -4383,15 +4383,15 @@ func (s *agentSession) maybeDeriveSlugFromFirstMessage(firstContent string) erro
 	}
 
 	// Rename the session file using the derived slug
-	newPath, err := sessionpkg.RenameSession(path, slug)
-	if err != nil {
-		return err
+	newPath, renameErr := sessionpkg.RenameSession(path, slug)
+	if newPath == "" {
+		return renameErr
 	}
 
-	// Update the writer to use the new path
+	// Rebind even when the move succeeded but owner-file cleanup failed.
 	newWriter, err := sessionpkg.NewWriter(newPath)
 	if err != nil {
-		return err
+		return errors.Join(renameErr, err)
 	}
 	var closeErr error
 	s.mu.Lock()
@@ -4404,10 +4404,10 @@ func (s *agentSession) maybeDeriveSlugFromFirstMessage(firstContent string) erro
 	}
 	s.mu.Unlock()
 	if closeErr != nil {
-		return fmt.Errorf("close session writer during slug rename: %w", closeErr)
+		return errors.Join(renameErr, fmt.Errorf("close session writer during slug rename: %w", closeErr))
 	}
 
-	return nil
+	return renameErr
 }
 
 // slugFromMessageContent derives a filesystem-safe slug from message content.

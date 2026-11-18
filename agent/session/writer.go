@@ -5,40 +5,79 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
+
+const (
+	ownerSuffix = ".owner"
+	// ownerLockMarker follows the PID in owner files held with flock. Older
+	// readers parse only the leading PID, so they still see a live owner.
+	ownerLockMarker   = "flock"
+	ownerLockAttempts = 3
+	// ownerBusyRetries bounds how often a busy owner lock is retried before
+	// the session is reported as open elsewhere.
+	ownerBusyRetries = 10
+)
+
+var errOwnerReplaced = errors.New("session owner file was replaced")
+
+// ownerBusyWait pauses between attempts to lock a busy owner file.
+var ownerBusyWait = func() { time.Sleep(5 * time.Millisecond) }
 
 // Writer appends entries to a session JSONL file with flock-based concurrency.
 type Writer struct {
 	path   string
 	file   *os.File
+	owner  *ownerClaim
 	mu     sync.Mutex
 	closed bool
 }
 
-var ownerRefs = struct {
-	sync.Mutex
-	byPath map[string]int
-}{byPath: make(map[string]int)}
+// ownerClaim is this process's exclusive flock on a session's .owner file.
+// Writers and explicit ClaimOwner calls in the same process share one claim;
+// the lock is dropped when the last reference is released.
+type ownerClaim struct {
+	key      string
+	file     *os.File
+	refs     int
+	explicit int
+}
 
-// NewWriter opens or creates a session file for appending. It acquires an
-// exclusive flock on each Append call and releases it after writing.
+var owners = struct {
+	sync.Mutex
+	byPath map[string]*ownerClaim
+}{byPath: make(map[string]*ownerClaim)}
+
+// NewWriter opens or creates a session file for appending and claims the
+// session for this process until Close. It fails when another process owns
+// the session. It acquires an exclusive flock on each Append call and
+// releases it after writing.
 func NewWriter(path string) (*Writer, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create session dir: %w", err)
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	owners.Lock()
+	claim, err := acquireOwnerLocked(path)
+	owners.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("open session file: %w", err)
+		return nil, err
 	}
 
-	return &Writer{path: path, file: f}, nil
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open session file: %w", err), releaseOwnerClaim(claim))
+	}
+
+	return &Writer{path: path, file: f, owner: claim}, nil
 }
 
 // Append marshals the entry and appends it as a JSON line with flock.
@@ -152,7 +191,8 @@ func (w *Writer) AppendHeader(h Header) error {
 	return w.Append(h)
 }
 
-// Close releases the file handle and owner file.
+// Close releases the file handle and this writer's ownership claim. Claims
+// held by other writers or ClaimOwner calls are unaffected.
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -164,9 +204,10 @@ func (w *Writer) Close() error {
 	if closeErr := w.file.Close(); closeErr != nil {
 		err = fmt.Errorf("close session file: %w", closeErr)
 	}
-	if releaseErr := ReleaseOwner(w.path); releaseErr != nil {
+	if releaseErr := releaseOwnerClaim(w.owner); releaseErr != nil {
 		err = errors.Join(err, fmt.Errorf("release session owner: %w", releaseErr))
 	}
+	w.owner = nil
 	return err
 }
 
@@ -176,7 +217,7 @@ func (w *Writer) Path() string {
 }
 
 // CreateSessionFile creates a new session JSONL file with the given header
-// and returns the Writer. It also creates the .owner file.
+// and returns the Writer, which owns the session until Close.
 func CreateSessionFile(dir string, header Header) (*Writer, error) {
 	slug := slugFromHeader(header)
 	var baseFilename string
@@ -215,75 +256,271 @@ func CreateSessionFile(dir string, header Header) (*Writer, error) {
 		return nil, fmt.Errorf("write header: %w", err)
 	}
 
-	// Create .owner file
-	if err := writeOwnerFile(path, os.Getpid()); err != nil {
-		// Non-fatal: owner file is advisory
-		_ = err
-	}
-
 	return w, nil
 }
 
-// ClaimOwner creates the .owner file for an existing session. Returns an
-// error if another live process owns it (not this process).
+// ClaimOwner claims a session for this process without opening a writer.
+// Each successful call must be paired with ReleaseOwner. It returns an error
+// if another live process owns the session.
 func ClaimOwner(sessionPath string) error {
-	ownerPath := sessionPath + ".owner"
-	key := filepath.Clean(sessionPath)
-
-	ownerRefs.Lock()
-	defer ownerRefs.Unlock()
-
-	// Check existing owner
-	data, err := os.ReadFile(ownerPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read owner file: %w", err)
-	}
-
-	if err == nil && len(data) > 0 {
-		var pid int
-		if _, perr := fmt.Sscanf(string(data), "%d", &pid); perr == nil {
-			if pid == os.Getpid() {
-				ownerRefs.byPath[key]++
-				return nil
-			}
-			if isProcessRunning(pid) {
-				return fmt.Errorf("session is open in another process (PID %d)", pid)
-			}
-			// Stale owner file; clean it up
-			_ = os.Remove(ownerPath)
-		}
-	}
-
-	if err := writeOwnerFile(sessionPath, os.Getpid()); err != nil {
+	owners.Lock()
+	defer owners.Unlock()
+	claim, err := acquireOwnerLocked(sessionPath)
+	if err != nil {
 		return err
 	}
-	ownerRefs.byPath[key] = 1
+	claim.explicit++
 	return nil
 }
 
-// ReleaseOwner removes the .owner file.
+// ReleaseOwner releases one ClaimOwner claim. Without an outstanding
+// ClaimOwner claim it does nothing, so it never drops a writer's claim.
 func ReleaseOwner(sessionPath string) error {
-	key := filepath.Clean(sessionPath)
-	ownerRefs.Lock()
-	if refs := ownerRefs.byPath[key]; refs > 1 {
-		ownerRefs.byPath[key] = refs - 1
-		ownerRefs.Unlock()
+	key, err := ownerKey(sessionPath)
+	if err != nil {
+		return err
+	}
+	owners.Lock()
+	defer owners.Unlock()
+	claim := owners.byPath[key]
+	if claim == nil || claim.explicit == 0 {
 		return nil
 	}
-	delete(ownerRefs.byPath, key)
-	ownerRefs.Unlock()
+	claim.explicit--
+	return claim.releaseLocked()
+}
 
-	err := os.Remove(sessionPath + ".owner")
-	if err != nil && !os.IsNotExist(err) {
-		return err
+func ownerKey(sessionPath string) (string, error) {
+	key, err := filepath.Abs(sessionPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve session path: %w", err)
+	}
+	return key, nil
+}
+
+// acquireOwnerLocked returns this process's claim on a session, taking the
+// cross-process lock if no claim exists yet. owners must be locked.
+func acquireOwnerLocked(sessionPath string) (*ownerClaim, error) {
+	key, err := ownerKey(sessionPath)
+	if err != nil {
+		return nil, err
+	}
+	if claim := owners.byPath[key]; claim != nil {
+		claim.refs++
+		return claim, nil
+	}
+	f, err := lockOwnerFile(key + ownerSuffix)
+	if err != nil {
+		return nil, err
+	}
+	claim := &ownerClaim{key: key, file: f, refs: 1}
+	owners.byPath[key] = claim
+	return claim, nil
+}
+
+func releaseOwnerClaim(claim *ownerClaim) error {
+	if claim == nil {
+		return nil
+	}
+	owners.Lock()
+	defer owners.Unlock()
+	return claim.releaseLocked()
+}
+
+// releaseLocked drops one reference. The last reference unlinks the owner
+// file while still holding its lock, so a waiting claimer either sees the
+// file gone or locks a fresh one. owners must be locked.
+func (c *ownerClaim) releaseLocked() error {
+	c.refs--
+	if c.refs > 0 {
+		return nil
+	}
+	if owners.byPath[c.key] == c {
+		delete(owners.byPath, c.key)
+	}
+	ownerPath := c.key + ownerSuffix
+	var err error
+	same, statErr := sameOwnerFile(c.file, ownerPath)
+	switch {
+	case errors.Is(statErr, os.ErrNotExist):
+	case statErr != nil:
+		err = statErr
+	case !same:
+		// Never unlink a lock file this claim does not hold.
+		err = &os.PathError{Op: "remove", Path: ownerPath, Err: errOwnerReplaced}
+	default:
+		if rmErr := os.Remove(ownerPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			err = rmErr
+		}
+	}
+	return errors.Join(err, closeOwnerFile(c.file))
+}
+
+// lockOwnerFile takes an exclusive, non-blocking flock on the owner file.
+// A file unlinked or replaced between open and lock is retried so two
+// processes never hold locks on different inodes for the same path.
+func lockOwnerFile(ownerPath string) (*os.File, error) {
+	for range ownerLockAttempts {
+		f, err := os.OpenFile(ownerPath, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("open session owner: %w", err)
+		}
+		locked, err := claimOwnerFile(f, ownerPath)
+		if err != nil {
+			return nil, errors.Join(err, closeOwnerFile(f))
+		}
+		if locked {
+			return f, nil
+		}
+		if err := closeOwnerFile(f); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("lock session owner %s: file was repeatedly replaced", ownerPath)
+}
+
+// claimOwnerFile locks f and records this process as owner. It reports false
+// without error when ownerPath no longer names f and the caller should retry.
+func claimOwnerFile(f *os.File, ownerPath string) (bool, error) {
+	if err := flockOwnerFile(f); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return false, ownerBusyError(f)
+		}
+		return false, fmt.Errorf("lock session owner: %w", err)
+	}
+	same, err := sameOwnerFile(f, ownerPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !same {
+		return false, nil
+	}
+	pid, lockHeld, err := readOwner(f)
+	if err != nil {
+		return false, err
+	}
+	// Files written by older versions carry only a PID and no lock.
+	if !lockHeld && pid > 0 && pid != os.Getpid() && isProcessRunning(pid) {
+		return false, fmt.Errorf("session is open in another process (PID %d)", pid)
+	}
+	if err := f.Truncate(0); err != nil {
+		return false, fmt.Errorf("truncate session owner: %w", err)
+	}
+	if _, err := f.WriteAt(fmt.Appendf(nil, "%d %s\n", os.Getpid(), ownerLockMarker), 0); err != nil {
+		return false, fmt.Errorf("write session owner: %w", err)
+	}
+	return true, nil
+}
+
+// flockOwnerFile takes an exclusive lock on f, retrying briefly while it is
+// busy. CleanupStaleOwners and a releasing claimer hold an owner lock only
+// momentarily and must not look like a live owner; a real owner still holds
+// the lock once the retries run out.
+func flockOwnerFile(f *os.File) error {
+	for attempt := 0; ; attempt++ {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if !errors.Is(err, syscall.EWOULDBLOCK) || attempt == ownerBusyRetries {
+			return err
+		}
+		ownerBusyWait()
+	}
+}
+
+func ownerBusyError(f *os.File) error {
+	pid, _, err := readOwner(f)
+	switch {
+	case err != nil:
+		return fmt.Errorf("session is open in another process: %w", err)
+	case pid == os.Getpid():
+		return errors.New("session is already open in this process under another path")
+	case pid > 0:
+		return fmt.Errorf("session is open in another process (PID %d)", pid)
+	}
+	return errors.New("session is open in another process")
+}
+
+// readOwner parses "<pid>[ flock]". Empty or unparsable content reports PID 0,
+// matching older versions that overwrote such files.
+func readOwner(f *os.File) (pid int, lockHeld bool, err error) {
+	buf := make([]byte, 64)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return 0, false, fmt.Errorf("read session owner: %w", err)
+	}
+	fields := strings.Fields(string(buf[:n]))
+	if len(fields) == 0 {
+		return 0, false, nil
+	}
+	pid, convErr := strconv.Atoi(fields[0])
+	if convErr != nil {
+		return 0, false, nil
+	}
+	return pid, len(fields) > 1 && fields[1] == ownerLockMarker, nil
+}
+
+// sameOwnerFile reports whether ownerPath still names the open file f. A
+// missing path is returned as an os.ErrNotExist error.
+func sameOwnerFile(f *os.File, ownerPath string) (bool, error) {
+	held, err := f.Stat()
+	if err != nil {
+		return false, fmt.Errorf("stat held session owner: %w", err)
+	}
+	current, err := os.Stat(ownerPath)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(held, current), nil
+}
+
+func closeOwnerFile(f *os.File) error {
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close session owner: %w", err)
 	}
 	return nil
 }
 
-// writeOwnerFile writes the PID to the .owner file.
-func writeOwnerFile(sessionPath string, pid int) error {
-	ownerPath := sessionPath + ".owner"
-	return os.WriteFile(ownerPath, []byte(fmt.Sprintf("%d", pid)), 0o644)
+// errOwnerLeftover marks a rename that moved the session but could not remove
+// the previous owner link.
+var errOwnerLeftover = errors.New("session renamed but previous owner file remains")
+
+// renameOwnedSession moves a session file and its held owner file together.
+// The owner is hard-linked to the new name first, so both paths stay claimed
+// while the session moves and an existing owner at the destination is never
+// clobbered. Filesystems without hard links cannot rename owned sessions; the
+// rename fails before the session moves. An error wrapping errOwnerLeftover
+// means the session did move.
+func renameOwnedSession(claim *ownerClaim, oldPath, newPath string) error {
+	newKey, err := ownerKey(newPath)
+	if err != nil {
+		return err
+	}
+	owners.Lock()
+	defer owners.Unlock()
+	if owners.byPath[newKey] != nil {
+		return fmt.Errorf("session destination %s is already open", newPath)
+	}
+	oldOwner := claim.key + ownerSuffix
+	newOwner := newKey + ownerSuffix
+	if err := os.Link(oldOwner, newOwner); err != nil {
+		return fmt.Errorf("claim renamed session: %w", err)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		renameErr := fmt.Errorf("rename session file: %w", err)
+		if rmErr := os.Remove(newOwner); rmErr != nil {
+			return errors.Join(renameErr, fmt.Errorf("remove renamed session owner: %w", rmErr))
+		}
+		return renameErr
+	}
+	delete(owners.byPath, claim.key)
+	claim.key = newKey
+	owners.byPath[newKey] = claim
+	if err := os.Remove(oldOwner); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: %w", errOwnerLeftover, err)
+	}
+	return nil
 }
 
 // isProcessRunning checks if a process with the given PID exists.
@@ -306,26 +543,36 @@ func slugFromHeader(h Header) string {
 	return ""
 }
 
-// uniqueFilename generates a unique filename by appending -1, -2, etc. if needed.
+// uniqueFilename generates a unique filename by appending -2, -3, etc. if
+// needed. A name whose owner file exists is taken too, since moving a session
+// there would leave it claimed by another session's owner.
 func uniqueFilename(dir, filename string) (string, error) {
-	path := filepath.Join(dir, filename)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return filename, nil
-	} else if err != nil {
-		return "", fmt.Errorf("stat session destination: %w", err)
-	}
-
-	// File exists, find a unique name
 	base := strings.TrimSuffix(filename, ".jsonl")
+	candidate := filename
 	for i := 2; ; i++ {
-		candidate := fmt.Sprintf("%s-%d.jsonl", base, i)
-		path := filepath.Join(dir, candidate)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			return candidate, nil
-		} else if err != nil {
-			return "", fmt.Errorf("stat session destination: %w", err)
+		taken, err := sessionNameTaken(filepath.Join(dir, candidate))
+		if err != nil {
+			return "", err
 		}
+		if !taken {
+			return candidate, nil
+		}
+		candidate = fmt.Sprintf("%s-%d.jsonl", base, i)
 	}
+}
+
+func sessionNameTaken(path string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat session destination: %w", err)
+	}
+	if _, err := os.Lstat(path + ownerSuffix); err == nil {
+		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat session destination owner: %w", err)
+	}
+	return false, nil
 }
 
 // SlugFromName converts a display name to a filesystem-safe slug.
@@ -358,19 +605,19 @@ func SlugFromName(name string) string {
 }
 
 // RenameSession renames a session file by writing a session_info entry and
-// moving the file.
+// moving the file. It fails if another process owns the session. A claim this
+// process holds moves with the file, so writers opened on the new path share
+// it and writers still open on the old path keep it until they close. If the
+// file moved but its previous owner file could not be removed, newPath is
+// returned along with the error.
 func RenameSession(oldPath, newName string) (newPath string, err error) {
 	w, err := NewWriter(oldPath)
 	if err != nil {
 		return "", err
 	}
-	closed := false
 	defer func() {
-		if closed {
-			return
-		}
-		if closeErr := w.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close session: %w", closeErr)
+		if closeErr := w.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close session: %w", closeErr))
 		}
 	}()
 
@@ -378,10 +625,6 @@ func RenameSession(oldPath, newName string) (newPath string, err error) {
 	if err := w.Append(info); err != nil {
 		return "", fmt.Errorf("write session_info: %w", err)
 	}
-	if err := w.Close(); err != nil {
-		return "", fmt.Errorf("close session before rename: %w", err)
-	}
-	closed = true
 
 	// Parse the header to get the ID for the new filename
 	h, err := ReadHeader(oldPath)
@@ -396,16 +639,20 @@ func RenameSession(oldPath, newName string) (newPath string, err error) {
 		slug,
 	)
 	newPath = filepath.Join(filepath.Dir(oldPath), newFilename)
-	if newPath != oldPath {
-		newFilename, err = uniqueFilename(filepath.Dir(oldPath), newFilename)
-		if err != nil {
-			return "", fmt.Errorf("rename filename: %w", err)
-		}
-		newPath = filepath.Join(filepath.Dir(oldPath), newFilename)
+	if newPath == oldPath {
+		return newPath, nil
 	}
+	newFilename, err = uniqueFilename(filepath.Dir(oldPath), newFilename)
+	if err != nil {
+		return "", fmt.Errorf("rename filename: %w", err)
+	}
+	newPath = filepath.Join(filepath.Dir(oldPath), newFilename)
 
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return "", fmt.Errorf("rename session file: %w", err)
+	if err := renameOwnedSession(w.owner, oldPath, newPath); err != nil {
+		if errors.Is(err, errOwnerLeftover) {
+			return newPath, err
+		}
+		return "", err
 	}
 
 	return newPath, nil

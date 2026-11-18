@@ -296,11 +296,19 @@ var rpcCmd = &cli.Command{
 	Action: runRPC,
 }
 
+var workerCmd = &cli.Command{
+	Name:   "worker",
+	Hidden: true,
+	Flags:  []cli.Flag{&cli.StringFlag{Name: "socket", Usage: "Coordinator socket path"}},
+	Action: runWorker,
+}
+
 var daemonCmd = &cli.Command{
 	Name:  "daemon",
-	Usage: "Start Unix socket RPC daemon",
+	Usage: "Start the local instance coordinator",
 	Flags: []cli.Flag{
 		&cli.StringFlag{Name: "socket", Usage: "Unix socket path"},
+		&cli.BoolFlag{Name: "legacy", Usage: "Use connection-owned legacy RPC instead of coordinated instances"},
 		&cli.StringFlag{Name: "websocket", Usage: "Opt-in WebSocket bridge address (host:port)"},
 		&cli.StringFlag{Name: "websocket-token", Usage: "Static bearer token for the WebSocket bridge", Sources: cli.EnvVars("TAU_WEBSOCKET_TOKEN")},
 		&cli.BoolFlag{Name: "systemd-user-unit", Usage: "Print a systemd user unit"},
@@ -443,6 +451,7 @@ var Commands = []*cli.Command{
 	sessionsCmd,
 	rpcCmd,
 	daemonCmd,
+	workerCmd,
 	doctorCmd,
 	reloadCmd,
 	skillsCmd,

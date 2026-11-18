@@ -645,6 +645,91 @@ func TestCleanupStaleOwnersReportsReadFailuresAndContinues(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleOwnersUsesOwnerLocks(t *testing.T) {
+	dir := t.TempDir()
+	storage := &Storage{baseDir: dir}
+	// A crashed lock holder whose PID was reused must not block the session.
+	crashed := filepath.Join(dir, "crashed.jsonl")
+	require.NoError(t, os.WriteFile(crashed+".owner", fmt.Appendf(nil, "%d flock\n", os.Getppid()), 0o644))
+	held := filepath.Join(dir, "held.jsonl")
+	holdOwnerAsOtherProcess(t, held, "99999999 flock\n")
+
+	require.NoError(t, storage.CleanupStaleOwners())
+	_, err := os.Stat(crashed + ".owner")
+	require.ErrorIs(t, err, os.ErrNotExist, "unlocked owner from a crashed holder survived cleanup")
+	_, err = os.Stat(held + ".owner")
+	require.NoError(t, err, "cleanup removed an owner that is still locked")
+}
+
+func TestStorageResumeOwnsSessionUntilClose(t *testing.T) {
+	storage, err := NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	header := NewHeader("/test", nil, nil)
+	writer, err := storage.Create(header)
+	require.NoError(t, err)
+	path := writer.Path()
+	require.NoError(t, writer.Close())
+
+	resumed, err := storage.Resume(header.ID)
+	require.NoError(t, err)
+	requireOwnerHeld(t, path)
+	require.NoError(t, resumed.Close())
+	requireOwnerReleased(t, path)
+
+	holdOwnerAsOtherProcess(t, path, "")
+	_, err = storage.Resume(header.ID)
+	require.ErrorContains(t, err, "another process")
+}
+
+func TestStorageOneShotWritesKeepLiveWriterClaim(t *testing.T) {
+	storage, err := NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	header := NewHeader("/test", nil, nil)
+	live, err := storage.Create(header)
+	require.NoError(t, err)
+	path := live.Path()
+	user := NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"hi"}`), nil)
+	require.NoError(t, live.Append(user))
+	accessor := NewSessionStoreAccessor(storage)
+	writes := []struct {
+		name  string
+		write func() error
+	}{
+		{"branch", func() error { return storage.BranchTo(header.ID, user.ID) }},
+		{"compact", func() error { return storage.Compact(header.ID, "summary", user.ID, 10, 2) }},
+		{"branch summary", func() error { return storage.SummarizeBranch(header.ID, user.ID, "summary") }},
+		{"label", func() error {
+			_, err := accessor.SetLabel(t.Context(), header.ID, user.ID, "label")
+			return err
+		}},
+	}
+	for _, w := range writes {
+		require.NoError(t, w.write(), w.name)
+		requireOwnerHeld(t, path)
+	}
+	require.NoError(t, live.Close())
+	requireOwnerReleased(t, path)
+}
+
+func TestStorageRenameMovesLiveOwnerClaim(t *testing.T) {
+	storage, err := NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	header := NewHeader("/test", nil, nil)
+	live, err := storage.Create(header)
+	require.NoError(t, err)
+	oldPath := live.Path()
+
+	require.NoError(t, storage.Rename(header.ID, "renamed"))
+	newPath, err := storage.resolveID(header.ID)
+	require.NoError(t, err)
+	require.NotEqual(t, oldPath, newPath)
+	requireOwnerHeld(t, newPath)
+	requireOwnerReleased(t, oldPath)
+
+	require.NoError(t, live.Close())
+	requireOwnerReleased(t, newPath)
+}
+
 func TestRecursiveSessionDiscoveryReportsMissingRoot(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "sessions")
 	storage, err := NewStorageAt(dir)

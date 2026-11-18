@@ -4,6 +4,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,12 +28,19 @@ func NewSessionStoreAccessor(storage *Storage) *SessionStoreAccessor {
 
 // AppendEntry appends a custom or custom_message entry to the active session.
 // Returns the new entry ID or an error.
-func (s *SessionStoreAccessor) AppendEntry(ctx context.Context, sessionID string, entryType string, payload []byte, parentID *string) (string, error) {
+func (s *SessionStoreAccessor) AppendEntry(ctx context.Context, sessionID string, entryType string, payload []byte, parentID *string) (_ string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	w, err := s.storage.Resume(sessionID)
 	if err != nil {
 		return "", fmt.Errorf("resume session: %w", err)
 	}
-	defer func() { _ = w.Close() }()
+	defer func() {
+		if closeErr := w.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close session writer: %w", closeErr))
+		}
+	}()
 
 	var entry Entry
 	switch entryType {
@@ -78,8 +86,6 @@ func (s *SessionStoreAccessor) AppendEntry(ctx context.Context, sessionID string
 	if err := w.Append(entry); err != nil {
 		return "", fmt.Errorf("append entry: %w", err)
 	}
-
-	_ = ReleaseOwner(w.Path())
 
 	return entry.ID, nil
 }
@@ -175,7 +181,10 @@ func (s *SessionStoreAccessor) GetLabel(ctx context.Context, sessionID string, e
 // SetLabel sets or clears a label on an entry.
 // Pass empty string to clear the label.
 // Returns the new label entry ID or an error.
-func (s *SessionStoreAccessor) SetLabel(ctx context.Context, sessionID string, entryID string, label string) (string, error) {
+func (s *SessionStoreAccessor) SetLabel(ctx context.Context, sessionID string, entryID string, label string) (_ string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	// First, verify the target entry exists
 	r, err := s.storage.Open(sessionID)
 	if err != nil {
@@ -192,14 +201,16 @@ func (s *SessionStoreAccessor) SetLabel(ctx context.Context, sessionID string, e
 	if err != nil {
 		return "", fmt.Errorf("resume session: %w", err)
 	}
-	defer func() { _ = w.Close() }()
+	defer func() {
+		if closeErr := w.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close session writer: %w", closeErr))
+		}
+	}()
 
 	entry := NewLabelEntry(entryID, label)
 	if err := w.Append(entry); err != nil {
 		return "", fmt.Errorf("append label entry: %w", err)
 	}
-
-	_ = ReleaseOwner(w.Path())
 
 	return entry.ID, nil
 }

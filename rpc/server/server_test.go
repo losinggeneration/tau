@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/losinggeneration/tau/agent/plugins"
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/sdk"
+	"github.com/losinggeneration/tau/ui"
 )
 
 func bashResponse(t *testing.T, sess *mockSession, ctx context.Context, args string) Response {
@@ -464,5 +466,81 @@ func TestRPCCommandSessionForwardsResourceReload(t *testing.T) {
 	server.session = newMockSession("unsupported", "/")
 	if err := reloader.ReloadResources(t.Context(), &ai.Settings{}, nil, nil, ""); err == nil {
 		t.Fatal("unsupported reload succeeded")
+	}
+}
+
+func TestShutdownCommandIsIdempotent(t *testing.T) {
+	s := NewServer(nil, nil, nil)
+	s.writer = io.Discard
+	for range 2 {
+		if err := s.handleShutdown(t.Context(), &Command{ID: "shutdown"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-s.shutdown:
+	default:
+		t.Fatal("shutdown was not signaled")
+	}
+}
+
+func TestRPCCommandUIRegistersBeforePublishing(t *testing.T) {
+	s := NewServer(nil, nil, nil)
+	s.ui = ui.NewRPCUI()
+	s.ui.Writer = rpcUIWriter{server: s}
+	// An immediate reply during Write used to arrive before WaitForResponse
+	// registered the request, leaving the slash command blocked until timeout.
+	s.writer = immediateUIReplyWriter{ui: s.ui}
+	adapter := rpcCommandUI{server: s}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if confirmed, err := adapter.Confirm(ctx, "Confirm", "Proceed?"); err != nil || !confirmed {
+		t.Fatalf("confirm = %v, %v", confirmed, err)
+	}
+	if selected, err := adapter.Select(ctx, "Select", []string{"first", "second"}); err != nil || selected != 1 {
+		t.Fatalf("select = %d, %v", selected, err)
+	}
+	if value, err := adapter.Input(ctx, "Input", "value"); err != nil || value != "second" {
+		t.Fatalf("input = %q, %v", value, err)
+	}
+}
+
+type immediateUIReplyWriter struct{ ui *ui.RPCUI }
+
+func (w immediateUIReplyWriter) Write(data []byte) (int, error) {
+	var event struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		return 0, err
+	}
+	confirmed := true
+	w.ui.DispatchResponseTyped(ui.UIResponse{ID: event.ID, Value: "second", Confirmed: &confirmed})
+	return len(data), nil
+}
+
+func TestEmitEventSessionSnapshotDoesNotTakeSessionLock(t *testing.T) {
+	s := NewServer(nil, nil, nil)
+	s.writer = io.Discard
+	s.eventSessionID.Store("initial")
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for range 50 {
+				s.eventSessionID.Store("next")
+				if err := s.emitEvent(sdk.Event{Type: "queue_update"}); err != nil {
+					t.Error(err)
+				}
+			}
+		})
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("event observer deadlocked against session Close")
 	}
 }

@@ -2609,6 +2609,9 @@ func runDaemon(ctx context.Context, cmd *cli.Command) error {
 	if cmd.Bool("systemd-user-unit") {
 		return printDaemonSystemdUnit(cmd.String("socket"))
 	}
+	if !cmd.Bool("legacy") {
+		return runCoordinator(ctx, cmd)
+	}
 
 	uiImpl := ui.NewNoOpUI()
 	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, nil)

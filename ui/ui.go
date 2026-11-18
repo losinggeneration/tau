@@ -983,6 +983,18 @@ func (u *RPCUI) DispatchResponseTyped(resp UIResponse) {
 	}
 }
 
+// CancelPending dismisses dialogs that are currently waiting for a response.
+func (u *RPCUI) CancelPending() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for id, ch := range u.pending {
+		select {
+		case ch <- UIResponse{ID: id, Cancelled: true}:
+		default:
+		}
+	}
+}
+
 // WaitForResponse waits for a response for the given ID and returns the
 // value payload as a string (legacy convenience shim). It is used by RPC
 // handlers whose typed response semantics are encoded in the `Value` field.

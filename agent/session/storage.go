@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/losinggeneration/tau/ai"
@@ -202,17 +203,13 @@ func (s *Storage) Open(id string) (*Reader, error) {
 	return ReadFile(path)
 }
 
-// Resume opens an existing session for appending, claiming ownership.
+// Resume opens an existing session for appending. The writer owns the
+// session until Close; no separate ReleaseOwner call is needed.
 func (s *Storage) Resume(id string) (*Writer, error) {
 	path, err := s.resolveID(id)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := ClaimOwner(path); err != nil {
-		return nil, err
-	}
-
 	return NewWriter(path)
 }
 
@@ -295,16 +292,10 @@ func (s *Storage) Rename(id, newName string) error {
 	}
 
 	newPath, err := RenameSession(path, newName)
-	if err != nil {
-		return err
+	if newPath != "" {
+		s.invalidateIndex()
 	}
-
-	// Move owner file if it exists
-	_ = os.Rename(path+".owner", newPath+".owner")
-
-	// Invalidate index cache
-	s.invalidateIndex()
-	return nil
+	return err
 }
 
 // MoveCWD rewrites a session's working directory and moves it into that CWD's scoped directory.
@@ -386,11 +377,7 @@ func (s *Storage) BranchTo(sessionID string, branchFromID string) (err error) {
 	}
 	defer func() { err = errors.Join(err, w.Close()) }()
 
-	entry := NewPositionChangeEntry(branchFromID)
-	if err := w.Append(entry); err != nil {
-		return err
-	}
-	return ReleaseOwner(w.Path())
+	return w.Append(NewPositionChangeEntry(branchFromID))
 }
 
 // GetBranchEntries returns all entries from the given entry back to root,
@@ -535,7 +522,7 @@ func (s *Storage) AppendSummaryUsage(id string, usage ai.Usage) (err error) {
 	if err := w.Append(entry); err != nil {
 		return fmt.Errorf("append summary usage: %w", err)
 	}
-	return ReleaseOwner(w.Path())
+	return nil
 }
 
 // Compact appends a compaction entry to the session.
@@ -559,10 +546,7 @@ func (s *Storage) CompactWithHook(id string, summary string, firstKeptID string,
 	if position := reader.CurrentPosition(); position != "" {
 		entry.ParentID = &position
 	}
-	if err := w.Append(entry); err != nil {
-		return err
-	}
-	return ReleaseOwner(w.Path())
+	return w.Append(entry)
 }
 
 // SummarizeBranch appends a branch_summary entry.
@@ -581,10 +565,7 @@ func (s *Storage) SummarizeBranch(id, fromID, summary string) (err error) {
 	if position := reader.CurrentPosition(); position != "" {
 		entry.ParentID = &position
 	}
-	if err := w.Append(entry); err != nil {
-		return err
-	}
-	return ReleaseOwner(w.Path())
+	return w.Append(entry)
 }
 
 // resolveID finds the session file matching an ID (supports unique prefixes).
@@ -916,7 +897,9 @@ func (s *Storage) isIndexStaleDir(indexFile, dir string, recursive bool) bool {
 	return false
 }
 
-// CleanupStaleOwners removes .owner files whose PIDs are no longer running.
+// CleanupStaleOwners removes .owner files whose holder is gone: unlocked
+// files from crashed lock holders, and legacy PID files whose process is no
+// longer running.
 func (s *Storage) CleanupStaleOwners() error {
 	matches, err := s.ownerFiles()
 	if err != nil {
@@ -925,27 +908,55 @@ func (s *Storage) CleanupStaleOwners() error {
 
 	var cleanupErr error
 	for _, m := range matches {
-		data, err := os.ReadFile(m)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("read session owner %s: %w", m, err))
-			continue
-		}
-
-		var pid int
-		if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err != nil {
-			continue
-		}
-
-		if !isProcessRunning(pid) {
-			if err := os.Remove(m); err != nil && !errors.Is(err, os.ErrNotExist) {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove stale session owner %s: %w", m, err))
-			}
-		}
+		cleanupErr = errors.Join(cleanupErr, removeStaleOwner(m))
 	}
 	return cleanupErr
+}
+
+// removeStaleOwner deletes the owner file while holding its lock, so a live
+// claimer can never be holding the inode being removed.
+func removeStaleOwner(ownerPath string) (err error) {
+	f, err := os.Open(ownerPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read session owner %s: %w", ownerPath, err)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close session owner %s: %w", ownerPath, closeErr))
+		}
+	}()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil
+		}
+		return fmt.Errorf("lock session owner %s: %w", ownerPath, err)
+	}
+	same, err := sameOwnerFile(f, ownerPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check session owner %s: %w", ownerPath, err)
+	}
+	if !same {
+		return nil
+	}
+	pid, lockHeld, err := readOwner(f)
+	if err != nil {
+		return fmt.Errorf("read session owner %s: %w", ownerPath, err)
+	}
+	// Unlocked legacy files are kept unless their PID is known to be dead.
+	if !lockHeld && (pid == 0 || isProcessRunning(pid)) {
+		return nil
+	}
+	if err := os.Remove(ownerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale session owner %s: %w", ownerPath, err)
+	}
+	return nil
 }
 
 // ExportJSON exports a session as structured JSON.

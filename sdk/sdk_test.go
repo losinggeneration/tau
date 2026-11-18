@@ -6252,7 +6252,6 @@ func TestCloseAfterDeadlineCanRetryCleanup(t *testing.T) {
 	cancel()
 	s := sess.(*agentSession)
 	path := s.sessionWriter.Path()
-	require.NoError(t, sessionpkg.ClaimOwner(path))
 	closeErr := s.close(ctx, time.Millisecond)
 	require.ErrorIs(t, closeErr, context.Canceled)
 	require.ErrorIs(t, closeErr, context.DeadlineExceeded)
@@ -9172,7 +9171,6 @@ func TestCloseReportsOwnerReleaseFailureAndFinishesCleanup(t *testing.T) {
 	}
 	s := sess.(*agentSession)
 	owner := s.sessionWriter.Path() + ".owner"
-	require.NoError(t, sessionpkg.ClaimOwner(s.sessionWriter.Path()))
 	require.NoError(t, os.Remove(owner))
 	require.NoError(t, os.Mkdir(owner, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(owner, "block"), nil, 0o600))
@@ -9202,7 +9200,6 @@ func TestCloseReleasesOnlyItsOwnWriterClaim(t *testing.T) {
 	for range events {
 	}
 	path := sess.(*agentSession).sessionWriter.Path()
-	require.NoError(t, sessionpkg.ClaimOwner(path))
 	require.NoError(t, sessionpkg.ClaimOwner(path))
 	require.NoError(t, sess.Close(t.Context()))
 	_, err = os.Stat(path + ".owner")
@@ -9364,7 +9361,6 @@ func TestCancelledCloseJoinsRunAndReleasesWriter(t *testing.T) {
 	collectSessionEvents(t, events)
 	s := sess.(*agentSession)
 	path := s.sessionWriter.Path()
-	require.NoError(t, sessionpkg.ClaimOwner(path))
 	entered := make(chan struct{})
 	s.mu.Lock()
 	events = s.runLocked(t.Context(), func(ctx context.Context) error {
@@ -9400,7 +9396,6 @@ func TestCancelledCloseRetainsCleanupFailure(t *testing.T) {
 	collectSessionEvents(t, events)
 	s := sess.(*agentSession)
 	owner := s.sessionWriter.Path() + ".owner"
-	require.NoError(t, sessionpkg.ClaimOwner(s.sessionWriter.Path()))
 	require.NoError(t, os.Remove(owner))
 	require.NoError(t, os.Mkdir(owner, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(owner, "block"), nil, 0o600))

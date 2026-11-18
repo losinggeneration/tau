@@ -1,12 +1,112 @@
-package client_test
+package client
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/losinggeneration/tau/rpc/client"
 )
+
+// unixPeer starts an in-process server on a Unix socket and returns a client
+// connected to it along with the accepted server side of the connection.
+func unixPeer(t *testing.T) (*Client, net.Conn) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "rpc.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	})
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			close(accepted)
+			return
+		}
+		accepted <- conn
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	c, err := NewUnixClient(ctx, path)
+	if err != nil {
+		t.Fatalf("NewUnixClient: %v", err)
+	}
+	conn, ok := <-accepted
+	if !ok {
+		t.Fatal("accept failed")
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("close server conn: %v", err)
+		}
+	})
+	return c, conn
+}
+
+func TestUnixClientDeliversUIEventsWithID(t *testing.T) {
+	c, conn := unixPeer(t)
+
+	if _, err := conn.Write([]byte(`{"type":"ui_confirm","id":"ui-1","title":"Proceed?"}` + "\n")); err != nil {
+		t.Fatalf("write event: %v", err)
+	}
+
+	select {
+	case evt := <-c.Events():
+		if evt.Type != "ui_confirm" {
+			t.Fatalf("event type = %q, want ui_confirm", evt.Type)
+		}
+		if evt.Payload["id"] != "ui-1" {
+			t.Fatalf("event id = %v, want ui-1", evt.Payload["id"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ui_confirm event with id was not delivered to Events")
+	}
+}
+
+func TestUnixClientCorrelatesResponses(t *testing.T) {
+	c, conn := unixPeer(t)
+
+	go func() {
+		line, err := bufio.NewReader(conn).ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var cmd Command
+		if err := json.Unmarshal(line, &cmd); err != nil {
+			return
+		}
+		resp, err := json.Marshal(Response{Type: "response", ID: cmd.ID, OK: true, Result: map[string]any{"cmd": cmd.Type}})
+		if err != nil {
+			return
+		}
+		if _, err := conn.Write(append(resp, '\n')); err != nil {
+			return
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp, err := c.GetState(ctx)
+	if err != nil {
+		t.Fatalf("GetState: %v", err)
+	}
+	if !resp.OK || resp.Result["cmd"] != "get_state" {
+		t.Fatalf("response = %+v", resp)
+	}
+}
 
 // TestRPCRoundTrip tests RPC round-trip via client: each command type,
 // response/event correlation, and ordering.
@@ -16,7 +116,7 @@ func TestRPCRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	c, err := client.NewClient()
+	c, err := NewClient()
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -147,7 +247,7 @@ func TestResponseCorrelation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	c, err := client.NewClient()
+	c, err := NewClient()
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -159,11 +259,11 @@ func TestResponseCorrelation(t *testing.T) {
 	// Send multiple concurrent commands and verify each response matches its command ID
 	commands := []struct {
 		name string
-		send func() (*client.Response, error)
+		send func() (*Response, error)
 	}{
-		{"GetState", func() (*client.Response, error) { return c.GetState(ctx) }},
-		{"ListSessions", func() (*client.Response, error) { return c.ListSessions(ctx, 5) }},
-		{"SetModel", func() (*client.Response, error) { return c.SetModel(ctx, "claude-3-5-sonnet") }},
+		{"GetState", func() (*Response, error) { return c.GetState(ctx) }},
+		{"ListSessions", func() (*Response, error) { return c.ListSessions(ctx, 5) }},
+		{"SetModel", func() (*Response, error) { return c.SetModel(ctx, "claude-3-5-sonnet") }},
 	}
 
 	for _, tc := range commands {
@@ -190,7 +290,7 @@ func TestEventOrdering(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	c, err := client.NewClient()
+	c, err := NewClient()
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -251,11 +351,11 @@ func TestIsClientEventType(t *testing.T) {
 		"ui_notify", "ui_set_status", "ui_set_widget",
 	}
 	for _, ty := range included {
-		if !client.IsClientEventType(ty) {
+		if !IsClientEventType(ty) {
 			t.Errorf("expected %q to be a client event type", ty)
 		}
 	}
-	if client.IsClientEventType("internal_heartbeat") {
+	if IsClientEventType("internal_heartbeat") {
 		t.Error("unrelated types should be filtered out")
 	}
 }
@@ -263,7 +363,7 @@ func TestIsClientEventType(t *testing.T) {
 func TestEventFromJSONDelta(t *testing.T) {
 	// Test that delta field is extracted correctly from flattened JSON
 	data := []byte(`{"type":"text_delta","session_id":"s1","seq":5,"ts":"2026-05-01T10:00:00Z","delta":"Hello ","message_id":"msg-1"}`)
-	var evt client.Event
+	var evt Event
 	if err := evt.FromJSON(data); err != nil {
 		t.Fatalf("FromJSON: %v", err)
 	}
@@ -286,7 +386,7 @@ func TestEventFromJSONDelta(t *testing.T) {
 
 func TestEventFromJSONThinkingDelta(t *testing.T) {
 	data := []byte(`{"type":"thinking_delta","delta":"thinking...","level":"medium"}`)
-	var evt client.Event
+	var evt Event
 	if err := evt.FromJSON(data); err != nil {
 		t.Fatalf("FromJSON: %v", err)
 	}
@@ -303,7 +403,7 @@ func TestEventFromJSONThinkingDelta(t *testing.T) {
 
 func TestEventFromJSONToolCall(t *testing.T) {
 	data := []byte(`{"type":"tool_call","tool_call_id":"tc-123","name":"read","input":{"path":"/tmp/test.txt"}}`)
-	var evt client.Event
+	var evt Event
 	if err := evt.FromJSON(data); err != nil {
 		t.Fatalf("FromJSON: %v", err)
 	}
@@ -317,7 +417,7 @@ func TestEventFromJSONToolCall(t *testing.T) {
 
 func TestEventFromJSONUsageTokens(t *testing.T) {
 	data := []byte(`{"type":"usage","tokens":12345}`)
-	var evt client.Event
+	var evt Event
 	if err := evt.FromJSON(data); err != nil {
 		t.Fatalf("FromJSON: %v", err)
 	}
@@ -331,7 +431,7 @@ func TestEventFromJSONUsageTokens(t *testing.T) {
 
 func TestEventFromJSONPreservesPayload(t *testing.T) {
 	data := []byte(`{"type":"tool_result","tool_call_id":"tc-456","content":"file contents here","is_error":false}`)
-	var evt client.Event
+	var evt Event
 	if err := evt.FromJSON(data); err != nil {
 		t.Fatalf("FromJSON: %v", err)
 	}
@@ -350,7 +450,7 @@ func TestEventFromJSONPreservesPayload(t *testing.T) {
 func TestEventFromJSONRoundTrip(t *testing.T) {
 	// Simulate what the server sends with flattened fields
 	serverJSON := []byte(`{"type":"text_delta","session_id":"session-abc","seq":42,"ts":"2026-05-07T12:00:00Z","delta":"final text","message_id":"msg-xyz"}`)
-	var evt client.Event
+	var evt Event
 	if err := evt.FromJSON(serverJSON); err != nil {
 		t.Fatalf("FromJSON: %v", err)
 	}
@@ -378,7 +478,7 @@ func TestEventFromJSONRoundTrip(t *testing.T) {
 
 func TestEventFromJSONMalformed(t *testing.T) {
 	badJSON := []byte(`{invalid json}`)
-	var evt client.Event
+	var evt Event
 	if err := evt.FromJSON(badJSON); err == nil {
 		t.Error("expected error for malformed JSON")
 	}
@@ -388,6 +488,6 @@ func TestSetThinkingLevelCommand(t *testing.T) {
 	// Verify SetThinkingLevel method exists on Client
 	// The actual RPC call would require a running tau rpc subprocess,
 	// but we can verify the method signature is correct at compile time.
-	var c *client.Client
+	var c *Client
 	_ = c.SetThinkingLevel // Method exists and is accessible with correct signature
 }

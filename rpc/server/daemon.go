@@ -13,6 +13,7 @@ import (
 
 	"github.com/losinggeneration/tau/agent/plugins"
 	"github.com/losinggeneration/tau/commands"
+	"github.com/losinggeneration/tau/rpc/coord"
 	"github.com/losinggeneration/tau/sdk"
 )
 
@@ -41,11 +42,10 @@ func RunUnix(ctx context.Context, path string, runtime sdk.Runtime, cmdRegistry 
 	if path == "" {
 		path = SocketPath()
 	}
-	if err := prepareSocketPath(path); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	listener, err := net.Listen("unix", path)
+	listener, err := coord.ListenUnix(path)
 	if err != nil {
 		return fmt.Errorf("listen unix socket: %w", err)
 	}
@@ -53,23 +53,17 @@ func RunUnix(ctx context.Context, path string, runtime sdk.Runtime, cmdRegistry 
 		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
 			err = errors.Join(err, fmt.Errorf("close unix listener: %w", closeErr))
 		}
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			err = errors.Join(err, fmt.Errorf("remove unix socket: %w", removeErr))
-		}
 	}()
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("chmod socket: %w", err)
-	}
 
-	go func() {
-		<-ctx.Done()
+	stopClose := context.AfterFunc(ctx, func() {
 		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
 			_, writeErr := fmt.Fprintf(os.Stderr, "tau daemon listener close error: %v\n", closeErr)
 			if writeErr != nil {
 				return
 			}
 		}
-	}()
+	})
+	defer stopClose()
 
 	for {
 		conn, err := listener.Accept()
@@ -81,20 +75,6 @@ func RunUnix(ctx context.Context, path string, runtime sdk.Runtime, cmdRegistry 
 		}
 		go runConn(ctx, conn, runtime, cmdRegistry, pluginManager)
 	}
-}
-
-func prepareSocketPath(path string) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create socket dir: %w", err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("chmod socket dir: %w", err)
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove stale socket: %w", err)
-	}
-	return nil
 }
 
 func runConn(ctx context.Context, conn net.Conn, runtime sdk.Runtime, cmdRegistry commands.Registry, pluginManager *plugins.Manager) {

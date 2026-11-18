@@ -32,7 +32,11 @@ func TestSocketPathFallbackIsUserScoped(t *testing.T) {
 }
 
 func TestRunUnixLifecyclePermissionsAndRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tau.sock")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "tau.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -94,7 +98,11 @@ func TestRunUnixLifecyclePermissionsAndRoundTrip(t *testing.T) {
 func TestRunUnixDoesNotCreateIdleSessionFile(t *testing.T) {
 	sessions := t.TempDir()
 	t.Setenv("TAU_SESSION_DIR", sessions)
-	path := filepath.Join(t.TempDir(), "tau.sock")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "tau.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -114,6 +122,32 @@ func TestRunUnixDoesNotCreateIdleSessionFile(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("idle daemon created session files: %v", entries)
+	}
+}
+
+func TestRunUnixDoesNotReplaceLiveEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "tau.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := RunUnix(ctx, path, &mockRuntime{}, nil, nil); err == nil {
+		t.Error("legacy daemon replaced a live endpoint")
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Errorf("live endpoint inode changed or disappeared: %v", err)
 	}
 }
 

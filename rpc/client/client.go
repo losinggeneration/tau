@@ -249,8 +249,8 @@ func (c *Client) readEvents() {
 			continue
 		}
 
-		if base.ID != "" {
-			// It's a response
+		// ui_* events also carry an id, so only the type identifies responses.
+		if base.Type == "response" {
 			var resp Response
 			if err := json.Unmarshal(line, &resp); err != nil {
 				continue

@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/losinggeneration/tau/agent"
@@ -82,6 +83,12 @@ type Server struct {
 	promptWG sync.WaitGroup
 	// writeMu serializes JSONL writes from commands, shells, and session events.
 	writeMu sync.Mutex
+	// eventMu keeps sequence assignment and publication in the same order.
+	eventMu sync.Mutex
+	// eventSessionID can be read by observers while sessionMu is held during Close.
+	eventSessionID atomic.Value
+	coordinated    bool
+	shutdownOnce   sync.Once
 }
 
 // NewServer creates a new RPC server with the given runtime and optional
@@ -103,7 +110,7 @@ func NewServer(runtime sdk.Runtime, cmdRegistry commands.Registry, pluginManager
 func (s *Server) Run(ctx context.Context) error {
 	// Set up RPCUI for UI event emission
 	s.ui = ui.NewRPCUI()
-	s.ui.Writer = s.writer
+	s.ui.Writer = rpcUIWriter{server: s}
 	if s.pluginManager != nil {
 		s.pluginManager.SetUI(s.ui)
 	}
@@ -305,6 +312,9 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 	behavior := cmp.Or(args.StreamingBehavior, args.StreamingBehaviorPi)
+	if behavior == "" && s.coordinated {
+		behavior = "steer"
+	}
 	switch behavior {
 	case "", "steer", "follow_up", "followUp":
 	default:
@@ -409,10 +419,13 @@ func (s *Server) streamPrompt(id, sessionID string, events <-chan sdk.Event) (er
 // handleInterrupt cancels the in-flight assistant response.
 func (s *Server) handleInterrupt(ctx context.Context, cmd *Command) error {
 	s.sessionMu.Lock()
-	if s.session != nil {
-		_ = s.session.Interrupt()
-	}
+	current := s.session
 	s.sessionMu.Unlock()
+	if current != nil {
+		if err := current.Interrupt(); err != nil {
+			return s.sendErrorResult(cmd.ID, err)
+		}
+	}
 
 	// Emit interrupt event
 	select {
@@ -471,59 +484,47 @@ type rpcCommandUI struct {
 	server *Server
 }
 
-func (a *rpcCommandUI) Confirm(ctx context.Context, title, message string) (bool, error) {
-	// Emit a ui_confirm event and wait for client response
-	eventID := fmt.Sprintf("ui-confirm-%d", time.Now().UnixNano())
-	event := map[string]any{
-		"type":    "ui_confirm",
-		"id":      eventID,
-		"title":   title,
-		"message": message,
+func (a *rpcCommandUI) responseContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if a.server.coordinated {
+		return context.WithCancel(ctx)
 	}
-	_ = a.server.emitEvent(sdk.Event{Type: "ui_confirm", Payload: event})
+	return context.WithTimeout(ctx, 60*time.Second)
+}
 
-	// Wait for ui_response with matching ID
-	value, err := a.server.ui.WaitForResponse(eventID, 60*time.Second)
-	if err != nil {
-		return false, err
-	}
-	return value == "true" || value == "yes", nil
+func (a *rpcCommandUI) Confirm(ctx context.Context, title, message string) (bool, error) {
+	ctx, cancel := a.responseContext(ctx)
+	defer cancel()
+	return a.server.ui.Confirm(ctx, title, message)
 }
 
 func (a *rpcCommandUI) Select(ctx context.Context, title string, options []string) (int, error) {
-	eventID := fmt.Sprintf("ui-select-%d", time.Now().UnixNano())
-	event := map[string]any{
-		"type":    "ui_select",
-		"id":      eventID,
-		"title":   title,
-		"options": options,
-	}
-	_ = a.server.emitEvent(sdk.Event{Type: "ui_select", Payload: event})
-
-	value, err := a.server.ui.WaitForResponse(eventID, 60*time.Second)
-	if err != nil {
-		return 0, err
-	}
-
-	// Parse the selected index
-	var idx int
-	if _, err := fmt.Sscanf(value, "%d", &idx); err != nil {
-		return 0, fmt.Errorf("invalid selection: %s", value)
-	}
-	return idx, nil
+	ctx, cancel := a.responseContext(ctx)
+	defer cancel()
+	return a.server.ui.Select(ctx, title, options)
 }
 
 func (a *rpcCommandUI) Input(ctx context.Context, title, placeholder string) (string, error) {
-	eventID := fmt.Sprintf("ui-input-%d", time.Now().UnixNano())
-	event := map[string]any{
-		"type":        "ui_input",
-		"id":          eventID,
-		"title":       title,
-		"placeholder": placeholder,
-	}
-	_ = a.server.emitEvent(sdk.Event{Type: "ui_input", Payload: event})
+	ctx, cancel := a.responseContext(ctx)
+	defer cancel()
+	return a.server.ui.Input(ctx, title, placeholder)
+}
 
-	return a.server.ui.WaitForResponse(eventID, 60*time.Second)
+// rpcUIWriter merges UI and SDK events into the server's serialized stream.
+type rpcUIWriter struct{ server *Server }
+
+func (w rpcUIWriter) Write(data []byte) (int, error) {
+	var event map[string]any
+	if err := json.Unmarshal(data, &event); err != nil {
+		return 0, fmt.Errorf("decode UI event: %w", err)
+	}
+	kind, _ := event["type"].(string)
+	delete(event, "session_id")
+	delete(event, "seq")
+	delete(event, "ts")
+	if err := w.server.emitEvent(sdk.Event{Type: kind, Payload: event}); err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 // rpcCommandSession adapts Server to commands.CommandSession for slash-command execution.
@@ -897,7 +898,7 @@ func (s *Server) handleCompact(ctx context.Context, cmd *Command) error {
 
 // handleShutdown gracefully exits.
 func (s *Server) handleShutdown(ctx context.Context, cmd *Command) error {
-	defer close(s.shutdown)
+	defer s.shutdownOnce.Do(func() { close(s.shutdown) })
 	return s.sendResult(cmd.ID, map[string]any{"ok": true})
 }
 
@@ -930,6 +931,7 @@ func (s *Server) ensureSession(ctx context.Context) (sdk.Session, error) {
 	}
 
 	sess, err := s.runtime.NewSession(ctx, sdk.SessionOptions{
+		UI:            s.ui,
 		Model:         s.modelOverride,
 		ThinkingLevel: s.thinkingLevel,
 	})
@@ -938,12 +940,14 @@ func (s *Server) ensureSession(ctx context.Context) (sdk.Session, error) {
 	}
 
 	s.session = sess
+	s.eventSessionID.Store(sess.ID())
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.observeSessionEvents(sess)
 	return sess, nil
 }
 
 func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, reason string) error {
+	opts.UI = s.ui
 	s.sessionMu.Lock()
 	prev := s.session
 	prevCancel := s.sessionCancel
@@ -994,6 +998,7 @@ func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, re
 
 	s.sessionMu.Lock()
 	s.session = sess
+	s.eventSessionID.Store(sess.ID())
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.sessionMu.Unlock()
 	s.observeSessionEvents(sess)
@@ -1083,9 +1088,11 @@ func (s *Server) emitEvent(event sdk.Event) error {
 	if event.Type == "meta" {
 		return nil
 	}
-	// Preserve real session_id from the event or the current session
-	if event.SessionID == "" && s.session != nil {
-		event.SessionID = s.session.ID()
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	// Observers must not take sessionMu: session Close can wait for them.
+	if event.SessionID == "" {
+		event.SessionID, _ = s.eventSessionID.Load().(string)
 	}
 
 	// RPC owns the emitted event sequence so SDK-originated events and
@@ -1587,6 +1594,7 @@ func (s *Server) handleFork(ctx context.Context, cmd *Command) error {
 	}
 
 	opts := sdk.SessionOptions{
+		UI:            s.ui,
 		Model:         s.modelOverride,
 		ThinkingLevel: s.thinkingLevel,
 		ForkFrom:      current.ID(),
@@ -1758,6 +1766,7 @@ func (s *Server) rebindSession(ctx context.Context, newSess sdk.Session) error {
 	prev := s.session
 	prevCancel := s.sessionCancel
 	s.session = newSess
+	s.eventSessionID.Store(newSess.ID())
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.sessionMu.Unlock()
 	s.observeSessionEvents(newSess)
