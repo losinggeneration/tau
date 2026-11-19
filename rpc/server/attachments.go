@@ -9,7 +9,7 @@ import (
 	"github.com/losinggeneration/tau/sdk"
 )
 
-func (s *Server) messageContentBlocks(images, attachFiles, attachmentIDs []string) ([]ai.ContentBlock, []string, error) {
+func messageContentBlocks(sess sdk.Session, images, attachFiles, attachmentIDs []string) ([]ai.ContentBlock, []string, error) {
 	content := make([]ai.ContentBlock, 0, len(images))
 	for _, img := range images {
 		content = append(content, ai.ContentBlock{Type: ai.ContentBlockImage, Data: img, MimeType: "image/png"})
@@ -19,7 +19,7 @@ func (s *Server) messageContentBlocks(images, attachFiles, attachmentIDs []strin
 	if len(attachFiles) == 0 {
 		return content, ids, nil
 	}
-	mgr, err := s.attachmentManager()
+	mgr, err := attachmentManager(sess)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -37,6 +37,10 @@ func (s *Server) attachmentManager() (sdk.AttachmentManager, error) {
 	s.sessionMu.Lock()
 	current := s.session
 	s.sessionMu.Unlock()
+	return attachmentManager(current)
+}
+
+func attachmentManager(current sdk.Session) (sdk.AttachmentManager, error) {
 	if current == nil {
 		return nil, fmt.Errorf("no active session")
 	}
@@ -67,16 +71,26 @@ func (s *Server) handleAttachFile(ctx context.Context, cmd *Command) error {
 }
 
 func (s *Server) handleAttachData(ctx context.Context, cmd *Command) error {
-	_ = ctx
 	var args struct {
-		Filename string `json:"filename"`
-		MimeType string `json:"mime_type"`
-		Data     string `json:"data"`
+		ExpectedSessionID string `json:"expected_session_id,omitempty"`
+		Filename          string `json:"filename"`
+		MimeType          string `json:"mime_type"`
+		Data              string `json:"data"`
 	}
 	if err := json.Unmarshal(cmd.Args, &args); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-	mgr, err := s.attachmentManager()
+	var mgr sdk.AttachmentManager
+	var err error
+	if args.ExpectedSessionID == "" {
+		mgr, err = s.attachmentManager()
+	} else {
+		var sess sdk.Session
+		sess, err = s.draftSession(ctx, args.ExpectedSessionID)
+		if err == nil {
+			mgr, err = attachmentManager(sess)
+		}
+	}
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}

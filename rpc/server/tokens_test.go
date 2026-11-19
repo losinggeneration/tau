@@ -143,3 +143,36 @@ func TestTokenStoreRejectsEmptyName(t *testing.T) {
 		t.Fatalf("revoke empty name = (%t, %v), want error", found, err)
 	}
 }
+
+func TestTokenStorePublishesWholeSnapshots(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens.json")
+	writer, reader := NewTokenStore(path), NewTokenStore(path)
+	keep, err := writer.Add("keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := writer.Add("changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(initial, current) || current.Mode().Perm() != 0o600 {
+		t.Fatal("add didn't publish a new private snapshot")
+	}
+	if !reader.Contains(keep.Token) || !reader.Contains(changed.Token) {
+		t.Fatal("reader did not accept both device tokens")
+	}
+	if found, err := writer.Revoke("changed"); err != nil || !found {
+		t.Fatalf("revoke = %t, %v", found, err)
+	}
+	if !reader.Contains(keep.Token) || reader.Contains(changed.Token) {
+		t.Fatal("reader didn't see the updated snapshot")
+	}
+}

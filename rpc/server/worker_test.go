@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -153,6 +155,27 @@ func (h *workerHarness) next(t *testing.T) coord.Frame {
 	}
 }
 
+// nextEvent skips instance registrations, which interleave with events.
+func (h *workerHarness) nextEvent(t *testing.T) coord.Frame {
+	t.Helper()
+	for {
+		if f := h.next(t); f.Type != coord.TypeRegister {
+			return f
+		}
+	}
+}
+
+func decodeResult(t *testing.T, r Response, v any) {
+	t.Helper()
+	data, err := json.Marshal(r.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (h *workerHarness) response(t *testing.T, id string) Response {
 	t.Helper()
 	for {
@@ -221,6 +244,25 @@ func TestWorkerDisconnectKeepsRun(t *testing.T) {
 		h.done <- err
 		t.Fatalf("disconnect stopped worker: %v", err)
 	default:
+	}
+}
+
+func TestWorkerReportsRunStatusFromSameEventStream(t *testing.T) {
+	rt := newWorkerRuntime()
+	h := startWorker(t, rt, nil)
+	observe := <-rt.sess.observerReady
+	h.send(t, "ready", `{"type":"get_state"}`)
+	if r := h.response(t, "ready"); !r.OK {
+		t.Fatalf("ready probe: %+v", r)
+	}
+	for _, pair := range [][2]string{{"agent_start", coord.StateBusy}, {"agent_end", coord.StateReady}} {
+		observe(sdk.Event{Type: pair[0], SessionID: "session"})
+		chat := h.next(t)
+		state := h.next(t)
+		if chat.Type != coord.TypeEvent || !strings.Contains(string(chat.Event), pair[0]) || state.Type != coord.TypeRegister ||
+			state.Instance == nil || state.Instance.SessionID != "session" || state.Instance.State != pair[1] {
+			t.Fatalf("%s frames = %+v / %+v", pair[0], chat, state)
+		}
 	}
 }
 
@@ -323,8 +365,21 @@ func TestWorkerUIAndObserverShareStream(t *testing.T) {
 	h.send(t, "reply", string(args))
 	// Either response can win; both must arrive without waiting on the slash handler.
 	seen := make(map[string]bool)
-	for len(seen) < 2 {
+	resolvedSeq := int64(-1)
+	for len(seen) < 2 || resolvedSeq < 0 {
 		frame := h.next(t)
+		if frame.Type == coord.TypeEvent {
+			var resolved struct {
+				Type string `json:"type"`
+				Seq  int64  `json:"seq"`
+			}
+			if err := json.Unmarshal(frame.Event, &resolved); err != nil {
+				t.Fatal(err)
+			}
+			if resolved.Type == "ui_resolved" {
+				resolvedSeq = resolved.Seq
+			}
+		}
 		if frame.Type == coord.TypeResponse {
 			var r Response
 			if err := json.Unmarshal(frame.Result, &r); err != nil {
@@ -340,14 +395,14 @@ func TestWorkerUIAndObserverShareStream(t *testing.T) {
 		t.Fatalf("response routes: %v", seen)
 	}
 	observer(sdk.Event{Type: "queue_update"})
-	f = h.next(t)
+	f = h.nextEvent(t)
 	var observed struct {
 		Seq int64 `json:"seq"`
 	}
 	if err := json.Unmarshal(f.Event, &observed); err != nil {
 		t.Fatal(err)
 	}
-	if observed.Seq != event.Seq+1 || f.SessionID != "session" {
+	if resolvedSeq != event.Seq+1 || observed.Seq != resolvedSeq+1 || f.SessionID != "session" {
 		t.Fatalf("observer stream diverged: %+v", f)
 	}
 }
@@ -413,7 +468,9 @@ func TestWorkerAdmissionBoundAndTarget(t *testing.T) {
 	h := startWorker(t, rt, nil)
 	h.send(t, "blocking", `{"type":"compact"}`)
 	<-started
-	h.send(t, "waiting", `{"type":"get_state"}`)
+	for i := range workerAdmissionSlots {
+		h.send(t, fmt.Sprintf("waiting-%d", i), `{"type":"get_state"}`)
+	}
 	h.send(t, "overflow", `{"type":"get_state"}`)
 	if r := h.response(t, "overflow"); r.OK || r.Error == nil || r.Error.Code != "busy" {
 		t.Fatalf("unbounded admission: %+v", r)
@@ -477,8 +534,18 @@ func TestWorkerInterruptReleasesBlockedSlashUI(t *testing.T) {
 	h.send(t, "interrupt", `{"type":"interrupt"}`)
 	h.send(t, "state", `{"type":"get_state"}`)
 	seen := make(map[string]Response)
+	var outcome string
 	for len(seen) < 3 {
 		f := h.next(t)
+		if f.Type == coord.TypeEvent && strings.Contains(string(f.Event), `"type":"ui_resolved"`) {
+			var resolved struct {
+				Outcome string `json:"outcome"`
+			}
+			if err := json.Unmarshal(f.Event, &resolved); err != nil {
+				t.Fatal(err)
+			}
+			outcome = resolved.Outcome
+		}
 		if f.Type != coord.TypeResponse {
 			continue
 		}
@@ -491,8 +558,126 @@ func TestWorkerInterruptReleasesBlockedSlashUI(t *testing.T) {
 	if r := seen["ask"]; r.OK || r.Error == nil || !strings.Contains(r.Error.Message, "context canceled") {
 		t.Fatalf("slash command not cancelled: %+v", r)
 	}
+	// The dialog resolves before the slash command replies.
+	if outcome != ui.OutcomeInterrupted {
+		t.Fatalf("dialog outcome = %q, want %q", outcome, ui.OutcomeInterrupted)
+	}
 	if !seen["interrupt"].OK || !seen["state"].OK {
 		t.Fatalf("worker did not recover after interrupt: %+v", seen)
+	}
+}
+
+func TestWorkerSharedDialogResolvesOnce(t *testing.T) {
+	rt := newWorkerRuntime()
+	reg := commands.NewInMemoryRegistry()
+	if err := reg.RegisterAt(commands.Info{Name: "pick"}, func(ctx context.Context, _ string, commandUI commands.CommandUI, _ commands.CommandSession) (commands.Result, error) {
+		idx, err := commandUI.Select(ctx, "Pick", []string{"red", "blue"})
+		if err != nil {
+			return commands.Result{}, err
+		}
+		return commands.Result{Output: []string{"red", "blue"}[idx]}, nil
+	}, "", commands.TierBuiltin); err != nil {
+		t.Fatal(err)
+	}
+	h := startWorker(t, rt, reg)
+	h.send(t, "pick", `{"type":"slash_command","args":{"name":"pick"}}`)
+	f := h.next(t)
+	var asked struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}
+	if err := json.Unmarshal(f.Event, &asked); err != nil {
+		t.Fatal(err)
+	}
+	if f.Type != coord.TypeEvent || asked.Type != "ui_select" || asked.ID == "" {
+		t.Fatalf("dialog event: %+v", f)
+	}
+	if f = h.next(t); f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.ID != "instance" || f.Instance.PendingInputs != 1 {
+		t.Fatalf("pending registration: %+v", f)
+	}
+	reply := func(id, value string) {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{"type": "ui_response", "args": map[string]any{"id": asked.ID, "value": value}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.send(t, id, string(data))
+	}
+	listed := func(id string) []ui.SharedRequest {
+		t.Helper()
+		// The slash command holds the dispatcher, so this must bypass it.
+		h.send(t, id, `{"type":"get_ui_requests"}`)
+		r := h.response(t, id)
+		if !r.OK {
+			t.Fatalf("get_ui_requests: %+v", r)
+		}
+		var result struct {
+			Requests []ui.SharedRequest `json:"requests"`
+		}
+		decodeResult(t, r, &result)
+		return result.Requests
+	}
+	want := []ui.SharedRequest{{ID: asked.ID, Method: ui.UIMethodSelect, Title: "Pick", Options: []string{"red", "blue"}}}
+	if got := listed("list"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("requests = %+v, want %+v", got, want)
+	}
+	reply("invalid", "green")
+	if r := h.response(t, "invalid"); r.OK || r.Error == nil || r.Error.Code != "invalid_response" {
+		t.Fatalf("invalid reply accepted: %+v", r)
+	}
+	if got := listed("relist"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("invalid reply consumed request: %+v", got)
+	}
+
+	reply("first", "blue")
+	reply("second", "red")
+	responses := make(map[string]Response)
+	var resolved coord.Frame
+	pending := -1
+	for len(responses) < 3 || resolved.Event == nil || pending != 0 {
+		f := h.next(t)
+		switch f.Type {
+		case coord.TypeResponse:
+			var r Response
+			if err := json.Unmarshal(f.Result, &r); err != nil {
+				t.Fatal(err)
+			}
+			responses[f.ID] = r
+		case coord.TypeRegister:
+			pending = f.Instance.PendingInputs
+		case coord.TypeEvent:
+			if strings.Contains(string(f.Event), `"type":"ui_resolved"`) {
+				resolved = f
+			}
+		}
+	}
+	var first, second struct {
+		Resolved bool `json:"resolved"`
+	}
+	decodeResult(t, responses["first"], &first)
+	decodeResult(t, responses["second"], &second)
+	if !responses["first"].OK || !first.Resolved || !responses["second"].OK || second.Resolved {
+		t.Fatalf("resolution was not first-wins: %+v", responses)
+	}
+	var output struct {
+		Output string `json:"output"`
+	}
+	decodeResult(t, responses["pick"], &output)
+	if output.Output != "blue" {
+		t.Fatalf("slash command saw %+v", responses["pick"])
+	}
+	var notice map[string]any
+	if err := json.Unmarshal(resolved.Event, &notice); err != nil {
+		t.Fatal(err)
+	}
+	if notice["id"] != asked.ID || notice["method"] != "select" || notice["outcome"] != ui.OutcomeAnswered || resolved.SessionID != "session" {
+		t.Fatalf("resolution notice: %v", notice)
+	}
+	if strings.Contains(string(resolved.Event), "blue") || notice["value"] != nil {
+		t.Fatalf("resolution notice leaked the answer: %s", resolved.Event)
+	}
+	if got := listed("after"); len(got) != 0 {
+		t.Fatalf("resolved request still listed: %+v", got)
 	}
 }
 

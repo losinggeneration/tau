@@ -15,6 +15,8 @@ import (
 	"github.com/losinggeneration/tau/ui"
 )
 
+const workerAdmissionSlots = 4
+
 // Worker owns one runtime independently of its coordinator connection.
 // A Worker is single-use; losing its link does not stop admitted work.
 type Worker struct {
@@ -38,6 +40,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	s.writer = output
 	s.ui = ui.NewRPCUI()
 	s.ui.Writer = rpcUIWriter{server: s}
+	s.ui.EnableSharedRequests()
 	if s.pluginManager != nil {
 		s.pluginManager.SetUI(s.ui)
 	}
@@ -81,6 +84,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	if err != nil {
 		return fmt.Errorf("register worker: %w", err)
 	}
+	instance.State = coord.StateReady
 	output.connect(link, instance)
 	var reader sync.WaitGroup
 	readerStop := make(chan struct{})
@@ -110,10 +114,11 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 			}
 		}
 	})
-	// Only one ordinary handler runs at a time, with one bounded waiting slot.
+	// Only one ordinary handler runs at a time. Frame size bounds the total
+	// payload in the waiting slots to 4 MiB.
 	// The reader never waits for that handler, so UI replies and cancellation
 	// remain serviceable even while slash commands or compaction block.
-	pending := make(chan *Command, 1)
+	pending := make(chan *Command, workerAdmissionSlots)
 	var (
 		handlerMu     sync.Mutex
 		cancelHandler context.CancelFunc
@@ -152,6 +157,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 		case frame, ok := <-frames:
 			if !ok {
 				// Do not derive workload cancellation from EOF or link failure.
+				output.loseLink(link.Err())
 				frames = nil
 				continue
 			}
@@ -181,15 +187,17 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 			}
 			switch cmd.Type {
 			case "interrupt", "abort":
+				// SDK prompt admission can also run a slash command inline.
+				// Resolving dialogs before cancelling the handler reports them
+				// as interrupted rather than racing the handler's context.
+				s.ui.CancelPending()
 				handlerMu.Lock()
 				if cancelHandler != nil {
 					cancelHandler()
 				}
 				handlerMu.Unlock()
-				// SDK prompt admission can also run a slash command inline.
-				s.ui.CancelPending()
 				w.dispatch(ctx, &cmd)
-			case "ui_response", "abort_bash":
+			case "ui_response", "get_ui_requests", "abort_bash":
 				w.dispatch(ctx, &cmd)
 			default:
 				select {
@@ -259,6 +267,7 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 		id, _ := w.server.eventSessionID.Load().(string)
 		if id != "" && id != w.instance.SessionID {
 			w.instance.SessionID = id
+			w.instance.State = coord.StateReady
 			if err := w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance}); err != nil {
 				w.disconnect(err)
 				return len(data), nil
@@ -297,15 +306,53 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 			}
 		}
 	}
+	if err == nil && frame.Type == coord.TypeEvent && frame.SessionID == w.instance.SessionID {
+		err = w.publishSummaryLocked(record.Type)
+	}
 	if err != nil {
 		w.disconnect(err)
 	}
 	return len(data), nil
 }
 
+func isSharedUIRecord(kind string) bool {
+	switch kind {
+	case "ui_confirm", "ui_select", "ui_input", "ui_resolved":
+		return true
+	}
+	return false
+}
+
+// publishSummaryLocked reports lifecycle and attention, without copying chat
+// payloads to clients watching only summaries. Caller holds mu.
+func (w *workerWriter) publishSummaryLocked(kind string) error {
+	previous := w.instance
+	switch kind {
+	case "agent_start":
+		w.instance.State = coord.StateBusy
+	case "agent_end", "session_shutdown":
+		w.instance.State = coord.StateReady
+	}
+	if isSharedUIRecord(kind) && w.server != nil && w.server.ui != nil {
+		w.instance.PendingInputs = w.server.ui.PendingRequests()
+	}
+	if w.instance == previous {
+		return nil
+	}
+	return w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance})
+}
+
+func (w *workerWriter) loseLink(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.link != nil {
+		w.disconnect(err)
+	}
+}
+
 // Caller holds mu. Closing asynchronously never stalls the SDK event drain.
 func (w *workerWriter) disconnect(err error) {
-	workerLog("coordinator link lost: %v", err)
+	workerLog("coordinator link lost for %s; worker is still running and retains session %s: %v", w.instance.ID, w.instance.SessionID, err)
 	link := w.link
 	w.link = nil
 	w.closing.Go(func() {

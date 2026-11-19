@@ -23,9 +23,6 @@ import (
 )
 
 func runCoordinator(ctx context.Context, cmd *cli.Command) error {
-	if cmd.String("websocket") != "" {
-		return errors.New("coordinated network access is not available yet; use --legacy for the existing authenticated bridge")
-	}
 	node, err := coordinatorNodeID(configDir())
 	if err != nil {
 		return err
@@ -38,9 +35,36 @@ func runCoordinator(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return fmt.Errorf("resolve coordinator socket: %w", err)
 	}
-	return coord.Run(ctx, path, func(ctx context.Context, request coord.LaunchRequest) error {
+	launch := func(ctx context.Context, request coord.LaunchRequest) error {
 		return launchWorkerProcess(ctx, path, node, request.InstanceID, request.Token, request.CWD, request.Ready)
-	})
+	}
+	addr := cmd.String("websocket")
+	if addr == "" {
+		return coord.Run(ctx, path, launch)
+	}
+	bridge, err := server.NewCoordinatedBridge(addr, path, cmd.String("websocket-token"), remoteTokenStore())
+	if err != nil {
+		return cli.Exit(fmt.Sprintf("websocket bridge: %v", err), ExitUserError)
+	}
+	writeLine(os.Stderr, "tau websocket bridge listening on %s/rpc\n", bridge.Addr())
+	return serveCoordinator(ctx, path, bridge, launch, coord.Run)
+}
+
+// serveCoordinator runs the coordinator and its WebSocket bridge together.
+// Either one stopping stops the other; the bridge only dials the
+// coordinator per connection, so neither waits for the other to start.
+func serveCoordinator(ctx context.Context, path string, bridge *server.CoordinatedBridge, launch coord.LaunchFunc, run func(context.Context, string, coord.LaunchFunc) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	bridgeDone := make(chan error, 1)
+	go func() {
+		err := bridge.Run(ctx)
+		cancel()
+		bridgeDone <- err
+	}()
+	err := run(ctx, path, launch)
+	cancel()
+	return errors.Join(err, <-bridgeDone)
 }
 
 func coordinatorNodeID(dir string) (id string, err error) {

@@ -45,6 +45,39 @@ func TestWebAppServesControllerAndAssets(t *testing.T) {
 	}
 }
 
+func TestCoordinatedWebAppServesInstanceController(t *testing.T) {
+	mux := http.NewServeMux()
+	registerCoordinatedWebApp(mux)
+	for _, tc := range []struct {
+		path string
+		want []string
+		omit []string
+	}{
+		{"/", []string{"Running instances", "Saved sessions", "Start instance", "Detach", "Stop instance"}, []string{`id="url"`, `<h2>Sessions</h2>`, `id="steer"`}},
+		{"/app.js", []string{"watch_instances", "instance_update", "get_ui_requests", "ui_resolved"}, nil},
+	} {
+		req, err := http.NewRequest(http.MethodGet, tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := newResponseRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.status != http.StatusOK {
+			t.Fatalf("%s status = %d", tc.path, rec.status)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(rec.body.String(), want) {
+				t.Fatalf("%s missing %q", tc.path, want)
+			}
+		}
+		for _, omit := range tc.omit {
+			if strings.Contains(rec.body.String(), omit) {
+				t.Fatalf("%s unexpectedly contains %q", tc.path, omit)
+			}
+		}
+	}
+}
+
 type responseRecorder struct {
 	header http.Header
 	body   strings.Builder

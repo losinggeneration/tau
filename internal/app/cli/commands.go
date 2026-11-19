@@ -309,7 +309,7 @@ var daemonCmd = &cli.Command{
 	Flags: []cli.Flag{
 		&cli.StringFlag{Name: "socket", Usage: "Unix socket path"},
 		&cli.BoolFlag{Name: "legacy", Usage: "Use connection-owned legacy RPC instead of coordinated instances"},
-		&cli.StringFlag{Name: "websocket", Usage: "Opt-in WebSocket bridge address (host:port)"},
+		&cli.StringFlag{Name: "websocket", Usage: "Opt-in WebSocket bridge address (host:port; loopback-only unless --legacy)"},
 		&cli.StringFlag{Name: "websocket-token", Usage: "Static bearer token for the WebSocket bridge", Sources: cli.EnvVars("TAU_WEBSOCKET_TOKEN")},
 		&cli.BoolFlag{Name: "systemd-user-unit", Usage: "Print a systemd user unit"},
 	},

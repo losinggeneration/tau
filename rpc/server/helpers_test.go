@@ -271,6 +271,7 @@ type mockSession struct {
 	closeErr      error
 	steeringCount int
 	followUpCount int
+	followUps     []sdk.Message
 	observer      func(sdk.Event)
 	sent          []sdk.Message
 	attachments   map[string]sdk.Attachment
@@ -349,6 +350,7 @@ func (s *mockSession) Steer(msg sdk.Message) error {
 
 func (s *mockSession) FollowUp(msg sdk.Message) error {
 	s.followUpCount++
+	s.followUps = append(s.followUps, msg)
 	return nil
 }
 

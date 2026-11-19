@@ -21,17 +21,20 @@ const (
 
 // Frame types.
 const (
-	TypeHello         = "hello"
-	TypeWelcome       = "welcome"
-	TypeListInstances = "list_instances"
-	TypeStartInstance = "start_instance"
-	TypeAttach        = "attach"
-	TypeDetach        = "detach"
-	TypeCommand       = "command"
-	TypeStopInstance  = "stop_instance"
-	TypeResponse      = "response"
-	TypeEvent         = "event"
-	TypeRegister      = "register"
+	TypeHello            = "hello"
+	TypeWelcome          = "welcome"
+	TypeListInstances    = "list_instances"
+	TypeWatchInstances   = "watch_instances"
+	TypeUnwatchInstances = "unwatch_instances"
+	TypeInstanceUpdate   = "instance_update"
+	TypeStartInstance    = "start_instance"
+	TypeAttach           = "attach"
+	TypeDetach           = "detach"
+	TypeCommand          = "command"
+	TypeStopInstance     = "stop_instance"
+	TypeResponse         = "response"
+	TypeEvent            = "event"
+	TypeRegister         = "register"
 )
 
 // Connection roles advertised in hello.
@@ -40,8 +43,11 @@ const (
 	RoleWorker = "worker"
 )
 
-// StateReady is the default state of a registered instance.
-const StateReady = "ready"
+// Worker states reported in Instance summaries.
+const (
+	StateReady = "ready"
+	StateBusy  = "busy"
+)
 
 // Error codes.
 const (
@@ -55,6 +61,7 @@ const (
 	CodeLimitExceeded      = "limit_exceeded"
 	CodeLaunchFailed       = "launch_failed"
 	CodeUnavailable        = "unavailable"
+	CodeWorkerLinkLost     = "worker_link_lost"
 	CodeConflict           = "conflict"
 	// CodeLegacyProtocol answers a legacy RPC command sent in place of hello.
 	CodeLegacyProtocol = "unsupported_protocol"
@@ -128,12 +135,13 @@ func (e *Error) Error() string {
 
 // Instance summarizes one registered worker.
 type Instance struct {
-	ID        string `json:"instance_id"`
-	NodeID    string `json:"node_id,omitempty"`
-	CWD       string `json:"cwd,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
-	State     string `json:"state,omitempty"`
-	PID       int    `json:"pid,omitempty"`
+	ID            string `json:"instance_id"`
+	NodeID        string `json:"node_id,omitempty"`
+	CWD           string `json:"cwd,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	State         string `json:"state,omitempty"`
+	PID           int    `json:"pid,omitempty"`
+	PendingInputs int    `json:"pending_inputs,omitempty"`
 }
 
 func decodeFrame(line []byte) (Frame, error) {
@@ -155,7 +163,8 @@ func decodeFrame(line []byte) (Frame, error) {
 func isFrameType(t string) bool {
 	switch t {
 	case TypeHello, TypeWelcome, TypeListInstances, TypeStartInstance, TypeAttach,
-		TypeDetach, TypeCommand, TypeStopInstance, TypeResponse, TypeEvent, TypeRegister:
+		TypeDetach, TypeCommand, TypeStopInstance, TypeResponse, TypeEvent, TypeRegister,
+		TypeWatchInstances, TypeUnwatchInstances, TypeInstanceUpdate:
 		return true
 	}
 	return false
@@ -233,6 +242,9 @@ func (f *Frame) validate() error {
 }
 
 func (i *Instance) validate() error {
+	if i.PendingInputs < 0 {
+		return fmt.Errorf("%w: negative pending input count", ErrInvalidFrame)
+	}
 	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State} {
 		if len(s) > maxIDBytes {
 			return fmt.Errorf("%w: instance identifier exceeds %d bytes", ErrInvalidFrame, maxIDBytes)

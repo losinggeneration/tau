@@ -94,11 +94,11 @@ func (c *CoordinatedClient) Welcome() coord.Frame {
 	return c.welcome
 }
 
-// Events returns targeted event frames from attached instances. Each frame
-// carries InstanceID and SessionID; Event holds the raw tau rpc event, which
-// Event.FromJSON can decode. A frame with Error set reports that the instance
-// became unavailable, and a frame with Instance set reports updated metadata.
-// The channel closes when the client disconnects; Err then reports why.
+// Events returns chat frames (TypeEvent) for attached instances and summary
+// frames (TypeInstanceUpdate) when watching. Both identify the instance and
+// session. Event holds a raw Tau RPC event; Instance holds updated metadata.
+// Error reports an omitted event or a lost worker link. Drain the channel to
+// stay connected. When it closes, Err reports why.
 func (c *CoordinatedClient) Events() <-chan coord.Frame {
 	return c.events
 }
@@ -122,6 +122,22 @@ func (c *CoordinatedClient) ListInstances(ctx context.Context) ([]coord.Instance
 		return nil, err
 	}
 	return reply.Instances, nil
+}
+
+// WatchInstances subscribes to status and attention without subscribing to
+// chat. The returned initial list precedes any subsequent summary frames.
+func (c *CoordinatedClient) WatchInstances(ctx context.Context) ([]coord.Instance, error) {
+	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeWatchInstances})
+	if err != nil {
+		return nil, err
+	}
+	return reply.Instances, nil
+}
+
+// UnwatchInstances ends summary updates without changing chat subscriptions.
+func (c *CoordinatedClient) UnwatchInstances(ctx context.Context) error {
+	_, err := c.request(ctx, coord.Frame{Type: coord.TypeUnwatchInstances})
+	return err
 }
 
 // StartInstance asks the coordinator to launch an instance rooted at cwd,
@@ -301,7 +317,7 @@ func (c *CoordinatedClient) readLoop() {
 		switch f.Type {
 		case coord.TypeResponse:
 			c.resolve(f)
-		case coord.TypeEvent:
+		case coord.TypeEvent, coord.TypeInstanceUpdate:
 			select {
 			case c.events <- f:
 			default:

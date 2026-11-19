@@ -4,12 +4,15 @@ package ui // import "github.com/losinggeneration/tau/ui"
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -687,6 +690,257 @@ type RPCUI struct {
 	scanCtx    context.Context
 	scanCancel context.CancelFunc
 	mu         sync.Mutex
+
+	// requests holds shared dialogs once EnableSharedRequests opts in.
+	requests map[string]*sharedRequest
+	nextID   uint64
+}
+
+// SharedRequest is the complete descriptor of a dialog awaiting an answer
+// from any attached client.
+type SharedRequest struct {
+	ID          string   `json:"id"`
+	Method      UIMethod `json:"method"`
+	Title       string   `json:"title"`
+	Message     string   `json:"message,omitempty"`
+	Placeholder string   `json:"placeholder,omitempty"`
+	Options     []string `json:"options,omitempty"`
+}
+
+// Outcomes reported by ui_resolved events. They never carry the answer.
+const (
+	OutcomeAnswered    = "answered"
+	OutcomeCancelled   = "cancelled"
+	OutcomeInterrupted = "interrupted"
+	OutcomeTimeout     = "timeout"
+	OutcomeAborted     = "aborted"
+	OutcomeFailed      = "failed"
+)
+
+var (
+	// ErrInvalidResponse reports a reply that cannot resolve its request.
+	// The request stays pending.
+	ErrInvalidResponse = errors.New("invalid UI response")
+	// ErrUIClosed reports a shared request abandoned by Close.
+	ErrUIClosed    = errors.New("UI closed")
+	errInterrupted = fmt.Errorf("UI request interrupted: %w", context.Canceled)
+)
+
+type sharedReply struct {
+	resp    UIResponse
+	outcome string
+	err     error
+}
+
+type sharedRequest struct {
+	desc  SharedRequest
+	order uint64
+	// reply has room for the single delivery made by whoever removes the
+	// request from RPCUI.requests, so delivery never blocks under mu.
+	reply chan sharedReply
+}
+
+func (r SharedRequest) event() map[string]any {
+	event := map[string]any{"type": "ui_" + string(r.Method), "id": r.ID, "title": r.Title}
+	switch r.Method {
+	case UIMethodConfirm:
+		event["message"] = r.Message
+	case UIMethodSelect:
+		event["options"] = r.Options
+	case UIMethodInput:
+		event["placeholder"] = r.Placeholder
+	}
+	return event
+}
+
+func (r SharedRequest) validate(resp UIResponse) error {
+	if resp.Method != "" && resp.Method != r.Method {
+		return fmt.Errorf("%w: method %q does not match %q", ErrInvalidResponse, resp.Method, r.Method)
+	}
+	if resp.Cancelled {
+		return nil
+	}
+	switch r.Method {
+	case UIMethodConfirm:
+		switch resp.Value {
+		case "true", "yes", "false", "no":
+			return nil
+		}
+		if resp.Confirmed == nil {
+			return fmt.Errorf("%w: confirm requires confirmed or cancelled", ErrInvalidResponse)
+		}
+	case UIMethodSelect:
+		if slices.Contains(r.Options, resp.Value) && resp.Value != "" {
+			return nil
+		}
+		if index, err := strconv.Atoi(resp.Value); err != nil || index < 0 || index >= len(r.Options) {
+			return fmt.Errorf("%w: select requires an option or an in-range index", ErrInvalidResponse)
+		}
+	}
+	return nil
+}
+
+func confirmResult(resp UIResponse) bool {
+	if resp.Cancelled {
+		return false
+	}
+	if resp.Confirmed != nil {
+		return *resp.Confirmed
+	}
+	// Backwards-compat: legacy clients send "true"/"false" in Value.
+	return resp.Value == "true" || resp.Value == "yes"
+}
+
+func selectResult(resp UIResponse, options []string) (int, error) {
+	if resp.Cancelled {
+		return -1, nil
+	}
+	// Typed Value carries the selected option label; look up its index.
+	if resp.Value != "" {
+		for i, opt := range options {
+			if opt == resp.Value {
+				return i, nil
+			}
+		}
+	}
+	// Backwards-compat: legacy clients send a numeric index in Value.
+	var idx int
+	if n, err := fmt.Sscanf(resp.Value, "%d", &idx); err == nil && n == 1 {
+		if idx >= 0 && idx < len(options) {
+			return idx, nil
+		}
+		return -1, fmt.Errorf("select index out of range: %d", idx)
+	}
+	return -1, fmt.Errorf("invalid select response: %q", resp.Value)
+}
+
+func inputResult(resp UIResponse) (string, error) {
+	if resp.Cancelled {
+		return "", ErrNoInput
+	}
+	return resp.Value, nil
+}
+
+// EnableSharedRequests switches Confirm, Select, and Input to requests that
+// any attached client may answer once. Without it, RPCUI keeps its
+// connection-owned reply semantics.
+func (u *RPCUI) EnableSharedRequests() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.requests == nil {
+		u.requests = make(map[string]*sharedRequest)
+	}
+}
+
+func (u *RPCUI) shared() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.requests != nil
+}
+
+// ask publishes desc and waits until it is resolved. The goroutine that
+// removes the request from u.requests decides its outcome, and the waiter
+// publishes ui_resolved before returning so later events follow it.
+func (u *RPCUI) ask(ctx context.Context, desc SharedRequest) (UIResponse, error) {
+	req := &sharedRequest{reply: make(chan sharedReply, 1)}
+	u.mu.Lock()
+	u.nextID++
+	req.order = u.nextID
+	desc.ID = fmt.Sprintf("ui-%d-%d", time.Now().UnixNano(), u.nextID)
+	req.desc = desc
+	u.requests[desc.ID] = req
+	u.mu.Unlock()
+
+	if err := u.emit(ctx, desc.event()); err != nil {
+		if u.release(desc.ID) {
+			return u.settle(desc, sharedReply{outcome: OutcomeFailed, err: err})
+		}
+		return u.settle(desc, <-req.reply)
+	}
+	var reply sharedReply
+	select {
+	case reply = <-req.reply:
+	case <-ctx.Done():
+		if !u.release(desc.ID) {
+			// A resolver won the race; honor the answer it was told succeeded.
+			reply = <-req.reply
+			break
+		}
+		reply = sharedReply{outcome: OutcomeAborted, err: ctx.Err()}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			reply.outcome = OutcomeTimeout
+		}
+	}
+	return u.settle(desc, reply)
+}
+
+func (u *RPCUI) settle(desc SharedRequest, reply sharedReply) (UIResponse, error) {
+	// The request is already resolved; a lost notice must not undo that.
+	_ = u.emit(context.Background(), map[string]any{
+		"type":    "ui_resolved",
+		"id":      desc.ID,
+		"method":  string(desc.Method),
+		"outcome": reply.outcome,
+	})
+	return reply.resp, reply.err
+}
+
+// release removes id and reports whether the caller won the resolution.
+func (u *RPCUI) release(id string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if _, ok := u.requests[id]; !ok {
+		return false
+	}
+	delete(u.requests, id)
+	return true
+}
+
+// Resolve applies the first valid reply to a shared request. Unknown or
+// already-resolved IDs report false without error. An invalid reply returns
+// ErrInvalidResponse and leaves the request pending.
+func (u *RPCUI) Resolve(resp UIResponse) (bool, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	req, ok := u.requests[resp.ID]
+	if !ok {
+		return false, nil
+	}
+	if err := req.desc.validate(resp); err != nil {
+		return false, err
+	}
+	delete(u.requests, resp.ID)
+	outcome := OutcomeAnswered
+	if resp.Cancelled {
+		outcome = OutcomeCancelled
+	}
+	req.reply <- sharedReply{resp: resp, outcome: outcome}
+	return true, nil
+}
+
+// Requests snapshots outstanding shared requests in creation order.
+func (u *RPCUI) Requests() []SharedRequest {
+	u.mu.Lock()
+	pending := make([]*sharedRequest, 0, len(u.requests))
+	for _, req := range u.requests {
+		pending = append(pending, req)
+	}
+	u.mu.Unlock()
+	slices.SortFunc(pending, func(a, b *sharedRequest) int { return cmp.Compare(a.order, b.order) })
+	out := make([]SharedRequest, len(pending))
+	for i, req := range pending {
+		out[i] = req.desc
+		out[i].Options = slices.Clone(req.desc.Options)
+	}
+	return out
+}
+
+// abandonLocked resolves every shared request with reply. Caller holds mu.
+func (u *RPCUI) abandonLocked(reply sharedReply) {
+	for id, req := range u.requests {
+		delete(u.requests, id)
+		req.reply <- reply
+	}
 }
 
 // NewRPCUI creates a RPCUI with defaults.
@@ -718,6 +972,13 @@ func (u *RPCUI) emit(ctx context.Context, event map[string]any) error {
 
 // Confirm emits a ui_confirm event and waits for a ui_response.
 func (u *RPCUI) Confirm(ctx context.Context, title, message string) (bool, error) {
+	if u.shared() {
+		resp, err := u.ask(ctx, SharedRequest{Method: UIMethodConfirm, Title: title, Message: message})
+		if err != nil {
+			return false, err
+		}
+		return confirmResult(resp), nil
+	}
 	id := fmt.Sprintf("ui-%d", time.Now().UnixNano())
 	respCh := make(chan UIResponse, 1)
 
@@ -742,14 +1003,7 @@ func (u *RPCUI) Confirm(ctx context.Context, title, message string) (bool, error
 
 	select {
 	case resp := <-respCh:
-		if resp.Cancelled {
-			return false, nil
-		}
-		if resp.Confirmed != nil {
-			return *resp.Confirmed, nil
-		}
-		// Backwards-compat: legacy clients send "true"/"false" in Value.
-		return resp.Value == "true" || resp.Value == "yes", nil
+		return confirmResult(resp), nil
 	case <-ctx.Done():
 		return false, ctx.Err()
 	}
@@ -757,6 +1011,13 @@ func (u *RPCUI) Confirm(ctx context.Context, title, message string) (bool, error
 
 // Select emits a ui_select event and waits for a ui_response.
 func (u *RPCUI) Select(ctx context.Context, title string, options []string) (int, error) {
+	if u.shared() {
+		resp, err := u.ask(ctx, SharedRequest{Method: UIMethodSelect, Title: title, Options: slices.Clone(options)})
+		if err != nil {
+			return -1, err
+		}
+		return selectResult(resp, options)
+	}
 	id := fmt.Sprintf("ui-%d", time.Now().UnixNano())
 	respCh := make(chan UIResponse, 1)
 
@@ -781,26 +1042,7 @@ func (u *RPCUI) Select(ctx context.Context, title string, options []string) (int
 
 	select {
 	case resp := <-respCh:
-		if resp.Cancelled {
-			return -1, nil
-		}
-		// Typed Value carries the selected option label; look up its index.
-		if resp.Value != "" {
-			for i, opt := range options {
-				if opt == resp.Value {
-					return i, nil
-				}
-			}
-		}
-		// Backwards-compat: legacy clients send a numeric index in Value.
-		var idx int
-		if n, err := fmt.Sscanf(resp.Value, "%d", &idx); err == nil && n == 1 {
-			if idx >= 0 && idx < len(options) {
-				return idx, nil
-			}
-			return -1, fmt.Errorf("select index out of range: %d", idx)
-		}
-		return -1, fmt.Errorf("invalid select response: %q", resp.Value)
+		return selectResult(resp, options)
 	case <-ctx.Done():
 		return -1, ctx.Err()
 	}
@@ -808,6 +1050,13 @@ func (u *RPCUI) Select(ctx context.Context, title string, options []string) (int
 
 // Input emits a ui_input event and waits for a ui_response.
 func (u *RPCUI) Input(ctx context.Context, title, placeholder string) (string, error) {
+	if u.shared() {
+		resp, err := u.ask(ctx, SharedRequest{Method: UIMethodInput, Title: title, Placeholder: placeholder})
+		if err != nil {
+			return "", err
+		}
+		return inputResult(resp)
+	}
 	id := fmt.Sprintf("ui-%d", time.Now().UnixNano())
 	respCh := make(chan UIResponse, 1)
 
@@ -948,11 +1197,14 @@ func (u *RPCUI) runScanner() {
 	}
 }
 
-// Close cancels the response reader and cleans up resources.
+// Close cancels the response reader and abandons outstanding shared requests.
 func (u *RPCUI) Close() error {
 	if u.scanCancel != nil {
 		u.scanCancel()
 	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.abandonLocked(sharedReply{outcome: OutcomeAborted, err: ErrUIClosed})
 	return nil
 }
 
@@ -984,9 +1236,12 @@ func (u *RPCUI) DispatchResponseTyped(resp UIResponse) {
 }
 
 // CancelPending dismisses dialogs that are currently waiting for a response.
+// Shared requests resolve as interrupted with an error wrapping
+// context.Canceled.
 func (u *RPCUI) CancelPending() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	u.abandonLocked(sharedReply{outcome: OutcomeInterrupted, err: errInterrupted})
 	for id, ch := range u.pending {
 		select {
 		case ch <- UIResponse{ID: id, Cancelled: true}:
@@ -1042,5 +1297,5 @@ func (u *RPCUI) PendingRequests() int {
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return len(u.pending)
+	return len(u.pending) + len(u.requests)
 }

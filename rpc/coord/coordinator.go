@@ -89,6 +89,7 @@ type client struct {
 	link     *Link
 	pending  map[string]pendingRef
 	subs     map[string]struct{}
+	watching bool
 }
 
 // pendingRef locates an in-flight client request. An empty routeID marks a
@@ -265,7 +266,7 @@ func (co *coordinator) serveClient(link *Link, identity string) {
 		subs:     make(map[string]struct{}),
 	}
 	co.clients[c.id] = c
-	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleClient, Generation: co.generation, ClientID: c.identity, Operations: []string{TypeListInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance}, Limits: protocolLimits()})
+	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleClient, Generation: co.generation, ClientID: c.identity, Operations: []string{TypeListInstances, TypeWatchInstances, TypeUnwatchInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance}, Limits: protocolLimits()})
 	co.mu.Unlock()
 	defer co.dropClient(c)
 
@@ -334,6 +335,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 	w := &worker{instance: record, link: link, routes: make(map[string]route)}
 	co.workers[record.ID] = w
 	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleWorker, Generation: co.generation, InstanceID: record.ID, Instance: &record, Operations: []string{TypeCommand, TypeRegister, TypeEvent, TypeResponse}, Limits: protocolLimits()})
+	co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: record.ID, SessionID: record.SessionID, Instance: &record})
 	pl.ready <- record
 	return w, nil
 }
@@ -359,17 +361,24 @@ func (co *coordinator) dropWorker(w *worker) {
 		return
 	}
 	delete(co.workers, id)
-	unavailable := &Error{Code: CodeUnavailable, Message: "instance disconnected"}
+	unavailable := &Error{Code: CodeUnavailable, Message: "worker link lost; command outcome unknown"}
 	for _, r := range w.routes {
 		delete(r.client.pending, r.requestID)
 		send(r.client.link, Frame{Type: TypeResponse, ID: r.requestID, InstanceID: id, Error: unavailable})
 	}
 	clear(w.routes)
+	message := "worker link closed; the worker may still be running"
+	if errors.Is(w.link.Err(), ErrSlowConsumer) {
+		message = "worker link closed: outbound queue full; the worker may still be running"
+	}
+	lost := Frame{Type: TypeInstanceUpdate, InstanceID: id, SessionID: w.instance.SessionID, Error: &Error{
+		Code: CodeWorkerLinkLost, Message: message,
+	}}
+	co.broadcast(lost)
+	lost.Type = TypeEvent
+	co.broadcast(lost)
 	for _, c := range co.clients {
-		if _, ok := c.subs[id]; ok {
-			delete(c.subs, id)
-			send(c.link, Frame{Type: TypeEvent, InstanceID: id, SessionID: w.instance.SessionID, Error: unavailable})
-		}
+		delete(c.subs, id)
 	}
 }
 
@@ -387,6 +396,12 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 	switch f.Type {
 	case TypeListInstances:
 		send(c.link, Frame{Type: TypeResponse, ID: f.ID, Instances: co.instances()})
+	case TypeWatchInstances:
+		c.watching = true
+		send(c.link, Frame{Type: TypeResponse, ID: f.ID, Instances: co.instances()})
+	case TypeUnwatchInstances:
+		c.watching = false
+		send(c.link, Frame{Type: TypeResponse, ID: f.ID})
 	case TypeStartInstance:
 		co.startInstance(c, f)
 	case TypeAttach:
@@ -621,7 +636,7 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 		// A worker labels events from a newly switched session before its
 		// register update arrives, so its own session ID wins.
 		session := cmp.Or(f.SessionID, w.instance.SessionID)
-		co.broadcast(id, Frame{Type: TypeEvent, InstanceID: id, SessionID: session, Event: f.Event})
+		co.broadcast(Frame{Type: TypeEvent, InstanceID: id, SessionID: session, Event: f.Event})
 	case TypeRegister:
 		if f.Instance == nil || f.Instance.ID != id {
 			send(w.link, Frame{Type: TypeResponse, ID: f.ID, Error: &Error{Code: CodeConflict, Message: "instance mismatch"}})
@@ -631,23 +646,32 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 		if f.Instance.State != "" {
 			w.instance.State = f.Instance.State
 		}
+		w.instance.PendingInputs = f.Instance.PendingInputs
 		inst := w.instance
 		if f.ID != "" {
 			send(w.link, Frame{Type: TypeResponse, ID: f.ID, InstanceID: id, Instance: &inst})
 		}
-		co.broadcast(id, Frame{Type: TypeEvent, InstanceID: id, SessionID: inst.SessionID, Instance: &inst})
+		co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: id, SessionID: inst.SessionID, Instance: &inst})
+		co.broadcast(Frame{Type: TypeEvent, InstanceID: id, SessionID: inst.SessionID, Instance: &inst})
 	default:
 		send(w.link, Frame{Type: TypeResponse, ID: f.ID, Error: &Error{Code: CodeInvalidFrame, Message: "unexpected frame type"}})
 	}
 }
 
-// ponytail: fan-out encodes once per subscriber under the global lock; encode
-// once outside the lock if large events across many clients show contention.
-func (co *coordinator) broadcast(instanceID string, f Frame) {
+// broadcast runs under co.mu so replies and subscription changes are ordered
+// with the events they expose. Encode at most once for all recipients.
+func (co *coordinator) broadcast(f Frame) {
+	var data []byte
+	var err error
 	for _, c := range co.clients {
-		if _, ok := c.subs[instanceID]; ok {
-			send(c.link, f)
+		_, attached := c.subs[f.InstanceID]
+		if (f.Type == TypeInstanceUpdate && !c.watching) || (f.Type != TypeInstanceUpdate && !attached) {
+			continue
 		}
+		if data == nil && err == nil {
+			data, err = encodeOrLimit(f)
+		}
+		queueFrame(c.link, data, err)
 	}
 }
 
@@ -680,15 +704,27 @@ func replyError(c *client, f Frame, code, msg string) {
 // learns what it missed. Any other failure, including a slow consumer, closes
 // link so the peer must resynchronize instead of missing a frame silently.
 func send(link *Link, f Frame) {
-	err := link.Send(f)
-	if errors.Is(err, ErrFrameTooLarge) {
-		err = link.Send(Frame{
-			Type:       f.Type,
-			ID:         f.ID,
-			InstanceID: f.InstanceID,
-			SessionID:  f.SessionID,
-			Error:      &Error{Code: CodeLimitExceeded, Message: f.Type + " exceeds frame limit"},
-		})
+	data, err := encodeOrLimit(f)
+	queueFrame(link, data, err)
+}
+
+func encodeOrLimit(f Frame) ([]byte, error) {
+	data, err := encodeFrame(f)
+	if !errors.Is(err, ErrFrameTooLarge) {
+		return data, err
+	}
+	return encodeFrame(Frame{
+		Type:       f.Type,
+		ID:         f.ID,
+		InstanceID: f.InstanceID,
+		SessionID:  f.SessionID,
+		Error:      &Error{Code: CodeLimitExceeded, Message: f.Type + " exceeds frame limit"},
+	})
+}
+
+func queueFrame(link *Link, data []byte, err error) {
+	if err == nil {
+		err = link.enqueue(data)
 	}
 	if err != nil {
 		link.fail(err)

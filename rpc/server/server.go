@@ -214,6 +214,8 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleShutdown(ctx, cmd)
 	case "ui_response":
 		return s.handleUIResponse(ctx, cmd)
+	case "get_ui_requests":
+		return s.handleGetUIRequests(ctx, cmd)
 	case "steer":
 		return s.handleSteer(ctx, cmd)
 	case "follow_up":
@@ -296,13 +298,30 @@ func (s *Server) handleEditContext(ctx context.Context, cmd *Command) error {
 	return s.sendResult(cmd.ID, map[string]any{"ok": true})
 }
 
+var errSessionChanged = errors.New("session changed; draft kept")
+
+// draftSession checks the target during dispatch, after earlier session
+// switches have run. Only the ordinary dispatcher changes the active session.
+func (s *Server) draftSession(ctx context.Context, expected string) (sdk.Session, error) {
+	if expected == "" {
+		return s.ensureSession(ctx)
+	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if s.session == nil || s.session.ID() != expected {
+		return nil, errSessionChanged
+	}
+	return s.session, nil
+}
+
 // handleSendMessage sends a user message and streams events.
 func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 	var args struct {
-		Text          string   `json:"text"`
-		Images        []string `json:"images,omitempty"`
-		AttachFiles   []string `json:"attach_files,omitempty"`
-		AttachmentIDs []string `json:"attachment_ids,omitempty"`
+		ExpectedSessionID string   `json:"expected_session_id,omitempty"`
+		Text              string   `json:"text"`
+		Images            []string `json:"images,omitempty"`
+		AttachFiles       []string `json:"attach_files,omitempty"`
+		AttachmentIDs     []string `json:"attachment_ids,omitempty"`
 		// StreamingBehavior queues the prompt when a run is active:
 		// "steer", or "follow_up" ("followUp" also works).
 		StreamingBehavior   string `json:"streaming_behavior,omitempty"`
@@ -321,12 +340,12 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 		return s.sendError(cmd.ID, "invalid_args", fmt.Sprintf("invalid streaming_behavior %q: use steer or follow_up", behavior))
 	}
 
-	sess, err := s.ensureSession(ctx)
+	sess, err := s.draftSession(ctx, args.ExpectedSessionID)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	content, attachmentIDs, err := s.messageContentBlocks(args.Images, args.AttachFiles, args.AttachmentIDs)
+	content, attachmentIDs, err := messageContentBlocks(sess, args.Images, args.AttachFiles, args.AttachmentIDs)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
@@ -913,12 +932,30 @@ func (s *Server) handleUIResponse(ctx context.Context, cmd *Command) error {
 	if err := json.Unmarshal(cmd.Args, &resp); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
+	if s.coordinated {
+		if resp.ID == "" {
+			return s.sendError(cmd.ID, "invalid_args", "id is required")
+		}
+		resolved, err := s.ui.Resolve(resp)
+		if err != nil {
+			return s.sendError(cmd.ID, "invalid_response", err.Error())
+		}
+		return s.sendResult(cmd.ID, map[string]any{"ok": true, "resolved": resolved})
+	}
 
 	// Dispatch the typed UI response to the pending channel in RPCUI.
 	s.ui.DispatchResponseTyped(resp)
 
 	// Send result first to unblock the client
 	return s.sendResult(cmd.ID, map[string]any{"ok": true})
+}
+
+// handleGetUIRequests snapshots dialogs that any attached client may answer.
+func (s *Server) handleGetUIRequests(_ context.Context, cmd *Command) error {
+	if !s.coordinated {
+		return s.sendError(cmd.ID, "not_supported", "get_ui_requests requires a coordinated worker")
+	}
+	return s.sendResult(cmd.ID, map[string]any{"requests": s.ui.Requests()})
 }
 
 // ensureSession creates a session if none exists.
@@ -1171,6 +1208,9 @@ func (s *Server) sendError(id, code, message string) error {
 
 // sendErrorResult sends an error response derived from an error.
 func (s *Server) sendErrorResult(id string, err error) error {
+	if errors.Is(err, errSessionChanged) {
+		return s.sendError(id, "session_changed", err.Error())
+	}
 	return s.sendError(id, "error", err.Error())
 }
 
@@ -1221,27 +1261,24 @@ func (s *Server) handleSteer(ctx context.Context, cmd *Command) error {
 // handleFollowUp adds a follow-up message to the queue.
 func (s *Server) handleFollowUp(ctx context.Context, cmd *Command) error {
 	var args struct {
-		Text   string   `json:"text"`
-		Images []string `json:"images,omitempty"`
+		ExpectedSessionID string   `json:"expected_session_id,omitempty"`
+		Text              string   `json:"text"`
+		Images            []string `json:"images,omitempty"`
+		AttachmentIDs     []string `json:"attachment_ids,omitempty"`
 	}
 	if err := json.Unmarshal(cmd.Args, &args); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	sess, err := s.ensureSession(ctx)
+	sess, err := s.draftSession(ctx, args.ExpectedSessionID)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-
-	content := make([]ai.ContentBlock, 0, len(args.Images))
-	for _, img := range args.Images {
-		content = append(content, ai.ContentBlock{
-			Type:     ai.ContentBlockImage,
-			Data:     img,
-			MimeType: "image/png",
-		})
+	content, ids, err := messageContentBlocks(sess, args.Images, nil, args.AttachmentIDs)
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
 	}
-	return s.queueMessage(cmd.ID, sess, "follow_up", sdk.Message{Role: "user", Text: args.Text, Images: content})
+	return s.queueMessage(cmd.ID, sess, "follow_up", sdk.Message{Role: "user", Text: args.Text, Images: content, AttachmentIDs: ids})
 }
 
 // queueMessage queues msg as a steering ("steer") or follow-up message and
@@ -1429,8 +1466,11 @@ func (s *Server) handleGetMessages(ctx context.Context, cmd *Command) error {
 	}
 
 	if agentSess, ok := sess.(sdk.MessageLister); ok {
-		messages := agentSess.GetMessages()
-		return s.sendResult(cmd.ID, map[string]any{"messages": messages})
+		result := map[string]any{"messages": agentSess.GetMessages()}
+		if s.coordinated {
+			result["session_id"] = sess.ID()
+		}
+		return s.sendResult(cmd.ID, result)
 	}
 
 	return s.sendError(cmd.ID, "not_supported", "get_messages not supported in this session")

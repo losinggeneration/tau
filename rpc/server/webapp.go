@@ -1,6 +1,9 @@
 package server
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+)
 
 const webAppHTML = `<!doctype html>
 <html lang="en">
@@ -52,18 +55,39 @@ const webManifest = `{"name":"tau remote","short_name":"tau","start_url":"/","di
 
 const serviceWorkerJS = `self.addEventListener("install",e=>e.waitUntil(caches.open("tau-remote-v1").then(c=>c.addAll(["/","/app.js","/manifest.webmanifest"]))));self.addEventListener("fetch",e=>e.respondWith(fetch(e.request).catch(()=>caches.match(e.request))));`
 
+const coordinatedPanels = `<div class="card"><h2>Running instances</h2><div class="row"><label>Project directory<input id="cwd" placeholder="Absolute path"></label><button id="start">Start instance</button></div><div id="instances" class="sessions muted">Connect to list running instances.</div></div>
+<div class="card"><h2>Saved sessions</h2><div id="sessions" class="muted"></div><button id="refresh" class="secondary">Refresh saved sessions</button></div>
+<div class="card"><h2>Conversation</h2><div class="muted" id="active"></div><div id="queue" class="muted"></div><div id="history" class="log"></div><textarea id="message" placeholder="Message"></textarea><input id="files" type="file" multiple><div id="attachments" class="muted"></div><div class="row"><button id="send">Send</button><button id="follow" class="secondary">Follow up</button><button id="interrupt" class="secondary">Interrupt</button><button id="detach" class="secondary">Detach</button><button id="stop" class="secondary">Stop instance</button></div></div>
+<div class="card"><h2>UI requests</h2><div id="uiRequests" class="muted">None</div></div>
+<div class="card"><h2>Live activity</h2><div id="log" class="log"></div></div>`
+
 func registerWebApp(mux *http.ServeMux) {
+	registerWebAppAssets(mux, webAppHTML, webAppJS)
+}
+
+func registerCoordinatedWebApp(mux *http.ServeMux) {
+	shell, _, _ := strings.Cut(webAppHTML, `<div class="card"><h2>Sessions`)
+	shell = strings.ReplaceAll(shell, `<label>WebSocket URL<input id="url" placeholder="ws://127.0.0.1:8080/rpc"></label>`, "")
+	shell = strings.ReplaceAll(shell, `<button id="refresh" class="secondary">Refresh sessions</button>`, "")
+	registerWebAppAssets(mux, shell+coordinatedPanels+`
+</div>
+<script src="/app.js"></script>
+</body>
+</html>`, coordinatedWebAppJS)
+}
+
+func registerWebAppAssets(mux *http.ServeMux, page, script string) {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(webAppHTML))
+		_, _ = w.Write([]byte(page))
 	})
 	mux.HandleFunc("/app.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-		_, _ = w.Write([]byte(webAppJS))
+		_, _ = w.Write([]byte(script))
 	})
 	mux.HandleFunc("/manifest.webmanifest", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/manifest+json")

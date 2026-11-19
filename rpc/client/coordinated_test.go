@@ -132,6 +132,55 @@ func TestCoordinatedClientRequiresExplicitTarget(t *testing.T) {
 	}
 }
 
+func TestCoordinatedClientWatchInstances(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+	send := func(f coord.Frame) {
+		t.Helper()
+		if err := srv.Send(f); err != nil {
+			t.Fatalf("send %s: %v", f.Type, err)
+		}
+	}
+	type result struct {
+		instances []coord.Instance
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		instances, err := c.WatchInstances(ctx)
+		done <- result{instances, err}
+	}()
+	f := readFrame(t, srv)
+	if f.Type != coord.TypeWatchInstances || f.InstanceID != "" {
+		t.Fatalf("watch frame = %+v", f)
+	}
+	inst := coord.Instance{ID: "instance", SessionID: "session"}
+	send(coord.Frame{Type: coord.TypeResponse, ID: f.ID, Instances: []coord.Instance{inst}})
+	inst.PendingInputs = 1
+	send(coord.Frame{Type: coord.TypeInstanceUpdate, InstanceID: inst.ID, SessionID: inst.SessionID, Instance: &inst})
+	if r := <-done; r.err != nil || len(r.instances) != 1 || r.instances[0].PendingInputs != 0 {
+		t.Fatalf("watch snapshot = %+v", r)
+	}
+	select {
+	case update := <-c.Events():
+		if update.Type != coord.TypeInstanceUpdate || update.Instance == nil || *update.Instance != inst {
+			t.Fatalf("summary event = %+v", update)
+		}
+	case <-ctx.Done():
+		t.Fatal("missing summary event")
+	}
+	unwatched := make(chan error, 1)
+	go func() { unwatched <- c.UnwatchInstances(ctx) }()
+	f = readFrame(t, srv)
+	if f.Type != coord.TypeUnwatchInstances {
+		t.Fatalf("unwatch frame = %+v", f)
+	}
+	send(coord.Frame{Type: coord.TypeResponse, ID: f.ID})
+	if err := <-unwatched; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCoordinatedClientCommandRoundTrip(t *testing.T) {
 	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
 	ctx := testContext(t)

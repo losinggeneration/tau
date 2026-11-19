@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -927,6 +929,220 @@ func TestRPCUI_WaitForResponseTypedReturnsFullPayload(t *testing.T) {
 		t.Errorf("Cancelled = true; want false")
 	}
 }
+
+// ─── RPCUI shared requests ────────────────────────────────────────────
+
+type eventSink chan map[string]any
+
+func (s eventSink) Write(p []byte) (int, error) {
+	var event map[string]any
+	if err := json.Unmarshal(p, &event); err != nil {
+		return 0, err
+	}
+	s <- event
+	return len(p), nil
+}
+
+func (s eventSink) next(t *testing.T) map[string]any {
+	t.Helper()
+	select {
+	case event := <-s:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("no UI event")
+		return nil
+	}
+}
+
+func newSharedRPCUI() (*RPCUI, eventSink) {
+	sink := make(eventSink, 16)
+	u := NewRPCUI()
+	u.Writer = sink
+	u.EnableSharedRequests()
+	return u, sink
+}
+
+func assertResolvedEvent(t *testing.T, event map[string]any, id string, method UIMethod, outcome string) {
+	t.Helper()
+	if event["type"] != "ui_resolved" || event["id"] != id || event["method"] != string(method) || event["outcome"] != outcome {
+		t.Fatalf("resolution event = %v, want %s %s %s", event, id, method, outcome)
+	}
+	for key := range event {
+		switch key {
+		case "type", "id", "method", "outcome", "session_id", "seq", "ts":
+		default:
+			t.Fatalf("resolution event exposes %q: %v", key, event)
+		}
+	}
+}
+
+func TestRPCUISharedFirstValidResponseWins(t *testing.T) {
+	u, sink := newSharedRPCUI()
+	type result struct {
+		idx int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		idx, err := u.Select(t.Context(), "Pick", []string{"red", "blue"})
+		done <- result{idx, err}
+	}()
+	asked := sink.next(t)
+	id, _ := asked["id"].(string)
+	if asked["type"] != "ui_select" || id == "" {
+		t.Fatalf("request event = %v", asked)
+	}
+	want := []SharedRequest{{ID: id, Method: UIMethodSelect, Title: "Pick", Options: []string{"red", "blue"}}}
+	if got := u.Requests(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Requests() = %+v, want %+v", got, want)
+	}
+
+	for _, bad := range []UIResponse{
+		{ID: id, Value: "green"},
+		{ID: id, Value: "7"},
+		{ID: id, Value: "1junk"},
+		{ID: id},
+		{ID: id, Method: UIMethodConfirm, Value: "red"},
+	} {
+		if ok, err := u.Resolve(bad); ok || !errors.Is(err, ErrInvalidResponse) {
+			t.Fatalf("Resolve(%+v) = %v, %v; want invalid", bad, ok, err)
+		}
+	}
+	if got := u.PendingRequests(); got != 1 {
+		t.Fatalf("invalid replies consumed the request: pending = %d", got)
+	}
+
+	var (
+		wins atomic.Int32
+		wg   sync.WaitGroup
+	)
+	for range 8 {
+		wg.Go(func() {
+			ok, err := u.Resolve(NewUIResponseValue(id, UIMethodSelect, "blue"))
+			if err != nil {
+				t.Error(err)
+			}
+			if ok {
+				wins.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("%d replies resolved the request, want 1", got)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || got.idx != 1 {
+			t.Fatalf("Select = %d, %v", got.idx, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Select did not return")
+	}
+	assertResolvedEvent(t, sink.next(t), id, UIMethodSelect, OutcomeAnswered)
+	if got := u.PendingRequests(); got != 0 || len(u.Requests()) != 0 {
+		t.Fatalf("resolved request still pending: %d %+v", got, u.Requests())
+	}
+	if ok, err := u.Resolve(NewUIResponseValue(id, UIMethodSelect, "red")); ok || err != nil {
+		t.Fatalf("late Resolve = %v, %v; want no-op", ok, err)
+	}
+}
+
+func TestRPCUISharedResolutionOutcomes(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		act     func(t *testing.T, u *RPCUI, id string, cancel context.CancelFunc)
+		wantErr error
+		outcome string
+	}{
+		{name: "dismissed", act: func(t *testing.T, u *RPCUI, id string, _ context.CancelFunc) {
+			if ok, err := u.Resolve(NewUIResponseCancelled(id, UIMethodInput)); !ok || err != nil {
+				t.Fatalf("dismiss = %v, %v", ok, err)
+			}
+		}, wantErr: ErrNoInput, outcome: OutcomeCancelled},
+		{name: "interrupted", act: func(_ *testing.T, u *RPCUI, _ string, _ context.CancelFunc) {
+			u.CancelPending()
+		}, wantErr: context.Canceled, outcome: OutcomeInterrupted},
+		{name: "aborted", act: func(_ *testing.T, _ *RPCUI, _ string, cancel context.CancelFunc) {
+			cancel()
+		}, wantErr: context.Canceled, outcome: OutcomeAborted},
+		{name: "timeout", timeout: 10 * time.Millisecond, wantErr: context.DeadlineExceeded, outcome: OutcomeTimeout},
+		{name: "closed", act: func(t *testing.T, u *RPCUI, _ string, _ context.CancelFunc) {
+			if err := u.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}, wantErr: ErrUIClosed, outcome: OutcomeAborted},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, sink := newSharedRPCUI()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.timeout > 0 {
+				ctx, cancel = context.WithTimeout(ctx, tt.timeout)
+				defer cancel()
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := u.Input(ctx, "Name", "anon")
+				done <- err
+			}()
+			asked := sink.next(t)
+			id, _ := asked["id"].(string)
+			if asked["type"] != "ui_input" || asked["placeholder"] != "anon" {
+				t.Fatalf("request event = %v", asked)
+			}
+			if tt.act != nil {
+				tt.act(t, u, id, cancel)
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Input error = %v, want %v", err, tt.wantErr)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Input did not return")
+			}
+			assertResolvedEvent(t, sink.next(t), id, UIMethodInput, tt.outcome)
+			if ok, err := u.Resolve(NewUIResponseValue(id, UIMethodInput, "late")); ok || err != nil {
+				t.Fatalf("late Resolve = %v, %v", ok, err)
+			}
+		})
+	}
+}
+
+// A reply delivered while the request is still being published must resolve
+// it without deadlocking on the UI's own lock.
+func TestRPCUISharedReplyDuringPublish(t *testing.T) {
+	u := NewRPCUI()
+	u.EnableSharedRequests()
+	var resolved atomic.Int32
+	u.Writer = writerFunc(func(p []byte) (int, error) {
+		var event struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		}
+		if err := json.Unmarshal(p, &event); err != nil {
+			return 0, err
+		}
+		if event.Type == "ui_confirm" {
+			if ok, err := u.Resolve(NewUIResponseConfirmed(event.ID, UIMethodConfirm, true)); ok && err == nil {
+				resolved.Add(1)
+			}
+		}
+		return len(p), nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if ok, err := u.Confirm(ctx, "Proceed", "Continue?"); err != nil || !ok || resolved.Load() != 1 {
+		t.Fatalf("Confirm = %v, %v (resolved %d)", ok, err, resolved.Load())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 // ─── JSONEventUI typed dispatch via scanner ──────────────────────────
 

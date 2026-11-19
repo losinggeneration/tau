@@ -152,18 +152,25 @@ func (l *Link) readLine() ([]byte, error) {
 // link when f cannot be encoded within MaxFrameBytes, and ErrSlowConsumer
 // after closing the link when the outbound queue is full.
 func (l *Link) Send(f Frame) error {
-	data, err := json.Marshal(f)
+	data, err := encodeFrame(f)
 	if err != nil {
-		return fmt.Errorf("encode frame: %w", err)
+		return err
 	}
-	if len(data)+1 > MaxFrameBytes {
-		return ErrFrameTooLarge
-	}
-	return l.enqueue(append(data, '\n'))
+	return l.enqueue(data)
 }
 
-// enqueue queues one newline-terminated line, closing the link when the
-// outbound queue is full.
+func encodeFrame(f Frame) ([]byte, error) {
+	data, err := json.Marshal(f)
+	if err != nil {
+		return nil, fmt.Errorf("encode frame: %w", err)
+	}
+	if len(data)+1 > MaxFrameBytes {
+		return nil, ErrFrameTooLarge
+	}
+	return append(data, '\n'), nil
+}
+
+// enqueue queues one immutable newline-terminated line. A full queue closes the link.
 func (l *Link) enqueue(data []byte) error {
 	l.mu.Lock()
 	if l.closing {

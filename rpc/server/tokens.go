@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -22,8 +23,10 @@ type RemoteToken struct {
 // TokenStore persists per-device bearer tokens as JSON. The bridge consults
 // it on every auth check, so revocation takes effect without a restart.
 type TokenStore struct {
-	path string
-	mu   sync.Mutex
+	path     string
+	mu       sync.Mutex
+	snapshot os.FileInfo
+	accepted map[string]struct{}
 }
 
 // NewTokenStore creates a token store backed by the given JSON file.
@@ -110,34 +113,65 @@ func (ts *TokenStore) Contains(token string) bool {
 	}
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	tokens, err := ts.load()
+	info, err := os.Stat(ts.path)
 	if err != nil {
+		ts.snapshot, ts.accepted = nil, nil
 		return false
 	}
-	for _, t := range tokens {
-		if t.Token == token {
-			return true
+	// A CLI update publishes a new inode. Keep the metadata check on every
+	// frame but only read and parse the store when its snapshot changes.
+	if ts.snapshot == nil || !os.SameFile(ts.snapshot, info) || info.Size() != ts.snapshot.Size() || !info.ModTime().Equal(ts.snapshot.ModTime()) {
+		tokens, snapshot, err := ts.readSnapshot()
+		if err != nil {
+			ts.snapshot, ts.accepted = nil, nil
+			return false
 		}
+		ts.accepted = make(map[string]struct{}, len(tokens))
+		for _, t := range tokens {
+			ts.accepted[t.Token] = struct{}{}
+		}
+		ts.snapshot = snapshot
 	}
-	return false
+	_, found := ts.accepted[token]
+	return found
 }
 
 func (ts *TokenStore) load() ([]RemoteToken, error) {
-	data, err := os.ReadFile(ts.path)
+	tokens, _, err := ts.readSnapshot()
+	return tokens, err
+}
+
+func (ts *TokenStore) readSnapshot() (_ []RemoteToken, _ os.FileInfo, err error) {
+	file, err := os.Open(ts.path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read token store: %w", err)
+		return nil, nil, fmt.Errorf("open token store: %w", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close token store: %w", closeErr))
+		}
+	}()
+	// The path may have been replaced since the caller's stat. Cache the
+	// metadata for the open file, not the path we used to find it.
+	info, err := file.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat token snapshot: %w", err)
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read token store: %w", err)
 	}
 	var tokens []RemoteToken
 	if err := json.Unmarshal(data, &tokens); err != nil {
-		return nil, fmt.Errorf("parse token store: %w", err)
+		return nil, nil, fmt.Errorf("parse token store: %w", err)
 	}
-	return tokens, nil
+	return tokens, info, nil
 }
 
-func (ts *TokenStore) save(tokens []RemoteToken) error {
+func (ts *TokenStore) save(tokens []RemoteToken) (err error) {
 	if err := os.MkdirAll(filepath.Dir(ts.path), 0o700); err != nil {
 		return fmt.Errorf("create token store dir: %w", err)
 	}
@@ -145,8 +179,29 @@ func (ts *TokenStore) save(tokens []RemoteToken) error {
 	if err != nil {
 		return fmt.Errorf("marshal token store: %w", err)
 	}
-	if err := os.WriteFile(ts.path, data, 0o600); err != nil {
-		return fmt.Errorf("write token store: %w", err)
+	// Readers in another process must never see a partially written store.
+	file, err := os.CreateTemp(filepath.Dir(ts.path), ".remote-tokens-*")
+	if err != nil {
+		return fmt.Errorf("create token snapshot: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if removeErr := os.Remove(file.Name()); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				err = errors.Join(err, fmt.Errorf("remove token snapshot: %w", removeErr))
+			}
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("write token snapshot: %w", errors.Join(err, file.Close()))
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync token snapshot: %w", errors.Join(err, file.Close()))
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close token snapshot: %w", err)
+	}
+	if err := os.Rename(file.Name(), ts.path); err != nil {
+		return fmt.Errorf("publish token snapshot: %w", err)
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,7 +16,59 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/rpc/coord"
+	"github.com/losinggeneration/tau/rpc/server"
 )
+
+func TestServeCoordinatorStopsBridgeWithCoordinator(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "c.sock")
+	bridge, err := server.NewCoordinatedBridge("127.0.0.1:0", socket, "secret", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := errors.New("coordinator already running")
+	err = serveCoordinator(t.Context(), socket, bridge, nil, func(context.Context, string, coord.LaunchFunc) error { return busy })
+	if !errors.Is(err, busy) {
+		t.Fatalf("serve = %v, want coordinator failure", err)
+	}
+	if conn, err := net.DialTimeout("tcp", bridge.Addr(), time.Second); err == nil {
+		t.Errorf("bridge still accepting after coordinator failure: %v", conn.Close())
+	}
+}
+
+func TestServeCoordinatorStopsCoordinatorOnCancel(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "c.sock")
+	bridge, err := server.NewCoordinatedBridge("127.0.0.1:0", socket, "secret", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	running := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- serveCoordinator(ctx, socket, bridge, nil, func(ctx context.Context, _ string, _ coord.LaunchFunc) error {
+			close(running)
+			<-ctx.Done()
+			return nil
+		})
+	}()
+	<-running
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("coordinator and bridge did not stop")
+	}
+}
+
+func TestCoordinatedBridgeRefusesNonLoopback(t *testing.T) {
+	if _, err := server.NewCoordinatedBridge("0.0.0.0:0", filepath.Join(t.TempDir(), "c.sock"), "secret", nil); err == nil {
+		t.Fatal("non-loopback coordinated bridge started")
+	}
+}
 
 func TestCoordinatorNodeIdentityPersists(t *testing.T) {
 	dir := t.TempDir()

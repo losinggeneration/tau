@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -505,6 +506,35 @@ func TestRPCCommandUIRegistersBeforePublishing(t *testing.T) {
 	}
 }
 
+// Stdio keeps its connection-owned reply shape; shared snapshots are
+// coordinated-only.
+func TestLegacyUIResponseKeepsReplyShape(t *testing.T) {
+	var out bytes.Buffer
+	s := NewServer(nil, nil, nil)
+	s.writer = &out
+	s.ui = ui.NewRPCUI()
+	if err := s.handleCommand(t.Context(), &Command{ID: "reply", Type: "ui_response", Args: json.RawMessage(`{"id":"unknown","value":"x"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handleCommand(t.Context(), &Command{ID: "list", Type: "get_ui_requests"}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("responses: %q", lines)
+	}
+	if lines[0] != `{"type":"response","id":"reply","ok":true,"result":{"ok":true}}` {
+		t.Fatalf("legacy ui_response reply = %s", lines[0])
+	}
+	var list Response
+	if err := json.Unmarshal([]byte(lines[1]), &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.OK || list.Error == nil || list.Error.Code != "not_supported" {
+		t.Fatalf("stdio get_ui_requests = %+v", list)
+	}
+}
+
 type immediateUIReplyWriter struct{ ui *ui.RPCUI }
 
 func (w immediateUIReplyWriter) Write(data []byte) (int, error) {
@@ -543,4 +573,58 @@ func TestEmitEventSessionSnapshotDoesNotTakeSessionLock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("event observer deadlocked against session Close")
 	}
+}
+
+func TestFollowUpQueuesUploadedAttachment(t *testing.T) {
+	sess := newMockSession("s", t.TempDir())
+	record, err := sess.ImportAttachmentData("note.txt", "text/plain", "bm90ZQ==")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	s := &Server{writer: &output, session: sess, coordinated: true}
+	cmd := &Command{ID: "f", Type: "follow_up", Args: fmt.Appendf(nil, `{"text":"use note","attachment_ids":[%q],"expected_session_id":"s"}`, record.ID)}
+	if err := s.handleCommand(t.Context(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	var reply Response
+	if err := json.Unmarshal(lastResponseLine(output.Bytes()), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if !reply.OK || len(sess.followUps) != 1 || sess.followUps[0].Text != "use note" || !slices.Equal(sess.followUps[0].AttachmentIDs, []string{record.ID}) {
+		t.Fatalf("reply = %s, queued messages = %+v", &output, sess.followUps)
+	}
+}
+
+func TestStaleSessionRejectsDraftSubmission(t *testing.T) {
+	for _, tc := range []struct{ typ, args string }{
+		{"send_message", `{"text":"draft","expected_session_id":"previous"}`},
+		{"follow_up", `{"text":"draft","expected_session_id":"previous"}`},
+		{"attach_data", `{"filename":"note.txt","mime_type":"text/plain","data":"bm90ZQ==","expected_session_id":"previous"}`},
+	} {
+		t.Run(tc.typ, func(t *testing.T) {
+			sess := newMockSession("current", t.TempDir())
+			var output bytes.Buffer
+			s := &Server{writer: &output, session: sess, coordinated: true}
+			if err := s.handleCommand(t.Context(), &Command{ID: "stale", Type: tc.typ, Args: json.RawMessage(tc.args)}); err != nil {
+				t.Fatal(err)
+			}
+			s.promptWG.Wait()
+			var reply Response
+			if err := json.Unmarshal(lastResponseLine(output.Bytes()), &reply); err != nil {
+				t.Fatalf("decode %s: %v", &output, err)
+			}
+			if reply.OK || reply.Error == nil || reply.Error.Code != "session_changed" {
+				t.Fatalf("reply = %s, want session_changed", &output)
+			}
+			if len(sess.sent) != 0 || sess.followUpCount != 0 || len(sess.attachments) != 0 {
+				t.Fatal("stale command mutated the current session")
+			}
+		})
+	}
+}
+
+func lastResponseLine(output []byte) []byte {
+	output = bytes.TrimSpace(output)
+	return output[bytes.LastIndexByte(output, '\n')+1:]
 }

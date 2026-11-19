@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -441,6 +442,42 @@ func TestEventsReachOnlySubscribersWithWorkerEnvelope(t *testing.T) {
 	}
 }
 
+func TestWatchInstancesOnlyDeliversSummaries(t *testing.T) {
+	h := startCoordinator(t, nil, launchTimeout)
+	actor, _ := h.client()
+	watcher, _ := h.client()
+	first, _ := h.start(actor, "first")
+	initial := request(t, watcher, Frame{Type: TypeWatchInstances, ID: "watch"})
+	if initial.Error != nil || len(initial.Instances) != 1 || initial.Instances[0].ID != first.ID {
+		t.Fatalf("initial watch snapshot = %+v", initial)
+	}
+	second, w := h.start(actor, "second")
+	if update := readFrame(t, watcher); update.Type != TypeInstanceUpdate || update.InstanceID != second.ID || update.SessionID != second.SessionID {
+		t.Fatalf("new instance summary = %+v", update)
+	}
+	mustSend(t, w.link, Frame{Type: TypeEvent, Event: json.RawMessage(`{"type":"private_chat_update"}`)})
+	attention := second
+	attention.State = "busy"
+	attention.PendingInputs = 2
+	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &attention})
+	if update := readFrame(t, watcher); update.Type != TypeInstanceUpdate || update.Instance == nil || *update.Instance != attention || len(update.Event) != 0 {
+		t.Fatalf("attention summary = %+v", update)
+	}
+	if err := w.link.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if update := readFrame(t, watcher); update.Type != TypeInstanceUpdate || update.InstanceID != second.ID || update.SessionID != second.SessionID || update.Error == nil || update.Error.Code != CodeWorkerLinkLost {
+		t.Fatalf("lost instance summary = %+v", update)
+	}
+	if reply := request(t, watcher, Frame{Type: TypeUnwatchInstances, ID: "unwatch"}); reply.Type != TypeResponse || reply.Error != nil {
+		t.Fatalf("unwatch = %+v", reply)
+	}
+	third, _ := h.start(actor, "third")
+	if reply := request(t, watcher, Frame{Type: TypeListInstances, ID: "list"}); reply.ID != "list" || !slices.ContainsFunc(reply.Instances, func(i Instance) bool { return i.ID == third.ID }) {
+		t.Fatalf("after unwatch = %+v", reply)
+	}
+}
+
 func TestStopInstanceRoutesShutdownAndReportsUnavailable(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	c, _ := h.client()
@@ -466,7 +503,7 @@ func TestStopInstanceRoutesShutdownAndReportsUnavailable(t *testing.T) {
 	}
 	wantError(t, readFrame(t, c), "busy", CodeUnavailable)
 	gone := readFrame(t, c)
-	if gone.Type != TypeEvent || gone.InstanceID != inst.ID || gone.Error == nil || gone.Error.Code != CodeUnavailable {
+	if gone.Type != TypeEvent || gone.InstanceID != inst.ID || gone.Error == nil || gone.Error.Code != CodeWorkerLinkLost || !strings.Contains(gone.Error.Message, "may still be running") {
 		t.Fatalf("unavailable event = %+v", gone)
 	}
 	if list := request(t, c, Frame{Type: TypeListInstances, ID: "l"}); len(list.Instances) != 0 {
@@ -529,7 +566,7 @@ func TestClientIdentitySurvivesConnectionReplacement(t *testing.T) {
 func TestWelcomeAdvertisesOperationsAndLimits(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	_, welcome := h.client()
-	if welcome.Limits == nil || welcome.Limits.FrameBytes != MaxFrameBytes || welcome.Limits.OutboundBytes != maxQueuedBytes || len(welcome.Operations) != 6 {
+	if welcome.Limits == nil || welcome.Limits.FrameBytes != MaxFrameBytes || welcome.Limits.OutboundBytes != maxQueuedBytes || !slices.Contains(welcome.Operations, TypeWatchInstances) || !slices.Contains(welcome.Operations, TypeUnwatchInstances) {
 		t.Fatalf("missing negotiated capabilities: %+v", welcome)
 	}
 }
@@ -761,6 +798,42 @@ func TestOversizedEventSendsLimitNotice(t *testing.T) {
 	}
 }
 
+func TestWorkerQueueOverflowReportsLostLink(t *testing.T) {
+	workerSide, stalled := net.Pipe()
+	defer stalled.Close()
+	clientSide, reader := net.Pipe()
+	defer reader.Close()
+	clientLink, clientReader := NewLink(clientSide), NewLink(reader)
+	defer clientLink.fail(io.EOF)
+	defer clientReader.fail(io.EOF)
+	workerLink := NewLink(workerSide)
+	defer workerLink.fail(io.EOF)
+	w := &worker{instance: Instance{ID: "worker", SessionID: "session"}, link: workerLink, routes: make(map[string]route)}
+	c := &client{link: clientLink, pending: make(map[string]pendingRef), subs: map[string]struct{}{w.instance.ID: {}}}
+	co := &coordinator{clients: map[string]*client{"client": c}, workers: map[string]*worker{w.instance.ID: w}}
+	for i := range maxQueuedFrames - 1 {
+		co.forward(c, Frame{ID: fmt.Sprintf("request-%d", i), InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`))
+	}
+	mustSend(t, workerLink, Frame{Type: TypeResponse})
+	co.forward(c, Frame{ID: "overflow", InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`))
+	wantError(t, readFrame(t, clientReader), "overflow", CodeUnavailable)
+	if err := workerLink.Err(); !errors.Is(err, ErrSlowConsumer) {
+		t.Fatalf("worker link error = %v, want overflow", err)
+	}
+	co.dropWorker(w)
+	for range maxQueuedFrames - 1 {
+		f := readFrame(t, clientReader)
+		if f.Error == nil || f.Error.Code != CodeUnavailable || !strings.Contains(f.Error.Message, "outcome unknown") {
+			t.Fatalf("pending reply = %+v (error %v)", f, f.Error)
+		}
+	}
+	f := readFrame(t, clientReader)
+	if f.Type != TypeEvent || f.InstanceID != w.instance.ID || f.SessionID != w.instance.SessionID ||
+		f.Error == nil || f.Error.Code != CodeWorkerLinkLost || !strings.Contains(f.Error.Message, "outbound queue full") {
+		t.Fatalf("lost link = %+v (error %v)", f, f.Error)
+	}
+}
+
 func TestSlowSubscriberClosedWithoutAffectingWorker(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	c, _ := h.client()
@@ -768,11 +841,17 @@ func TestSlowSubscriberClosedWithoutAffectingWorker(t *testing.T) {
 	if resp := request(t, c, Frame{Type: TypeAttach, ID: "att", InstanceID: inst.ID}); resp.Error != nil {
 		t.Fatalf("attach = %+v", resp)
 	}
+	fast, _ := h.client()
+	if resp := request(t, fast, Frame{Type: TypeAttach, ID: "attach-fast", InstanceID: inst.ID}); resp.Error != nil {
+		t.Fatalf("attach fast reader = %+v", resp)
+	}
 	const events = 80
 	ev := Frame{Type: TypeEvent, Event: json.RawMessage(`{"d":"` + strings.Repeat("x", 100_000) + `"}`)}
-	for range events {
+	for i := range events {
 		mustSend(t, w.link, ev)
-		waitFlushed(t, w.link)
+		if f := readFrame(t, fast); f.InstanceID != inst.ID || string(f.Event) != string(ev.Event) {
+			t.Fatalf("fast subscriber event %d: wrong instance or payload", i)
+		}
 	}
 	if err := c.conn.SetReadDeadline(time.Now().Add(testTimeout)); err != nil {
 		t.Fatal(err)
