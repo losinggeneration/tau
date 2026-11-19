@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"github.com/losinggeneration/tau/agent/plugins"
 	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/rpc/coord"
@@ -31,12 +33,15 @@ func NewWorker(rt sdk.Runtime, reg commands.Registry, mgr *plugins.Manager) *Wor
 }
 
 // Run initializes a session, registers it, and serves until explicit shutdown
-// or process cancellation. Reconnection and replay are deliberately not attempted.
+// or process cancellation. The worker does not redial after coordinator loss.
 func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, token string) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := w.server
-	output := &workerWriter{instance: instance, server: s}
+	output := &workerWriter{
+		instance: instance, server: s,
+		journal: eventJournal{position: coord.Position{InstanceID: instance.ID, Epoch: uuid.NewString()}},
+	}
 	s.writer = output
 	s.ui = ui.NewRPCUI()
 	s.ui.Writer = rpcUIWriter{server: s}
@@ -44,11 +49,12 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	if s.pluginManager != nil {
 		s.pluginManager.SetUI(s.ui)
 	}
-	var admission sync.WaitGroup
+	var admission, reads sync.WaitGroup
 	cleaned := false
 	cleanup := func() error {
 		cancel()
 		admission.Wait()
+		reads.Wait()
 		cleaned = true
 		cleanupErr := s.cleanup(ctx)
 		closeCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), sessionCleanupTimeout)
@@ -93,6 +99,10 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 			err = errors.Join(err, cleanup())
 		}
 		close(readerStop)
+		// Stop late event writers from scheduling another asynchronous close.
+		output.mu.Lock()
+		output.link = nil
+		output.mu.Unlock()
 		if closeErr := link.Close(); closeErr != nil {
 			err = errors.Join(err, closeErr)
 		}
@@ -119,6 +129,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	// The reader never waits for that handler, so UI replies and cancellation
 	// remain serviceable even while slash commands or compaction block.
 	pending := make(chan *Command, workerAdmissionSlots)
+	reconstruction := make(chan *Command, workerAdmissionSlots)
 	var (
 		handlerMu     sync.Mutex
 		cancelHandler context.CancelFunc
@@ -147,6 +158,28 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 				handlerMu.Lock()
 				cancelHandler = nil
 				handlerMu.Unlock()
+			}
+		}
+	})
+	reads.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case cmd := <-reconstruction:
+				if ctx.Err() != nil {
+					return
+				}
+				handle := output.replayEvents
+				switch cmd.Type {
+				case "get_snapshot":
+					handle = output.getSnapshot
+				case "get_history":
+					handle = output.getHistory
+				}
+				if err := handle(cmd); err != nil {
+					workerLog("send reconstruction reply: %v", err)
+				}
 			}
 		}
 	})
@@ -197,6 +230,14 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 				}
 				handlerMu.Unlock()
 				w.dispatch(ctx, &cmd)
+			case "replay_events", "get_snapshot", "get_history":
+				select {
+				case reconstruction <- &cmd:
+				default:
+					if err := s.sendError(cmd.ID, coord.CodeBusy, "worker reconstruction admission is full"); err != nil {
+						return err
+					}
+				}
 			case "ui_response", "get_ui_requests", "abort_bash":
 				w.dispatch(ctx, &cmd)
 			default:
@@ -231,14 +272,16 @@ func (w *Worker) dispatch(ctx context.Context, cmd *Command) {
 	}
 }
 
-// workerWriter adapts complete serialized RPC records without retaining events
-// while disconnected. Link.Send itself is nonblocking and bounded.
+// workerWriter adapts serialized RPC records to the bounded worker stream.
+// Link.Send itself is nonblocking and bounded.
 type workerWriter struct {
 	server   *Server
 	mu       sync.Mutex
 	link     *coord.Link
 	instance coord.Instance
 	closing  sync.WaitGroup
+	journal  eventJournal
+	live     liveSnapshot
 }
 
 func (w *workerWriter) connect(link *coord.Link, instance coord.Instance) {
@@ -260,57 +303,73 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.link == nil {
-		return len(data), nil
-	}
+	var changedSession bool
 	if w.server != nil {
 		id, _ := w.server.eventSessionID.Load().(string)
 		if id != "" && id != w.instance.SessionID {
 			w.instance.SessionID = id
 			w.instance.State = coord.StateReady
-			if err := w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance}); err != nil {
-				w.disconnect(err)
-				return len(data), nil
-			}
+			w.live = liveSnapshot{}
+			changedSession = true
 		}
 	}
 	frame := coord.Frame{Type: coord.TypeEvent, InstanceID: w.instance.ID, SessionID: record.SessionID, Event: json.RawMessage(data)}
+	var omitted bool
 	if record.Type == "response" {
 		frame.Type, frame.ID, frame.Event, frame.Result = coord.TypeResponse, record.ID, nil, json.RawMessage(data)
 	} else {
 		if frame.SessionID == "" {
 			frame.SessionID = w.instance.SessionID
 		}
-	}
-	err := w.link.Send(frame)
-	if errors.Is(err, coord.ErrFrameTooLarge) {
-		if frame.Type == coord.TypeResponse {
-			frame.Result = nil
-			frame.Error = &coord.Error{Code: coord.CodeLimitExceeded, Message: "worker reply exceeds frame size limit"}
-		} else {
-			notice, encodeErr := json.Marshal(map[string]any{
-				"type": "event_omitted", "code": coord.CodeLimitExceeded,
+		position := w.journal.position
+		position.Offset++
+		frame.Position = &position
+		// The replay entry has two bounded identifiers from registration and
+		// the raw event, plus fixed fields. Leave room for JSON escaping.
+		size := len(data) + 256 + 12*len(frame.InstanceID) + 6*(len(frame.SessionID)+len(position.Epoch))
+		if size > replayPageBytes {
+			notice, err := json.Marshal(map[string]any{
+				"type": "event_omitted", "code": coord.CodeLimitExceeded, "event_type": record.Type,
 				"session_id": frame.SessionID, "seq": record.Seq, "ts": record.Timestamp,
 			})
-			if encodeErr != nil {
-				return 0, fmt.Errorf("encode omitted event: %w", encodeErr)
+			if err != nil {
+				return 0, fmt.Errorf("encode omitted event: %w", err)
 			}
-			frame.Event = notice
+			size += len(notice) - len(data)
+			frame.Event, omitted = notice, true
 		}
-		err = w.link.Send(frame)
-		// Fail an interactive dialog whose request cannot reach a client.
-		switch record.Type {
-		case "ui_confirm", "ui_select", "ui_input":
-			if err == nil {
-				return 0, coord.ErrFrameTooLarge
+		if frame.SessionID == w.instance.SessionID {
+			if err := w.live.update(record.Type, json.RawMessage(data)); err != nil {
+				w.live.Truncated = true
+				workerLog("%v", err)
 			}
+		}
+		w.journal.position = position
+		w.journal.publish(frame, size)
+	}
+	if w.link != nil && changedSession {
+		if err := w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance}); err != nil {
+			w.disconnect(err)
 		}
 	}
-	if err == nil && frame.Type == coord.TypeEvent && frame.SessionID == w.instance.SessionID {
-		err = w.publishSummaryLocked(record.Type)
+	if w.link != nil {
+		err := w.link.Send(frame)
+		if errors.Is(err, coord.ErrFrameTooLarge) && frame.Type == coord.TypeResponse {
+			frame.Result = nil
+			frame.Error = &coord.Error{Code: coord.CodeLimitExceeded, Message: "worker reply exceeds frame size limit"}
+			err = w.link.Send(frame)
+		}
+		if err != nil {
+			w.disconnect(err)
+		}
 	}
-	if err != nil {
-		w.disconnect(err)
+	if frame.Type == coord.TypeEvent && frame.SessionID == w.instance.SessionID {
+		if err := w.publishSummaryLocked(record.Type); err != nil {
+			w.disconnect(err)
+		}
+	}
+	if omitted && record.Type != "ui_resolved" && isSharedUIRecord(record.Type) {
+		return 0, coord.ErrFrameTooLarge
 	}
 	return len(data), nil
 }
@@ -336,7 +395,7 @@ func (w *workerWriter) publishSummaryLocked(kind string) error {
 	if isSharedUIRecord(kind) && w.server != nil && w.server.ui != nil {
 		w.instance.PendingInputs = w.server.ui.PendingRequests()
 	}
-	if w.instance == previous {
+	if w.link == nil || w.instance == previous {
 		return nil
 	}
 	return w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance})

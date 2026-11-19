@@ -74,4 +74,47 @@ func TestIndexHistoryPagesBranch(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{ids[6], ids[7]}, indexEntryIDs(page))
 	require.Empty(t, next)
+	_, _, err = x.History(w.Path(), ids[7], ids[5], 10)
+	require.ErrorContains(t, err, "no longer exists")
+}
+
+func TestIndexHistoryPagesWithinCompactionAnchors(t *testing.T) {
+	w, err := CreateSessionFile(t.TempDir(), NewHeader("/test", nil, nil))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, w.Close()) })
+	old := NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"old"}`), nil)
+	kept := NewMessageEntry(&old.ID, json.RawMessage(`{"role":"user","content":"kept"}`), nil)
+	require.NoError(t, w.Append(old))
+	require.NoError(t, w.Append(kept))
+	parent := kept.ID
+	want := []string{old.ID}
+	for range 4 {
+		summary := NewCompactionEntry("compacted", kept.ID, 1, 1, false)
+		summary.ParentID = &parent
+		require.NoError(t, w.Append(summary))
+		parent = summary.ID
+		want = append(want, summary.ID)
+	}
+	head := NewMessageEntry(&parent, json.RawMessage(`{"role":"assistant","content":"new"}`), nil)
+	require.NoError(t, w.Append(head))
+	want = append(want, kept.ID, head.ID)
+
+	for _, limit := range []int{1, 2, 3} {
+		var x Index
+		var before string
+		var got []string
+		for range len(want) {
+			page, next, err := x.History(w.Path(), head.ID, before, limit)
+			require.NoError(t, err)
+			require.NotEmpty(t, page)
+			require.LessOrEqual(t, len(page), limit)
+			got = append(indexEntryIDs(page), got...)
+			if next == "" {
+				break
+			}
+			require.Equal(t, page[0].ID, next)
+			before = next
+		}
+		require.Equal(t, want, got)
+	}
 }

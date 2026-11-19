@@ -34,6 +34,7 @@ type indexEntry struct {
 	offset int64
 	length int32
 	parent int32
+	anchor int32 // kept entry for a compaction summary, or -1
 	kind   indexKind
 }
 
@@ -48,7 +49,8 @@ const (
 // History returns up to limit displayable entries of the branch, oldest
 // first. The page ends just before the entry before, or at head (inclusive)
 // when before is empty. next is the entry to pass as before for the page
-// preceding this one, empty once the start of the branch is reached.
+// preceding this one, empty once the start of the branch is reached. It can
+// name a compaction summary when the page ends within its anchor group.
 // Compaction summaries appear before the first entry they kept, as in
 // Reader.AllEntries.
 func (x *Index) History(path, head, before string, limit int) (entries []Entry, next string, err error) {
@@ -74,25 +76,48 @@ func (x *Index) History(path, head, before string, limit int) (entries []Entry, 
 	}
 
 	start := int32(-1)
+	var beforeEntry int32 = -1
 	if before != "" {
-		if i, ok := x.byID[before]; ok {
-			start = x.entries[i].parent
+		i, ok := x.byID[before]
+		if !ok {
+			return nil, "", fmt.Errorf("history position %q no longer exists", before)
+		}
+		beforeEntry = i
+		start = i
+		if x.entries[i].anchor >= 0 {
+			start = x.entries[i].anchor
 		}
 	} else if i, ok := x.byID[head]; ok {
 		start = i
 	}
 
-	// Walk newest-first, then reverse. A page only ends on a chain entry, so
-	// the summaries anchored to it are never split from it.
+	// Walk display order backwards. Look one entry beyond the page to
+	// distinguish an older page from a tail of hidden records.
 	var picked []int32
-	last := int32(-1)
-	for i := start; i >= 0 && len(picked) < limit; i = x.entries[i].parent {
-		last = i
-		if x.entries[i].kind == indexDisplayed {
+	more := false
+walk:
+	for i := start; i >= 0; i = x.entries[i].parent {
+		anchors := x.anchored[i]
+		if i == start && beforeEntry >= 0 {
+			if beforeEntry != i {
+				end, found := slices.BinarySearch(anchors, beforeEntry)
+				if !found {
+					return nil, "", fmt.Errorf("history summary %q no longer has an anchor", before)
+				}
+				anchors = anchors[:end]
+			}
+		} else if x.entries[i].kind == indexDisplayed {
+			if len(picked) == limit {
+				more = true
+				break
+			}
 			picked = append(picked, i)
 		}
-		anchors := x.anchored[i]
 		for j := len(anchors) - 1; j >= 0; j-- {
+			if len(picked) == limit {
+				more = true
+				break walk
+			}
 			picked = append(picked, anchors[j])
 		}
 	}
@@ -105,12 +130,8 @@ func (x *Index) History(path, head, before string, limit int) (entries []Entry, 
 		}
 		entries = append(entries, e)
 	}
-	if last >= 0 && x.entries[last].parent >= 0 {
-		e, err := x.read(f, last)
-		if err != nil {
-			return nil, "", err
-		}
-		next = e.ID
+	if more && len(entries) > 0 {
+		next = entries[0].ID
 	}
 	return entries, next, nil
 }
@@ -163,7 +184,7 @@ func (x *Index) add(line []byte) {
 	if json.Unmarshal(line, &head) != nil || head.ID == "" || head.Type == EntryTypeSession || head.Status == EntryStatusDeleted {
 		return
 	}
-	ie := indexEntry{offset: x.size, length: int32(len(line)), parent: -1}
+	ie := indexEntry{offset: x.size, length: int32(len(line)), parent: -1, anchor: -1}
 	if head.ParentID != nil {
 		if p, ok := x.byID[*head.ParentID]; ok {
 			ie.parent = p
@@ -177,6 +198,7 @@ func (x *Index) add(line []byte) {
 		ie.kind = indexCompaction
 		if head.FirstKeptID != nil {
 			if kept, ok := x.byID[*head.FirstKeptID]; ok {
+				ie.anchor = kept
 				x.anchored[kept] = append(x.anchored[kept], i)
 			}
 		}

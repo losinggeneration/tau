@@ -3,6 +3,7 @@ package server
 import (
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -53,29 +54,64 @@ func TestCoordinatedWebAppServesInstanceController(t *testing.T) {
 		want []string
 		omit []string
 	}{
-		{"/", []string{"Running instances", "Saved sessions", "Start instance", "Detach", "Stop instance"}, []string{`id="url"`, `<h2>Sessions</h2>`, `id="steer"`}},
-		{"/app.js", []string{"watch_instances", "instance_update", "get_ui_requests", "ui_resolved"}, nil},
+		{
+			"/",
+			[]string{"Running instances", "Saved sessions", "Start instance", "Detach", "Stop instance", `id="outcomes"`},
+			[]string{`id="url"`, `<h2>Sessions</h2>`, `id="steer"`},
+		},
+		{
+			"/app.js",
+			[]string{
+				"watch_instances", "instance_update", "ui_resolved",
+				`"get_snapshot"`, `"get_history"`, "session_id: session, before", `"replay_events"`, "after: {...v.position}",
+				"request_id", "launch_request_id", "randomUUID", "outcome_unknown",
+				"event_omitted", "worker_link_lost", "STAGE_FRAMES", "STAGE_BYTES", "HISTORY_MAX",
+				"textRevision", "filesRevision", "uploads.delete(file)",
+			},
+			[]string{`"get_messages"`, `"get_ui_requests"`, `"get_state"`},
+		},
 	} {
-		req, err := http.NewRequest(http.MethodGet, tc.path, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		rec := newResponseRecorder()
-		mux.ServeHTTP(rec, req)
-		if rec.status != http.StatusOK {
-			t.Fatalf("%s status = %d", tc.path, rec.status)
-		}
+		body := serveCoordinatedAsset(t, mux, tc.path)
 		for _, want := range tc.want {
-			if !strings.Contains(rec.body.String(), want) {
+			if !strings.Contains(body, want) {
 				t.Fatalf("%s missing %q", tc.path, want)
 			}
 		}
 		for _, omit := range tc.omit {
-			if strings.Contains(rec.body.String(), omit) {
+			if strings.Contains(body, omit) {
 				t.Fatalf("%s unexpectedly contains %q", tc.path, omit)
 			}
 		}
 	}
+}
+
+func TestCoordinatedWebAppScriptTargetsExistingElements(t *testing.T) {
+	mux := http.NewServeMux()
+	registerCoordinatedWebApp(mux)
+	page, script := serveCoordinatedAsset(t, mux, "/"), serveCoordinatedAsset(t, mux, "/app.js")
+	ids := regexp.MustCompile(`\$\("([A-Za-z]+)"\)`).FindAllStringSubmatch(script, -1)
+	if len(ids) == 0 {
+		t.Fatal("script references no elements")
+	}
+	for _, id := range ids {
+		if !strings.Contains(page, `id="`+id[1]+`"`) {
+			t.Errorf("script uses element %q missing from page", id[1])
+		}
+	}
+}
+
+func serveCoordinatedAsset(t *testing.T, mux *http.ServeMux, path string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := newResponseRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.status != http.StatusOK {
+		t.Fatalf("%s status = %d", path, rec.status)
+	}
+	return rec.body.String()
 }
 
 type responseRecorder struct {

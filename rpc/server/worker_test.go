@@ -29,12 +29,20 @@ type workerSession struct {
 	steerCount     atomic.Int32
 	observerReady  chan func(sdk.Event)
 	messages       []sdk.Message
+	historyFn      func() ([]sdk.HistoryEntry, string, error)
 }
 
 func (s *workerSession) Send(ctx context.Context, msg sdk.Message) (<-chan sdk.Event, error) {
 	return s.sendFn(ctx, msg)
 }
 func (s *workerSession) GetMessages() []sdk.Message { return s.messages }
+
+func (s *workerSession) History(string, int) ([]sdk.HistoryEntry, string, error) {
+	if s.historyFn != nil {
+		return s.historyFn()
+	}
+	return nil, "", nil
+}
 
 func (s *workerSession) Interrupt() error        { s.interruptCount.Add(1); return nil }
 func (s *workerSession) Steer(sdk.Message) error { s.steerCount.Add(1); return nil }
@@ -57,9 +65,13 @@ type workerRuntime struct {
 	opts    chan sdk.SessionOptions
 	closeFn func(context.Context) error
 	newErr  error
+	newFn   func(sdk.SessionOptions) (sdk.Session, error)
 }
 
 func (r *workerRuntime) NewSession(_ context.Context, opts sdk.SessionOptions) (sdk.Session, error) {
+	if r.newFn != nil {
+		return r.newFn(opts)
+	}
 	r.opts <- opts
 	return r.sess, r.newErr
 }
@@ -84,6 +96,11 @@ type workerHarness struct {
 
 func startWorker(t *testing.T, rt *workerRuntime, reg commands.Registry) *workerHarness {
 	t.Helper()
+	return startWorkerInstance(t, rt, reg, coord.Instance{ID: "instance", CWD: "/project"})
+}
+
+func startWorkerInstance(t *testing.T, rt sdk.Runtime, reg commands.Registry, instance coord.Instance) *workerHarness {
+	t.Helper()
 	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "w"))
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +113,7 @@ func startWorker(t *testing.T, rt *workerRuntime, reg commands.Registry) *worker
 	ctx, cancel := context.WithCancel(t.Context())
 	h := &workerHarness{done: make(chan error, 1), frames: make(chan coord.Frame, 256)}
 	go func() {
-		h.done <- NewWorker(rt, reg, nil).Run(ctx, listener.Addr().String(), coord.Instance{ID: "instance", CWD: "/project"}, "secret")
+		h.done <- NewWorker(rt, reg, nil).Run(ctx, listener.Addr().String(), instance, "secret")
 	}()
 	conn, err := listener.Accept()
 	if err != nil {
@@ -487,6 +504,63 @@ func TestWorkerAdmissionBoundAndTarget(t *testing.T) {
 	}
 }
 
+func TestWorkerRejectsDraftAfterQueuedSessionSwitch(t *testing.T) {
+	rt := newWorkerRuntime()
+	next := newWorkerRuntime().sess
+	next.mockSession = newMockSession("new-session", "/other")
+	var sent atomic.Int32
+	countSend := func(context.Context, sdk.Message) (<-chan sdk.Event, error) {
+		sent.Add(1)
+		ch := make(chan sdk.Event)
+		close(ch)
+		return ch, nil
+	}
+	rt.sess.sendFn, next.sendFn = countSend, countSend
+	rt.newFn = func(opts sdk.SessionOptions) (sdk.Session, error) {
+		if opts.CWD == "/other" {
+			return next, nil
+		}
+		return rt.sess, nil
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	rt.sess.compactFn = func(ctx context.Context) error {
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	h := startWorker(t, rt, nil)
+	h.send(t, "compact", `{"type":"compact"}`)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("compaction did not hold admission")
+	}
+	h.send(t, "switch", `{"type":"new_session","args":{"cwd":"/other"}}`)
+	h.send(t, "draft", `{"type":"send_message","args":{"text":"for the old session","expected_session_id":"session"}}`)
+	h.send(t, "barrier", `{"type":"get_ui_requests"}`)
+	for {
+		f := h.next(t)
+		if f.Type != coord.TypeResponse {
+			continue
+		}
+		if f.ID != "barrier" {
+			t.Fatalf("ordinary command ran before admission released: %+v", f)
+		}
+		break
+	}
+	close(release)
+	if r := h.response(t, "switch"); !r.OK {
+		t.Fatalf("session switch: %+v", r)
+	}
+	if r := h.response(t, "draft"); r.OK || r.Error == nil || r.Error.Code != "session_changed" || sent.Load() != 0 {
+		t.Fatalf("stale draft got %+v and reached Send %d times", r, sent.Load())
+	}
+}
+
 func TestWorkerBusyPromptDefaultsToSteer(t *testing.T) {
 	rt := newWorkerRuntime()
 	rt.sess.sendFn = func(context.Context, sdk.Message) (<-chan sdk.Event, error) { return nil, sdk.ErrSessionBusy }
@@ -494,6 +568,40 @@ func TestWorkerBusyPromptDefaultsToSteer(t *testing.T) {
 	h.send(t, "more", `{"type":"send_message","args":{"text":"adjust"}}`)
 	if r := h.response(t, "more"); !r.OK || rt.sess.steerCount.Load() != 1 {
 		t.Fatalf("busy ordinary send: %+v", r)
+	}
+}
+
+func TestWorkerReplaysEventPositions(t *testing.T) {
+	rt := newWorkerRuntime()
+	h := startWorker(t, rt, nil)
+	observer := <-rt.sess.observerReady
+	h.send(t, "ready", `{"type":"get_state"}`)
+	h.response(t, "ready")
+	observer(sdk.Event{Type: "agent_start"})
+	first := h.nextEvent(t)
+	observer(sdk.Event{Type: "text_delta", Payload: map[string]any{"delta": "during disconnect"}})
+	last := h.nextEvent(t)
+	if first.Position == nil || first.Position.Epoch == "" || first.Position.InstanceID != "instance" ||
+		last.Position == nil || last.Position.Offset != first.Position.Offset+1 {
+		t.Fatalf("non-contiguous positions: %+v, %+v", first.Position, last.Position)
+	}
+	after, err := json.Marshal(first.Position)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.send(t, "replay", `{"type":"replay_events","args":{"after":`+string(after)+`}}`)
+	r := h.response(t, "replay")
+	var page struct {
+		Events []coord.Frame
+		More   bool
+	}
+	decodeResult(t, r, &page)
+	if !r.OK || page.More || len(page.Events) != 1 || !reflect.DeepEqual(page.Events[0].Position, last.Position) || !strings.Contains(string(page.Events[0].Event), "during disconnect") {
+		t.Fatalf("replay after %s: %+v", after, r)
+	}
+	h.send(t, "invalid", `{"type":"replay_events","args":{}}`)
+	if r := h.response(t, "invalid"); r.OK || r.Error == nil || r.Error.Code != coord.CodeResyncRequired {
+		t.Fatalf("missing cursor: %+v", r)
 	}
 }
 
@@ -710,5 +818,80 @@ func TestWorkerInterruptReleasesDialogInPromptAdmission(t *testing.T) {
 	}
 	if seen["ask"].OK || !seen["interrupt"].OK || !seen["state"].OK {
 		t.Fatalf("worker did not recover after interrupt: %+v", seen)
+	}
+}
+
+func TestWorkerSnapshotDuringPublication(t *testing.T) {
+	rt := newWorkerRuntime()
+	reading, resume := make(chan struct{}), make(chan struct{})
+	rt.sess.historyFn = func() ([]sdk.HistoryEntry, string, error) {
+		close(reading)
+		select {
+		case <-resume:
+			return []sdk.HistoryEntry{{EntryID: "saved", Message: sdk.Message{Role: "user", Text: "prompt"}}}, "older", nil
+		case <-t.Context().Done():
+			return nil, "", t.Context().Err()
+		}
+	}
+	h := startWorker(t, rt, nil)
+	observer := <-rt.sess.observerReady
+	h.send(t, "ready", `{"type":"get_state"}`)
+	h.response(t, "ready")
+	observer(sdk.Event{Type: "text_delta", Payload: map[string]any{"message_id": "partial", "delta": "early"}})
+	early := h.nextEvent(t)
+	h.send(t, "snapshot", `{"type":"get_snapshot","args":{}}`)
+	select {
+	case <-reading:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not reach history read")
+	}
+	observer(sdk.Event{Type: "text_delta", Payload: map[string]any{"message_id": "partial", "delta": " late"}})
+	late := h.nextEvent(t)
+	h.send(t, "controls", `{"type":"get_ui_requests"}`)
+	h.response(t, "controls")
+	close(resume)
+	r := h.response(t, "snapshot")
+	var snapshot struct {
+		Position coord.Position
+		History  historyPage
+		Live     liveSnapshot
+	}
+	decodeResult(t, r, &snapshot)
+	if !r.OK || early.Position == nil || late.Position == nil || snapshot.Position != *early.Position || late.Position.Offset != snapshot.Position.Offset+1 ||
+		len(snapshot.Live.Messages) != 1 || snapshot.Live.Messages[0].Text != "early" || len(snapshot.History.Entries) != 1 || snapshot.History.Before != "older" {
+		t.Fatalf("snapshot boundary incorrect: %+v, early=%+v late=%+v", snapshot, early.Position, late.Position)
+	}
+}
+
+func TestWorkerQueuesConcurrentSnapshots(t *testing.T) {
+	rt := newWorkerRuntime()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	rt.sess.historyFn = func() ([]sdk.HistoryEntry, string, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			select {
+			case <-release:
+			case <-t.Context().Done():
+				return nil, "", t.Context().Err()
+			}
+		}
+		return []sdk.HistoryEntry{{EntryID: "entry"}}, "", nil
+	}
+	h := startWorker(t, rt, nil)
+	h.send(t, "first", `{"type":"get_snapshot"}`)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first snapshot did not enter history")
+	}
+	h.send(t, "second", `{"type":"get_snapshot"}`)
+	h.send(t, "ui", `{"type":"get_ui_requests"}`)
+	h.response(t, "ui")
+	close(release)
+	for _, id := range []string{"first", "second"} {
+		if r := h.response(t, id); !r.OK {
+			t.Errorf("snapshot %s: %+v", id, r.Error)
+		}
 	}
 }

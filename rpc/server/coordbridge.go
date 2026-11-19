@@ -277,10 +277,12 @@ func (b *CoordinatedBridge) relay(conn *websocket.Conn, link *coord.Link, welcom
 }
 
 // browserFrame lists the only fields a browser may set. Role, version,
-// token, client and worker identities are dropped by decoding.
+// token, client and worker identities are dropped by decoding. RequestID is
+// a correlation identifier the coordinator validates; it grants nothing.
 type browserFrame struct {
 	Type       string          `json:"type"`
 	ID         string          `json:"id"`
+	RequestID  string          `json:"request_id"`
 	InstanceID string          `json:"instance_id"`
 	CWD        string          `json:"cwd"`
 	Command    json.RawMessage `json:"command"`
@@ -296,7 +298,10 @@ func parseBrowserFrame(data []byte) (coord.Frame, *coord.Error) {
 	if len(in.ID) > maxBrowserIDBytes || len(in.InstanceID) > maxBrowserIDBytes {
 		return coord.Frame{}, &coord.Error{Code: coord.CodeInvalidFrame, Message: "identifier exceeds limit"}
 	}
-	f := coord.Frame{Type: in.Type, ID: in.ID, InstanceID: in.InstanceID}
+	if in.RequestID != "" && !coord.ValidRequestID(in.RequestID) {
+		return coord.Frame{ID: in.ID, InstanceID: in.InstanceID}, &coord.Error{Code: coord.CodeInvalidFrame, Message: "request_id must be a random UUID"}
+	}
+	f := coord.Frame{Type: in.Type, ID: in.ID, RequestID: in.RequestID, InstanceID: in.InstanceID}
 	switch in.Type {
 	case coord.TypeListInstances, coord.TypeWatchInstances, coord.TypeUnwatchInstances, coord.TypeStartInstance, coord.TypeAttach,
 		coord.TypeDetach, coord.TypeCommand, coord.TypeStopInstance:

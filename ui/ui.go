@@ -842,8 +842,23 @@ func (u *RPCUI) shared() bool {
 // removes the request from u.requests decides its outcome, and the waiter
 // publishes ui_resolved before returning so later events follow it.
 func (u *RPCUI) ask(ctx context.Context, desc SharedRequest) (UIResponse, error) {
+	const maxSharedRequests, maxDescriptorBytes = 16, 8 << 10
+	if len(desc.Options) > 256 {
+		return UIResponse{}, fmt.Errorf("too many shared request options")
+	}
+	data, err := json.Marshal(desc)
+	if err != nil {
+		return UIResponse{}, fmt.Errorf("encode shared request: %w", err)
+	}
+	if len(data) > maxDescriptorBytes {
+		return UIResponse{}, fmt.Errorf("shared request exceeds size limit")
+	}
 	req := &sharedRequest{reply: make(chan sharedReply, 1)}
 	u.mu.Lock()
+	if len(u.requests) >= maxSharedRequests {
+		u.mu.Unlock()
+		return UIResponse{}, fmt.Errorf("too many pending shared requests")
+	}
 	u.nextID++
 	req.order = u.nextID
 	desc.ID = fmt.Sprintf("ui-%d-%d", time.Now().UnixNano(), u.nextID)

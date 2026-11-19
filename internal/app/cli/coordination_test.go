@@ -87,9 +87,13 @@ func TestCoordinatorNodeIdentityPersists(t *testing.T) {
 }
 
 func TestWorkerLaunchDoesNotInheritTrustOverride(t *testing.T) {
-	env := workerEnvironment([]string{"TAU_COORD_TOKEN=old", "TAU_COORD_INSTANCE=old", "TAU_COORD_NODE=old", "PATH=/bin"}, "token", "instance", "node")
+	inherited := []string{"TAU_COORD_TOKEN=old", "TAU_COORD_INSTANCE=old", "TAU_COORD_NODE=old", "TAU_COORD_LAUNCH_REQUEST=old", "PATH=/bin"}
+	if env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"}); strings.Contains(strings.Join(env, "\n"), "TAU_COORD_LAUNCH_REQUEST") {
+		t.Fatalf("launch without a request ID inherited one: %q", env)
+	}
+	env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance", LaunchRequestID: "request"})
 	joined := strings.Join(env, "\n")
-	for _, expected := range []string{"TAU_COORD_TOKEN=token", "TAU_COORD_INSTANCE=instance", "TAU_COORD_NODE=node", "PATH=/bin"} {
+	for _, expected := range []string{"TAU_COORD_TOKEN=token", "TAU_COORD_INSTANCE=instance", "TAU_COORD_NODE=node", "TAU_COORD_LAUNCH_REQUEST=request", "PATH=/bin"} {
 		if !strings.Contains(joined, expected) {
 			t.Errorf("missing %q in environment", expected)
 		}
@@ -100,7 +104,7 @@ func TestWorkerLaunchDoesNotInheritTrustOverride(t *testing.T) {
 }
 
 func TestWorkerEnvironmentDropsCoordinatorPWD(t *testing.T) {
-	env := workerEnvironment([]string{"PWD=/coordinator", "PWDX=keep", "PATH=/bin"}, "token", "instance", "node")
+	env := workerEnvironment([]string{"PWD=/coordinator", "PWDX=keep", "PATH=/bin"}, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"})
 	for _, entry := range env {
 		if strings.HasPrefix(entry, "PWD=") {
 			t.Fatalf("coordinator PWD inherited: %q", env)
@@ -296,7 +300,7 @@ func TestWorkerStartEarlyExitKillsGroupBeforeReap(t *testing.T) {
 func TestCancelledWorkerLaunchDoesNotSpawn(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if err := launchWorkerProcess(ctx, "unused", "node", "instance", "token", t.TempDir(), nil); err == nil {
+	if err := launchWorkerProcess(ctx, "unused", "node", coord.LaunchRequest{InstanceID: "instance", Token: "token", CWD: t.TempDir()}); err == nil {
 		t.Fatal("cancelled launch succeeded")
 	}
 }

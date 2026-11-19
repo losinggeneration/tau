@@ -7303,6 +7303,63 @@ func TestIdleCustomMessageReturnsPersistenceError(t *testing.T) {
 	require.Error(t, s.SendCustomMessage(t.Context(), CustomMessage{CustomType: "notice"}, CustomMessageOptions{}))
 }
 
+// An idle custom message_end names its persisted entry and carries display
+// text like a run's message_end, so frontends can render and page it.
+func TestIdleCustomMessageEndCarriesEntryID(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(t.Context())) })
+	sess, err := rt.NewSession(t.Context(), SessionOptions{})
+	require.NoError(t, err)
+	s := sess.(*agentSession)
+	t.Cleanup(func() { require.NoError(t, s.Close(t.Context())) })
+	var (
+		mu  sync.Mutex
+		end map[string]any
+	)
+	s.SetEventObserver(func(event Event) {
+		if event.Type != "message_end" {
+			return
+		}
+		mu.Lock()
+		end, _ = event.Payload.(map[string]any)
+		mu.Unlock()
+	})
+	require.NoError(t, s.SendCustomMessage(t.Context(), CustomMessage{
+		CustomType: "notice",
+		Content:    []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "heads up"}},
+		Display:    true,
+	}, CustomMessageOptions{}))
+
+	mu.Lock()
+	payload := end
+	mu.Unlock()
+	require.NotNil(t, payload, "message_end not observed")
+	assert.Equal(t, "custom", payload["role"])
+	assert.Equal(t, "heads up", payload["content"])
+	assert.Equal(t, "notice", payload["custom_type"])
+	assert.Equal(t, true, payload["display"])
+	message, ok := payload["message"].(*agent.Message)
+	require.True(t, ok, "message payload type = %T", payload["message"])
+	assert.Equal(t, "notice", message.CustomType)
+	entryID, _ := payload["entry_id"].(string)
+	require.NotEmpty(t, entryID)
+
+	page, _, err := s.History("", 10)
+	require.NoError(t, err)
+	var found bool
+	for _, entry := range page {
+		if entry.EntryID == entryID {
+			found = true
+			assert.Equal(t, "notice", entry.Message.CustomType)
+			require.Len(t, entry.Message.Content, 1)
+			assert.Equal(t, "heads up", entry.Message.Content[0].Text)
+		}
+	}
+	assert.True(t, found, "entry %q not in history", entryID)
+}
+
 func TestCustomBusyDelivery(t *testing.T) {
 	for _, delivery := range []string{"", "followUp", "context", "nextTurn"} {
 		t.Run(delivery, func(t *testing.T) {

@@ -7,13 +7,31 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/losinggeneration/tau/rpc/coord"
 )
 
-const coordinatedEventBuffer = 256
+const (
+	coordinatedEventBuffer = 256
+	maxClientIDBytes       = 256
+	// Live frames withheld for one instance while its view is rebuilt.
+	maxStagedFrames = coordinatedEventBuffer
+	maxStagedBytes  = 8 << 20
+	// A worker journal holds at most 2048 frames and 8 MiB, so a resume that
+	// needs more is chasing an unbounded stream.
+	maxReplayFrames = 4096
+	maxReplayBytes  = 16 << 20
+)
+
+// Worker reconstruction commands.
+const (
+	cmdGetSnapshot  = "get_snapshot"
+	cmdReplayEvents = "replay_events"
+	cmdGetHistory   = "get_history"
+)
 
 var (
 	// ErrTargetRequired reports a targeted request without an instance ID.
@@ -23,16 +41,125 @@ var (
 	// ErrTooManyPending reports that coord.MaxPending requests are already in
 	// flight. The request was not sent.
 	ErrTooManyPending = errors.New("coordinated client: too many pending requests")
-	// ErrOutcomeUnknown reports that a request was sent but no reply arrived
-	// before the wait ended. The coordinator may or may not have acted on it;
-	// requests are never retried automatically.
+	// ErrOutcomeUnknown reports that a request was sent but no definite reply
+	// arrived. The coordinator may or may not have acted on it; requests are
+	// never retried automatically and request IDs do not deduplicate. See
+	// OutcomeUnknownError for the request's identity.
 	ErrOutcomeUnknown = errors.New("coordinated client: request outcome unknown")
 	// ErrSlowEventConsumer reports that Events was not drained quickly enough.
 	// The client disconnects rather than dropping events.
 	ErrSlowEventConsumer = errors.New("coordinated client: event consumer too slow")
 	// ErrClientClosed reports use of a client after Close.
 	ErrClientClosed = errors.New("coordinated client: closed")
+	// ErrInvalidClientID reports an unusable stable client ID, or a
+	// coordinator that bound the connection to a different one.
+	ErrInvalidClientID = errors.New("coordinated client: invalid client id")
+	// ErrInvalidRequestID reports a caller-supplied request ID that is not a
+	// canonical random (version 4) UUID. The request was not sent.
+	ErrInvalidRequestID = errors.New("coordinated client: request id must be a random UUID")
+	// ErrReconstructionBusy reports a second concurrent reconstruction of one
+	// instance on the same client.
+	ErrReconstructionBusy = errors.New("coordinated client: instance reconstruction already in progress")
+
+	// ErrResyncRequired reports that a view cannot be continued from its
+	// cursor. Discard the view and rebuild it with AttachSnapshot.
+	ErrResyncRequired = errors.New("coordinated client: resync required")
+	// ErrStaleCursor reports an event from another worker epoch.
+	ErrStaleCursor = errors.New("coordinated client: event cursor stale")
+	// ErrEventGap reports an event that skips past the next expected offset.
+	ErrEventGap = errors.New("coordinated client: event gap")
+	// ErrEventOmitted reports a placeholder for an event too large to deliver.
+	ErrEventOmitted = errors.New("coordinated client: worker omitted event")
+	// ErrEventTarget reports an event for an instance other than the cursor's.
+	ErrEventTarget = errors.New("coordinated client: event for another instance")
+	// ErrReconstructionOverflow reports staged live events or replay pages
+	// exceeding the client's bounds. Nothing was silently dropped: the whole
+	// reconstruction failed.
+	ErrReconstructionOverflow = errors.New("coordinated client: reconstruction exceeded bounds")
 )
+
+// OutcomeUnknownError identifies a request whose outcome is unknown: the
+// client gave up waiting, the connection ended, or the coordinator lost the
+// worker after routing it (coord.CodeOutcomeUnknown). The client never
+// resends it and nothing deduplicates a resend, so reconcile by inspecting
+// instance state before repeating a mutation.
+type OutcomeUnknownError struct {
+	// Op is the coordinated frame type, such as coord.TypeCommand.
+	Op         string
+	InstanceID string
+	// RequestID is the mutation's correlation ID; empty for reads.
+	RequestID string
+	// Err is the cause: a context error, the disconnect reason, or the
+	// coordinator's *coord.Error.
+	Err error
+}
+
+func (e *OutcomeUnknownError) Error() string {
+	msg := e.Op
+	if e.InstanceID != "" {
+		msg += " " + e.InstanceID
+	}
+	if e.RequestID != "" {
+		msg += " request " + e.RequestID
+	}
+	return fmt.Sprintf("%s: %v: %v", msg, ErrOutcomeUnknown, e.Err)
+}
+
+// Unwrap matches both ErrOutcomeUnknown and the cause.
+func (e *OutcomeUnknownError) Unwrap() []error {
+	return []error{ErrOutcomeUnknown, e.Err}
+}
+
+// ResyncError reports why an instance's event stream cannot continue from
+// Cursor. It matches ErrResyncRequired and its cause: ErrStaleCursor,
+// ErrEventGap, ErrEventTarget, ErrReconstructionOverflow, or the worker's
+// *coord.Error with coord.CodeResyncRequired.
+type ResyncError struct {
+	InstanceID string
+	// Cursor is the last position applied.
+	Cursor coord.Position
+	// Got is the offending event position, when there is one.
+	Got *coord.Position
+	Err error
+}
+
+func (e *ResyncError) Error() string {
+	msg := fmt.Sprintf("%v: %s at %s/%d", ErrResyncRequired, e.InstanceID, e.Cursor.Epoch, e.Cursor.Offset)
+	if e.Got != nil {
+		msg += fmt.Sprintf(", got %s %s/%d", e.Got.InstanceID, e.Got.Epoch, e.Got.Offset)
+	}
+	return fmt.Sprintf("%s: %v", msg, e.Err)
+}
+
+// Unwrap matches both ErrResyncRequired and the cause.
+func (e *ResyncError) Unwrap() []error {
+	return []error{ErrResyncRequired, e.Err}
+}
+
+// CoordinatedOption configures NewCoordinatedClient.
+type CoordinatedOption func(*coordinatedOptions)
+
+type coordinatedOptions struct {
+	clientID string
+	stable   bool
+}
+
+// WithClientID announces id instead of a freshly generated client ID. Reuse
+// it across reconnects so the coordinator binds each authenticated
+// connection to the same client identity. It identifies the client and
+// grants no authority. The handshake fails with ErrInvalidClientID if id is
+// empty or too long, or if the coordinator assigns a different identity.
+func WithClientID(id string) CoordinatedOption {
+	return func(o *coordinatedOptions) {
+		o.clientID, o.stable = id, true
+	}
+}
+
+// NewRequestID returns a random request ID for a mutation. Persist it with
+// the intent before sending so an unknown outcome can be matched later.
+func NewRequestID() string {
+	return uuid.NewString()
+}
 
 // CoordinatedClient talks to a local coordinator that owns many tau
 // instances. Every instance-scoped request names its target explicitly, and
@@ -51,16 +178,28 @@ type CoordinatedClient struct {
 	mu      sync.Mutex
 	err     error
 	pending map[string]chan coord.Frame
+	stages  map[string]*liveStage
 }
 
 // NewCoordinatedClient connects to the coordinator socket at path and
-// completes the handshake under a freshly generated client ID.
-func NewCoordinatedClient(ctx context.Context, path string) (*CoordinatedClient, error) {
-	return dialCoordinated(ctx, path, coordinatedEventBuffer)
+// completes the handshake, under a freshly generated client ID unless
+// WithClientID supplies a stable one.
+func NewCoordinatedClient(ctx context.Context, path string, opts ...CoordinatedOption) (*CoordinatedClient, error) {
+	return dialCoordinated(ctx, path, coordinatedEventBuffer, opts...)
 }
 
-func dialCoordinated(ctx context.Context, path string, eventBuffer int) (*CoordinatedClient, error) {
+func dialCoordinated(ctx context.Context, path string, eventBuffer int, opts ...CoordinatedOption) (*CoordinatedClient, error) {
+	var o coordinatedOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	clientID := uuid.NewString()
+	if o.stable {
+		if o.clientID == "" || len(o.clientID) > maxClientIDBytes {
+			return nil, ErrInvalidClientID
+		}
+		clientID = o.clientID
+	}
 	link, welcome, err := coord.Dial(ctx, path, coord.Frame{
 		Type:     coord.TypeHello,
 		Version:  coord.Version,
@@ -68,6 +207,13 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int) (*Coordi
 		ClientID: clientID,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if o.stable && welcome.ClientID != clientID {
+		err := fmt.Errorf("%w: coordinator assigned %q", ErrInvalidClientID, welcome.ClientID)
+		if closeErr := link.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 		return nil, err
 	}
 	c := &CoordinatedClient{
@@ -78,6 +224,7 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int) (*Coordi
 		done:     make(chan struct{}),
 		closed:   make(chan struct{}),
 		pending:  make(map[string]chan coord.Frame),
+		stages:   make(map[string]*liveStage),
 	}
 	go c.readLoop()
 	return c, nil
@@ -99,6 +246,10 @@ func (c *CoordinatedClient) Welcome() coord.Frame {
 // session. Event holds a raw Tau RPC event; Instance holds updated metadata.
 // Error reports an omitted event or a lost worker link. Drain the channel to
 // stay connected. When it closes, Err reports why.
+//
+// While AttachSnapshot or Resume rebuilds an instance's view, that
+// instance's chat frames are withheld here and returned in the Handoff
+// instead; frames for other instances keep flowing.
 func (c *CoordinatedClient) Events() <-chan coord.Frame {
 	return c.events
 }
@@ -141,9 +292,22 @@ func (c *CoordinatedClient) UnwatchInstances(ctx context.Context) error {
 }
 
 // StartInstance asks the coordinator to launch an instance rooted at cwd,
-// which must be absolute, and waits for it to register.
+// which must be absolute, and waits for it to register. It sends a fresh
+// request ID; see StartInstanceWithRequestID.
 func (c *CoordinatedClient) StartInstance(ctx context.Context, cwd string) (*coord.Instance, error) {
-	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeStartInstance, CWD: cwd})
+	return c.StartInstanceWithRequestID(ctx, cwd, "")
+}
+
+// StartInstanceWithRequestID is StartInstance under the caller's request ID,
+// which must be a random UUID; empty generates one. The started instance
+// reports it as LaunchRequestID. An unknown outcome is an
+// *OutcomeUnknownError carrying the ID.
+func (c *CoordinatedClient) StartInstanceWithRequestID(ctx context.Context, cwd, requestID string) (*coord.Instance, error) {
+	requestID, err := requestIDOrNew(requestID)
+	if err != nil {
+		return nil, err
+	}
+	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeStartInstance, CWD: cwd, RequestID: requestID})
 	if err != nil {
 		return nil, err
 	}
@@ -166,29 +330,50 @@ func (c *CoordinatedClient) Detach(ctx context.Context, instanceID string) error
 }
 
 // Command sends a tau rpc command to instanceID and returns the instance's
-// response. A missing cmd.ID is filled in. Routing failures are returned as
-// *coord.Error; command failures are reported in the Response.
+// response. A missing cmd.ID is filled in, and a fresh request ID is sent;
+// see CommandWithRequestID. Routing failures are returned as *coord.Error;
+// command failures are reported in the Response.
 func (c *CoordinatedClient) Command(ctx context.Context, instanceID string, cmd Command) (*Response, error) {
+	return c.CommandWithRequestID(ctx, instanceID, "", cmd)
+}
+
+// CommandWithRequestID is Command under the caller's request ID, which must
+// be a random UUID; empty generates one. Reuse one ID for one mutation
+// intent. The ID correlates the request for the worker and in an
+// *OutcomeUnknownError; it does not deduplicate, so sending it again may
+// apply the mutation twice.
+func (c *CoordinatedClient) CommandWithRequestID(ctx context.Context, instanceID, requestID string, cmd Command) (*Response, error) {
 	if instanceID == "" {
 		return nil, ErrTargetRequired
 	}
-	if cmd.ID == "" {
-		cmd.ID = uuid.NewString()
-	}
-	raw, err := json.Marshal(cmd)
-	if err != nil {
-		return nil, fmt.Errorf("marshal command: %w", err)
-	}
-	reply, err := c.targeted(ctx, coord.Frame{Type: coord.TypeCommand, InstanceID: instanceID, Command: raw})
+	requestID, err := requestIDOrNew(requestID)
 	if err != nil {
 		return nil, err
 	}
-	return commandResponse(cmd.ID, reply.Result)
+	reply, cmdID, err := c.command(ctx, instanceID, requestID, cmd)
+	if err != nil {
+		return nil, err
+	}
+	return commandResponse(cmdID, reply.Result)
 }
 
-// StopInstance asks instanceID to shut down.
+// StopInstance asks instanceID to shut down. It sends a fresh request ID;
+// see StopInstanceWithRequestID.
 func (c *CoordinatedClient) StopInstance(ctx context.Context, instanceID string) error {
-	reply, err := c.targeted(ctx, coord.Frame{Type: coord.TypeStopInstance, InstanceID: instanceID})
+	return c.StopInstanceWithRequestID(ctx, instanceID, "")
+}
+
+// StopInstanceWithRequestID is StopInstance under the caller's request ID,
+// which must be a random UUID; empty generates one.
+func (c *CoordinatedClient) StopInstanceWithRequestID(ctx context.Context, instanceID, requestID string) error {
+	if instanceID == "" {
+		return ErrTargetRequired
+	}
+	requestID, err := requestIDOrNew(requestID)
+	if err != nil {
+		return err
+	}
+	reply, err := c.targeted(ctx, coord.Frame{Type: coord.TypeStopInstance, InstanceID: instanceID, RequestID: requestID})
 	if err != nil {
 		return err
 	}
@@ -212,6 +397,459 @@ func (c *CoordinatedClient) Close() error {
 	err := c.link.Close()
 	<-c.done
 	return err
+}
+
+// Snapshot is a bounded baseline of one instance. Position anchors Live.
+// Persisted history, session state and pending requests can already reflect
+// later events, so merge messages and requests by ID and apply state updates
+// as replacements.
+type Snapshot struct {
+	Position coord.Position `json:"position"`
+	Instance coord.Instance `json:"instance"`
+	History  History        `json:"history"`
+	State    SnapshotState  `json:"state"`
+	// Live holds in-progress messages, tool calls, and bash runs.
+	Live       json.RawMessage   `json:"live,omitempty"`
+	UIRequests []json.RawMessage `json:"ui_requests"`
+}
+
+// SnapshotState holds the session state read during snapshot capture.
+type SnapshotState struct {
+	SessionID     string          `json:"session_id"`
+	Model         json.RawMessage `json:"model,omitempty"`
+	ThinkingLevel string          `json:"thinking_level,omitempty"`
+	IsStreaming   bool            `json:"is_streaming"`
+	Queue         json.RawMessage `json:"queue,omitempty"`
+}
+
+// History is one page of persisted conversation, newest last. Pass Before
+// to History to fetch the preceding page; empty means no earlier entries.
+type History struct {
+	Entries []HistoryEntry `json:"entries"`
+	Before  string         `json:"before"`
+}
+
+// HistoryEntry is one persisted message. Omitted entries exceeded the page
+// bound and carry no message.
+type HistoryEntry struct {
+	EntryID string          `json:"entry_id"`
+	Message json.RawMessage `json:"message,omitempty"`
+	Omitted bool            `json:"omitted,omitempty"`
+}
+
+// ReplayPage is one contiguous page of events after a cursor.
+type ReplayPage struct {
+	Events []coord.Frame `json:"events"`
+	More   bool          `json:"more"`
+}
+
+// Handoff is a rebuilt view of one instance and the live events that
+// follow it.
+type Handoff struct {
+	// Snapshot is the baseline from AttachSnapshot. It is nil for Resume,
+	// whose caller retained its own view.
+	Snapshot *Snapshot
+	// Events continue the baseline in position order, with no repeated
+	// event positions. When Snapshot is present, merge by entry or request
+	// ID because history and dialogs may already reflect these events.
+	Events []coord.Frame
+	// Cursor is positioned after Events. Pass every later frame for this
+	// instance from Events() through Cursor.Accept.
+	Cursor *EventCursor
+}
+
+// Snapshot fetches instanceID's current baseline without attaching. Use
+// AttachSnapshot to continue it with live events.
+func (c *CoordinatedClient) Snapshot(ctx context.Context, instanceID string) (*Snapshot, error) {
+	if instanceID == "" {
+		return nil, ErrTargetRequired
+	}
+	var s Snapshot
+	if err := c.call(ctx, instanceID, Command{Type: cmdGetSnapshot}, &s); err != nil {
+		return nil, err
+	}
+	if s.Position.InstanceID != instanceID || s.Position.Epoch == "" || (s.Instance.ID != "" && s.Instance.ID != instanceID) {
+		return nil, fmt.Errorf("%s: %w: snapshot does not identify the target", cmdGetSnapshot, coord.ErrInvalidFrame)
+	}
+	return &s, nil
+}
+
+// History fetches the page of sessionID's persisted conversation before the
+// entry ID before; empty fetches the newest page.
+func (c *CoordinatedClient) History(ctx context.Context, instanceID, sessionID, before string) (*History, error) {
+	if instanceID == "" {
+		return nil, ErrTargetRequired
+	}
+	if sessionID == "" {
+		return nil, fmt.Errorf("%s: session id required", cmdGetHistory)
+	}
+	args := struct {
+		SessionID string `json:"session_id"`
+		Before    string `json:"before,omitempty"`
+	}{sessionID, before}
+	var h History
+	if err := c.call(ctx, instanceID, Command{Type: cmdGetHistory, Args: args}, &h); err != nil {
+		return nil, err
+	}
+	return &h, nil
+}
+
+// ReplayEvents fetches the page of events after the position after, from
+// the instance it names. The page is verified to continue after exactly;
+// otherwise, or when the worker no longer holds that position, it returns a
+// *ResyncError.
+func (c *CoordinatedClient) ReplayEvents(ctx context.Context, after coord.Position) (*ReplayPage, error) {
+	if after.InstanceID == "" {
+		return nil, ErrTargetRequired
+	}
+	args := struct {
+		After coord.Position `json:"after"`
+	}{after}
+	var page ReplayPage
+	if err := c.call(ctx, after.InstanceID, Command{Type: cmdReplayEvents, Args: args}, &page); err != nil {
+		if rerr, ok := errors.AsType[*ResyncError](err); ok {
+			rerr.Cursor = after
+		}
+		return nil, err
+	}
+	if page.More && len(page.Events) == 0 {
+		return nil, fmt.Errorf("%s: %w: empty page reports more", cmdReplayEvents, coord.ErrInvalidFrame)
+	}
+	cursor := NewEventCursor(after)
+	for _, f := range page.Events {
+		if err := cursor.next(f); err != nil {
+			return nil, err
+		}
+	}
+	return &page, nil
+}
+
+// AttachSnapshot attaches to instanceID, then fetches its snapshot. Live
+// events arriving meanwhile are staged rather than sent to Events: those at
+// or before the snapshot position are duplicates and dropped, and the rest
+// must continue it contiguously. A gap, another epoch, or overflowing the
+// stage returns a *ResyncError. On error the instance stays attached.
+func (c *CoordinatedClient) AttachSnapshot(ctx context.Context, instanceID string) (*Handoff, error) {
+	if instanceID == "" {
+		return nil, ErrTargetRequired
+	}
+	if err := c.beginStage(instanceID); err != nil {
+		return nil, err
+	}
+	snap, err := c.attachSnapshot(ctx, instanceID)
+	stage := c.endStage(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	cursor := NewEventCursor(snap.Position)
+	events, err := cursor.handoff(stage)
+	if err != nil {
+		return nil, err
+	}
+	return &Handoff{Snapshot: snap, Events: events, Cursor: cursor}, nil
+}
+
+func (c *CoordinatedClient) attachSnapshot(ctx context.Context, instanceID string) (*Snapshot, error) {
+	if err := c.Attach(ctx, instanceID); err != nil {
+		return nil, err
+	}
+	return c.Snapshot(ctx, instanceID)
+}
+
+// Resume continues a view the caller retained up to after, typically on a
+// new connection. It attaches to after.InstanceID, staging live events, and
+// replays pages after the saved cursor until they reach the staged events
+// or the journal's end. A cursor from another epoch, one the worker no
+// longer holds, a wrong target, or a gap returns a *ResyncError; rebuild
+// with AttachSnapshot. On error the instance stays attached.
+func (c *CoordinatedClient) Resume(ctx context.Context, after coord.Position) (*Handoff, error) {
+	instanceID := after.InstanceID
+	if instanceID == "" {
+		return nil, ErrTargetRequired
+	}
+	if err := c.beginStage(instanceID); err != nil {
+		return nil, err
+	}
+	cursor := NewEventCursor(after)
+	replayed, err := c.resume(ctx, cursor)
+	stage := c.endStage(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	live, err := cursor.handoff(stage)
+	if err != nil {
+		return nil, err
+	}
+	return &Handoff{Events: append(replayed, live...), Cursor: cursor}, nil
+}
+
+func (c *CoordinatedClient) resume(ctx context.Context, cursor *EventCursor) ([]coord.Frame, error) {
+	if err := c.Attach(ctx, cursor.position.InstanceID); err != nil {
+		return nil, err
+	}
+	var (
+		events []coord.Frame
+		size   int
+	)
+	for {
+		page, err := c.ReplayEvents(ctx, cursor.position)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range page.Events {
+			size += len(f.Event)
+		}
+		events = append(events, page.Events...)
+		if n := len(page.Events); n > 0 {
+			cursor.position = *page.Events[n-1].Position
+		}
+		if len(events) > maxReplayFrames || size > maxReplayBytes {
+			return nil, cursor.resync(nil, ErrReconstructionOverflow)
+		}
+		covered, overflow := c.stageStatus(cursor.position)
+		if overflow {
+			return nil, cursor.resync(nil, ErrReconstructionOverflow)
+		}
+		if !page.More || covered {
+			return events, nil
+		}
+	}
+}
+
+// EventCursor tracks the last applied position in one instance's event
+// stream.
+type EventCursor struct {
+	position coord.Position
+}
+
+// NewEventCursor returns a cursor after position.
+func NewEventCursor(position coord.Position) *EventCursor {
+	return &EventCursor{position: position}
+}
+
+// Position returns the last applied position. Save it to Resume later.
+func (c *EventCursor) Position() coord.Position {
+	return c.position
+}
+
+// Accept reports whether f should be applied and advances past it. Frames
+// without a position, such as instance metadata, are applied without
+// advancing. A frame at or before the cursor is a duplicate. A delivery
+// error, omitted event, wrong target or epoch, or gap returns a *ResyncError
+// without advancing.
+func (c *EventCursor) Accept(f coord.Frame) (bool, error) {
+	if f.InstanceID != c.position.InstanceID {
+		return false, c.resync(f.Position, ErrEventTarget)
+	}
+	if f.Error != nil {
+		return false, c.resync(f.Position, f.Error)
+	}
+	if f.Position == nil {
+		return true, nil
+	}
+	p := *f.Position
+	switch {
+	case p.InstanceID != c.position.InstanceID:
+		return false, c.resync(f.Position, ErrEventTarget)
+	case p.Epoch != c.position.Epoch:
+		return false, c.resync(f.Position, ErrStaleCursor)
+	case p.Offset <= c.position.Offset:
+		return false, nil
+	case p.Offset != c.position.Offset+1:
+		return false, c.resync(f.Position, ErrEventGap)
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(f.Event, &event); err != nil {
+		return false, c.resync(f.Position, fmt.Errorf("decode event: %w", err))
+	}
+	if event.Type == "event_omitted" {
+		return false, c.resync(f.Position, ErrEventOmitted)
+	}
+	c.position = p
+	return true, nil
+}
+
+// next requires f to be exactly the next positioned event.
+func (c *EventCursor) next(f coord.Frame) error {
+	if f.Position == nil {
+		return c.resync(nil, ErrEventGap)
+	}
+	ok, err := c.Accept(f)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return c.resync(f.Position, ErrEventGap)
+	}
+	return nil
+}
+
+func (c *EventCursor) handoff(s *liveStage) ([]coord.Frame, error) {
+	if s.overflow {
+		return nil, c.resync(nil, ErrReconstructionOverflow)
+	}
+	events := make([]coord.Frame, 0, len(s.frames))
+	for _, f := range s.frames {
+		ok, err := c.Accept(f)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			events = append(events, f)
+		}
+	}
+	return events, nil
+}
+
+func (c *EventCursor) resync(got *coord.Position, cause error) *ResyncError {
+	return &ResyncError{InstanceID: c.position.InstanceID, Cursor: c.position, Got: got, Err: cause}
+}
+
+// liveStage holds one instance's live frames, in arrival order, while its
+// view is rebuilt. Guarded by CoordinatedClient.mu.
+type liveStage struct {
+	frames   []coord.Frame
+	bytes    int
+	overflow bool
+}
+
+func (s *liveStage) add(f coord.Frame) {
+	if s.overflow {
+		return
+	}
+	if len(s.frames) == maxStagedFrames || s.bytes+len(f.Event) > maxStagedBytes {
+		s.overflow, s.frames = true, nil
+		return
+	}
+	s.frames = append(s.frames, f)
+	s.bytes += len(f.Event)
+}
+
+func (c *CoordinatedClient) beginStage(instanceID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return c.err
+	}
+	if c.stages[instanceID] != nil {
+		return ErrReconstructionBusy
+	}
+	c.stages[instanceID] = &liveStage{}
+	return nil
+}
+
+func (c *CoordinatedClient) endStage(instanceID string) *liveStage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.stages[instanceID]
+	delete(c.stages, instanceID)
+	return s
+}
+
+// stageStatus reports whether staged live events already continue from
+// cursor, so replay can stop, and whether the stage overflowed.
+func (c *CoordinatedClient) stageStatus(cursor coord.Position) (covered, overflow bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.stages[cursor.InstanceID]
+	if s == nil {
+		return false, false
+	}
+	for _, f := range s.frames {
+		if f.Position != nil {
+			return f.Position.Epoch == cursor.Epoch && f.Position.Offset <= cursor.Offset+1, s.overflow
+		}
+	}
+	return false, s.overflow
+}
+
+// stageEvent withholds f for an instance under reconstruction.
+func (c *CoordinatedClient) stageEvent(f coord.Frame) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.stages[f.InstanceID]
+	if s == nil {
+		return false
+	}
+	s.add(f)
+	return true
+}
+
+// call sends a read-only worker command and decodes its result into out.
+func (c *CoordinatedClient) call(ctx context.Context, instanceID string, cmd Command, out any) error {
+	for attempt := 1; ; attempt++ {
+		err := c.readResult(ctx, instanceID, cmd, out)
+		perr, ok := errors.AsType[*coord.Error](err)
+		retry := ok && (perr.Code == coord.CodeBusy || (cmd.Type == cmdGetSnapshot && perr.Code == coord.CodeResyncRequired))
+		if attempt == 4 || !retry {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(50*attempt) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *CoordinatedClient) readResult(ctx context.Context, instanceID string, cmd Command, out any) error {
+	reply, _, err := c.command(ctx, instanceID, "", cmd)
+	if err != nil {
+		if perr, ok := errors.AsType[*coord.Error](err); ok && perr.Code == coord.CodeResyncRequired {
+			return &ResyncError{InstanceID: instanceID, Err: perr}
+		}
+		return err
+	}
+	if len(reply.Result) == 0 {
+		return fmt.Errorf("%s: %w: empty result", cmd.Type, coord.ErrInvalidFrame)
+	}
+	var resp struct {
+		Type   string          `json:"type"`
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+		Error  *ErrorInfo      `json:"error"`
+	}
+	if err := json.Unmarshal(reply.Result, &resp); err != nil {
+		return fmt.Errorf("decode %s: %w", cmd.Type, err)
+	}
+	payload := reply.Result
+	if resp.Type == "response" {
+		if !resp.OK {
+			if resp.Error == nil {
+				return fmt.Errorf("%s failed without error details", cmd.Type)
+			}
+			perr := &coord.Error{Code: resp.Error.Code, Message: resp.Error.Message}
+			if perr.Code == coord.CodeResyncRequired {
+				return &ResyncError{InstanceID: instanceID, Err: perr}
+			}
+			return perr
+		}
+		payload = resp.Result
+	}
+	if len(payload) == 0 || string(payload) == "null" {
+		return fmt.Errorf("%s: %w: empty result", cmd.Type, coord.ErrInvalidFrame)
+	}
+	if err := json.Unmarshal(payload, out); err != nil {
+		return fmt.Errorf("decode %s result: %w", cmd.Type, err)
+	}
+	return nil
+}
+
+// command routes cmd to instanceID and returns the reply and the command ID.
+func (c *CoordinatedClient) command(ctx context.Context, instanceID, requestID string, cmd Command) (coord.Frame, string, error) {
+	if cmd.ID == "" {
+		cmd.ID = uuid.NewString()
+	}
+	raw, err := json.Marshal(cmd)
+	if err != nil {
+		return coord.Frame{}, "", fmt.Errorf("marshal command: %w", err)
+	}
+	reply, err := c.targeted(ctx, coord.Frame{Type: coord.TypeCommand, InstanceID: instanceID, RequestID: requestID, Command: raw})
+	return reply, cmd.ID, err
 }
 
 // commandResponse accepts either a full tau rpc response or a bare result
@@ -238,6 +876,16 @@ func commandResponse(id string, result json.RawMessage) (*Response, error) {
 		return nil, fmt.Errorf("decode command result: %w", err)
 	}
 	return resp, nil
+}
+
+func requestIDOrNew(id string) (string, error) {
+	if id == "" {
+		return uuid.NewString(), nil
+	}
+	if !coord.ValidRequestID(id) {
+		return "", ErrInvalidRequestID
+	}
+	return id, nil
 }
 
 func (c *CoordinatedClient) targeted(ctx context.Context, f coord.Frame) (coord.Frame, error) {
@@ -285,21 +933,28 @@ func (c *CoordinatedClient) request(ctx context.Context, f coord.Frame) (coord.F
 
 	select {
 	case r := <-reply:
-		return replyResult(r)
+		return replyResult(f, r)
 	case <-c.closed:
 		select {
 		case r := <-reply:
-			return replyResult(r)
+			return replyResult(f, r)
 		default:
 		}
-		return coord.Frame{}, fmt.Errorf("%s: %w: %w", f.Type, ErrOutcomeUnknown, c.Err())
+		return coord.Frame{}, outcomeUnknown(f, c.Err())
 	case <-ctx.Done():
-		return coord.Frame{}, fmt.Errorf("%s: %w: %w", f.Type, ErrOutcomeUnknown, ctx.Err())
+		return coord.Frame{}, outcomeUnknown(f, ctx.Err())
 	}
 }
 
-func replyResult(r coord.Frame) (coord.Frame, error) {
+func outcomeUnknown(f coord.Frame, cause error) *OutcomeUnknownError {
+	return &OutcomeUnknownError{Op: f.Type, InstanceID: f.InstanceID, RequestID: f.RequestID, Err: cause}
+}
+
+func replyResult(sent, r coord.Frame) (coord.Frame, error) {
 	if r.Error != nil {
+		if r.Error.Code == coord.CodeOutcomeUnknown {
+			return coord.Frame{}, outcomeUnknown(sent, r.Error)
+		}
 		return coord.Frame{}, r.Error
 	}
 	return r, nil
@@ -318,6 +973,9 @@ func (c *CoordinatedClient) readLoop() {
 		case coord.TypeResponse:
 			c.resolve(f)
 		case coord.TypeEvent, coord.TypeInstanceUpdate:
+			if f.Type == coord.TypeEvent && c.stageEvent(f) {
+				continue
+			}
 			select {
 			case c.events <- f:
 			default:

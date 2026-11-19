@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,7 +17,22 @@ import (
 
 // fakeCoordinator accepts one client on a real Unix socket, completes the
 // handshake, and hands the server side of the link to the test.
-func fakeCoordinator(t *testing.T, eventBuffer int) (*CoordinatedClient, *coord.Link, coord.Frame) {
+func fakeCoordinator(t *testing.T, eventBuffer int, opts ...CoordinatedOption) (*CoordinatedClient, *coord.Link, coord.Frame) {
+	t.Helper()
+	assign := func(coord.Frame) string { return "assigned" }
+	if len(opts) > 0 {
+		assign = func(hello coord.Frame) string { return hello.ClientID }
+	}
+	c, srv, hello, err := dialFake(t, eventBuffer, assign, opts...)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	return c, srv, hello
+}
+
+// dialFake is fakeCoordinator with the welcome's client ID chosen by assign
+// and the dial error returned.
+func dialFake(t *testing.T, eventBuffer int, assign func(hello coord.Frame) string, opts ...CoordinatedOption) (*CoordinatedClient, *coord.Link, coord.Frame, error) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "c.sock")
 	ln, err := net.Listen("unix", path)
@@ -44,20 +60,25 @@ func fakeCoordinator(t *testing.T, eventBuffer int) (*CoordinatedClient, *coord.
 		link := coord.NewLink(conn)
 		hello, err := link.Read()
 		if err == nil {
-			err = link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, Generation: "gen-1", ClientID: "assigned"})
+			err = link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, Generation: "gen-1", ClientID: assign(hello)})
 		}
 		ready <- accepted{link: link, hello: hello, err: err}
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	c, err := dialCoordinated(ctx, path, eventBuffer)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
+	c, err := dialCoordinated(ctx, path, eventBuffer, opts...)
 	srv := <-ready
 	if srv.err != nil {
 		t.Fatalf("server handshake: %v", srv.err)
+	}
+	if err != nil {
+		t.Cleanup(func() {
+			if err := srv.link.Close(); err != nil {
+				t.Errorf("close server link: %v", err)
+			}
+		})
+		return nil, srv.link, srv.hello, err
 	}
 	t.Cleanup(func() {
 		if err := c.Close(); err != nil {
@@ -67,7 +88,7 @@ func fakeCoordinator(t *testing.T, eventBuffer int) (*CoordinatedClient, *coord.
 			t.Errorf("close server link: %v", err)
 		}
 	})
-	return c, srv.link, srv.hello
+	return c, srv.link, srv.hello, nil
 }
 
 func readFrame(t *testing.T, link *coord.Link) coord.Frame {
@@ -604,5 +625,539 @@ func TestLegacyUnixClientGetsCoordinatorModeDiagnostic(t *testing.T) {
 	}
 	if r.OK || r.Error == nil || r.Error.Code != coord.CodeLegacyProtocol || !strings.Contains(r.Error.Message, "tau daemon --legacy") {
 		t.Fatalf("wrong mode diagnostic: %+v, error: %+v", r, r.Error)
+	}
+}
+
+const testEpoch = "epoch-1"
+
+func posEvent(instanceID string, offset uint64) coord.Frame {
+	return coord.Frame{
+		Type: coord.TypeEvent, InstanceID: instanceID, SessionID: "s",
+		Position: &coord.Position{InstanceID: instanceID, Epoch: testEpoch, Offset: offset},
+		Event:    json.RawMessage(fmt.Sprintf(`{"type":"text_delta","delta":"%d"}`, offset)),
+	}
+}
+
+func sendFrames(t *testing.T, srv *coord.Link, frames ...coord.Frame) {
+	t.Helper()
+	for _, f := range frames {
+		if err := srv.Send(f); err != nil {
+			t.Fatalf("send %s: %v", f.Type, err)
+		}
+	}
+}
+
+type routedCommand struct {
+	Type string          `json:"type"`
+	Args json.RawMessage `json:"args"`
+}
+
+func readCommand(t *testing.T, srv *coord.Link) (coord.Frame, routedCommand) {
+	t.Helper()
+	f := readFrame(t, srv)
+	if f.Type != coord.TypeCommand {
+		t.Fatalf("frame = %+v, want command", f)
+	}
+	var cmd routedCommand
+	if err := json.Unmarshal(f.Command, &cmd); err != nil {
+		t.Fatalf("decode command: %v", err)
+	}
+	return f, cmd
+}
+
+// sendWorkerReply answers f the way a worker's response reaches a client:
+// a full tau rpc response inside the coordinated reply.
+func sendWorkerReply(t *testing.T, srv *coord.Link, f coord.Frame, response map[string]any) {
+	t.Helper()
+	response["type"], response["id"] = "response", "route"
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("encode reply: %v", err)
+	}
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: f.ID, InstanceID: f.InstanceID, Result: data})
+}
+
+func sendWorkerResult(t *testing.T, srv *coord.Link, f coord.Frame, result any) {
+	t.Helper()
+	sendWorkerReply(t, srv, f, map[string]any{"ok": true, "result": result})
+}
+
+func offsets(frames []coord.Frame) []uint64 {
+	out := make([]uint64, 0, len(frames))
+	for _, f := range frames {
+		if f.Position != nil {
+			out = append(out, f.Position.Offset)
+		}
+	}
+	return out
+}
+
+func stageCount(c *CoordinatedClient) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.stages)
+}
+
+func TestCoordinatedClientStableClientID(t *testing.T) {
+	c, _, hello := fakeCoordinator(t, coordinatedEventBuffer, WithClientID("client-a"))
+	if hello.ClientID != "client-a" || c.ClientID() != "client-a" || c.Welcome().ClientID != "client-a" {
+		t.Fatalf("hello %q, client %q, welcome %q; want client-a", hello.ClientID, c.ClientID(), c.Welcome().ClientID)
+	}
+	for _, id := range []string{"", strings.Repeat("x", maxClientIDBytes+1)} {
+		_, err := NewCoordinatedClient(testContext(t), filepath.Join(t.TempDir(), "none.sock"), WithClientID(id))
+		if !errors.Is(err, ErrInvalidClientID) {
+			t.Fatalf("client id of %d bytes: error = %v, want ErrInvalidClientID", len(id), err)
+		}
+	}
+}
+
+func TestCoordinatedClientRejectsReassignedClientID(t *testing.T) {
+	_, _, hello, err := dialFake(t, coordinatedEventBuffer, func(coord.Frame) string { return "other" }, WithClientID("client-a"))
+	if hello.ClientID != "client-a" {
+		t.Fatalf("hello client id = %q", hello.ClientID)
+	}
+	if !errors.Is(err, ErrInvalidClientID) {
+		t.Fatalf("dial error = %v, want ErrInvalidClientID", err)
+	}
+}
+
+func TestCoordinatedClientRequestIDs(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+
+	supplied := NewRequestID()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.CommandWithRequestID(ctx, "inst-a", supplied, Command{Type: "prompt"})
+		done <- err
+	}()
+	f := readFrame(t, srv)
+	if f.RequestID != supplied {
+		t.Fatalf("request id = %q, want caller's %q", f.RequestID, supplied)
+	}
+	sendWorkerResult(t, srv, f, map[string]any{})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		_, err := c.Command(ctx, "inst-a", Command{Type: "prompt"})
+		done <- err
+	}()
+	f = readFrame(t, srv)
+	if !coord.ValidRequestID(f.RequestID) || f.RequestID == supplied {
+		t.Fatalf("generated request id = %q", f.RequestID)
+	}
+	sendWorkerResult(t, srv, f, map[string]any{})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		_, err := c.StartInstance(ctx, "/project")
+		done <- err
+	}()
+	f = readFrame(t, srv)
+	if f.Type != coord.TypeStartInstance || !coord.ValidRequestID(f.RequestID) {
+		t.Fatalf("start frame = %+v", f)
+	}
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: f.ID, RequestID: f.RequestID, Instance: &coord.Instance{ID: "inst-b", LaunchRequestID: f.RequestID}})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := []string{"not-a-uuid", strings.ToUpper(supplied), "00000000-0000-1000-8000-000000000000"}
+	for _, id := range invalid {
+		if _, err := c.CommandWithRequestID(ctx, "inst-a", id, Command{Type: "prompt"}); !errors.Is(err, ErrInvalidRequestID) {
+			t.Errorf("command request id %q: error = %v", id, err)
+		}
+		if _, err := c.StartInstanceWithRequestID(ctx, "/project", id); !errors.Is(err, ErrInvalidRequestID) {
+			t.Errorf("start request id %q: error = %v", id, err)
+		}
+		if err := c.StopInstanceWithRequestID(ctx, "inst-a", id); !errors.Is(err, ErrInvalidRequestID) {
+			t.Errorf("stop request id %q: error = %v", id, err)
+		}
+	}
+	// Rejected requests were never sent: the next frame is this one.
+	go func() {
+		_, err := c.ListInstances(ctx)
+		done <- err
+	}()
+	f = readFrame(t, srv)
+	if f.Type != coord.TypeListInstances {
+		t.Fatalf("invalid request reached the coordinator: %+v", f)
+	}
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: f.ID})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCoordinatedClientOutcomeUnknownCarriesIdentity(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+
+	requestID := NewRequestID()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.CommandWithRequestID(ctx, "inst-a", requestID, Command{Type: "prompt"})
+		done <- err
+	}()
+	f := readFrame(t, srv)
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: f.ID, RequestID: requestID, InstanceID: "inst-a", Error: &coord.Error{Code: coord.CodeOutcomeUnknown, Message: "worker link lost after routing"}})
+	err := <-done
+	unknown, ok := errors.AsType[*OutcomeUnknownError](err)
+	if !ok || unknown.RequestID != requestID || unknown.InstanceID != "inst-a" || unknown.Op != coord.TypeCommand {
+		t.Fatalf("error = %#v, want outcome unknown for %s", err, requestID)
+	}
+	if perr, ok := errors.AsType[*coord.Error](err); !ok || perr.Code != coord.CodeOutcomeUnknown || !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("error = %v, want coordinator outcome_unknown", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	second := NewRequestID()
+	go func() {
+		done <- c.StopInstanceWithRequestID(cancelCtx, "inst-a", second)
+	}()
+	readFrame(t, srv)
+	cancel()
+	err = <-done
+	if unknown, ok := errors.AsType[*OutcomeUnknownError](err); !ok || unknown.RequestID != second || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled stop error = %v", err)
+	}
+}
+
+func TestEventCursorAccept(t *testing.T) {
+	cursor := NewEventCursor(coord.Position{InstanceID: "inst-a", Epoch: testEpoch, Offset: 4})
+	if ok, err := cursor.Accept(posEvent("inst-a", 4)); ok || err != nil {
+		t.Fatalf("duplicate: %v, %v", ok, err)
+	}
+	meta := coord.Frame{Type: coord.TypeEvent, InstanceID: "inst-a", Instance: &coord.Instance{ID: "inst-a"}}
+	if ok, err := cursor.Accept(meta); !ok || err != nil || cursor.Position().Offset != 4 {
+		t.Fatalf("positionless frame: %v, %v, at %d", ok, err, cursor.Position().Offset)
+	}
+	if ok, err := cursor.Accept(posEvent("inst-a", 5)); !ok || err != nil || cursor.Position().Offset != 5 {
+		t.Fatalf("next: %v, %v, at %d", ok, err, cursor.Position().Offset)
+	}
+
+	otherEpoch := posEvent("inst-a", 6)
+	otherEpoch.Position.Epoch = "epoch-2"
+	misaddressed := posEvent("inst-a", 6)
+	misaddressed.Position.InstanceID = "inst-b"
+	omitted := posEvent("inst-a", 6)
+	omitted.Event = json.RawMessage(`{"type":"event_omitted"}`)
+	linkLost := coord.Frame{Type: coord.TypeEvent, InstanceID: "inst-a", Error: &coord.Error{Code: coord.CodeWorkerLinkLost}}
+	rejected := map[string]struct {
+		frame coord.Frame
+		cause error
+	}{
+		"gap":        {posEvent("inst-a", 7), ErrEventGap},
+		"epoch":      {otherEpoch, ErrStaleCursor},
+		"target":     {posEvent("inst-b", 6), ErrEventTarget},
+		"position":   {misaddressed, ErrEventTarget},
+		"untargeted": {coord.Frame{Type: coord.TypeEvent}, ErrEventTarget},
+		"omitted":    {omitted, ErrEventOmitted},
+		"lost link":  {linkLost, linkLost.Error},
+	}
+	for name, tc := range rejected {
+		ok, err := cursor.Accept(tc.frame)
+		resync, isResync := errors.AsType[*ResyncError](err)
+		if ok || !errors.Is(err, ErrResyncRequired) || !errors.Is(err, tc.cause) || !isResync || resync.Cursor.Offset != 5 {
+			t.Errorf("%s: %v, %v", name, ok, err)
+		}
+		if cursor.Position().Offset != 5 {
+			t.Fatalf("%s moved cursor to %d", name, cursor.Position().Offset)
+		}
+	}
+}
+
+func TestLiveStageOverflowIsExplicit(t *testing.T) {
+	cursor := NewEventCursor(coord.Position{InstanceID: "inst-a", Epoch: testEpoch})
+	var byCount liveStage
+	for i := range maxStagedFrames + 1 {
+		byCount.add(posEvent("inst-a", uint64(i+1)))
+	}
+	byBytes := liveStage{bytes: maxStagedBytes}
+	byBytes.add(posEvent("inst-a", 1))
+	for name, s := range map[string]*liveStage{"count": &byCount, "bytes": &byBytes} {
+		if !s.overflow || s.frames != nil {
+			t.Errorf("%s: stage not marked overflowed: %d frames", name, len(s.frames))
+		}
+		if _, err := cursor.handoff(s); !errors.Is(err, ErrReconstructionOverflow) || !errors.Is(err, ErrResyncRequired) {
+			t.Errorf("%s: handoff error = %v, want overflow", name, err)
+		}
+	}
+}
+
+const testSnapshot = `{
+	"position": {"instance_id": "inst-a", "epoch": "epoch-1", "offset": 4},
+	"instance": {"instance_id": "inst-a", "session_id": "s"},
+	"history": {"entries": [{"entry_id": "e1", "message": {"role": "user"}}, {"entry_id": "e2", "omitted": true}], "before": "e1"},
+	"state": {"session_id": "s", "model": "provider/model", "thinking_level": "high", "is_streaming": true, "queue": {"steering": 1, "follow_up": 0}},
+	"live": {"messages": []},
+	"ui_requests": [{"id": "ui-1"}]
+}`
+
+func TestAttachSnapshotStagesLiveEvents(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+
+	type result struct {
+		h   *Handoff
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		h, err := c.AttachSnapshot(ctx, "inst-a")
+		done <- result{h, err}
+	}()
+	attach := readFrame(t, srv)
+	if attach.Type != coord.TypeAttach || attach.InstanceID != "inst-a" {
+		t.Fatalf("first frame = %+v, want attach", attach)
+	}
+	sendFrames(t, srv, posEvent("inst-a", 3), posEvent("inst-b", 1), coord.Frame{Type: coord.TypeResponse, ID: attach.ID, InstanceID: "inst-a"})
+	f, cmd := readCommand(t, srv)
+	if cmd.Type != cmdGetSnapshot || f.InstanceID != "inst-a" || f.RequestID != "" {
+		t.Fatalf("snapshot request = %+v %+v", f, cmd)
+	}
+	sendFrames(t, srv, posEvent("inst-a", 4), posEvent("inst-a", 5))
+	sendWorkerResult(t, srv, f, json.RawMessage(testSnapshot))
+
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("AttachSnapshot: %v", r.err)
+	}
+	s := r.h.Snapshot
+	if s.Position.Offset != 4 || s.State.SessionID != "s" || !s.State.IsStreaming || s.State.ThinkingLevel != "high" ||
+		len(s.History.Entries) != 2 || s.History.Entries[0].EntryID != "e1" || !s.History.Entries[1].Omitted ||
+		s.History.Before != "e1" || len(s.UIRequests) != 1 || len(s.Live) == 0 {
+		t.Fatalf("snapshot = %+v", s)
+	}
+	if got := offsets(r.h.Events); len(got) != 1 || got[0] != 5 {
+		t.Fatalf("handoff events = %v, want [5]", got)
+	}
+	if r.h.Cursor.Position().Offset != 5 || stageCount(c) != 0 {
+		t.Fatalf("cursor at %d, stages %d", r.h.Cursor.Position().Offset, stageCount(c))
+	}
+
+	// Only the reconstructed instance was withheld from Events.
+	select {
+	case f := <-c.Events():
+		if f.InstanceID != "inst-b" {
+			t.Fatalf("event = %+v, want inst-b", f)
+		}
+	case <-ctx.Done():
+		t.Fatal("other instance's event was withheld")
+	}
+	select {
+	case f := <-c.Events():
+		t.Fatalf("staged event leaked to Events: %+v", f)
+	default:
+	}
+
+	sendFrames(t, srv, posEvent("inst-a", 6))
+	select {
+	case f := <-c.Events():
+		if ok, err := r.h.Cursor.Accept(f); !ok || err != nil {
+			t.Fatalf("live continuation: %v, %v", ok, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("live event after handoff missing")
+	}
+}
+
+func TestAttachSnapshotRejectsStagedGap(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.AttachSnapshot(ctx, "inst-a")
+		done <- err
+	}()
+	attach := readFrame(t, srv)
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: attach.ID, InstanceID: "inst-a"})
+	f, _ := readCommand(t, srv)
+	sendFrames(t, srv, posEvent("inst-a", 6))
+	sendWorkerResult(t, srv, f, json.RawMessage(testSnapshot))
+	err := <-done
+	if resync, ok := errors.AsType[*ResyncError](err); !ok || !errors.Is(err, ErrEventGap) || resync.Got == nil || resync.Got.Offset != 6 {
+		t.Fatalf("error = %v, want gap after 4", err)
+	}
+	if stageCount(c) != 0 {
+		t.Fatal("stage left behind")
+	}
+}
+
+func TestResumeReplaysAfterCursorAndMergesStagedLive(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+	after := coord.Position{InstanceID: "inst-a", Epoch: testEpoch, Offset: 2}
+
+	type result struct {
+		h   *Handoff
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		h, err := c.Resume(ctx, after)
+		done <- result{h, err}
+	}()
+	attach := readFrame(t, srv)
+	if attach.Type != coord.TypeAttach {
+		t.Fatalf("first frame = %+v, want attach", attach)
+	}
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: attach.ID, InstanceID: "inst-a"}, posEvent("inst-a", 4), posEvent("inst-a", 5), posEvent("inst-a", 6))
+	f, cmd := readCommand(t, srv)
+	var args struct {
+		After coord.Position `json:"after"`
+	}
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Type != cmdReplayEvents || args.After != after {
+		t.Fatalf("replay request = %s after %+v", cmd.Type, args.After)
+	}
+	// More remains, but staged live events already continue from 4, so no
+	// second page is requested.
+	sendWorkerResult(t, srv, f, ReplayPage{Events: []coord.Frame{posEvent("inst-a", 3), posEvent("inst-a", 4)}, More: true})
+
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("Resume: %v", r.err)
+	}
+	if got := offsets(r.h.Events); fmt.Sprint(got) != "[3 4 5 6]" {
+		t.Fatalf("handoff events = %v, want [3 4 5 6]", got)
+	}
+	if r.h.Snapshot != nil || r.h.Cursor.Position().Offset != 6 || stageCount(c) != 0 {
+		t.Fatalf("handoff = %+v, cursor %+v", r.h, r.h.Cursor.Position())
+	}
+}
+
+func TestResumeExposesResync(t *testing.T) {
+	after := coord.Position{InstanceID: "inst-a", Epoch: testEpoch, Offset: 2}
+	otherEpoch := posEvent("inst-a", 3)
+	otherEpoch.Position.Epoch = "epoch-2"
+	tests := map[string]struct {
+		respond func(t *testing.T, srv *coord.Link, f coord.Frame)
+		cause   error
+	}{
+		"expired": {func(t *testing.T, srv *coord.Link, f coord.Frame) {
+			sendWorkerReply(t, srv, f, map[string]any{"ok": false, "error": map[string]any{"code": coord.CodeResyncRequired, "message": "event position missing"}})
+		}, nil},
+		"epoch": {func(t *testing.T, srv *coord.Link, f coord.Frame) {
+			sendWorkerResult(t, srv, f, ReplayPage{Events: []coord.Frame{otherEpoch}})
+		}, ErrStaleCursor},
+		"gap": {func(t *testing.T, srv *coord.Link, f coord.Frame) {
+			sendWorkerResult(t, srv, f, ReplayPage{Events: []coord.Frame{posEvent("inst-a", 4)}})
+		}, ErrEventGap},
+		"target": {func(t *testing.T, srv *coord.Link, f coord.Frame) {
+			sendWorkerResult(t, srv, f, ReplayPage{Events: []coord.Frame{posEvent("inst-b", 3)}})
+		}, ErrEventTarget},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+			ctx := testContext(t)
+			done := make(chan error, 1)
+			go func() {
+				_, err := c.Resume(ctx, after)
+				done <- err
+			}()
+			attach := readFrame(t, srv)
+			sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: attach.ID, InstanceID: "inst-a"})
+			f, _ := readCommand(t, srv)
+			tc.respond(t, srv, f)
+			err := <-done
+			resync, ok := errors.AsType[*ResyncError](err)
+			if !ok || !errors.Is(err, ErrResyncRequired) || resync.Cursor != after {
+				t.Fatalf("error = %v, want resync at %+v", err, after)
+			}
+			if tc.cause != nil && !errors.Is(err, tc.cause) {
+				t.Fatalf("error = %v, want %v", err, tc.cause)
+			}
+			if tc.cause == nil {
+				if perr, ok := errors.AsType[*coord.Error](err); !ok || perr.Code != coord.CodeResyncRequired {
+					t.Fatalf("error = %v, want worker resync_required", err)
+				}
+			}
+			if stageCount(c) != 0 {
+				t.Fatal("stage left behind")
+			}
+		})
+	}
+}
+
+func TestReconstructionRejectsConcurrentStage(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.AttachSnapshot(ctx, "inst-a")
+		done <- err
+	}()
+	attach := readFrame(t, srv)
+	if _, err := c.Resume(ctx, coord.Position{InstanceID: "inst-a", Epoch: testEpoch}); !errors.Is(err, ErrReconstructionBusy) {
+		t.Fatalf("concurrent resume error = %v", err)
+	}
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: attach.ID, Error: &coord.Error{Code: coord.CodeNotFound}})
+	if err := <-done; err == nil {
+		t.Fatal("attach failure ignored")
+	}
+	if stageCount(c) != 0 {
+		t.Fatal("stage left behind")
+	}
+}
+
+func TestHistoryPage(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+	type result struct {
+		h   *History
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		h, err := c.History(ctx, "inst-a", "s", "e5")
+		done <- result{h, err}
+	}()
+	f, cmd := readCommand(t, srv)
+	var args map[string]string
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Type != cmdGetHistory || args["session_id"] != "s" || args["before"] != "e5" {
+		t.Fatalf("history request = %s %v", cmd.Type, args)
+	}
+	sendWorkerResult(t, srv, f, json.RawMessage(`{"entries":[{"entry_id":"e4","message":{"role":"assistant"}}],"before":""}`))
+	r := <-done
+	if r.err != nil || len(r.h.Entries) != 1 || r.h.Entries[0].EntryID != "e4" || r.h.Before != "" {
+		t.Fatalf("history = %+v, %v", r.h, r.err)
+	}
+	if _, err := c.History(ctx, "inst-a", "", ""); err == nil {
+		t.Fatal("history without session id was sent")
+	}
+}
+
+func TestAttachSnapshotRetriesTransientWorkerReads(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.AttachSnapshot(ctx, "inst-a")
+		done <- err
+	}()
+	attach := readFrame(t, srv)
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: attach.ID})
+	for _, code := range []string{coord.CodeBusy, coord.CodeResyncRequired} {
+		f, cmd := readCommand(t, srv)
+		if cmd.Type != cmdGetSnapshot || f.RequestID != "" {
+			t.Fatalf("unexpected reconstruction command: %+v, %+v", f, cmd)
+		}
+		sendWorkerReply(t, srv, f, map[string]any{"ok": false, "error": map[string]string{"code": code, "message": "try again"}})
+	}
+	f, _ := readCommand(t, srv)
+	sendWorkerResult(t, srv, f, json.RawMessage(testSnapshot))
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

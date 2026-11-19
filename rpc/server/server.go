@@ -86,9 +86,10 @@ type Server struct {
 	// eventMu keeps sequence assignment and publication in the same order.
 	eventMu sync.Mutex
 	// eventSessionID can be read by observers while sessionMu is held during Close.
-	eventSessionID atomic.Value
-	coordinated    bool
-	shutdownOnce   sync.Once
+	eventSessionID    atomic.Value
+	sessionGeneration atomic.Uint64
+	coordinated       bool
+	shutdownOnce      sync.Once
 }
 
 // NewServer creates a new RPC server with the given runtime and optional
@@ -294,6 +295,11 @@ func (s *Server) handleEditContext(ctx context.Context, cmd *Command) error {
 	}
 	if err := editor.EditContext(ctx, args.EntryID, args.Replacement); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
+	}
+	if s.coordinated {
+		if err := s.emitEvent(sdk.Event{Type: "context_edited", SessionID: sess.ID()}); err != nil {
+			return err
+		}
 	}
 	return s.sendResult(cmd.ID, map[string]any{"ok": true})
 }
@@ -734,9 +740,8 @@ func (s *Server) handleSetThinkingLevel(ctx context.Context, cmd *Command) error
 	}
 
 	// Update server-side thinking level
-	s.thinkingLevel = args.Level
-
 	s.sessionMu.Lock()
+	s.thinkingLevel = args.Level
 	current := s.session
 	s.sessionMu.Unlock()
 
@@ -977,6 +982,7 @@ func (s *Server) ensureSession(ctx context.Context) (sdk.Session, error) {
 	}
 
 	s.session = sess
+	s.sessionGeneration.Add(1)
 	s.eventSessionID.Store(sess.ID())
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.observeSessionEvents(sess)
@@ -989,6 +995,7 @@ func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, re
 	prev := s.session
 	prevCancel := s.sessionCancel
 	s.session = nil
+	s.sessionGeneration.Add(1)
 	s.sessionCancel = nil
 	s.sessionCtx = nil
 	s.sessionMu.Unlock()
@@ -1035,6 +1042,7 @@ func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, re
 
 	s.sessionMu.Lock()
 	s.session = sess
+	s.sessionGeneration.Add(1)
 	s.eventSessionID.Store(sess.ID())
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.sessionMu.Unlock()
@@ -1344,7 +1352,14 @@ func (s *Server) handleCycleThinkingLevel(ctx context.Context, cmd *Command) err
 
 	if agentSess, ok := sess.(sdk.ThinkingCycler); ok {
 		level := agentSess.CycleThinkingLevel()
+		s.sessionMu.Lock()
 		s.thinkingLevel = level
+		s.sessionMu.Unlock()
+		if s.coordinated {
+			if err := s.emitEvent(sdk.Event{Type: "thinking_level_change", SessionID: sess.ID(), Payload: map[string]any{"level": level}}); err != nil {
+				return err
+			}
+		}
 		return s.sendResult(cmd.ID, map[string]any{"level": level})
 	}
 
@@ -1758,6 +1773,11 @@ func (s *Server) startBash(ctx context.Context, cmd *Command) error {
 			s.activeBashCancel = nil
 			s.activeBashMu.Unlock()
 			cancel()
+			if s.coordinated {
+				if err := s.emitEvent(sdk.Event{Type: "bash_execution_end", SessionID: sess.ID(), Payload: map[string]any{"id": cmd.ID}}); err != nil {
+					workerLog("publish shell completion: %v", err)
+				}
+			}
 		}()
 		if err := s.handleBash(bashCtx, executor, cmd); err != nil {
 			if sendErr := s.sendError(cmd.ID, "handler_error", fmt.Sprintf("handle command: %v", err)); sendErr != nil {
@@ -1806,6 +1826,7 @@ func (s *Server) rebindSession(ctx context.Context, newSess sdk.Session) error {
 	prev := s.session
 	prevCancel := s.sessionCancel
 	s.session = newSess
+	s.sessionGeneration.Add(1)
 	s.eventSessionID.Store(newSess.ID())
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.sessionMu.Unlock()

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -36,7 +37,7 @@ func runCoordinator(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("resolve coordinator socket: %w", err)
 	}
 	launch := func(ctx context.Context, request coord.LaunchRequest) error {
-		return launchWorkerProcess(ctx, path, node, request.InstanceID, request.Token, request.CWD, request.Ready)
+		return launchWorkerProcess(ctx, path, node, request)
 	}
 	addr := cmd.String("websocket")
 	if addr == "" {
@@ -129,20 +130,27 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	return os.Rename(tmp.Name(), path)
 }
 
-func workerEnvironment(env []string, token, instance, node string) []string {
-	out := make([]string, 0, len(env)+3)
+var workerLaunchVariables = []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE", "TAU_COORD_LAUNCH_REQUEST"}
+
+func workerEnvironment(env []string, node string, request coord.LaunchRequest) []string {
+	out := make([]string, 0, len(env)+len(workerLaunchVariables))
 	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
 		// PWD describes the coordinator's directory, not the worker's.
-		if strings.HasPrefix(entry, "TAU_COORD_TOKEN=") || strings.HasPrefix(entry, "TAU_COORD_INSTANCE=") ||
-			strings.HasPrefix(entry, "TAU_COORD_NODE=") || strings.HasPrefix(entry, "PWD=") {
+		if name == "PWD" || slices.Contains(workerLaunchVariables, name) {
 			continue
 		}
 		out = append(out, entry)
 	}
-	return append(out, "TAU_COORD_TOKEN="+token, "TAU_COORD_INSTANCE="+instance, "TAU_COORD_NODE="+node)
+	out = append(out, "TAU_COORD_TOKEN="+request.Token, "TAU_COORD_INSTANCE="+request.InstanceID, "TAU_COORD_NODE="+node)
+	if request.LaunchRequestID != "" {
+		out = append(out, "TAU_COORD_LAUNCH_REQUEST="+request.LaunchRequestID)
+	}
+	return out
 }
 
-func launchWorkerProcess(ctx context.Context, socket, node, instance, token, cwd string, ready <-chan struct{}) (err error) {
+func launchWorkerProcess(ctx context.Context, socket, node string, request coord.LaunchRequest) (err error) {
+	instance, cwd, ready := request.InstanceID, request.CWD, request.Ready
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -171,7 +179,7 @@ func launchWorkerProcess(ctx context.Context, socket, node, instance, token, cwd
 	defer func() { err = errors.Join(err, log.Close()) }()
 	child := exec.Command(executable, "--config-dir", cfg, "worker", "--socket", socket)
 	child.Dir = cwd
-	child.Env = workerEnvironment(os.Environ(), token, instance, node)
+	child.Env = workerEnvironment(os.Environ(), node, request)
 	child.Stdout = log
 	child.Stderr = log
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -288,10 +296,11 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 	token := os.Getenv("TAU_COORD_TOKEN")
 	instance := os.Getenv("TAU_COORD_INSTANCE")
 	node := os.Getenv("TAU_COORD_NODE")
+	launchRequest := os.Getenv("TAU_COORD_LAUNCH_REQUEST")
 	if token == "" || instance == "" || node == "" || cmd.String("socket") == "" {
 		return errors.New("worker is an internal entry point; launch through the coordinator")
 	}
-	for _, name := range []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE"} {
+	for _, name := range workerLaunchVariables {
 		if err := os.Unsetenv(name); err != nil {
 			return fmt.Errorf("clear worker launch environment: %w", err)
 		}
@@ -331,6 +340,6 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 		return errors.Join(errors.New("worker initialization exceeded deadline"), runtime.Close(cleanupCtx))
 	}
 	return server.NewWorker(runtime, reg, mgr).Run(ctx, cmd.String("socket"), coord.Instance{
-		ID: instance, NodeID: node, CWD: cwd, PID: os.Getpid(), State: "ready",
+		ID: instance, NodeID: node, CWD: cwd, PID: os.Getpid(), State: "ready", LaunchRequestID: launchRequest,
 	}, token)
 }

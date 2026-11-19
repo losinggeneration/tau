@@ -13,8 +13,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type fakeWorker struct {
@@ -60,6 +63,7 @@ func (h *harness) spawnWorker() LaunchFunc {
 		go func() {
 			hello := Frame{Role: RoleWorker, Token: req.Token, Instance: &Instance{
 				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: "session-" + req.InstanceID, PID: 42,
+				LaunchRequestID: req.LaunchRequestID,
 			}}
 			link, welcome, err := Dial(context.Background(), h.path, hello)
 			if err != nil {
@@ -478,7 +482,7 @@ func TestWatchInstancesOnlyDeliversSummaries(t *testing.T) {
 	}
 }
 
-func TestStopInstanceRoutesShutdownAndReportsUnavailable(t *testing.T) {
+func TestStopInstanceRoutesShutdownAndReportsOutcomeUnknown(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	c, _ := h.client()
 	inst, w := h.start(c, "start")
@@ -501,13 +505,159 @@ func TestStopInstanceRoutesShutdownAndReportsUnavailable(t *testing.T) {
 	if resp := readFrame(t, c); resp.ID != "stop" || resp.Error != nil {
 		t.Fatalf("stop response = %+v", resp)
 	}
-	wantError(t, readFrame(t, c), "busy", CodeUnavailable)
+	wantError(t, readFrame(t, c), "busy", CodeOutcomeUnknown)
 	gone := readFrame(t, c)
 	if gone.Type != TypeEvent || gone.InstanceID != inst.ID || gone.Error == nil || gone.Error.Code != CodeWorkerLinkLost || !strings.Contains(gone.Error.Message, "may still be running") {
 		t.Fatalf("unavailable event = %+v", gone)
 	}
 	if list := request(t, c, Frame{Type: TypeListInstances, ID: "l"}); len(list.Instances) != 0 {
 		t.Fatalf("stopped instance still listed: %+v", list.Instances)
+	}
+}
+
+func TestRoutedCommandOutcomeUnknownAfterWorkerLinkLoss(t *testing.T) {
+	h := startCoordinator(t, nil, launchTimeout)
+	c, _ := h.client()
+	inst, w := h.start(c, "start")
+	requestID := uuid.NewString()
+	cmd := json.RawMessage(`{"type":"prompt"}`)
+	mustSend(t, c, Frame{Type: TypeCommand, ID: "prompt", RequestID: requestID, InstanceID: inst.ID, Command: cmd})
+	if routed := w.next(t); routed.Type != TypeCommand || routed.RequestID != requestID {
+		t.Fatalf("routed command = %+v", routed)
+	}
+	if err := w.link.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resp := readFrame(t, c)
+	wantError(t, resp, "prompt", CodeOutcomeUnknown)
+	if resp.RequestID != requestID || resp.InstanceID != inst.ID {
+		t.Fatalf("outcome unknown reply = %+v", resp)
+	}
+	for f := range w.frames {
+		t.Fatalf("worker received a frame after the routed command: %+v", f)
+	}
+	wantError(t, request(t, c, Frame{Type: TypeCommand, ID: "after", RequestID: requestID, InstanceID: inst.ID, Command: cmd}), "after", CodeNotFound)
+}
+
+func TestCommandCorrelationCarriesIdentityWithoutAuthority(t *testing.T) {
+	h := startCoordinator(t, nil, launchTimeout)
+	a, aWelcome := h.client()
+	b, bWelcome := h.client()
+	inst, w := h.start(a, "start")
+	requestID := uuid.NewString()
+	cmd := json.RawMessage(`{"type":"get_state"}`)
+
+	mustSend(t, a, Frame{Type: TypeCommand, ID: "a", RequestID: requestID, InstanceID: inst.ID, Command: cmd})
+	fromA := w.next(t)
+	mustSend(t, b, Frame{Type: TypeCommand, ID: "b", RequestID: requestID, InstanceID: inst.ID, Command: cmd})
+	fromB := w.next(t)
+	if fromA.RequestID != requestID || fromA.ClientID != aWelcome.ClientID || fromA.InstanceID != inst.ID ||
+		fromB.RequestID != requestID || fromB.ClientID != bWelcome.ClientID || fromB.InstanceID != inst.ID || fromA.ID == fromB.ID {
+		t.Fatalf("routed frames = %+v, %+v", fromA, fromB)
+	}
+
+	mustSend(t, w.link, Frame{Type: TypeResponse, ID: requestID, Result: json.RawMessage(`{"spoof":true}`)})
+	mustSend(t, w.link, Frame{Type: TypeResponse, ID: fromB.ID, RequestID: uuid.NewString(), Result: json.RawMessage(`{"who":"b"}`)})
+	mustSend(t, w.link, Frame{Type: TypeResponse, ID: fromA.ID, Result: json.RawMessage(`{"who":"a"}`)})
+	for name, tc := range map[string]struct {
+		link *Link
+		id   string
+		want string
+	}{"a": {a, "a", `{"who":"a"}`}, "b": {b, "b", `{"who":"b"}`}} {
+		resp := readFrame(t, tc.link)
+		if resp.Type != TypeResponse || resp.ID != tc.id || resp.RequestID != requestID || string(resp.Result) != tc.want {
+			t.Fatalf("client %s response = %+v result %s", name, resp, resp.Result)
+		}
+	}
+
+	for _, bad := range []string{"not-a-uuid", strings.ToUpper(uuid.NewString()), "6ba7b810-9dad-11d1-80b4-00c04fd430c8"} {
+		resp := request(t, a, Frame{Type: TypeCommand, ID: "bad", RequestID: bad, InstanceID: inst.ID, Command: cmd})
+		wantError(t, resp, "bad", CodeInvalidFrame)
+		if resp.RequestID != "" {
+			t.Fatalf("invalid request ID echoed: %+v", resp)
+		}
+	}
+	mustSend(t, a, Frame{Type: TypeCommand, ID: "legacy", InstanceID: inst.ID, Command: cmd})
+	if f := w.next(t); f.ClientID != aWelcome.ClientID || f.RequestID != "" {
+		t.Fatalf("legacy command routed as %+v", f)
+	}
+}
+
+func TestLaunchRequestIDIsRetainedByCoordinator(t *testing.T) {
+	spoofed := make(chan error, 2)
+	launch := func(h *harness) LaunchFunc {
+		spawn := h.spawnWorker()
+		return func(ctx context.Context, req LaunchRequest) error {
+			_, _, err := Dial(ctx, h.path, Frame{Role: RoleWorker, Token: req.Token, Instance: &Instance{
+				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: "spoof", LaunchRequestID: uuid.NewString(),
+			}})
+			spoofed <- err
+			return spawn(ctx, req)
+		}
+	}
+	h := startCoordinator(t, launch, launchTimeout)
+	c, _ := h.client()
+	requestID := uuid.NewString()
+	mustSend(t, c, Frame{Type: TypeStartInstance, ID: "start", RequestID: requestID, CWD: h.cwd})
+	w := h.nextWorker()
+	resp := readFrame(t, c)
+	if resp.Error != nil || resp.ID != "start" || resp.RequestID != requestID || resp.Instance == nil ||
+		resp.Instance.ID != w.req.InstanceID || resp.Instance.LaunchRequestID != requestID || resp.Instance.ID == requestID {
+		t.Fatalf("start response = %+v (instance %+v)", resp, resp.Instance)
+	}
+	if w.req.LaunchRequestID != requestID || w.welcome.Instance == nil || w.welcome.Instance.LaunchRequestID != requestID {
+		t.Fatalf("launch request = %+v, worker welcome = %+v", w.req, w.welcome)
+	}
+	var protoErr *Error
+	if err := <-spoofed; !errors.As(err, &protoErr) || protoErr.Code != CodeConflict {
+		t.Fatalf("mismatched launch request ID registration = %v, want conflict", err)
+	}
+
+	summary := *resp.Instance
+	summary.LaunchRequestID = uuid.NewString()
+	summary.State = StateBusy
+	mustSend(t, w.link, Frame{Type: TypeRegister, ID: "reg", Instance: &summary})
+	if ack := w.next(t); ack.Instance == nil || ack.Instance.LaunchRequestID != requestID || ack.Instance.State != StateBusy {
+		t.Fatalf("register ack = %+v", ack)
+	}
+	list := request(t, c, Frame{Type: TypeListInstances, ID: "list"})
+	if len(list.Instances) != 1 || list.Instances[0].LaunchRequestID != requestID {
+		t.Fatalf("listed instances = %+v", list.Instances)
+	}
+
+	legacy, _ := h.start(c, "legacy")
+	if legacy.LaunchRequestID != "" {
+		t.Fatalf("start without request ID retained %q", legacy.LaunchRequestID)
+	}
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "bad", RequestID: "bad", CWD: h.cwd}), "bad", CodeInvalidFrame)
+}
+
+func TestLostLaunchReplyLeavesRetainedRequestIDObservable(t *testing.T) {
+	var launches atomic.Int32
+	launch := func(h *harness) LaunchFunc {
+		spawn := h.spawnWorker()
+		return func(ctx context.Context, req LaunchRequest) error {
+			launches.Add(1)
+			return spawn(ctx, req)
+		}
+	}
+	h := startCoordinator(t, launch, launchTimeout)
+	c, _ := h.client()
+	requestID := uuid.NewString()
+	mustSend(t, c, Frame{Type: TypeStartInstance, ID: "start", RequestID: requestID, CWD: h.cwd})
+	w := h.nextWorker()
+	// The accepted launch's reply is never read: the connection drops.
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	other, _ := h.client()
+	list := request(t, other, Frame{Type: TypeListInstances, ID: "list"})
+	if len(list.Instances) != 1 || list.Instances[0].ID != w.req.InstanceID || list.Instances[0].LaunchRequestID != requestID {
+		t.Fatalf("instances after lost reply = %+v, launch %+v", list.Instances, w.req)
+	}
+	if n := launches.Load(); n != 1 {
+		t.Fatalf("launches = %d, want 1", n)
 	}
 }
 
@@ -742,14 +892,15 @@ func TestOversizedResponseAfterRewriteRepliesLimitExceeded(t *testing.T) {
 	c, _ := h.client()
 	inst, w := h.start(c, "start")
 	longID := strings.Repeat("r", maxIDBytes)
-	mustSend(t, c, Frame{Type: TypeCommand, ID: longID, InstanceID: inst.ID, Command: json.RawMessage(`{"type":"get_state"}`)})
+	correlation := "9d5dae32-70d6-4cb7-819e-cf108314ec14"
+	mustSend(t, c, Frame{Type: TypeCommand, ID: longID, RequestID: correlation, InstanceID: inst.ID, Command: json.RawMessage(`{"type":"get_state"}`)})
 	route := w.next(t)
 	mustSend(t, w.link, fill(t, Frame{Type: TypeResponse, ID: route.ID}, 16, func(f *Frame, s string) {
 		f.Result = json.RawMessage(`{"d":"` + s + `"}`)
 	}))
 	resp := readFrame(t, c)
 	wantError(t, resp, longID, CodeLimitExceeded)
-	if resp.InstanceID != inst.ID || resp.Result != nil {
+	if resp.InstanceID != inst.ID || resp.RequestID != correlation || resp.Result != nil {
 		t.Fatalf("limit response = %+v", resp)
 	}
 
@@ -784,12 +935,13 @@ func TestOversizedEventSendsLimitNotice(t *testing.T) {
 	if resp := request(t, c, Frame{Type: TypeAttach, ID: "att", InstanceID: inst.ID}); resp.Error != nil {
 		t.Fatalf("attach = %+v", resp)
 	}
-	mustSend(t, w.link, fill(t, Frame{Type: TypeEvent}, 16, func(f *Frame, s string) {
+	position := Position{InstanceID: inst.ID, Epoch: "epoch", Offset: 1}
+	mustSend(t, w.link, fill(t, Frame{Type: TypeEvent, Position: &position}, 16, func(f *Frame, s string) {
 		f.Event = json.RawMessage(`{"d":"` + s + `"}`)
 	}))
 	notice := readFrame(t, c)
 	if notice.Type != TypeEvent || notice.Event != nil || notice.Error == nil || notice.Error.Code != CodeLimitExceeded ||
-		notice.InstanceID != inst.ID || notice.SessionID != inst.SessionID {
+		notice.InstanceID != inst.ID || notice.SessionID != inst.SessionID || notice.Position == nil || *notice.Position != position {
 		t.Fatalf("oversized event notice = %+v (error %v)", notice, notice.Error)
 	}
 	mustSend(t, w.link, Frame{Type: TypeEvent, Event: json.RawMessage(`{"type":"next"}`)})
@@ -823,7 +975,7 @@ func TestWorkerQueueOverflowReportsLostLink(t *testing.T) {
 	co.dropWorker(w)
 	for range maxQueuedFrames - 1 {
 		f := readFrame(t, clientReader)
-		if f.Error == nil || f.Error.Code != CodeUnavailable || !strings.Contains(f.Error.Message, "outcome unknown") {
+		if f.Error == nil || f.Error.Code != CodeOutcomeUnknown || !strings.Contains(f.Error.Message, "outcome unknown") {
 			t.Fatalf("pending reply = %+v (error %v)", f, f.Error)
 		}
 	}

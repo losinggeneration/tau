@@ -31,12 +31,15 @@ var shutdownCommand = json.RawMessage(`{"type":"shutdown"}`)
 
 // LaunchRequest describes a worker the coordinator expects to register.
 // The worker must Dial with role worker, Token, and an Instance whose ID is
-// InstanceID.
+// InstanceID. LaunchRequestID, when set, is the requesting client's
+// correlation ID; the launcher passes it to the worker, whose hello may echo
+// it, so the instance can later be matched to the start request.
 type LaunchRequest struct {
-	InstanceID string
-	Token      string
-	CWD        string
-	Ready      <-chan struct{}
+	InstanceID      string
+	LaunchRequestID string
+	Token           string
+	CWD             string
+	Ready           <-chan struct{}
 }
 
 // LaunchFunc starts a detached worker for a request. It may wait for Ready
@@ -100,8 +103,9 @@ type pendingRef struct {
 }
 
 type route struct {
-	client    *client
-	requestID string
+	client        *client
+	requestID     string
+	correlationID string
 }
 
 type worker struct {
@@ -113,6 +117,7 @@ type worker struct {
 type pendingLaunch struct {
 	token      string
 	cwd        string
+	requestID  string
 	ready      chan Instance
 	registered chan struct{}
 }
@@ -312,7 +317,8 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 	if co.workers[inst.ID] != nil {
 		return nil, &Error{Code: CodeConflict, Message: "instance already registered"}
 	}
-	if inst.NodeID == "" || inst.SessionID == "" || inst.CWD != pl.cwd {
+	if inst.NodeID == "" || inst.SessionID == "" || inst.CWD != pl.cwd ||
+		(inst.LaunchRequestID != "" && inst.LaunchRequestID != pl.requestID) {
 		return nil, &Error{Code: CodeConflict, Message: "worker readiness metadata does not match launch"}
 	}
 	for _, existing := range co.workers {
@@ -326,6 +332,9 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 	}
 
 	record := *inst
+	// The coordinator retained the launch correlation; never take the
+	// worker's word for it.
+	record.LaunchRequestID = pl.requestID
 	if record.CWD == "" {
 		record.CWD = pl.cwd
 	}
@@ -361,10 +370,11 @@ func (co *coordinator) dropWorker(w *worker) {
 		return
 	}
 	delete(co.workers, id)
-	unavailable := &Error{Code: CodeUnavailable, Message: "worker link lost; command outcome unknown"}
+	// Routed commands were queued for the worker and may have run.
+	unknown := &Error{Code: CodeOutcomeUnknown, Message: "worker link lost after routing; command outcome unknown"}
 	for _, r := range w.routes {
 		delete(r.client.pending, r.requestID)
-		send(r.client.link, Frame{Type: TypeResponse, ID: r.requestID, InstanceID: id, Error: unavailable})
+		send(r.client.link, Frame{Type: TypeResponse, ID: r.requestID, RequestID: r.correlationID, InstanceID: id, Error: unknown})
 	}
 	clear(w.routes)
 	message := "worker link closed; the worker may still be running"
@@ -387,6 +397,11 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 	defer co.mu.Unlock()
 	if f.ID == "" {
 		replyError(c, f, CodeInvalidFrame, "id required")
+		return
+	}
+	if f.RequestID != "" && !ValidRequestID(f.RequestID) {
+		f.RequestID = ""
+		replyError(c, f, CodeInvalidFrame, "request_id must be a random UUID")
 		return
 	}
 	if _, duplicate := c.pending[f.ID]; duplicate {
@@ -457,7 +472,7 @@ func (co *coordinator) startInstance(c *client, f Frame) {
 	id := uuid.NewString()
 	co.validating++
 	c.pending[f.ID] = pendingRef{instanceID: id}
-	co.wg.Go(func() { co.runLaunch(c, f.ID, id, f.CWD) })
+	co.wg.Go(func() { co.runLaunch(c, f, id) })
 }
 
 // projectDir validates dir off the coordinator lock. The caller holds a
@@ -482,9 +497,11 @@ func (co *coordinator) projectDir(dir string) (string, error) {
 	}
 }
 
-func (co *coordinator) runLaunch(c *client, requestID, id, dir string) {
+func (co *coordinator) runLaunch(c *client, f Frame, id string) {
+	requestID := f.ID
 	ref := pendingRef{instanceID: id}
-	cwd, err := co.projectDir(dir)
+	cwd, err := co.projectDir(f.CWD)
+	reply := Frame{ID: requestID, RequestID: f.RequestID}
 
 	co.mu.Lock()
 	co.validating--
@@ -494,17 +511,17 @@ func (co *coordinator) runLaunch(c *client, requestID, id, dir string) {
 	}
 	if co.ctx.Err() != nil {
 		delete(c.pending, requestID)
-		replyError(c, Frame{ID: requestID}, CodeUnavailable, "coordinator is shutting down")
+		replyError(c, reply, CodeUnavailable, "coordinator is shutting down")
 		co.mu.Unlock()
 		return
 	}
 	if err != nil {
 		delete(c.pending, requestID)
-		replyError(c, Frame{ID: requestID}, CodeInvalidFrame, boundedText(err.Error()))
+		replyError(c, reply, CodeInvalidFrame, boundedText(err.Error()))
 		co.mu.Unlock()
 		return
 	}
-	pl := &pendingLaunch{token: rand.Text(), cwd: cwd, ready: make(chan Instance, 1), registered: make(chan struct{})}
+	pl := &pendingLaunch{token: rand.Text(), cwd: cwd, requestID: f.RequestID, ready: make(chan Instance, 1), registered: make(chan struct{})}
 	co.launches[id] = pl
 	co.mu.Unlock()
 
@@ -518,10 +535,10 @@ func (co *coordinator) runLaunch(c *client, requestID, id, dir string) {
 	delete(c.pending, requestID)
 	if err != nil {
 		msg := boundedText(strings.ReplaceAll(err.Error(), pl.token, "[redacted]"))
-		send(c.link, Frame{Type: TypeResponse, ID: requestID, InstanceID: id, Error: &Error{Code: CodeLaunchFailed, Message: msg}})
+		send(c.link, Frame{Type: TypeResponse, ID: requestID, RequestID: f.RequestID, InstanceID: id, Error: &Error{Code: CodeLaunchFailed, Message: msg}})
 		return
 	}
-	send(c.link, Frame{Type: TypeResponse, ID: requestID, InstanceID: id, SessionID: inst.SessionID, Instance: &inst})
+	send(c.link, Frame{Type: TypeResponse, ID: requestID, RequestID: f.RequestID, InstanceID: id, SessionID: inst.SessionID, Instance: &inst})
 }
 
 // superviseLaunch runs the launcher and decides its outcome under co.mu.
@@ -534,7 +551,7 @@ func (co *coordinator) superviseLaunch(id string, pl *pendingLaunch) (Instance, 
 	defer cancel()
 	launched := make(chan error, 1)
 	co.wg.Go(func() {
-		launched <- co.launch(ctx, LaunchRequest{InstanceID: id, Token: pl.token, CWD: pl.cwd, Ready: pl.registered})
+		launched <- co.launch(ctx, LaunchRequest{InstanceID: id, LaunchRequestID: pl.requestID, Token: pl.token, CWD: pl.cwd, Ready: pl.registered})
 	})
 	timer := time.NewTimer(co.launchTimeout)
 	defer timer.Stop()
@@ -579,7 +596,11 @@ func (co *coordinator) superviseLaunch(id string, pl *pendingLaunch) (Instance, 
 }
 
 // forward routes a targeted command under a fresh route ID so client request
-// IDs never reach workers and cannot collide across clients.
+// IDs never reach workers and cannot collide across clients. The worker sees
+// the authenticated client identity, the explicit target, and the client's
+// correlation ID, which identifies the request but authorizes nothing. A
+// failed enqueue is definitive non-delivery; once queued, a lost link makes
+// the outcome unknown.
 func (co *coordinator) forward(c *client, f Frame, cmd json.RawMessage) {
 	if f.InstanceID == "" {
 		replyError(c, f, CodeInvalidFrame, "instance_id required")
@@ -601,6 +622,7 @@ func (co *coordinator) forward(c *client, f Frame, cmd json.RawMessage) {
 		InstanceID: w.instance.ID,
 		SessionID:  w.instance.SessionID,
 		ClientID:   c.identity,
+		RequestID:  f.RequestID,
 		Command:    cmd,
 	})
 	if err != nil {
@@ -611,7 +633,7 @@ func (co *coordinator) forward(c *client, f Frame, cmd json.RawMessage) {
 		replyError(c, f, code, "command not delivered")
 		return
 	}
-	w.routes[routeID] = route{client: c, requestID: f.ID}
+	w.routes[routeID] = route{client: c, requestID: f.ID, correlationID: f.RequestID}
 	c.pending[f.ID] = pendingRef{instanceID: w.instance.ID, routeID: routeID}
 }
 
@@ -627,7 +649,7 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 		}
 		delete(w.routes, f.ID)
 		delete(r.client.pending, r.requestID)
-		send(r.client.link, Frame{Type: TypeResponse, ID: r.requestID, InstanceID: id, Result: f.Result, Error: f.Error})
+		send(r.client.link, Frame{Type: TypeResponse, ID: r.requestID, RequestID: r.correlationID, InstanceID: id, Result: f.Result, Error: f.Error})
 	case TypeEvent:
 		if !isObject(f.Event) {
 			send(w.link, Frame{Type: TypeResponse, ID: f.ID, Error: &Error{Code: CodeInvalidFrame, Message: "event object required"}})
@@ -636,7 +658,7 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 		// A worker labels events from a newly switched session before its
 		// register update arrives, so its own session ID wins.
 		session := cmp.Or(f.SessionID, w.instance.SessionID)
-		co.broadcast(Frame{Type: TypeEvent, InstanceID: id, SessionID: session, Event: f.Event})
+		co.broadcast(Frame{Type: TypeEvent, InstanceID: id, SessionID: session, Position: f.Position, Event: f.Event})
 	case TypeRegister:
 		if f.Instance == nil || f.Instance.ID != id {
 			send(w.link, Frame{Type: TypeResponse, ID: f.ID, Error: &Error{Code: CodeConflict, Message: "instance mismatch"}})
@@ -695,7 +717,7 @@ func admit(c *client, requestID string) *Error {
 }
 
 func replyError(c *client, f Frame, code, msg string) {
-	send(c.link, Frame{Type: TypeResponse, ID: f.ID, InstanceID: f.InstanceID, Error: &Error{Code: code, Message: msg}})
+	send(c.link, Frame{Type: TypeResponse, ID: f.ID, RequestID: f.RequestID, InstanceID: f.InstanceID, Error: &Error{Code: code, Message: msg}})
 }
 
 // send queues f on link. A frame that outgrew MaxFrameBytes in transit, such
@@ -716,8 +738,10 @@ func encodeOrLimit(f Frame) ([]byte, error) {
 	return encodeFrame(Frame{
 		Type:       f.Type,
 		ID:         f.ID,
+		RequestID:  f.RequestID,
 		InstanceID: f.InstanceID,
 		SessionID:  f.SessionID,
+		Position:   f.Position,
 		Error:      &Error{Code: CodeLimitExceeded, Message: f.Type + " exceeds frame limit"},
 	})
 }

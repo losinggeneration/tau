@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -61,8 +63,11 @@ const (
 	CodeLimitExceeded      = "limit_exceeded"
 	CodeLaunchFailed       = "launch_failed"
 	CodeUnavailable        = "unavailable"
+	CodeOutcomeUnknown     = "outcome_unknown"
+	CodeResyncRequired     = "resync_required"
 	CodeWorkerLinkLost     = "worker_link_lost"
 	CodeConflict           = "conflict"
+	CodeBusy               = "busy"
 	// CodeLegacyProtocol answers a legacy RPC command sent in place of hello.
 	CodeLegacyProtocol = "unsupported_protocol"
 )
@@ -80,10 +85,18 @@ var (
 	ErrFrameTooLarge = errors.New("frame too large")
 )
 
+// ValidRequestID reports whether id is a canonical UUIDv4. It grants no authority.
+func ValidRequestID(id string) bool {
+	parsed, err := uuid.Parse(id)
+	return err == nil && parsed.Version() == 4 && parsed.Variant() == uuid.RFC4122 && parsed.String() == id
+}
+
 // Frame is one JSONL message exchanged with the coordinator.
 type Frame struct {
 	Type       string          `json:"type"`
 	ID         string          `json:"id,omitempty"`
+	RequestID  string          `json:"request_id,omitempty"`
+	Position   *Position       `json:"position,omitempty"`
 	Version    int             `json:"version,omitempty"`
 	Role       string          `json:"role,omitempty"`
 	Generation string          `json:"generation,omitempty"`
@@ -100,6 +113,14 @@ type Frame struct {
 	Instances  []Instance      `json:"instances,omitempty"`
 	Operations []string        `json:"operations,omitempty"`
 	Limits     *Limits         `json:"limits,omitempty"`
+}
+
+// Position identifies a point in one worker's event stream. Offset zero is
+// the position before the first event, not a missing position.
+type Position struct {
+	InstanceID string `json:"instance_id"`
+	Epoch      string `json:"epoch"`
+	Offset     uint64 `json:"offset"`
 }
 
 // Limits describes the coordinator's negotiated resource budgets.
@@ -135,13 +156,14 @@ func (e *Error) Error() string {
 
 // Instance summarizes one registered worker.
 type Instance struct {
-	ID            string `json:"instance_id"`
-	NodeID        string `json:"node_id,omitempty"`
-	CWD           string `json:"cwd,omitempty"`
-	SessionID     string `json:"session_id,omitempty"`
-	State         string `json:"state,omitempty"`
-	PID           int    `json:"pid,omitempty"`
-	PendingInputs int    `json:"pending_inputs,omitempty"`
+	ID              string `json:"instance_id"`
+	NodeID          string `json:"node_id,omitempty"`
+	CWD             string `json:"cwd,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	State           string `json:"state,omitempty"`
+	PID             int    `json:"pid,omitempty"`
+	PendingInputs   int    `json:"pending_inputs,omitempty"`
+	LaunchRequestID string `json:"launch_request_id,omitempty"`
 }
 
 func decodeFrame(line []byte) (Frame, error) {
@@ -206,10 +228,13 @@ func (f *Frame) validate() error {
 	if !isFrameType(f.Type) {
 		return fmt.Errorf("%w: unknown type %.32q", ErrInvalidFrame, f.Type)
 	}
-	for _, s := range []string{f.ID, f.Role, f.Generation, f.InstanceID, f.SessionID, f.ClientID, f.Token} {
+	for _, s := range []string{f.ID, f.Role, f.Generation, f.InstanceID, f.SessionID, f.ClientID, f.Token, f.RequestID} {
 		if len(s) > maxIDBytes {
 			return fmt.Errorf("%w: identifier exceeds %d bytes", ErrInvalidFrame, maxIDBytes)
 		}
+	}
+	if f.Position != nil && (len(f.Position.InstanceID) > maxIDBytes || len(f.Position.Epoch) > maxIDBytes) {
+		return fmt.Errorf("%w: event position exceeds limits", ErrInvalidFrame)
 	}
 	if len(f.CWD) > maxTextBytes {
 		return fmt.Errorf("%w: cwd exceeds %d bytes", ErrInvalidFrame, maxTextBytes)
@@ -245,7 +270,7 @@ func (i *Instance) validate() error {
 	if i.PendingInputs < 0 {
 		return fmt.Errorf("%w: negative pending input count", ErrInvalidFrame)
 	}
-	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State} {
+	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State, i.LaunchRequestID} {
 		if len(s) > maxIDBytes {
 			return fmt.Errorf("%w: instance identifier exceeds %d bytes", ErrInvalidFrame, maxIDBytes)
 		}

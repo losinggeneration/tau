@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/losinggeneration/tau/rpc/coord"
 )
@@ -319,6 +320,58 @@ func TestCoordinatedBridgeClientsShareCoordinator(t *testing.T) {
 	event, raw := relayRead(t, b)
 	if event["type"] != coord.TypeEvent || event["instance_id"] != instance || !strings.Contains(raw, `"delta":"hi"`) {
 		t.Fatalf("subscriber event = %s", raw)
+	}
+}
+
+func TestCoordinatedBridgeRelaysRequestCorrelationWithoutTrust(t *testing.T) {
+	h := startRelay(t)
+	auth := http.Header{"Authorization": {"Bearer " + h.static}}
+	a := h.dial(t, websocket.DefaultDialer, auth)
+	b := h.dial(t, websocket.DefaultDialer, auth)
+	welcomeA, _ := relayRead(t, a)
+	relayRead(t, b)
+
+	launchID := uuid.NewString()
+	relaySend(t, a, `{"type":"start_instance","id":"start","request_id":"`+launchID+`","client_id":"spoof","cwd":"`+h.cwd+`"}`)
+	started := relayResponse(t, a, "start")
+	instance, _ := started["instance_id"].(string)
+	summary, _ := started["instance"].(map[string]any)
+	if started["error"] != nil || started["request_id"] != launchID || summary["launch_request_id"] != launchID || instance == launchID {
+		t.Fatalf("start = %v", started)
+	}
+	w := h.worker(t)
+
+	// Another client of the same user reconciles the launch by its retained ID.
+	relaySend(t, b, `{"type":"list_instances","id":"list"}`)
+	listed, _ := relayResponse(t, b, "list")["instances"].([]any)
+	if len(listed) != 1 {
+		t.Fatalf("listed = %v", listed)
+	}
+	if entry, _ := listed[0].(map[string]any); entry["launch_request_id"] != launchID {
+		t.Fatalf("listed = %v", listed)
+	}
+
+	commandID := uuid.NewString()
+	relaySend(t, a, `{"type":"command","id":"cmd","request_id":"`+commandID+`","client_id":"spoof","instance_id":"`+instance+`","command":{"type":"get_state"}}`)
+	if resp := relayResponse(t, a, "cmd"); resp["error"] != nil || resp["request_id"] != commandID {
+		t.Fatalf("command response = %v", resp)
+	}
+	select {
+	case cmd := <-w.commands:
+		if cmd.RequestID != commandID || cmd.ClientID != welcomeA["client_id"] || cmd.InstanceID != instance {
+			t.Fatalf("worker command = %+v, want request %q from %q", cmd, commandID, welcomeA["client_id"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not receive command")
+	}
+
+	relaySend(t, a, `{"type":"command","id":"long","request_id":"`+strings.Repeat("x", 300)+`","instance_id":"`+instance+`","command":{"type":"get_state"}}`)
+	if resp := relayResponse(t, a, "long"); resp["error"] == nil || resp["request_id"] != nil {
+		t.Fatalf("oversized request id = %v, want rejection", resp)
+	}
+	relaySend(t, a, `{"type":"command","id":"bad","request_id":"not-a-uuid","instance_id":"`+instance+`","command":{"type":"get_state"}}`)
+	if resp := relayResponse(t, a, "bad"); resp["error"] == nil || resp["request_id"] != nil {
+		t.Fatalf("non-UUID request id = %v, want rejection", resp)
 	}
 }
 

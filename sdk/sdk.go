@@ -1095,8 +1095,16 @@ func (s *agentSession) SendCustomMessage(ctx context.Context, custom CustomMessa
 			}
 		case agent.MessageEnd:
 			if e.Message == message {
-				persistenceErr = s.persistMessage(message)
-				s.notify("message_end", map[string]any{"role": "custom", "message": message})
+				var entryID string
+				entryID, persistenceErr = s.persistMessageEntry(message)
+				s.notify("message_end", map[string]any{
+					"role":        "custom",
+					"message":     message,
+					"entry_id":    entryID,
+					"content":     agentMessageText(message),
+					"custom_type": message.CustomType,
+					"display":     message.Display,
+				})
 			}
 		}
 	})
