@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -20,11 +21,13 @@ import (
 )
 
 const (
-	launchTimeout  = 20 * time.Second
-	maxClients     = 64
-	maxWorkers     = 64
-	maxLaunches    = 8
-	maxConnections = maxClients + maxWorkers + 16
+	launchTimeout     = 20 * time.Second
+	maxClients        = 64
+	maxWorkers        = 64
+	maxLaunches       = 8
+	maxConnections    = maxClients + maxWorkers + 16
+	heartbeatInterval = 2 * time.Second
+	heartbeatTimeout  = 8 * time.Second
 )
 
 var shutdownCommand = json.RawMessage(`{"type":"shutdown"}`)
@@ -40,6 +43,9 @@ type LaunchRequest struct {
 	Token           string
 	CWD             string
 	Ready           <-chan struct{}
+	// Lifetime, when set, must be inherited by the child and held open
+	// until process exit. The launcher must not unlock or close this copy.
+	Lifetime *os.File
 }
 
 // LaunchFunc starts a detached worker for a request. It may wait for Ready
@@ -73,14 +79,16 @@ type coordinator struct {
 	launch        LaunchFunc
 	launchTimeout time.Duration
 	generation    string
+	receipts      *receiptStore
 	resolveDir    func(string) (string, error)
 	conns         chan struct{}
 	wg            sync.WaitGroup
 
-	mu       sync.Mutex
-	clients  map[string]*client
-	workers  map[string]*worker
-	launches map[string]*pendingLaunch
+	mu          sync.Mutex
+	clients     map[string]*client
+	workers     map[string]*worker
+	launches    map[string]*pendingLaunch
+	startingIDs map[string]struct{}
 	// validating counts starts whose directory check holds a launch slot.
 	validating int
 	stopping   int
@@ -109,9 +117,13 @@ type route struct {
 }
 
 type worker struct {
-	instance Instance
-	link     *Link
-	routes   map[string]route
+	instance  Instance
+	link      *Link
+	routes    map[string]route
+	tokenHash [sha256.Size]byte
+	epoch     string
+	receiptID string
+	lastPong  time.Time
 }
 
 type pendingLaunch struct {
@@ -120,6 +132,7 @@ type pendingLaunch struct {
 	requestID  string
 	ready      chan Instance
 	registered chan struct{}
+	lifetime   *os.File
 }
 
 // Run owns the coordinator endpoint at path until ctx is canceled. It returns
@@ -129,7 +142,24 @@ func Run(ctx context.Context, path string, launch LaunchFunc) error {
 	return run(ctx, path, launch, launchTimeout)
 }
 
-func run(ctx context.Context, path string, launch LaunchFunc, timeout time.Duration) (err error) {
+// RunRecoverable is Run with private launch receipts in a persistent directory
+// dedicated to path. Its parent must already exist.
+// The launcher must honor LaunchRequest.Lifetime for restart recovery. New
+// correlated launches require a UUIDv7 issued in the last 24 hours (up to
+// five minutes of future clock skew is allowed). Live receipts do not expire.
+// The endpoint accepts at most 4096 retained receipts.
+func RunRecoverable(ctx context.Context, path, receiptDir string, launch LaunchFunc) error {
+	if !filepath.IsAbs(receiptDir) {
+		return errors.New("recoverable coordinator requires an absolute receipt directory")
+	}
+	return runWithReceipts(ctx, path, launch, launchTimeout, receiptDir)
+}
+
+func run(ctx context.Context, path string, launch LaunchFunc, timeout time.Duration) error {
+	return runWithReceipts(ctx, path, launch, timeout, "")
+}
+
+func runWithReceipts(ctx context.Context, path string, launch LaunchFunc, timeout time.Duration, receiptDir string) (err error) {
 	if launch == nil {
 		return errors.New("coordinator: launch function required")
 	}
@@ -143,20 +173,33 @@ func run(ctx context.Context, path string, launch LaunchFunc, timeout time.Durat
 		}
 	}()
 
+	var receipts *receiptStore
+	if receiptDir != "" {
+		receipts, err = openReceiptStore(receiptDir)
+		if err != nil {
+			return fmt.Errorf("initialize launch receipts: %w", err)
+		}
+		if _, err := receipts.prune(time.Now()); err != nil {
+			return fmt.Errorf("initialize launch receipts: %w", err)
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	co := &coordinator{
 		ctx:           ctx,
 		launch:        launch,
 		launchTimeout: timeout,
 		generation:    uuid.NewString(),
+		receipts:      receipts,
 		resolveDir:    resolveProjectDir,
 		conns:         make(chan struct{}, maxConnections),
 		clients:       make(map[string]*client),
 		workers:       make(map[string]*worker),
 		launches:      make(map[string]*pendingLaunch),
+		startingIDs:   make(map[string]struct{}),
 	}
 	defer co.wg.Wait()
 	defer cancel()
+	co.wg.Go(co.monitorWorkers)
 	stop := context.AfterFunc(ctx, ep.closeListener)
 	defer stop()
 
@@ -271,7 +314,11 @@ func (co *coordinator) serveClient(link *Link, identity string) {
 		subs:     make(map[string]struct{}),
 	}
 	co.clients[c.id] = c
-	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleClient, Generation: co.generation, ClientID: c.identity, Operations: []string{TypeListInstances, TypeWatchInstances, TypeUnwatchInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance}, Limits: protocolLimits()})
+	launchVersion := 4
+	if co.receipts != nil {
+		launchVersion = 7
+	}
+	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleClient, LaunchRequestVersion: launchVersion, Generation: co.generation, PID: os.Getpid(), ClientID: c.identity, Operations: []string{TypeListInstances, TypeWatchInstances, TypeUnwatchInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance}, Limits: protocolLimits()})
 	co.mu.Unlock()
 	defer co.dropClient(c)
 
@@ -301,52 +348,121 @@ func (co *coordinator) serveWorker(link *Link, hello Frame) {
 	}
 }
 
-// register accepts a worker only against the token issued for its launch.
-// Tokens are single use, so a second claimant for the same instance fails.
+// receiptKey uses the launch intent when supplied. A legacy start without
+// a request ID still needs its own receipt to authenticate worker recovery.
+func receiptKey(instance, request string) string {
+	if request != "" {
+		return "r-" + request
+	}
+	return "i-" + instance
+}
+
 func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
-	co.mu.Lock()
-	defer co.mu.Unlock()
 	inst := hello.Instance
 	if inst == nil || inst.ID == "" || hello.Token == "" {
 		return nil, &Error{Code: CodeUnauthorized, Message: "worker hello requires instance and token"}
 	}
-	pl := co.launches[inst.ID]
-	if pl == nil || subtle.ConstantTimeCompare([]byte(pl.token), []byte(hello.Token)) != 1 {
+	hash := sha256.Sum256([]byte(hello.Token))
+	var epoch string
+	if p := hello.Position; p != nil && p.InstanceID == inst.ID {
+		epoch = p.Epoch
+	}
+	key := receiptKey(inst.ID, inst.LaunchRequestID)
+	var recoverable bool
+	if co.receipts != nil && ValidLaunchRequestID(cmp.Or(inst.LaunchRequestID, inst.ID)) {
+		// Prevent pruning from racing the receipt lookup/exit check and registry insertion.
+		co.receipts.mu.RLock()
+		defer co.receipts.mu.RUnlock()
+		r, err := co.receipts.read(key)
+		if errors.Is(err, os.ErrNotExist) && ValidRequestID(cmp.Or(inst.LaunchRequestID, inst.ID)) {
+			key = cmp.Or(inst.LaunchRequestID, inst.ID)
+			r, err = co.receipts.read(key)
+		}
+		if err == nil && r.Generation != co.generation && r.InstanceID == inst.ID && r.CWD == inst.CWD &&
+			subtle.ConstantTimeCompare(hash[:], r.TokenHash[:]) == 1 {
+			if exited, err := co.receipts.exited(key); err == nil && !exited {
+				recoverable = true
+			}
+		}
+	}
+
+	co.mu.Lock()
+	defer co.mu.Unlock()
+	pl, existing := co.launches[inst.ID], co.workers[inst.ID]
+	var requestID string
+	switch {
+	case existing != nil:
+		if subtle.ConstantTimeCompare(hash[:], existing.tokenHash[:]) != 1 || existing.epoch == "" || epoch != existing.epoch {
+			return nil, &Error{Code: CodeUnauthorized, Message: "unknown worker identity"}
+		}
+		if existing.link != nil || existing.instance.LinkState == LinkExited || inst.PID != existing.instance.PID ||
+			inst.NodeID != existing.instance.NodeID || inst.CWD != existing.instance.CWD || inst.LaunchRequestID != existing.instance.LaunchRequestID {
+			return nil, &Error{Code: CodeConflict, Message: "instance identity conflict"}
+		}
+		requestID = inst.LaunchRequestID
+	case pl != nil:
+		if subtle.ConstantTimeCompare([]byte(pl.token), []byte(hello.Token)) != 1 {
+			return nil, &Error{Code: CodeUnauthorized, Message: "unknown instance or token"}
+		}
+		if inst.CWD != pl.cwd || (inst.LaunchRequestID != "" && inst.LaunchRequestID != pl.requestID) {
+			return nil, &Error{Code: CodeConflict, Message: "worker readiness metadata does not match launch"}
+		}
+		requestID = pl.requestID
+	case recoverable && epoch != "" && inst.PID > 0:
+		if len(co.workers)+len(co.launches)+co.validating >= maxWorkers && !co.evictExited() {
+			return nil, &Error{Code: CodeLimitExceeded, Message: "too many instances"}
+		}
+		requestID = inst.LaunchRequestID
+	default:
 		return nil, &Error{Code: CodeUnauthorized, Message: "unknown instance or token"}
 	}
-	if co.workers[inst.ID] != nil {
-		return nil, &Error{Code: CodeConflict, Message: "instance already registered"}
+	if inst.NodeID == "" || inst.SessionID == "" || (co.receipts != nil && (epoch == "" || inst.PID <= 0)) {
+		return nil, &Error{Code: CodeConflict, Message: "worker readiness metadata is incomplete"}
 	}
-	if inst.NodeID == "" || inst.SessionID == "" || inst.CWD != pl.cwd ||
-		(inst.LaunchRequestID != "" && inst.LaunchRequestID != pl.requestID) {
-		return nil, &Error{Code: CodeConflict, Message: "worker readiness metadata does not match launch"}
-	}
-	for _, existing := range co.workers {
-		if existing.instance.NodeID == inst.NodeID && existing.instance.SessionID == inst.SessionID {
+	for id, w := range co.workers {
+		if id != inst.ID && w.instance.LinkState != LinkExited && w.instance.NodeID == inst.NodeID && w.instance.SessionID == inst.SessionID {
 			return nil, &Error{Code: CodeConflict, Message: "session already owned by a worker"}
 		}
 	}
-	delete(co.launches, inst.ID)
-	if pl.registered != nil {
-		close(pl.registered)
-	}
-
 	record := *inst
-	// The coordinator retained the launch correlation; never take the
-	// worker's word for it.
-	record.LaunchRequestID = pl.requestID
-	if record.CWD == "" {
-		record.CWD = pl.cwd
-	}
+	record.LaunchRequestID = requestID
+	record.LinkState = LinkConnected
 	if record.State == "" {
 		record.State = StateReady
 	}
-	w := &worker{instance: record, link: link, routes: make(map[string]route)}
+	w := &worker{instance: record, link: link, routes: make(map[string]route), tokenHash: hash, epoch: epoch}
+	if co.receipts != nil {
+		w.receiptID = receiptKey(record.ID, requestID)
+		switch {
+		case existing != nil:
+			w.receiptID = existing.receiptID
+		case pl == nil:
+			w.receiptID = key
+		}
+		w.lastPong = time.Now()
+	}
 	co.workers[record.ID] = w
 	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleWorker, Generation: co.generation, InstanceID: record.ID, Instance: &record, Operations: []string{TypeCommand, TypeRegister, TypeEvent, TypeResponse}, Limits: protocolLimits()})
 	co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: record.ID, SessionID: record.SessionID, Instance: &record})
-	pl.ready <- record
+	if pl != nil {
+		delete(co.launches, record.ID)
+		if pl.registered != nil {
+			close(pl.registered)
+		}
+		pl.ready <- record
+	}
 	return w, nil
+}
+
+func (co *coordinator) evictExited() bool {
+	for id, w := range co.workers {
+		if w.instance.LinkState == LinkExited && w.link == nil {
+			delete(co.workers, id)
+			co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: id, Error: &Error{Code: CodeNotFound, Message: "exited worker removed from registry"}})
+			return true
+		}
+	}
+	return false
 }
 
 func (co *coordinator) dropClient(c *client) {
@@ -369,7 +485,14 @@ func (co *coordinator) dropWorker(w *worker) {
 	if co.workers[id] != w {
 		return
 	}
-	delete(co.workers, id)
+	link := w.link
+	w.link = nil
+	if co.receipts == nil {
+		delete(co.workers, id)
+	}
+	if w.instance.LinkState != LinkExited {
+		w.instance.LinkState = LinkDisconnected
+	}
 	// Routed commands were queued for the worker and may have run.
 	unknown := &Error{Code: CodeOutcomeUnknown, Message: "worker link lost after routing; command outcome unknown"}
 	for _, r := range w.routes {
@@ -378,18 +501,100 @@ func (co *coordinator) dropWorker(w *worker) {
 	}
 	clear(w.routes)
 	message := "worker link closed; the worker may still be running"
-	if errors.Is(w.link.Err(), ErrSlowConsumer) {
+	if w.instance.LinkState == LinkExited {
+		message = "worker exited"
+	} else if errors.Is(link.Err(), ErrSlowConsumer) {
 		message = "worker link closed: outbound queue full; the worker may still be running"
 	}
 	lost := Frame{Type: TypeInstanceUpdate, InstanceID: id, SessionID: w.instance.SessionID, Error: &Error{
 		Code: CodeWorkerLinkLost, Message: message,
 	}}
+	if co.receipts != nil {
+		inst := w.instance
+		lost.Instance = &inst
+	}
 	co.broadcast(lost)
 	lost.Type = TypeEvent
 	co.broadcast(lost)
 	for _, c := range co.clients {
 		delete(c.subs, id)
 	}
+}
+
+// monitorWorkers probes the transport, not the agent. A pending approval or
+// idle session still responds. A closed socket alone never proves exit.
+func (co *coordinator) monitorWorkers() {
+	if co.receipts == nil {
+		return
+	}
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	prune := time.NewTicker(time.Minute)
+	defer prune.Stop()
+	for {
+		select {
+		case <-co.ctx.Done():
+			return
+		case now := <-ticker.C:
+			co.checkWorkers(now)
+		case now := <-prune.C:
+			removed, err := co.receipts.prune(now)
+			if err != nil {
+				logf("prune launch receipts: %v", err)
+			}
+			co.mu.Lock()
+			for _, w := range co.workers {
+				if _, ok := removed[w.receiptID]; ok {
+					co.markExited(w)
+				}
+			}
+			co.mu.Unlock()
+		}
+	}
+}
+
+func (co *coordinator) checkWorkers(now time.Time) {
+	type suspect struct{ id, receipt string }
+	var disconnected []suspect
+	co.mu.Lock()
+	for id, w := range co.workers {
+		switch {
+		case w.link != nil:
+			if now.Sub(w.lastPong) >= heartbeatTimeout {
+				w.link.fail(errors.New("worker heartbeat timed out"))
+			} else {
+				send(w.link, Frame{Type: TypePing})
+			}
+		case w.instance.LinkState == LinkDisconnected:
+			disconnected = append(disconnected, suspect{id, w.receiptID})
+		}
+	}
+	co.mu.Unlock()
+	for _, worker := range disconnected {
+		exited, err := co.receipts.exited(worker.receipt)
+		if err != nil || !exited {
+			continue
+		}
+		co.mu.Lock()
+		if w := co.workers[worker.id]; w != nil {
+			co.markExited(w)
+		}
+		co.mu.Unlock()
+	}
+}
+
+// markExited requires co.mu and proof that the worker released its lifetime lock.
+func (co *coordinator) markExited(w *worker) {
+	if w.instance.LinkState == LinkExited {
+		return
+	}
+	w.instance.LinkState = LinkExited
+	if w.link != nil {
+		w.link.fail(errors.New("worker exited"))
+		return // dropWorker publishes the exit after draining the routes.
+	}
+	inst := w.instance
+	co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: inst.ID, SessionID: inst.SessionID, Instance: &inst})
 }
 
 func (co *coordinator) handleClient(c *client, f Frame) {
@@ -399,9 +604,9 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 		replyError(c, f, CodeInvalidFrame, "id required")
 		return
 	}
-	if f.RequestID != "" && !ValidRequestID(f.RequestID) {
+	if f.RequestID != "" && !ValidOperationRequestID(f.Type, f.RequestID) {
 		f.RequestID = ""
-		replyError(c, f, CodeInvalidFrame, "request_id must be a random UUID")
+		replyError(c, f, CodeInvalidFrame, "invalid request_id for operation")
 		return
 	}
 	if _, duplicate := c.pending[f.ID]; duplicate {
@@ -410,10 +615,10 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 	}
 	switch f.Type {
 	case TypeListInstances:
-		send(c.link, Frame{Type: TypeResponse, ID: f.ID, Instances: co.instances()})
+		send(c.link, Frame{Type: TypeResponse, ID: f.ID, Generation: co.generation, Instances: co.instances()})
 	case TypeWatchInstances:
 		c.watching = true
-		send(c.link, Frame{Type: TypeResponse, ID: f.ID, Instances: co.instances()})
+		send(c.link, Frame{Type: TypeResponse, ID: f.ID, Generation: co.generation, Instances: co.instances()})
 	case TypeUnwatchInstances:
 		c.watching = false
 		send(c.link, Frame{Type: TypeResponse, ID: f.ID})
@@ -423,6 +628,10 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 		w := co.workers[f.InstanceID]
 		if w == nil {
 			replyError(c, f, CodeNotFound, "instance not found")
+			return
+		}
+		if w.link == nil {
+			replyError(c, f, CodeUnavailable, "worker is not connected")
 			return
 		}
 		c.subs[f.InstanceID] = struct{}{}
@@ -464,15 +673,43 @@ func (co *coordinator) startInstance(c *client, f Frame) {
 		send(c.link, Frame{Type: TypeResponse, ID: f.ID, Error: e})
 		return
 	}
+	if f.RequestID != "" {
+		if _, ok := co.startingIDs[f.RequestID]; ok {
+			replyError(c, f, CodeOutcomeUnknown, "launch intent already in progress; check the registry")
+			return
+		}
+		for _, w := range co.workers {
+			if w.instance.LaunchRequestID == f.RequestID {
+				co.reconcileLaunch(c, f, w)
+				return
+			}
+		}
+	}
 	starting := len(co.launches) + co.validating + co.stopping
-	if starting >= maxLaunches || len(co.workers)+starting >= maxWorkers {
+	if starting >= maxLaunches || (len(co.workers)+starting >= maxWorkers && !co.evictExited()) {
 		replyError(c, f, CodeLimitExceeded, "too many instances")
 		return
 	}
 	id := uuid.NewString()
+	if co.receipts != nil && f.RequestID == "" {
+		id = uuid.Must(uuid.NewV7()).String()
+	}
+	if f.RequestID != "" {
+		co.startingIDs[f.RequestID] = struct{}{}
+	}
 	co.validating++
 	c.pending[f.ID] = pendingRef{instanceID: id}
 	co.wg.Go(func() { co.runLaunch(c, f, id) })
+}
+
+// An existing intent identifies one worker; resolving cwd is only for a new launch.
+func (co *coordinator) reconcileLaunch(c *client, f Frame, w *worker) {
+	if w.link == nil || w.instance.LinkState == LinkExited {
+		replyError(c, f, CodeOutcomeUnknown, "launch intent already recorded; no running worker has confirmed its outcome")
+		return
+	}
+	inst := w.instance
+	send(c.link, Frame{Type: TypeResponse, ID: f.ID, RequestID: f.RequestID, InstanceID: inst.ID, SessionID: inst.SessionID, Instance: &inst})
 }
 
 // projectDir validates dir off the coordinator lock. The caller holds a
@@ -498,9 +735,22 @@ func (co *coordinator) projectDir(dir string) (string, error) {
 }
 
 func (co *coordinator) runLaunch(c *client, f Frame, id string) {
+	defer func() {
+		co.mu.Lock()
+		delete(co.startingIDs, f.RequestID)
+		co.mu.Unlock()
+	}()
 	requestID := f.ID
 	ref := pendingRef{instanceID: id}
-	cwd, err := co.projectDir(f.CWD)
+	var receiptErr error
+	if co.receipts != nil {
+		receiptErr = co.receipts.check(receiptKey(id, f.RequestID), time.Now())
+	}
+	var cwd string
+	var err error
+	if receiptErr == nil {
+		cwd, err = co.projectDir(f.CWD)
+	}
 	reply := Frame{ID: requestID, RequestID: f.RequestID}
 
 	co.mu.Lock()
@@ -515,6 +765,12 @@ func (co *coordinator) runLaunch(c *client, f Frame, id string) {
 		co.mu.Unlock()
 		return
 	}
+	if receiptErr != nil {
+		delete(c.pending, requestID)
+		co.replyReceiptError(c, f, receiptErr)
+		co.mu.Unlock()
+		return
+	}
 	if err != nil {
 		delete(c.pending, requestID)
 		replyError(c, reply, CodeInvalidFrame, boundedText(err.Error()))
@@ -525,20 +781,57 @@ func (co *coordinator) runLaunch(c *client, f Frame, id string) {
 	co.launches[id] = pl
 	co.mu.Unlock()
 
-	inst, err := co.superviseLaunch(id, pl)
+	var inst Instance
+	if co.receipts != nil {
+		pl.lifetime, receiptErr = co.receipts.create(receiptKey(id, f.RequestID), launchReceipt{
+			InstanceID: id, CWD: cwd, Generation: co.generation, TokenHash: sha256.Sum256([]byte(pl.token)),
+		})
+	}
+	if receiptErr == nil {
+		inst, err = co.superviseLaunch(id, pl)
+	}
 
 	co.mu.Lock()
 	defer co.mu.Unlock()
+	if co.launches[id] == pl {
+		delete(co.launches, id)
+	}
 	if c.pending[requestID] != ref {
 		return
 	}
 	delete(c.pending, requestID)
+	if receiptErr != nil {
+		co.replyReceiptError(c, f, receiptErr)
+		return
+	}
 	if err != nil {
 		msg := boundedText(strings.ReplaceAll(err.Error(), pl.token, "[redacted]"))
 		send(c.link, Frame{Type: TypeResponse, ID: requestID, RequestID: f.RequestID, InstanceID: id, Error: &Error{Code: CodeLaunchFailed, Message: msg}})
 		return
 	}
 	send(c.link, Frame{Type: TypeResponse, ID: requestID, RequestID: f.RequestID, InstanceID: id, SessionID: inst.SessionID, Instance: &inst})
+}
+
+func (co *coordinator) replyReceiptError(c *client, f Frame, err error) {
+	switch {
+	case errors.Is(err, os.ErrExist), errors.Is(err, errExpiredLaunchIntent):
+		// Registration may have completed while the receipt was being checked.
+		if f.RequestID != "" {
+			for _, w := range co.workers {
+				if w.instance.LaunchRequestID == f.RequestID {
+					co.reconcileLaunch(c, f, w)
+					return
+				}
+			}
+		}
+		replyError(c, f, CodeOutcomeUnknown, "launch intent was recorded or is outside the receipt window; check the registry")
+	case errors.Is(err, errFutureLaunchIntent), errors.Is(err, errLegacyLaunchIntent):
+		replyError(c, f, CodeInvalidFrame, err.Error())
+	case errors.Is(err, errReceiptLimit):
+		replyError(c, f, CodeLimitExceeded, err.Error())
+	default:
+		replyError(c, f, CodeLaunchFailed, boundedText(err.Error()))
+	}
 }
 
 // superviseLaunch runs the launcher and decides its outcome under co.mu.
@@ -551,7 +844,11 @@ func (co *coordinator) superviseLaunch(id string, pl *pendingLaunch) (Instance, 
 	defer cancel()
 	launched := make(chan error, 1)
 	co.wg.Go(func() {
-		launched <- co.launch(ctx, LaunchRequest{InstanceID: id, LaunchRequestID: pl.requestID, Token: pl.token, CWD: pl.cwd, Ready: pl.registered})
+		err := co.launch(ctx, LaunchRequest{InstanceID: id, LaunchRequestID: pl.requestID, Token: pl.token, CWD: pl.cwd, Ready: pl.registered, Lifetime: pl.lifetime})
+		if pl.lifetime != nil {
+			err = errors.Join(err, pl.lifetime.Close())
+		}
+		launched <- err
 	})
 	timer := time.NewTimer(co.launchTimeout)
 	defer timer.Stop()
@@ -611,6 +908,10 @@ func (co *coordinator) forward(c *client, f Frame, cmd json.RawMessage) {
 		replyError(c, f, CodeNotFound, "instance not found")
 		return
 	}
+	if w.link == nil {
+		replyError(c, f, CodeUnavailable, "worker is not connected")
+		return
+	}
 	if e := admit(c, f.ID); e != nil {
 		send(c.link, Frame{Type: TypeResponse, ID: f.ID, InstanceID: f.InstanceID, Error: e})
 		return
@@ -642,6 +943,8 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 	defer co.mu.Unlock()
 	id := w.instance.ID
 	switch f.Type {
+	case TypePong:
+		w.lastPong = time.Now()
 	case TypeResponse:
 		r, ok := w.routes[f.ID]
 		if !ok {
@@ -655,6 +958,7 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 			send(w.link, Frame{Type: TypeResponse, ID: f.ID, Error: &Error{Code: CodeInvalidFrame, Message: "event object required"}})
 			return
 		}
+		w.instance.LastActivity = time.Now().UTC()
 		// A worker labels events from a newly switched session before its
 		// register update arrives, so its own session ID wins.
 		session := cmp.Or(f.SessionID, w.instance.SessionID)
@@ -669,6 +973,9 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 			w.instance.State = f.Instance.State
 		}
 		w.instance.PendingInputs = f.Instance.PendingInputs
+		if f.Instance.LastActivity.After(w.instance.LastActivity) {
+			w.instance.LastActivity = f.Instance.LastActivity
+		}
 		inst := w.instance
 		if f.ID != "" {
 			send(w.link, Frame{Type: TypeResponse, ID: f.ID, InstanceID: id, Instance: &inst})
@@ -683,6 +990,9 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 // broadcast runs under co.mu so replies and subscription changes are ordered
 // with the events they expose. Encode at most once for all recipients.
 func (co *coordinator) broadcast(f Frame) {
+	if f.Type == TypeInstanceUpdate {
+		f.Generation = co.generation
+	}
 	var data []byte
 	var err error
 	for _, c := range co.clients {

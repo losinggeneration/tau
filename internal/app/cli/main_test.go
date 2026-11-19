@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,6 +34,7 @@ import (
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/internal/app/tui"
+	"github.com/losinggeneration/tau/rpc/coord"
 	"github.com/losinggeneration/tau/rpc/server"
 	"github.com/losinggeneration/tau/sdk"
 	"github.com/losinggeneration/tau/ui"
@@ -3559,4 +3562,174 @@ func TestRPCDiscoversExplicitExtension(t *testing.T) {
 	captureStdout(t, func() { result = runRPC(ctx, cmd) })
 	require.NoError(t, result)
 	require.Contains(t, strings.Join(diagnostics.Lines(), "\n"), "plugin discovery error", "RPC never inspected its explicit extension")
+}
+
+func TestSystemdQuoteEscapesUnitSyntax(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"/usr/bin/tau", `"/usr/bin/tau"`},
+		{"/opt/my tau/tau", `"/opt/my tau/tau"`},
+		{"100%/$HOME", `"100%%/$$HOME"`},
+		{`a"b\c`, `"a\"b\\c"`},
+		{"-leading", `"-leading"`},
+		{"", `""`},
+	} {
+		got, err := systemdQuote(tc.in)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, got, "input %q", tc.in)
+	}
+	for _, bad := range []string{"line\nbreak", "tab\there", "del\x7f", "\xff"} {
+		_, err := systemdQuote(bad)
+		assert.Error(t, err, "input %q", bad)
+	}
+}
+
+func TestDaemonSystemdUnitPinsPathsAndKillsOnlyCoordinator(t *testing.T) {
+	unit, err := daemonSystemdUnit("/opt/my tau/tau", "/home/u/.tau 100%/agent", "/run/user/1/tau$x.sock")
+	require.NoError(t, err)
+	assert.Contains(t, unit, "\nExecStart=\"/opt/my tau/tau\" \"--config-dir\" \"/home/u/.tau 100%%/agent\" \"daemon\" \"--socket\" \"/run/user/1/tau$$x.sock\"\n")
+	assert.Contains(t, unit, "\nKillMode=process\n")
+	assert.Contains(t, unit, "\nRestart=on-failure\n")
+	assert.Contains(t, unit, "# KillMode=process is deliberate.")
+	for _, line := range strings.Split(unit, "\n") {
+		if strings.HasPrefix(line, "#") {
+			assert.NotContains(t, line, "%", "comment lines must not carry specifiers")
+		}
+	}
+
+	_, err = daemonSystemdUnit("/usr/bin/tau", "/cfg", "/run/evil\nExecStartPre=/bin/sh")
+	require.Error(t, err, "a newline would inject a unit directive")
+}
+
+func TestPrintDaemonSystemdUnitResolvesAbsolutePaths(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("TAU_CONFIG_DIR", cfg)
+	t.Chdir(t.TempDir())
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+
+	var result error
+	out := captureStdout(t, func() { result = printDaemonSystemdUnit("rel.sock") })
+	require.NoError(t, result)
+
+	want, err := daemonSystemdUnit(executable, cfg, filepath.Join(cwd, "rel.sock"))
+	require.NoError(t, err)
+	assert.Equal(t, want, out)
+}
+
+func withDoctorTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	previous := doctorTimeout
+	doctorTimeout = d
+	t.Cleanup(func() { doctorTimeout = previous })
+}
+
+func TestDoctorReportsMissingEndpointWithoutCreatingIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.sock")
+	var out bytes.Buffer
+	require.NoError(t, writeDoctorCoordinator(t.Context(), &out, path, time.Now()))
+	assert.Contains(t, out.String(), "Endpoint: missing\n")
+	assert.Contains(t, out.String(), "Daemon PID: unknown\n")
+	_, err := os.Lstat(path)
+	assert.ErrorIs(t, err, os.ErrNotExist, "doctor must never start a coordinator")
+}
+
+func TestDoctorReportsNonSocketEndpointWithoutRemovingIt(t *testing.T) {
+	withDoctorTimeout(t, 200*time.Millisecond)
+	path := filepath.Join(t.TempDir(), "file.sock")
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+	var out bytes.Buffer
+	require.NoError(t, writeDoctorCoordinator(t.Context(), &out, path, time.Now()))
+	assert.Contains(t, out.String(), "Endpoint: present but not a socket")
+	assert.Contains(t, out.String(), "Coordinator: unresponsive")
+	assert.Contains(t, out.String(), "Daemon PID: unknown\n")
+	_, err := os.Lstat(path)
+	assert.NoError(t, err)
+}
+
+func TestDoctorBoundsHungEndpoint(t *testing.T) {
+	withDoctorTimeout(t, 100*time.Millisecond)
+	path := filepath.Join(t.TempDir(), "hung.sock")
+	listener, err := net.Listen("unix", path)
+	require.NoError(t, err)
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	accepted := make(chan struct{})
+	go func() {
+		defer close(accepted)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		require.NoError(t, listener.Close())
+		<-accepted
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			require.NoError(t, conn.Close())
+		}
+	})
+
+	start := time.Now()
+	var out bytes.Buffer
+	require.NoError(t, writeDoctorCoordinator(t.Context(), &out, path, time.Now()))
+	assert.Less(t, time.Since(start), time.Second, "doctor must not wait past its deadline")
+	assert.Contains(t, out.String(), "Endpoint: present\n")
+	assert.Contains(t, out.String(), "Coordinator: unresponsive")
+	assert.Contains(t, out.String(), "Daemon PID: unknown\n")
+	_, err = os.Lstat(path)
+	assert.NoError(t, err, "doctor must not unlink a hung endpoint")
+}
+
+func TestDoctorReportsResponsiveCoordinator(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private", "c.sock")
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- coord.Run(ctx, path, func(context.Context, coord.LaunchRequest) error {
+			return errors.New("doctor must never launch workers")
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, <-done)
+	})
+	require.Eventually(t, func() bool {
+		conn, err := net.Dial("unix", path)
+		if err != nil {
+			return false
+		}
+		return conn.Close() == nil
+	}, time.Second, 5*time.Millisecond)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, newRootCommand().Run(t.Context(), []string{"tau", "doctor", "--socket", path}))
+	})
+	assert.Contains(t, out, "Socket: "+path+"\n")
+	assert.Contains(t, out, "Endpoint: present\n")
+	assert.Contains(t, out, "Coordinator: handshake ok (generation ")
+	assert.Contains(t, out, fmt.Sprintf("Daemon PID: %d\n", os.Getpid()))
+	assert.Contains(t, out, "Instances: 0\n")
+}
+
+func TestDoctorInstanceLine(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	busy := coord.Instance{ID: "a", CWD: "/p", PID: 42, State: coord.StateBusy, LinkState: "connected", LastActivity: now.Add(-90 * time.Second)}
+	assert.Equal(t, "a pid=42 status=busy link=connected last-activity=2026-01-02T03:02:35Z (1m30s ago) cwd=/p", doctorInstanceLine(busy, now))
+
+	approval := busy
+	approval.PendingInputs = 2
+	assert.Contains(t, doctorInstanceLine(approval, now), "status=approval (2 pending)")
+
+	assert.Equal(t, "b pid=unknown status=unknown link=unknown last-activity=unknown cwd=", doctorInstanceLine(coord.Instance{ID: "b"}, now))
 }

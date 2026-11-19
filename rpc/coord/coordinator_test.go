@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 )
 
 type fakeWorker struct {
@@ -464,7 +466,7 @@ func TestWatchInstancesOnlyDeliversSummaries(t *testing.T) {
 	attention.State = "busy"
 	attention.PendingInputs = 2
 	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &attention})
-	if update := readFrame(t, watcher); update.Type != TypeInstanceUpdate || update.Instance == nil || *update.Instance != attention || len(update.Event) != 0 {
+	if update := readFrame(t, watcher); update.Type != TypeInstanceUpdate || update.Instance == nil || update.Instance.State != attention.State || update.Instance.PendingInputs != 2 || update.Instance.LastActivity.IsZero() || update.Generation != initial.Generation || len(update.Event) != 0 {
 		t.Fatalf("attention summary = %+v", update)
 	}
 	if err := w.link.Close(); err != nil {
@@ -1102,5 +1104,195 @@ func TestLegacyFirstFrameGetsCompatibleRejection(t *testing.T) {
 				t.Fatalf("legacy reply = %+v (error %+v)", resp, resp.Error)
 			}
 		})
+	}
+}
+
+func TestRecoveredLaunchDoesNotSpawnAgain(t *testing.T) {
+	path := filepath.Join(socketDir(t), "c.sock")
+	cwd := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "project")
+	if err := os.Symlink(cwd, alias); err != nil {
+		t.Fatal(err)
+	}
+	receiptDir := filepath.Join(t.TempDir(), "receipts")
+	var launches atomic.Int32
+	held := make(chan *os.File, 1)
+	identity := make(chan Frame, 1)
+	dial := func(hello Frame) (*Link, Frame, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		return Dial(ctx, path, hello)
+	}
+	launch := func(ctx context.Context, r LaunchRequest) error {
+		launches.Add(1)
+		if r.Lifetime == nil {
+			return errors.New("missing lifetime lock")
+		}
+		fd, err := unix.Dup(int(r.Lifetime.Fd()))
+		if err != nil {
+			return err
+		}
+		held <- os.NewFile(uintptr(fd), "fake worker lifetime")
+		inst := Instance{ID: r.InstanceID, LaunchRequestID: r.LaunchRequestID, CWD: r.CWD, NodeID: "node", SessionID: "session", PID: 42}
+		hello := Frame{Role: RoleWorker, Instance: &inst, Token: r.Token, Position: &Position{InstanceID: inst.ID, Epoch: "epoch"}}
+		link, _, err := dial(hello)
+		if err != nil {
+			return err
+		}
+		identity <- hello
+		<-ctx.Done()
+		// The worker side stays connected independently of launch readiness.
+		go func() {
+			if _, err := link.Read(); err != nil && !errors.Is(err, io.EOF) {
+				t.Error(err)
+			}
+		}()
+		return nil
+	}
+	start := func() (func(), *Link, Frame) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := RunRecoverable(ctx, path, receiptDir, launch); err != nil {
+				t.Error(err)
+			}
+		}()
+		stop := func() { cancel(); <-done }
+		t.Cleanup(stop)
+		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+			link, welcome, err := dial(Frame{Role: RoleClient})
+			if err == nil {
+				return stop, link, welcome
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatal("coordinator did not start")
+		return nil, nil, Frame{}
+	}
+	stop, first, welcome := start()
+	if welcome.LaunchRequestVersion != 7 {
+		t.Fatalf("recoverable coordinator advertised launch ID version %d", welcome.LaunchRequestVersion)
+	}
+	wantError(t, request(t, first, Frame{Type: TypeStartInstance, ID: "v4", RequestID: uuid.NewString(), CWD: alias}), "v4", CodeInvalidFrame)
+	reqID := launchIDAt(time.Now().Add(time.Second))
+	mustSend(t, first, Frame{Type: TypeStartInstance, ID: "start", RequestID: reqID, CWD: alias})
+	var hello Frame
+	select {
+	case hello = <-identity:
+	case <-time.After(testTimeout):
+		t.Fatal("worker did not register")
+	}
+	lock := <-held
+	t.Cleanup(func() {
+		if lock != nil {
+			if err := lock.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	// The client does not consume the start reply before this generation ends.
+	stop()
+	_, next, recovered := start()
+	baseline := request(t, next, Frame{Type: TypeWatchInstances, ID: "watch"})
+	if baseline.Generation == welcome.Generation || baseline.Generation != recovered.Generation || len(baseline.Instances) != 0 {
+		t.Fatalf("wrong baseline for a new generation: %+v", baseline)
+	}
+	startAgain := Frame{Type: TypeStartInstance, ID: "retry", RequestID: reqID, CWD: alias}
+	wantError(t, request(t, next, startAgain), "retry", CodeOutcomeUnknown)
+	forged := hello
+	forged.Token = "wrong secret"
+	_, _, err := dial(forged)
+	var rejection *Error
+	if !errors.As(err, &rejection) || rejection.Code != CodeUnauthorized {
+		t.Fatalf("forged recovery: %v", err)
+	}
+	hello.Instance.PendingInputs = 2
+	workerLink, _, err := dial(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update := readFrame(t, next); update.Generation != recovered.Generation || update.Instance == nil || update.Instance.PendingInputs != 2 || update.Instance.LinkState != LinkConnected {
+		t.Fatalf("missing recovered status: %+v", update)
+	}
+	if reply := request(t, next, startAgain); reply.Instance == nil || reply.Instance.ID != hello.Instance.ID || reply.Instance.LaunchRequestID != reqID || launches.Load() != 1 {
+		t.Fatalf("retry did not reconcile: %+v, %d launches", reply, launches.Load())
+	}
+	wrongEpoch := hello
+	wrongEpoch.Position = &Position{InstanceID: hello.Instance.ID, Epoch: "conflict"}
+	_, _, err = dial(wrongEpoch)
+	if !errors.As(err, &rejection) || rejection.Code != CodeUnauthorized {
+		t.Fatalf("conflicting epoch: %v", err)
+	}
+	if err := workerLink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if update := readFrame(t, next); update.Instance == nil || update.Instance.LinkState != LinkDisconnected {
+		t.Fatalf("socket close did not leave disconnected status: %+v", update)
+	}
+	workerLink, _, err = dial(hello)
+	if err != nil {
+		t.Fatalf("same-generation redial: %v", err)
+	}
+	if update := readFrame(t, next); update.Instance == nil || update.Instance.LinkState != LinkConnected || update.Instance.ID != hello.Instance.ID {
+		t.Fatalf("redial changed identity: %+v", update)
+	}
+	if err := workerLink.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if update := readFrame(t, next); update.Instance == nil || update.Instance.LinkState != LinkDisconnected {
+		t.Fatalf("socket close did not leave disconnected status: %+v", update)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lock = nil
+	wantError(t, request(t, next, startAgain), "retry", CodeOutcomeUnknown)
+}
+
+func TestLauncherExistErrorIsNotAReceiptCollision(t *testing.T) {
+	h := startCoordinator(t, func(*harness) LaunchFunc {
+		return func(context.Context, LaunchRequest) error { return fmt.Errorf("create worker log: %w", os.ErrExist) }
+	}, launchTimeout)
+	c, _ := h.client()
+	got := request(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd, RequestID: uuid.NewString()})
+	wantError(t, got, "start", CodeLaunchFailed)
+}
+
+func TestEmbeddedRunRemovesAnEpochWorkerOnDisconnect(t *testing.T) {
+	h := startCoordinator(t, func(h *harness) LaunchFunc {
+		return func(ctx context.Context, r LaunchRequest) error {
+			inst := Instance{ID: r.InstanceID, CWD: r.CWD, NodeID: "node", SessionID: "session", PID: 42}
+			dialCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), testTimeout)
+			defer cancel()
+			link, welcome, err := Dial(dialCtx, h.path, Frame{
+				Role: RoleWorker, Instance: &inst, Token: r.Token,
+				Position: &Position{InstanceID: inst.ID, Epoch: "epoch"},
+			})
+			if err == nil {
+				h.workers <- &fakeWorker{req: r, link: link, welcome: welcome}
+			}
+			return err
+		}
+	}, launchTimeout)
+	c, _ := h.client()
+	request(t, c, Frame{Type: TypeWatchInstances, ID: "watch"})
+	for range 2 {
+		mustSend(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd})
+		w := h.nextWorker()
+		readFrame(t, c) // instance update comes before readiness
+		if f := readFrame(t, c); f.Error != nil || f.Instance == nil || f.Instance.ID != w.req.InstanceID {
+			t.Fatalf("worker did not start: %+v", f)
+		}
+		if err := w.link.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if f := readFrame(t, c); f.Type != TypeInstanceUpdate || f.Instance != nil || f.Error == nil || f.Error.Code != CodeWorkerLinkLost {
+			t.Fatalf("expected removal, got %+v", f)
+		}
+		if f := request(t, c, Frame{Type: TypeListInstances, ID: "list"}); len(f.Instances) != 0 {
+			t.Fatalf("closed embedded workers remain in registry: %+v", f)
+		}
 	}
 }

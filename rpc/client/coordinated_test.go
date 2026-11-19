@@ -23,7 +23,7 @@ func fakeCoordinator(t *testing.T, eventBuffer int, opts ...CoordinatedOption) (
 	if len(opts) > 0 {
 		assign = func(hello coord.Frame) string { return hello.ClientID }
 	}
-	c, srv, hello, err := dialFake(t, eventBuffer, assign, opts...)
+	c, srv, hello, err := dialFake(t, eventBuffer, assign, 0, opts...)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -32,7 +32,7 @@ func fakeCoordinator(t *testing.T, eventBuffer int, opts ...CoordinatedOption) (
 
 // dialFake is fakeCoordinator with the welcome's client ID chosen by assign
 // and the dial error returned.
-func dialFake(t *testing.T, eventBuffer int, assign func(hello coord.Frame) string, opts ...CoordinatedOption) (*CoordinatedClient, *coord.Link, coord.Frame, error) {
+func dialFake(t *testing.T, eventBuffer int, assign func(hello coord.Frame) string, launchVersion int, opts ...CoordinatedOption) (*CoordinatedClient, *coord.Link, coord.Frame, error) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "c.sock")
 	ln, err := net.Listen("unix", path)
@@ -60,7 +60,7 @@ func dialFake(t *testing.T, eventBuffer int, assign func(hello coord.Frame) stri
 		link := coord.NewLink(conn)
 		hello, err := link.Read()
 		if err == nil {
-			err = link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, Generation: "gen-1", ClientID: assign(hello)})
+			err = link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, Generation: "gen-1", ClientID: assign(hello), LaunchRequestVersion: launchVersion})
 		}
 		ready <- accepted{link: link, hello: hello, err: err}
 	}()
@@ -712,12 +712,32 @@ func TestCoordinatedClientStableClientID(t *testing.T) {
 }
 
 func TestCoordinatedClientRejectsReassignedClientID(t *testing.T) {
-	_, _, hello, err := dialFake(t, coordinatedEventBuffer, func(coord.Frame) string { return "other" }, WithClientID("client-a"))
+	_, _, hello, err := dialFake(t, coordinatedEventBuffer, func(coord.Frame) string { return "other" }, 0, WithClientID("client-a"))
 	if hello.ClientID != "client-a" {
 		t.Fatalf("hello client id = %q", hello.ClientID)
 	}
 	if !errors.Is(err, ErrInvalidClientID) {
 		t.Fatalf("dial error = %v, want ErrInvalidClientID", err)
+	}
+}
+
+func TestCoordinatedClientUsesAdvertisedLaunchIDVersion(t *testing.T) {
+	c, srv, _, err := dialFake(t, coordinatedEventBuffer, func(coord.Frame) string { return "assigned" }, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.StartInstance(t.Context(), "/project")
+		done <- err
+	}()
+	f := readFrame(t, srv)
+	if f.Type != coord.TypeStartInstance || !coord.ValidLaunchRequestID(f.RequestID) || coord.ValidRequestID(f.RequestID) {
+		t.Fatalf("expected UUIDv7 start: %+v", f)
+	}
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: f.ID, Instance: &coord.Instance{ID: "inst", LaunchRequestID: f.RequestID}})
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

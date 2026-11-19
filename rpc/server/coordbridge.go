@@ -298,8 +298,8 @@ func parseBrowserFrame(data []byte) (coord.Frame, *coord.Error) {
 	if len(in.ID) > maxBrowserIDBytes || len(in.InstanceID) > maxBrowserIDBytes {
 		return coord.Frame{}, &coord.Error{Code: coord.CodeInvalidFrame, Message: "identifier exceeds limit"}
 	}
-	if in.RequestID != "" && !coord.ValidRequestID(in.RequestID) {
-		return coord.Frame{ID: in.ID, InstanceID: in.InstanceID}, &coord.Error{Code: coord.CodeInvalidFrame, Message: "request_id must be a random UUID"}
+	if in.RequestID != "" && !coord.ValidOperationRequestID(in.Type, in.RequestID) {
+		return coord.Frame{ID: in.ID, InstanceID: in.InstanceID}, &coord.Error{Code: coord.CodeInvalidFrame, Message: "invalid request_id for operation"}
 	}
 	f := coord.Frame{Type: in.Type, ID: in.ID, RequestID: in.RequestID, InstanceID: in.InstanceID}
 	switch in.Type {

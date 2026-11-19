@@ -343,8 +343,13 @@ var daemonCmd = &cli.Command{
 }
 
 var doctorCmd = &cli.Command{
-	Name:   "doctor",
-	Usage:  "Show local tau status",
+	Name:  "doctor",
+	Usage: "Show local tau status",
+	Description: `Report the coordinator endpoint, whether it answers a coordinated
+		handshake and instance listing within a deadline, and each worker's PID,
+		status, link state, and last activity. Doctor only observes: it never
+		starts a coordinator or removes a stale endpoint.`,
+	Flags:  []cli.Flag{&cli.StringFlag{Name: "socket", Usage: "Coordinator socket path"}},
 	Action: runDoctor,
 }
 

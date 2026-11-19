@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -37,6 +38,8 @@ const (
 	TypeResponse         = "response"
 	TypeEvent            = "event"
 	TypeRegister         = "register"
+	TypePing             = "ping"
+	TypePong             = "pong"
 )
 
 // Connection roles advertised in hello.
@@ -49,6 +52,13 @@ const (
 const (
 	StateReady = "ready"
 	StateBusy  = "busy"
+)
+
+// Worker link states are separate from the agent lifecycle.
+const (
+	LinkConnected    = "connected"
+	LinkDisconnected = "disconnected"
+	LinkExited       = "exited"
 )
 
 // Error codes.
@@ -91,6 +101,29 @@ func ValidRequestID(id string) bool {
 	return err == nil && parsed.Version() == 4 && parsed.Variant() == uuid.RFC4122 && parsed.String() == id
 }
 
+// ValidLaunchRequestID reports whether id is a canonical UUIDv7 or a legacy
+// UUIDv4. Only UUIDv7 can reserve a new intent on a recoverable coordinator.
+func ValidLaunchRequestID(id string) bool {
+	return ValidRequestID(id) || !launchTime(id).IsZero()
+}
+
+func launchTime(id string) time.Time {
+	u, err := uuid.Parse(id)
+	if err != nil || u.Version() != 7 || u.Variant() != uuid.RFC4122 || u.String() != id {
+		return time.Time{}
+	}
+	sec, ns := u.Time().UnixTime()
+	return time.Unix(sec, ns)
+}
+
+// ValidOperationRequestID checks the correlation ID for a client operation.
+func ValidOperationRequestID(operation, id string) bool {
+	if operation == TypeStartInstance {
+		return ValidLaunchRequestID(id)
+	}
+	return ValidRequestID(id)
+}
+
 // Frame is one JSONL message exchanged with the coordinator.
 type Frame struct {
 	Type       string          `json:"type"`
@@ -100,6 +133,7 @@ type Frame struct {
 	Version    int             `json:"version,omitempty"`
 	Role       string          `json:"role,omitempty"`
 	Generation string          `json:"generation,omitempty"`
+	PID        int             `json:"pid,omitempty"`
 	InstanceID string          `json:"instance_id,omitempty"`
 	SessionID  string          `json:"session_id,omitempty"`
 	CWD        string          `json:"cwd,omitempty"`
@@ -113,6 +147,9 @@ type Frame struct {
 	Instances  []Instance      `json:"instances,omitempty"`
 	Operations []string        `json:"operations,omitempty"`
 	Limits     *Limits         `json:"limits,omitempty"`
+	// LaunchRequestVersion advertises the preferred UUID version for new starts.
+	// An absent value means UUIDv4.
+	LaunchRequestVersion int `json:"launch_request_version,omitempty"`
 }
 
 // Position identifies a point in one worker's event stream. Offset zero is
@@ -156,14 +193,16 @@ func (e *Error) Error() string {
 
 // Instance summarizes one registered worker.
 type Instance struct {
-	ID              string `json:"instance_id"`
-	NodeID          string `json:"node_id,omitempty"`
-	CWD             string `json:"cwd,omitempty"`
-	SessionID       string `json:"session_id,omitempty"`
-	State           string `json:"state,omitempty"`
-	PID             int    `json:"pid,omitempty"`
-	PendingInputs   int    `json:"pending_inputs,omitempty"`
-	LaunchRequestID string `json:"launch_request_id,omitempty"`
+	ID              string    `json:"instance_id"`
+	NodeID          string    `json:"node_id,omitempty"`
+	CWD             string    `json:"cwd,omitempty"`
+	SessionID       string    `json:"session_id,omitempty"`
+	State           string    `json:"state,omitempty"`
+	PID             int       `json:"pid,omitempty"`
+	PendingInputs   int       `json:"pending_inputs,omitempty"`
+	LaunchRequestID string    `json:"launch_request_id,omitempty"`
+	LinkState       string    `json:"link_state,omitempty"`
+	LastActivity    time.Time `json:"last_activity,omitzero"`
 }
 
 func decodeFrame(line []byte) (Frame, error) {
@@ -186,7 +225,7 @@ func isFrameType(t string) bool {
 	switch t {
 	case TypeHello, TypeWelcome, TypeListInstances, TypeStartInstance, TypeAttach,
 		TypeDetach, TypeCommand, TypeStopInstance, TypeResponse, TypeEvent, TypeRegister,
-		TypeWatchInstances, TypeUnwatchInstances, TypeInstanceUpdate:
+		TypeWatchInstances, TypeUnwatchInstances, TypeInstanceUpdate, TypePing, TypePong:
 		return true
 	}
 	return false
@@ -270,7 +309,7 @@ func (i *Instance) validate() error {
 	if i.PendingInputs < 0 {
 		return fmt.Errorf("%w: negative pending input count", ErrInvalidFrame)
 	}
-	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State, i.LaunchRequestID} {
+	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State, i.LaunchRequestID, i.LinkState} {
 		if len(s) > maxIDBytes {
 			return fmt.Errorf("%w: instance identifier exceeds %d bytes", ErrInvalidFrame, maxIDBytes)
 		}

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,10 +22,15 @@ import (
 	"github.com/losinggeneration/tau/sdk"
 	"github.com/losinggeneration/tau/ui"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sys/unix"
 )
 
 func runCoordinator(ctx context.Context, cmd *cli.Command) error {
-	node, err := coordinatorNodeID(configDir())
+	cfgDir, err := filepath.Abs(configDir())
+	if err != nil {
+		return fmt.Errorf("resolve coordinator configuration directory: %w", err)
+	}
+	node, err := coordinatorNodeID(cfgDir)
 	if err != nil {
 		return err
 	}
@@ -39,16 +45,21 @@ func runCoordinator(ctx context.Context, cmd *cli.Command) error {
 	launch := func(ctx context.Context, request coord.LaunchRequest) error {
 		return launchWorkerProcess(ctx, path, node, request)
 	}
+	// Keep recovery state outside the socket's volatile runtime directory.
+	receiptDir := filepath.Join(cfgDir, fmt.Sprintf("coordinator-%x.workers", sha256.Sum256([]byte(path))))
+	run := func(ctx context.Context, path string, launch coord.LaunchFunc) error {
+		return coord.RunRecoverable(ctx, path, receiptDir, launch)
+	}
 	addr := cmd.String("websocket")
 	if addr == "" {
-		return coord.Run(ctx, path, launch)
+		return run(ctx, path, launch)
 	}
 	bridge, err := server.NewCoordinatedBridge(addr, path, cmd.String("websocket-token"), remoteTokenStore())
 	if err != nil {
 		return cli.Exit(fmt.Sprintf("websocket bridge: %v", err), ExitUserError)
 	}
 	writeLine(os.Stderr, "tau websocket bridge listening on %s/rpc\n", bridge.Addr())
-	return serveCoordinator(ctx, path, bridge, launch, coord.Run)
+	return serveCoordinator(ctx, path, bridge, launch, run)
 }
 
 // serveCoordinator runs the coordinator and its WebSocket bridge together.
@@ -130,7 +141,7 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	return os.Rename(tmp.Name(), path)
 }
 
-var workerLaunchVariables = []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE", "TAU_COORD_LAUNCH_REQUEST"}
+var workerLaunchVariables = []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE", "TAU_COORD_LAUNCH_REQUEST", "TAU_COORD_LIFETIME"}
 
 func workerEnvironment(env []string, node string, request coord.LaunchRequest) []string {
 	out := make([]string, 0, len(env)+len(workerLaunchVariables))
@@ -145,6 +156,9 @@ func workerEnvironment(env []string, node string, request coord.LaunchRequest) [
 	out = append(out, "TAU_COORD_TOKEN="+request.Token, "TAU_COORD_INSTANCE="+request.InstanceID, "TAU_COORD_NODE="+node)
 	if request.LaunchRequestID != "" {
 		out = append(out, "TAU_COORD_LAUNCH_REQUEST="+request.LaunchRequestID)
+	}
+	if request.Lifetime != nil {
+		out = append(out, "TAU_COORD_LIFETIME=3")
 	}
 	return out
 }
@@ -180,6 +194,9 @@ func launchWorkerProcess(ctx context.Context, socket, node string, request coord
 	child := exec.Command(executable, "--config-dir", cfg, "worker", "--socket", socket)
 	child.Dir = cwd
 	child.Env = workerEnvironment(os.Environ(), node, request)
+	if request.Lifetime != nil {
+		child.ExtraFiles = []*os.File{request.Lifetime}
+	}
 	child.Stdout = log
 	child.Stderr = log
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -299,6 +316,11 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 	launchRequest := os.Getenv("TAU_COORD_LAUNCH_REQUEST")
 	if token == "" || instance == "" || node == "" || cmd.String("socket") == "" {
 		return errors.New("worker is an internal entry point; launch through the coordinator")
+	}
+	if os.Getenv("TAU_COORD_LIFETIME") == "3" {
+		// Keep the inherited lock held until this process exits. A tool or
+		// extension subprocess must not keep it alive after worker exit.
+		unix.CloseOnExec(3)
 	}
 	for _, name := range workerLaunchVariables {
 		if err := os.Unsetenv(name); err != nil {

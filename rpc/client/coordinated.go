@@ -43,7 +43,7 @@ var (
 	ErrTooManyPending = errors.New("coordinated client: too many pending requests")
 	// ErrOutcomeUnknown reports that a request was sent but no definite reply
 	// arrived. The coordinator may or may not have acted on it; requests are
-	// never retried automatically and request IDs do not deduplicate. See
+	// never retried automatically. See
 	// OutcomeUnknownError for the request's identity.
 	ErrOutcomeUnknown = errors.New("coordinated client: request outcome unknown")
 	// ErrSlowEventConsumer reports that Events was not drained quickly enough.
@@ -54,9 +54,10 @@ var (
 	// ErrInvalidClientID reports an unusable stable client ID, or a
 	// coordinator that bound the connection to a different one.
 	ErrInvalidClientID = errors.New("coordinated client: invalid client id")
-	// ErrInvalidRequestID reports a caller-supplied request ID that is not a
-	// canonical random (version 4) UUID. The request was not sent.
-	ErrInvalidRequestID = errors.New("coordinated client: request id must be a random UUID")
+	// ErrInvalidRequestID reports a caller-supplied request ID that is not
+	// a canonical UUID of the supported version for the operation. The
+	// request was not sent.
+	ErrInvalidRequestID = errors.New("coordinated client: invalid request id for operation")
 	// ErrReconstructionBusy reports a second concurrent reconstruction of one
 	// instance on the same client.
 	ErrReconstructionBusy = errors.New("coordinated client: instance reconstruction already in progress")
@@ -81,8 +82,7 @@ var (
 // OutcomeUnknownError identifies a request whose outcome is unknown: the
 // client gave up waiting, the connection ended, or the coordinator lost the
 // worker after routing it (coord.CodeOutcomeUnknown). The client never
-// resends it and nothing deduplicates a resend, so reconcile by inspecting
-// instance state before repeating a mutation.
+// resends it. Reconcile by inspecting state before repeating a mutation.
 type OutcomeUnknownError struct {
 	// Op is the coordinated frame type, such as coord.TypeCommand.
 	Op         string
@@ -159,6 +159,12 @@ func WithClientID(id string) CoordinatedOption {
 // the intent before sending so an unknown outcome can be matched later.
 func NewRequestID() string {
 	return uuid.NewString()
+}
+
+// NewLaunchRequestID returns a UUIDv7 for a start intent. Persist it with the
+// intent before sending so a lost reply can be reconciled without a new launch.
+func NewLaunchRequestID() string {
+	return uuid.Must(uuid.NewV7()).String()
 }
 
 // CoordinatedClient talks to a local coordinator that owns many tau
@@ -241,6 +247,13 @@ func (c *CoordinatedClient) Welcome() coord.Frame {
 	return c.welcome
 }
 
+// Generation identifies this connection's registry baseline. After reconnect,
+// call WatchInstances again and replace all previous registry summaries.
+func (c *CoordinatedClient) Generation() string { return c.welcome.Generation }
+
+// CoordinatorPID is the process ID reported by the coordinator, or zero.
+func (c *CoordinatedClient) CoordinatorPID() int { return c.welcome.PID }
+
 // Events returns chat frames (TypeEvent) for attached instances and summary
 // frames (TypeInstanceUpdate) when watching. Both identify the instance and
 // session. Event holds a raw Tau RPC event; Instance holds updated metadata.
@@ -266,7 +279,8 @@ func (c *CoordinatedClient) Err() error {
 	return c.err
 }
 
-// ListInstances returns every instance registered with the coordinator.
+// ListInstances returns the coordinator registry, including any retained
+// disconnected or exited workers. Check LinkState before attaching.
 func (c *CoordinatedClient) ListInstances(ctx context.Context) ([]coord.Instance, error) {
 	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeListInstances})
 	if err != nil {
@@ -276,7 +290,8 @@ func (c *CoordinatedClient) ListInstances(ctx context.Context) ([]coord.Instance
 }
 
 // WatchInstances subscribes to status and attention without subscribing to
-// chat. The returned initial list precedes any subsequent summary frames.
+// chat. The initial list is a full baseline for Generation(); replace any
+// older registry view with it before applying subsequent summary frames.
 func (c *CoordinatedClient) WatchInstances(ctx context.Context) ([]coord.Instance, error) {
 	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeWatchInstances})
 	if err != nil {
@@ -299,13 +314,23 @@ func (c *CoordinatedClient) StartInstance(ctx context.Context, cwd string) (*coo
 }
 
 // StartInstanceWithRequestID is StartInstance under the caller's request ID,
-// which must be a random UUID; empty generates one. The started instance
-// reports it as LaunchRequestID. An unknown outcome is an
-// *OutcomeUnknownError carrying the ID.
+// which should come from NewLaunchRequestID on a recoverable coordinator.
+// An empty ID uses the UUID version advertised at handshake. The started
+// instance reports it as LaunchRequestID. A recoverable coordinator records
+// the ID before spawning. Reusing it can return the matching live worker,
+// regardless of cwd, but cannot launch a replacement for a recorded intent.
+// An expired ID or a recorded ID with no live match reports
+// *OutcomeUnknownError. A new UUIDv4 intent is rejected on a recoverable
+// coordinator. Other mutations do not deduplicate.
 func (c *CoordinatedClient) StartInstanceWithRequestID(ctx context.Context, cwd, requestID string) (*coord.Instance, error) {
-	requestID, err := requestIDOrNew(requestID)
-	if err != nil {
-		return nil, err
+	if requestID == "" {
+		if c.welcome.LaunchRequestVersion == 7 {
+			requestID = NewLaunchRequestID()
+		} else {
+			requestID = NewRequestID()
+		}
+	} else if !coord.ValidLaunchRequestID(requestID) {
+		return nil, ErrInvalidRequestID
 	}
 	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeStartInstance, CWD: cwd, RequestID: requestID})
 	if err != nil {

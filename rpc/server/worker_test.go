@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -310,6 +311,42 @@ func TestWorkerStopWaitsForCleanup(t *testing.T) {
 	}
 	if !runtimeClosed.Load() {
 		t.Fatal("stop replied before runtime close")
+	}
+}
+
+func TestStoppingWorkerAnswersHeartbeatWithConcurrentCommand(t *testing.T) {
+	rt := newWorkerRuntime()
+	closing, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	rt.sess.closeFn = func(context.Context) error {
+		close(closing)
+		<-release
+		return nil
+	}
+	h := startWorker(t, rt, nil)
+	t.Cleanup(unblock)
+	h.send(t, "stop", `{"type":"shutdown"}`)
+	<-closing
+	h.send(t, "more", `{"type":"get_state"}`)
+	if err := h.link.Send(coord.Frame{Type: coord.TypePing}); err != nil {
+		t.Fatal(err)
+	}
+	rejected := false
+	for {
+		f := h.next(t)
+		if f.Type == coord.TypePong {
+			break
+		}
+		if f.ID == "more" && f.Error != nil && f.Error.Code == coord.CodeUnavailable {
+			rejected = true
+		}
+	}
+	if !rejected {
+		t.Fatal("command during stop was not rejected")
+	}
+	unblock()
+	if r := h.response(t, "stop"); !r.OK {
+		t.Fatalf("stop reply: %+v", r)
 	}
 }
 
@@ -893,5 +930,111 @@ func TestWorkerQueuesConcurrentSnapshots(t *testing.T) {
 		if r := h.response(t, id); !r.OK {
 			t.Errorf("snapshot %s: %+v", id, r.Error)
 		}
+	}
+}
+
+func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
+	rt := newWorkerRuntime()
+	path := filepath.Join(t.TempDir(), "w")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- NewWorker(rt, nil, nil).Run(ctx, path, coord.Instance{ID: "instance", CWD: "/project"}, "secret")
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("worker still running after cancellation")
+		}
+	})
+	accept := func() (*coord.Link, coord.Frame) {
+		t.Helper()
+		if err := listener.SetDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		link := coord.NewLink(conn)
+		t.Cleanup(func() {
+			if err := link.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		hello, err := link.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version}); err != nil {
+			t.Fatal(err)
+		}
+		return link, hello
+	}
+	read := func(link *coord.Link, kind string) coord.Frame {
+		t.Helper()
+		for {
+			frame, err := link.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if frame.Type == kind {
+				return frame
+			}
+		}
+	}
+	first, original := accept()
+	if err := first.Send(coord.Frame{Type: coord.TypeCommand, ID: "ready", InstanceID: "instance", Command: json.RawMessage(`{"type":"get_state"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	read(first, coord.TypeResponse)
+	sessionUI := (<-rt.opts).UI
+	resolved := make(chan error, 1)
+	go func() {
+		_, err := sessionUI.Input(ctx, "Waiting", "value")
+		resolved <- err
+	}()
+	t.Cleanup(func() { cancel(); <-resolved })
+	event := read(first, coord.TypeEvent)
+	if event.Position == nil || !strings.Contains(string(event.Event), `"type":"ui_input"`) {
+		t.Fatalf("missing input event: %+v", event)
+	}
+	read(first, coord.TypeRegister)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, rejoined := accept()
+	if rejoined.Instance.ID != original.Instance.ID || rejoined.Instance.SessionID != original.Instance.SessionID || rejoined.Instance.PendingInputs != 1 {
+		t.Fatalf("lost session or input: %+v", rejoined.Instance)
+	}
+	if err := second.Send(coord.Frame{Type: coord.TypeCommand, ID: "snapshot", InstanceID: "instance", Command: json.RawMessage(`{"type":"get_snapshot"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	var snap struct {
+		Result snapshotResult
+	}
+	frame := read(second, coord.TypeResponse)
+	if err := json.Unmarshal(frame.Result, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Result.Position != *event.Position || len(snap.Result.UIRequests) != 1 {
+		t.Fatalf("snapshot after redial lost cursor or dialog: %+v", snap.Result)
 	}
 }

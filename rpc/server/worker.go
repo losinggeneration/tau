@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -32,8 +33,8 @@ func NewWorker(rt sdk.Runtime, reg commands.Registry, mgr *plugins.Manager) *Wor
 	return &Worker{server: s}
 }
 
-// Run initializes a session, registers it, and serves until explicit shutdown
-// or process cancellation. The worker does not redial after coordinator loss.
+// Run initializes a session and serves until explicit shutdown or process
+// cancellation. A failed link is replaced without cancelling the runtime.
 func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, token string) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -83,47 +84,31 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	if err := s.replaceSession(ctx, sdk.SessionOptions{CWD: instance.CWD, SessionID: instance.SessionID}, "worker_start"); err != nil {
 		return fmt.Errorf("initialize worker session: %w", err)
 	}
-	instance.SessionID = s.session.ID()
-	link, _, err := coord.Dial(ctx, path, coord.Frame{
-		Role: coord.RoleWorker, Version: coord.Version, Instance: &instance, Token: token,
-	})
+	output.mu.Lock()
+	output.instance.SessionID = s.session.ID()
+	if output.instance.State == "" {
+		output.instance.State = coord.StateReady
+	}
+	output.mu.Unlock()
+	link, err := output.dial(ctx, path, token)
 	if err != nil {
 		return fmt.Errorf("register worker: %w", err)
 	}
-	instance.State = coord.StateReady
-	output.connect(link, instance)
+	linkCtx, stopLinks := context.WithCancel(context.WithoutCancel(ctx))
 	var reader sync.WaitGroup
-	readerStop := make(chan struct{})
+	frames := make(chan coord.Frame)
+	reader.Go(func() {
+		defer close(frames)
+		output.readLinks(linkCtx, ctx, path, token, link, frames)
+	})
 	defer func() {
 		if !cleaned {
 			err = errors.Join(err, cleanup())
 		}
-		close(readerStop)
-		// Stop late event writers from scheduling another asynchronous close.
-		output.mu.Lock()
-		output.link = nil
-		output.mu.Unlock()
-		if closeErr := link.Close(); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
+		stopLinks()
 		reader.Wait()
 		output.closing.Wait()
 	}()
-	frames := make(chan coord.Frame)
-	reader.Go(func() {
-		defer close(frames)
-		for {
-			frame, readErr := link.Read()
-			if readErr != nil {
-				return
-			}
-			select {
-			case frames <- frame:
-			case <-readerStop:
-				return
-			}
-		}
-	})
 	// Only one ordinary handler runs at a time. Frame size bounds the total
 	// payload in the waiting slots to 4 MiB.
 	// The reader never waits for that handler, so UI replies and cancellation
@@ -189,10 +174,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 			return nil
 		case frame, ok := <-frames:
 			if !ok {
-				// Do not derive workload cancellation from EOF or link failure.
-				output.loseLink(link.Err())
-				frames = nil
-				continue
+				return nil
 			}
 			if frame.Type != coord.TypeCommand {
 				continue
@@ -284,10 +266,98 @@ type workerWriter struct {
 	live     liveSnapshot
 }
 
-func (w *workerWriter) connect(link *coord.Link, instance coord.Instance) {
+func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Link, error) {
+	w.mu.Lock()
+	inst, pos := w.instance, w.journal.position
+	w.mu.Unlock()
+	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	link, _, err := coord.Dial(probe, path, coord.Frame{
+		Role: coord.RoleWorker, Instance: &inst, Token: token, Position: &pos,
+	})
+	if err != nil {
+		return nil, err
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.link, w.instance = link, instance
+	w.link = link
+	// Changes made during the handshake were journaled but could not be
+	// forwarded. Publish the latest summary before forwarding new events.
+	if w.instance != inst {
+		if err := link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance}); err != nil {
+			w.disconnect(err)
+		}
+	}
+	return link, nil
+}
+
+func (w *workerWriter) readLinks(ctx, work context.Context, path, token string, link *coord.Link, frames chan<- coord.Frame) {
+	for {
+		// A blocked Read must finish after explicit stop, even if the peer
+		// never sends another frame. Close flushes the shutdown reply first.
+		closed := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			closeWorkerLink(link)
+			close(closed)
+		})
+		w.readCommands(ctx, work, link, frames)
+		if !stop() {
+			<-closed
+		}
+		w.loseLink(link)
+		if ctx.Err() != nil || work.Err() != nil {
+			return
+		}
+		for delay := 100 * time.Millisecond; ; delay = min(2*delay, 3*time.Second) {
+			timer := time.NewTimer(delay)
+			select {
+			case <-work.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			next, err := w.dial(work, path, token)
+			if err == nil {
+				link = next
+				break
+			}
+			if delay == 100*time.Millisecond {
+				workerLog("reconnect coordinator: %v", err)
+			}
+		}
+	}
+}
+
+func (w *workerWriter) readCommands(ctx, work context.Context, link *coord.Link, frames chan<- coord.Frame) {
+	for {
+		frame, err := link.Read()
+		if err != nil {
+			return
+		}
+		if frame.Type == coord.TypePing {
+			if err := link.Send(coord.Frame{Type: coord.TypePong}); err != nil {
+				w.loseLink(link)
+				return
+			}
+			continue
+		}
+		if frame.Type != coord.TypeCommand {
+			continue
+		}
+		select {
+		case frames <- frame:
+		case <-ctx.Done():
+			return
+		case <-work.Done():
+			// Keep reading pings while cleanup owns the command loop.
+			if err := link.Send(coord.Frame{Type: coord.TypeResponse, ID: frame.ID, Error: &coord.Error{
+				Code: coord.CodeUnavailable, Message: "worker is stopping",
+			}}); err != nil {
+				w.loseLink(link)
+				return
+			}
+		}
+	}
 }
 
 func (w *workerWriter) Write(data []byte) (int, error) {
@@ -344,6 +414,7 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 				workerLog("%v", err)
 			}
 		}
+		w.instance.LastActivity = time.Now().UTC()
 		w.journal.position = position
 		w.journal.publish(frame, size)
 	}
@@ -401,11 +472,11 @@ func (w *workerWriter) publishSummaryLocked(kind string) error {
 	return w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance})
 }
 
-func (w *workerWriter) loseLink(err error) {
+func (w *workerWriter) loseLink(link *coord.Link) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.link != nil {
-		w.disconnect(err)
+	if w.link == link {
+		w.disconnect(link.Err())
 	}
 }
 
@@ -414,11 +485,13 @@ func (w *workerWriter) disconnect(err error) {
 	workerLog("coordinator link lost for %s; worker is still running and retains session %s: %v", w.instance.ID, w.instance.SessionID, err)
 	link := w.link
 	w.link = nil
-	w.closing.Go(func() {
-		if closeErr := link.Close(); closeErr != nil {
-			workerLog("close coordinator link: %v", closeErr)
-		}
-	})
+	w.closing.Go(func() { closeWorkerLink(link) })
+}
+
+func closeWorkerLink(link *coord.Link) {
+	if err := link.Close(); err != nil {
+		workerLog("close coordinator link: %v", err)
+	}
 }
 
 func workerLog(format string, args ...any) {

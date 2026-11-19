@@ -8,9 +8,13 @@ const $ = id => document.getElementById(id);
 const STAGE_FRAMES = 1024, STAGE_BYTES = 4 << 20, REPLAY_PAGES = 16, SYNC_ATTEMPTS = 4;
 const HISTORY_MAX = 1000, LIVE_TEXT_MAX = 64 << 10, LIVE_ROWS = 64, LOG_ROWS = 300;
 const OUTCOMES_MAX = 20, LOST_STARTS_MAX = 16;
+const RECONNECT_BASE_MS = 500, RECONNECT_MAX_MS = 30000, RECONNECT_ATTEMPTS = 10;
 const instances = new Map(), drafts = new Map(), pending = new Map(), lostStarts = new Map();
 const uploads = new WeakMap();
 let ws, seq = 0, links = 0, ready = false, view = null, intended = null, outcomes = [], switching = Promise.resolve();
+// watching is set once this connection's baseline is applied; generation
+// identifies the coordinator process that produced it.
+let launchIDVersion = 0, watching = false, generation = "", manual = false, fatal = "", retries = 0, retryTimer = 0;
 
 function failure(message, fields = {}) { return Object.assign(new Error(message), fields); }
 function uuid4() {
@@ -18,6 +22,17 @@ function uuid4() {
     const b = crypto.getRandomValues(new Uint8Array(16));
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
+    return uuidString(b);
+}
+function launchRequestID() {
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    let ms = Date.now();
+    for (let i = 5; i >= 0; i--, ms = Math.floor(ms / 256)) b[i] = ms % 256;
+    b[6] = (b[6] & 0x0f) | 0x70;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    return uuidString(b);
+}
+function uuidString(b) {
     const h = Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
     return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
 }
@@ -84,10 +99,39 @@ function renderOutcomes() {
         line(box, o.text).appendChild(button("Dismiss", () => { outcomes = outcomes.filter(x => x !== o); renderOutcomes(); }));
     }
 }
+// connect is an explicit user request, so it resets the backoff.
 function connect() {
+    manual = false;
+    retries = 0;
+    clearTimeout(retryTimer);
+    retryTimer = 0;
+    open();
+}
+function disconnect() {
+    manual = true;
+    clearTimeout(retryTimer);
+    retryTimer = 0;
+    if (ws && ws.readyState !== WebSocket.CLOSED) ws.close(1000, "disconnect");
+    else status("Disconnected");
+}
+// An abnormal close retries with capped, jittered exponential backoff. Only
+// connection setup and reads are automatic; mutations are never resent.
+function reconnectLater(kept) {
+    if (retries >= RECONNECT_ATTEMPTS) {
+        status("Connection lost; stopped reconnecting after " + retries + " attempts. Connect to retry." + kept);
+        return;
+    }
+    const delay = Math.round(Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** retries) * (0.5 + Math.random() / 2));
+    retries++;
+    status("Connection lost; reconnecting in " + Math.ceil(delay / 1000) + "s." + kept);
+    retryTimer = setTimeout(() => Promise.resolve().then(open).catch(report), delay);
+}
+function open() {
+    retryTimer = 0;
     if (ws && ws.readyState !== WebSocket.CLOSED) return;
     const token = $("token").value.trim();
     if (!token) throw new Error("Enter a token first");
+    fatal = "";
     const url = new URL("/rpc", location.href);
     url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const proto = ["tau.coord.v1"];
@@ -95,21 +139,25 @@ function connect() {
     else url.searchParams.set("token", token);
     const socket = ws = new WebSocket(url, proto);
     status("Connecting…");
-    socket.onclose = () => {
+    socket.onclose = e => {
         if (ws !== socket) return;
         ready = false;
+        watching = false;
         for (const {timer, reject} of pending.values()) {
             clearTimeout(timer);
             reject(failure("Connection closed before reply; outcome unknown", {code: "outcome_unknown", unknown: true}));
         }
         pending.clear();
-        // Keep the view, its position, and drafts so a manual reconnect can
-        // resume the intended instance.
-        if (view) { view.subscribed = false; view.syncing = false; view.link = ++links; }
+        // Keep the view, its position, drafts, and lost launch markers so a
+        // reconnect can resume the intended instance from where it was.
+        if (view) unlink(view);
         instances.clear();
         renderInstances();
         renderActive();
-        status(intended ? "Disconnected; connect again to resume. Drafts are kept." : "Disconnected");
+        const kept = intended ? " Drafts are kept." : "";
+        if (manual) status(intended ? "Disconnected; connect again to resume. Drafts are kept." : "Disconnected");
+        else if (fatal || [1002, 1003, 1008].includes(e?.code)) status((fatal || "Connection refused: " + (e.reason || e.code)) + ". Connect again to retry." + kept);
+        else reconnectLater(kept);
     };
     socket.onmessage = ({data}) => {
         if (ws !== socket) return;
@@ -118,18 +166,13 @@ function connect() {
 }
 function frame(f, socket, size) {
     if (f.type === "welcome") {
-        if (f.role !== "client" || f.version !== 1) { socket.close(); return; }
+        if (f.role !== "client" || f.version !== 1) { fatal = "Unsupported coordinator protocol"; socket.close(); return; }
+        launchIDVersion = f.launch_request_version;
         ready = true;
         status("Connected");
-        call("watch_instances").then(r => {
-            if (ws !== socket || !ready) return;
-            instances.clear();
-            for (const inst of r.instances || []) instances.set(inst.instance_id, inst);
-            reconcileStarts();
-            renderInstances();
-            refreshSaved();
-            resume();
-        }).catch(report);
+        // A watch lost to a close is retried by reconnecting; keep that status.
+        call("watch_instances").then(r => { if (ws === socket && ready) rediscover(r, f.generation || ""); })
+            .catch(err => { if (ws === socket && ready) report(err); });
         return;
     }
     if (f.type === "response") {
@@ -142,10 +185,13 @@ function frame(f, socket, size) {
         return;
     }
     if (f.type === "instance_update") {
+        if (!watching || (f.generation && generation && f.generation !== generation)) return;
         if (f.instance) instances.set(f.instance_id, f.instance);
-        if (f.error) instances.delete(f.instance_id);
+        else if (f.error) instances.delete(f.instance_id);
         reconcileStarts();
+        if (intended && f.instance_id === intended) linkChanged();
         renderInstances();
+        renderActive();
         return;
     }
     const v = view;
@@ -156,24 +202,58 @@ function frame(f, socket, size) {
     if (v.failed) return;
     follow(v, apply(v, f));
 }
+// Each watch response is a complete baseline, and updates follow it in
+// order. A new generation means the coordinator restarted: surviving workers
+// re-register over time, and the intended one is reattached when it does.
+function rediscover(r, welcomed) {
+    const next = r.generation || welcomed, restarted = !!(generation && next && next !== generation);
+    generation = next;
+    watching = true;
+    retries = 0;
+    instances.clear();
+    for (const inst of r.instances || []) instances.set(inst.instance_id, inst);
+    reconcileStarts();
+    renderInstances();
+    renderActive();
+    refreshSaved();
+    if (restarted) status("Coordinator restarted; waiting for instances to register again.");
+    resume();
+}
+// Summaries without link_state come from coordinators that drop lost workers.
+function connected(inst) { return !!inst && (!inst.link_state || inst.link_state === "connected"); }
+function unlink(v) {
+    v.subscribed = false;
+    v.syncing = false;
+    v.link = ++links;
+}
+function linkChanged() {
+    const v = view, inst = instances.get(intended);
+    if (!connected(inst) && v?.id === intended && v.subscribed) {
+        unlink(v);
+        note(v, "Instance " + (inst?.link_state || "link lost") + "; it is reattached if it returns.");
+    }
+    resume();
+}
 function unpositioned(v, f) {
-    if (f.error?.code === "worker_link_lost") {
-        v.subscribed = false;
-        v.syncing = false;
-        v.link = ++links;
+    if (f.error?.code === "worker_link_lost" || (f.instance && !connected(f.instance))) {
+        unlink(v);
         renderActive();
         renderInstances();
-        note(v, f.error.message || f.error.code);
+        note(v, f.error?.message || f.error?.code || "Instance " + f.instance.link_state);
         return;
     }
     if (f.error) { note(v, f.error.message || f.error.code); resync(v, "snapshot"); return; }
     const session = f.instance?.session_id || f.session_id;
     if (session && v.session && session !== v.session) resync(v, "snapshot");
 }
+// resume only attaches and reads; it never sends a mutation.
 function resume() {
-    if (!intended || view?.subscribed) return;
-    if (!instances.has(intended)) { status("Instance " + intended + " is not running; its draft is kept."); return; }
-    select(intended).catch(report);
+    if (!intended || !ready || view?.subscribed) return;
+    const inst = instances.get(intended);
+    if (connected(inst)) { select(intended).catch(report); return; }
+    if (inst?.link_state === "exited") status("Instance " + intended + " exited; its draft is kept.");
+    else if (inst) status("Instance " + intended + " is disconnected; it is reattached if it returns. Its draft is kept.");
+    else status("Instance " + intended + " is not running; it is reattached if it registers. Its draft is kept.");
 }
 // A lost start is reconciled only from instance summaries; it is never retried.
 function reconcileStarts() {
@@ -309,7 +389,8 @@ function renderInstances() {
     const selected = view?.id ?? intended;
     for (const i of instances.values()) {
         const needs = i.pending_inputs ? " — Needs input (" + i.pending_inputs + ")" : "";
-        const b = button(i.cwd + " — " + i.session_id + " — " + (i.state || "ready") + needs, () => select(i.instance_id));
+        const shown = connected(i) ? (i.state || "ready") + needs : i.link_state;
+        const b = button(i.cwd + " — " + i.session_id + " — " + shown, () => select(i.instance_id));
         b.setAttribute("aria-pressed", String(i.instance_id === selected));
         b.title = i.node_id + "/" + i.instance_id;
         box.appendChild(b);
@@ -324,7 +405,8 @@ function renderActive() {
         const st = v.state || {};
         if (st.model) text += " — " + st.model + (st.thinking_level ? " (" + st.thinking_level + ")" : "");
         if (st.is_streaming) text += " — working";
-        if (!v.subscribed) text += " — not attached";
+        const inst = instances.get(v.id);
+        if (!v.subscribed) text += " — " + (inst && !connected(inst) ? inst.link_state : "not attached");
         else if (v.syncing) text += " — synchronizing…";
         else if (v.failed) text += " — out of sync; select the instance to retry";
     }
@@ -380,6 +462,7 @@ function select(id) {
         renderActive();
         renderInstances();
         if (!view || !ready) return;
+        if (instances.has(view.id) && !connected(instances.get(view.id))) { resume(); return; }
         const v = view, link = v.link = ++links;
         v.subscribed = true;
         // Stage from before attach so no event between attach and load is lost.
@@ -683,10 +766,10 @@ async function send(type) {
 }
 function on(id, action) { $(id).onclick = () => Promise.resolve().then(action).catch(report); }
 on("connect", connect);
-on("disconnect", () => ws?.close());
+on("disconnect", disconnect);
 on("refresh", refreshSaved);
 on("start", async () => {
-    const cwd = $("cwd").value.trim(), request_id = uuid4();
+    const cwd = $("cwd").value.trim(), request_id = launchIDVersion === 7 ? launchRequestID() : uuid4();
     let r;
     try { r = await call("start_instance", {cwd, request_id}); }
     catch (err) {
