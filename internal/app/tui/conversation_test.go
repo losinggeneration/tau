@@ -111,3 +111,23 @@ func TestConversationDropAndPrependKeepPositions(t *testing.T) {
 		t.Fatalf("position 3 = %q after the prepend, want %q", got, full.Components[3].ID)
 	}
 }
+
+func TestPrependHistoryRejoinsToolResultAcrossPages(t *testing.T) {
+	conv := NewConversationModel()
+	conv.AddToolResultWithName("call", "bash", "completed output", false)
+	conv.AddAssistantMessage("done")
+
+	older := NewConversationModel()
+	older.AddUserMessage("test")
+	older.AddToolCallWithID("call", "bash", `{"command":"pwd"}`)
+	conv.PrependHistory(older)
+
+	components := conv.Snapshot().Components
+	if len(components) != 3 {
+		t.Fatalf("want user, completed bash, assistant; got %+v", components)
+	}
+	tool := components[1].ToolExecution
+	if tool.State != toolExecutionComplete || tool.Args != `{"command":"pwd"}` || tool.Output != "completed output" {
+		t.Fatalf("bash result split across pages: %+v", tool)
+	}
+}

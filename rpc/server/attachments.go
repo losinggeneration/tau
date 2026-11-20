@@ -2,18 +2,19 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/sdk"
 )
 
 func messageContentBlocks(sess sdk.Session, images, attachFiles, attachmentIDs []string) ([]ai.ContentBlock, []string, error) {
-	content := make([]ai.ContentBlock, 0, len(images))
-	for _, img := range images {
-		content = append(content, ai.ContentBlock{Type: ai.ContentBlockImage, Data: img, MimeType: "image/png"})
-	}
+	content := rpcImageBlocks(images)
 
 	ids := append([]string(nil), attachmentIDs...)
 	if len(attachFiles) == 0 {
@@ -31,6 +32,27 @@ func messageContentBlocks(sess sdk.Session, images, attachFiles, attachmentIDs [
 		ids = append(ids, record.ID)
 	}
 	return content, ids, nil
+}
+
+// rpcImageBlocks accepts the original base64 strings without requiring a
+// wire change. Sniff only the prefix; the full payload is decoded downstream.
+func rpcImageBlocks(images []string) []ai.ContentBlock {
+	content := make([]ai.ContentBlock, 0, len(images))
+	for _, data := range images {
+		if header, body, ok := strings.Cut(data, ","); ok && strings.HasPrefix(header, "data:image/") && strings.HasSuffix(header, ";base64") {
+			data = body
+		}
+		var prefix [512]byte
+		n, err := io.ReadFull(base64.NewDecoder(base64.StdEncoding, strings.NewReader(data)), prefix[:])
+		mimeType := "image/png" // Preserve the original default for unrecognized data.
+		if err == nil || err == io.ErrUnexpectedEOF {
+			if detected := http.DetectContentType(prefix[:n]); strings.HasPrefix(detected, "image/") {
+				mimeType = detected
+			}
+		}
+		content = append(content, ai.ContentBlock{Type: ai.ContentBlockImage, Data: data, MimeType: mimeType})
+	}
+	return content
 }
 
 func (s *Server) attachmentManager() (sdk.AttachmentManager, error) {

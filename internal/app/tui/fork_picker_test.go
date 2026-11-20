@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
@@ -241,5 +243,82 @@ func TestForgetSelectorWithoutEntriesReportsError(t *testing.T) {
 	msgs := a.conv.Messages()
 	if len(msgs) == 0 || msgs[len(msgs)-1].Text != "forget: no messages to forget" {
 		t.Fatalf("messages = %#v", msgs)
+	}
+}
+
+func TestMessageSelectorReportsUnavailableOncePerCommand(t *testing.T) {
+	for _, tc := range []struct {
+		command, want string
+		sess          sdk.Session
+	}{
+		{"/forget", "forget: no messages to forget", &forgetSession{fakeSession: &fakeSession{stateID: "s"}}},
+		{"/fork", "fork: session switching is unavailable", &forkEntrySession{fakeSession: &fakeSession{stateID: "s"}, entries: forkPickerEntries()}},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			a := newAppWithSelector(t)
+			a.sess = tc.sess
+			ctx := stubCtx()
+			errors := func() int {
+				var n int
+				for _, m := range a.conv.Messages() {
+					if m.Text == tc.want {
+						n++
+					}
+				}
+				return n
+			}
+			for _, text := range []string{tc.command + " ", tc.command + " a", tc.command + " ab", tc.command + " a"} {
+				a.editor.SetText(ctx, text)
+				a.refreshSelector(text, ctx)
+			}
+			if got := errors(); got != 1 {
+				t.Fatalf("%d %q errors while typing, want 1", got, tc.want)
+			}
+			for _, text := range []string{"", tc.command + " "} {
+				a.editor.SetText(ctx, text)
+				a.refreshSelector(text, ctx)
+			}
+			if got := errors(); got != 2 {
+				t.Fatalf("%d %q errors after retyping the command, want 2", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCoordinatedForgetRunsOffTheUILoop(t *testing.T) {
+	fc := newCoordFake(t)
+	s, conn := openCoordTestSession(t, fc)
+	nextCoordEvent(t, s)
+	a := newAppWithSelector(t)
+	a.app = &tauui.App{}
+	a.sess, a.coordinated = s, s
+	a.loopCtx = stubCtx()
+	a.conv.AddUserMessage("kept until the worker redraws")
+	ctx := stubCtx()
+
+	typed := make(chan struct{})
+	go func() {
+		defer close(typed)
+		for _, text := range []string{"/forget ", "/forget a"} {
+			a.editor.SetText(ctx, text)
+			a.refreshSelector(text, ctx)
+		}
+	}()
+	select {
+	case <-typed:
+	case <-time.After(time.Second):
+		t.Fatal("typing /forget waited for the worker")
+	}
+	f, _ := conn.expectCommand(t, "get_forget_entries")
+	conn.reply(t, f, map[string]any{"entries": []map[string]string{{"entry_id": "e1", "role": "user", "text": "first"}}})
+
+	forgetFrom(a, "e1")
+	f, raw := conn.expectCommand(t, "forget")
+	if !strings.Contains(string(raw), `"entry_id":"e1"`) {
+		t.Fatalf("forget args = %s", raw)
+	}
+	conn.reply(t, f, map[string]any{"ok": true})
+	if msgs := a.conv.Messages(); len(msgs) != 1 || msgs[0].Text != "kept until the worker redraws" {
+		t.Fatalf("chat = %#v", msgs)
 	}
 }

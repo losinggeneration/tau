@@ -33,9 +33,8 @@ var RootFlags = []cli.Flag{
 		Usage:   "Enable verbose output",
 	},
 	&cli.BoolFlag{
-		Name:    "offline",
-		Usage:   "Run in offline mode",
-		Sources: cli.EnvVars("TAU_OFFLINE"),
+		Name:  "offline",
+		Usage: "Run in offline mode (also TAU_OFFLINE)",
 	},
 	&cli.StringFlag{
 		Name:  "session-dir",
@@ -49,6 +48,11 @@ var RootFlags = []cli.Flag{
 
 // ConversationFlags are flags for the root command (prompt mode).
 var ConversationFlags = []cli.Flag{
+	&cli.BoolFlag{
+		Name:    "standalone",
+		Aliases: []string{"so"},
+		Usage:   "Open the terminal UI without connecting to a running daemon",
+	},
 	// Session flags
 	&cli.StringFlag{
 		Name:    "session",
@@ -228,13 +232,13 @@ var ConversationFlags = []cli.Flag{
 	// at runtime: non-TTY stdin selects print (text); TTY selects interactive.
 	&cli.StringFlag{
 		Name:  "mode",
-		Usage: "Output mode: text, json, or rpc (default: text on non-TTY stdin, interactive on TTY)",
+		Usage: "Output mode: text or json (default: text on non-TTY stdin, interactive on TTY)",
 		Validator: func(mode string) error {
 			switch mode {
-			case "", "text", "json", "rpc":
+			case "", "text", "json":
 				return nil
 			default:
-				return cli.Exit("invalid --mode: "+mode+" (expected text, json, or rpc)", ExitUserError)
+				return cli.Exit("invalid --mode: "+mode+" (expected text or json)", ExitUserError)
 			}
 		},
 	},

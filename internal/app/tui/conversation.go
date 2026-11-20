@@ -483,17 +483,32 @@ func (m *ConversationModel) PrependHistory(src *ConversationModel) {
 	if src == nil || len(src.committed) == 0 {
 		return
 	}
-	items := src.committed
-	src.committed = nil
-	for i := range items {
-		items[i].id = m.nextID("history")
-		items[i].revision = m.nextRevision()
-		items[i].projection = nil
-		if items[i].kind == conversationItemToolExecution {
-			m.recordToolCallID(items[i].toolCallID)
-		}
-	}
 	m.mu.Lock()
+	items := src.committed[:0]
+	for _, item := range src.committed {
+		if item.kind == conversationItemToolExecution {
+			if item.role == RoleToolCall && item.toolState == toolExecutionExecuting && item.toolCallID != "" {
+				idx := m.findTool(item.toolCallID)
+				if idx >= 0 && m.committed[idx].role == RoleToolResult {
+					// Keep the result at its held position so scroll anchors stay valid.
+					row := &m.committed[idx]
+					row.role, row.toolArgs = RoleToolCall, item.toolArgs
+					if row.toolName == "" {
+						row.toolName = item.toolName
+					}
+					row.revision = m.nextRevision()
+					continue
+				}
+			}
+			m.recordToolCallID(item.toolCallID)
+		}
+		item.id = m.nextID("history")
+		item.revision = m.nextRevision()
+		item.projection = nil
+		items = append(items, item)
+	}
+	clear(src.committed[len(items):])
+	src.committed = nil
 	m.committed = append(items, m.committed...)
 	m.base -= len(items)
 	m.draftAfter += len(items)

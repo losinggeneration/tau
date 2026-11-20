@@ -54,26 +54,15 @@ const (
 // Compaction summaries appear before the first entry they kept, as in
 // Reader.AllEntries.
 func (x *Index) History(path, head, before string, limit int) (entries []Entry, next string, err error) {
-	f, err := os.Open(path)
+	f, release, err := x.open(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("open session: %w", err)
-	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close session: %w", closeErr)
-		}
-	}()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-		return nil, "", fmt.Errorf("lock session for read: %w", err)
-	}
-	defer func() {
-		if unlockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); unlockErr != nil && err == nil {
-			err = fmt.Errorf("unlock session read: %w", unlockErr)
-		}
-	}()
-	if err := x.refresh(f); err != nil {
 		return nil, "", err
 	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil && err == nil {
+			err = releaseErr
+		}
+	}()
 
 	start := int32(-1)
 	var beforeEntry int32 = -1
@@ -134,6 +123,54 @@ walk:
 		next = entries[0].ID
 	}
 	return entries, next, nil
+}
+
+// Entry reads the displayable entry id wherever it sits in the session tree,
+// not only on the active branch. ok is false when there is no such entry.
+func (x *Index) Entry(path, id string) (entry Entry, ok bool, err error) {
+	f, release, err := x.open(path)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil && err == nil {
+			err = releaseErr
+		}
+	}()
+	i, found := x.byID[id]
+	if !found || x.entries[i].kind == indexHidden {
+		return Entry{}, false, nil
+	}
+	if entry, err = x.read(f, i); err != nil {
+		return Entry{}, false, err
+	}
+	return entry, true, nil
+}
+
+// open opens path under a shared lock and indexes what was appended. release
+// unlocks and closes the file.
+func (x *Index) open(path string) (*os.File, func() error, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open session: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, nil, errors.Join(fmt.Errorf("lock session for read: %w", err), f.Close())
+	}
+	release := func() error {
+		var errs []error
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+			errs = append(errs, fmt.Errorf("unlock session read: %w", err))
+		}
+		if err := f.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close session: %w", err))
+		}
+		return errors.Join(errs...)
+	}
+	if err := x.refresh(f); err != nil {
+		return nil, nil, errors.Join(err, release())
+	}
+	return f, release, nil
 }
 
 func (x *Index) read(f *os.File, i int32) (Entry, error) {

@@ -27,6 +27,7 @@ const (
 	TypeHello            = "hello"
 	TypeWelcome          = "welcome"
 	TypeListInstances    = "list_instances"
+	TypeSessionDirectory = "session_directory"
 	TypeWatchInstances   = "watch_instances"
 	TypeUnwatchInstances = "unwatch_instances"
 	TypeInstanceUpdate   = "instance_update"
@@ -41,6 +42,23 @@ const (
 	TypePing             = "ping"
 	TypePong             = "pong"
 )
+
+// OperationSavedSessionLaunch advertises that start_instance honors session_id.
+const OperationSavedSessionLaunch = "start_saved_session"
+
+// OperationInstancePrompts opts clients into prompt previews and tells workers
+// the coordinator accepts prompt previews in registrations.
+const OperationInstancePrompts = "instance_prompts"
+
+// OperationInstanceBuild opts local clients into the outdated indicator and
+// allows workers to report their build identity in registrations.
+const OperationInstanceBuild = "instance_build"
+
+// OperationInstanceRestart advertises session-preserving shutdown support.
+const OperationInstanceRestart = "instance_restart"
+
+// MaxInstancePromptBytes bounds a preview before JSON escaping.
+const MaxInstancePromptBytes = 256
 
 // Connection roles advertised in hello.
 const (
@@ -206,6 +224,9 @@ type Instance struct {
 	NodeID          string    `json:"node_id,omitempty"`
 	CWD             string    `json:"cwd,omitempty"`
 	SessionID       string    `json:"session_id,omitempty"`
+	FirstPrompt     string    `json:"first_prompt,omitempty"`
+	BuildID         string    `json:"build_id,omitempty"`
+	Outdated        bool      `json:"outdated,omitempty"`
 	State           string    `json:"state,omitempty"`
 	PID             int       `json:"pid,omitempty"`
 	PendingInputs   int       `json:"pending_inputs,omitempty"`
@@ -232,7 +253,7 @@ func decodeFrame(line []byte) (Frame, error) {
 
 func isFrameType(t string) bool {
 	switch t {
-	case TypeHello, TypeWelcome, TypeListInstances, TypeStartInstance, TypeAttach,
+	case TypeHello, TypeWelcome, TypeListInstances, TypeSessionDirectory, TypeStartInstance, TypeAttach,
 		TypeDetach, TypeCommand, TypeStopInstance, TypeResponse, TypeEvent, TypeRegister,
 		TypeWatchInstances, TypeUnwatchInstances, TypeInstanceUpdate, TypePing, TypePong:
 		return true
@@ -270,7 +291,7 @@ type legacyResponse struct {
 }
 
 const legacyGuidance = "this socket serves coordinated protocol v1 and requires a hello handshake; " +
-	"connection-owned RPC clients need a daemon started with `tau daemon --legacy`"
+	"the old connection-owned RPC protocol has been removed"
 
 func (f *Frame) validate() error {
 	if !isFrameType(f.Type) {
@@ -321,10 +342,13 @@ func (i *Instance) validate() error {
 	if i.PendingInputs < 0 {
 		return fmt.Errorf("%w: negative pending input count", ErrInvalidFrame)
 	}
-	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State, i.LaunchRequestID, i.LinkState} {
+	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State, i.LaunchRequestID, i.LinkState, i.BuildID} {
 		if len(s) > maxIDBytes {
 			return fmt.Errorf("%w: instance identifier exceeds %d bytes", ErrInvalidFrame, maxIDBytes)
 		}
+	}
+	if len(i.FirstPrompt) > MaxInstancePromptBytes {
+		return fmt.Errorf("%w: instance prompt exceeds %d bytes", ErrInvalidFrame, MaxInstancePromptBytes)
 	}
 	if len(i.CWD) > maxTextBytes {
 		return fmt.Errorf("%w: instance cwd exceeds %d bytes", ErrInvalidFrame, maxTextBytes)

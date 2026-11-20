@@ -1892,6 +1892,29 @@ func TestPeekQueuedMessagesDoesNotConsumeQueues(t *testing.T) {
 	}
 }
 
+func TestEditQueuedTextOnlyReplacesPendingRevision(t *testing.T) {
+	a, err := New(Config{})
+	require.NoError(t, err)
+	a.Steer(NewUserMessage("steer now"))
+	msg := NewUserMessage("later")
+	msg.Content = append(msg.Content, ai.ContentBlock{Type: ai.ContentBlockText, Text: "attachment contents"})
+	a.FollowUp(msg)
+	a.FollowUp(NewUserMessage("last"))
+	steering, followUp := a.QueuedMessages()
+	originalID := followUp[0].ID
+	require.True(t, a.EditQueuedText(originalID, "edited"))
+	require.False(t, a.EditQueuedText(originalID, "stale edit"))
+	afterSteering, afterFollowUp := a.QueuedMessages()
+	require.Equal(t, steering, afterSteering)
+	require.Equal(t, followUp[1], afterFollowUp[1])
+	require.Equal(t, "edited", afterFollowUp[0].Message.Content[0].Text)
+	require.Equal(t, msg.Content[1], afterFollowUp[0].Message.Content[1])
+	require.Equal(t, "later", msg.Content[0].Text)
+	_, drained := a.ClearAllQueues()
+	require.Equal(t, "edited", drained[0].Content[0].Text)
+	require.False(t, a.EditQueuedText(afterFollowUp[0].ID, "already taken"))
+}
+
 func TestClearAllQueuesReturnsQueuedMessages(t *testing.T) {
 	a, err := New(Config{})
 	if err != nil {
@@ -3559,8 +3582,8 @@ func TestCancelledStatefulQueueSuppliersRetainMessages(t *testing.T) {
 			}
 			require.ErrorIs(t, err, context.Canceled)
 			require.Empty(t, messages)
-			require.Equal(t, []*Message{queued}, a.steeringQueue)
-			require.Equal(t, []*Message{queued}, a.followUpQueue)
+			require.Equal(t, []*Message{queued}, queuedContents(a.steeringQueue))
+			require.Equal(t, []*Message{queued}, queuedContents(a.followUpQueue))
 		})
 	}
 }
@@ -3584,9 +3607,9 @@ func TestCancelledContinueRetainsQueuedAssistantContinuation(t *testing.T) {
 			require.ErrorIs(t, err, context.Canceled)
 			require.ErrorIs(t, err, cause)
 			if queue == "steering" {
-				require.Equal(t, []*Message{queued}, a.steeringQueue)
+				require.Equal(t, []*Message{queued}, queuedContents(a.steeringQueue))
 			} else {
-				require.Equal(t, []*Message{queued}, a.followUpQueue)
+				require.Equal(t, []*Message{queued}, queuedContents(a.followUpQueue))
 			}
 			require.Len(t, a.Messages(), 2)
 			require.Same(t, original, a.Messages()[1])
@@ -3630,8 +3653,8 @@ func TestTurnCancellationRetainsStatefulQueues(t *testing.T) {
 			require.ErrorIs(t, err, cause)
 			require.ErrorIs(t, err, context.Canceled)
 			require.Equal(t, 1, streams)
-			require.Equal(t, []*Message{queued}, a.steeringQueue)
-			require.Equal(t, []*Message{queued}, a.followUpQueue)
+			require.Equal(t, []*Message{queued}, queuedContents(a.steeringQueue))
+			require.Equal(t, []*Message{queued}, queuedContents(a.followUpQueue))
 			require.False(t, a.State().IsStreaming)
 			require.ErrorIs(t, a.State().Error, cause)
 			var ends, aborted int

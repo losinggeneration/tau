@@ -1,6 +1,7 @@
 package client
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -507,7 +508,7 @@ func fakeWorker(ctx context.Context, path string, req coord.LaunchRequest, comma
 	link, _, err := coord.Dial(ctx, path, coord.Frame{
 		Role:     coord.RoleWorker,
 		Token:    req.Token,
-		Instance: &coord.Instance{ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: "sess-" + req.InstanceID},
+		Instance: &coord.Instance{ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: cmp.Or(req.SessionID, "sess-"+req.InstanceID)},
 	})
 	if err != nil {
 		return
@@ -673,28 +674,6 @@ func TestStopInstanceReportsWorkerCleanupFailure(t *testing.T) {
 	}
 }
 
-func TestLegacyUnixClientGetsCoordinatorModeDiagnostic(t *testing.T) {
-	path, _ := runCoordinator(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
-	defer cancel()
-	c, err := NewUnixClient(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := c.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	r, err := c.GetState(ctx)
-	if err != nil {
-		t.Fatalf("expected an explicit mode diagnostic: %v", err)
-	}
-	if r.OK || r.Error == nil || r.Error.Code != coord.CodeLegacyProtocol || !strings.Contains(r.Error.Message, "tau daemon --legacy") {
-		t.Fatalf("wrong mode diagnostic: %+v, error: %+v", r, r.Error)
-	}
-}
-
 const testEpoch = "epoch-1"
 
 func posEvent(instanceID string, offset uint64) coord.Frame {
@@ -733,7 +712,7 @@ func readCommand(t *testing.T, srv *coord.Link) (coord.Frame, routedCommand) {
 }
 
 // sendWorkerReply answers f the way a worker's response reaches a client:
-// a full tau rpc response inside the coordinated reply.
+// a full worker response inside the coordinated reply.
 func sendWorkerReply(t *testing.T, srv *coord.Link, f coord.Frame, response map[string]any) {
 	t.Helper()
 	response["type"], response["id"] = "response", "route"
@@ -1225,6 +1204,29 @@ func TestHistoryPage(t *testing.T) {
 	}
 }
 
+func TestEntryContentRejectsMismatchedRevision(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
+	ctx := testContext(t)
+	request := EntryContentRequest{SessionID: "s", EntryID: "e", Offset: 3, Revision: "first"}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.EntryContent(ctx, "inst-a", request)
+		done <- err
+	}()
+	f, cmd := readCommand(t, srv)
+	var args EntryContentRequest
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Type != cmdEntryContent || f.InstanceID != "inst-a" || args != request {
+		t.Fatalf("unexpected content request: %s %s %+v", f.InstanceID, cmd.Type, args)
+	}
+	sendWorkerResult(t, srv, f, EntryContentChunk{Revision: "second", Data: []byte("tail")})
+	if err := <-done; !errors.Is(err, coord.ErrInvalidFrame) {
+		t.Fatalf("EntryContent error = %v, want invalid frame", err)
+	}
+}
+
 func TestAttachSnapshotRetriesTransientWorkerReads(t *testing.T) {
 	c, srv, _ := fakeCoordinator(t, coordinatedEventBuffer)
 	ctx := testContext(t)
@@ -1246,5 +1248,92 @@ func TestAttachSnapshotRetriesTransientWorkerReads(t *testing.T) {
 	sendWorkerResult(t, srv, f, json.RawMessage(testSnapshot))
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStartSavedSessionReusesConnectedOwner(t *testing.T) {
+	path, _ := runCoordinator(t)
+	ctx := testContext(t)
+	owner, err := NewCoordinatedClient(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := owner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	joiner, err := NewCoordinatedClient(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := joiner.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	cwd, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := uuid.NewString()
+	started, err := owner.StartSavedSession(ctx, cwd, sessionID)
+	if err != nil {
+		t.Fatalf("start saved session: %v", err)
+	}
+	got, err := joiner.StartSavedSession(ctx, cwd, sessionID)
+	if err != nil {
+		t.Fatalf("resume with connected owner: %v", err)
+	}
+	if got.ID != started.ID || got.SessionID != sessionID {
+		t.Fatalf("got %+v, want original worker %+v", got, started)
+	}
+	if err := joiner.Attach(ctx, got.ID); err != nil {
+		t.Fatalf("attach to existing owner: %v", err)
+	}
+	list, err := joiner.ListInstances(ctx)
+	if err != nil || len(list) != 1 || list[0].ID != started.ID {
+		t.Fatalf("registry after resume: %+v, error %v", list, err)
+	}
+	_, err = joiner.StartSavedSession(ctx, t.TempDir(), sessionID)
+	if conflict, ok := errors.AsType[*coord.Error](err); !ok || conflict.Code != coord.CodeConflict {
+		t.Fatalf("resume from another project: got %v, want conflict", err)
+	}
+}
+
+func TestStartSavedSessionWaitsForBusyOwner(t *testing.T) {
+	c, srv, _ := fakeCoordinator(t, 16)
+	c.welcome.Operations = []string{coord.OperationSavedSessionLaunch}
+	ctx := testContext(t)
+	id := uuid.NewString()
+	inst := coord.Instance{ID: "owner", SessionID: id, CWD: "/work", LinkState: coord.LinkConnected}
+	type result struct {
+		inst *coord.Instance
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := c.StartSavedSession(ctx, inst.CWD, id)
+		done <- result{got, err}
+	}()
+	first := readFrame(t, srv)
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: first.ID, Error: &coord.Error{Code: coord.CodeBusy}})
+	retry := readFrame(t, srv)
+	if retry.Type != coord.TypeStartInstance || retry.SessionID != id || retry.CWD != inst.CWD {
+		t.Fatalf("wrong retry: %+v", retry)
+	}
+	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: retry.ID, Instance: &inst})
+	if got := <-done; got.err != nil || got.inst == nil || got.inst.ID != inst.ID {
+		t.Fatalf("resume after busy: instance=%+v error=%v", got.inst, got.err)
+	}
+}
+
+func TestSavedSessionOperationsRequireCoordinatorSupport(t *testing.T) {
+	c, _, _ := fakeCoordinator(t, 16)
+	if _, err := c.StartSavedSession(t.Context(), "/work", uuid.NewString()); err == nil || !strings.Contains(err.Error(), "restart") {
+		t.Fatalf("old coordinator launch: %v", err)
+	}
+	if _, err := c.SessionDirectory(t.Context(), "/work"); err == nil || !strings.Contains(err.Error(), "restart") {
+		t.Fatalf("old coordinator lookup: %v", err)
 	}
 }

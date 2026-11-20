@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -626,7 +625,7 @@ func TestBuildConversationRuntimeOptionsHonorsRootFlags(t *testing.T) {
 		requireNoError(os.Chdir(origWD))
 	}()
 
-	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	cmd := newRootCommand()
 	requireNoError(cmd.Set("session-dir", sessionDir))
 	requireNoError(cmd.Set("no-skills", "true"))
 
@@ -670,7 +669,7 @@ func TestBuildConversationRuntimeOptionsIncludesCLIArtifactPaths(t *testing.T) {
 		}
 	}()
 
-	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	cmd := newRootCommand()
 	if err := cmd.Set("skill", skillPath); err != nil {
 		t.Fatalf("set skill flag: %v", err)
 	}
@@ -710,7 +709,7 @@ func TestBuildConversationRuntimeOptionsResolvesModelsFlag(t *testing.T) {
 		t.Fatalf("save settings: %v", err)
 	}
 
-	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
+	cmd := newRootCommand()
 	if err := cmd.Set("models", "claude-sonnet-4-6"); err != nil {
 		t.Fatalf("set models flag: %v", err)
 	}
@@ -1213,8 +1212,6 @@ func TestResolveAppMode(t *testing.T) {
 		want      string
 	}{
 		// --mode primary
-		{name: "mode_rpc_tty", mode: "rpc", stdinTTY: true, want: "rpc"},
-		{name: "mode_rpc_nontty", mode: "rpc", stdinTTY: false, want: "rpc"},
 		{name: "mode_json_tty", mode: "json", stdinTTY: true, want: "json"},
 		{name: "mode_json_nontty", mode: "json", stdinTTY: false, want: "json"},
 		{name: "mode_text_tty", mode: "text", stdinTTY: true, want: "text"},
@@ -1242,7 +1239,6 @@ func TestResolveAppMode(t *testing.T) {
 
 		// --mode wins over --json (alias only honored when --mode unset)
 		{name: "json_ignored_when_mode_text", mode: "text", json: true, stdinTTY: true, want: "text"},
-		{name: "json_ignored_when_mode_rpc", mode: "rpc", json: true, stdinTTY: true, want: "rpc"},
 		{name: "print_ignored_when_mode_json", mode: "json", print: true, stdinTTY: true, want: "json"},
 	}
 
@@ -1347,82 +1343,6 @@ func requireNoError(t *testing.T, err error) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-}
-
-// TestRpcModeValidation_RejectsPrompts covers the guard in runRoot that
-// rejects positional prompts and @file attachments when the resolved
-// mode is rpc. RPC is a long-lived server, so positional prompts would
-// be lost and @file attachments cannot be expanded; clients must send
-// both through JSON-RPC.
-func TestRpcModeValidation_RejectsPrompts(t *testing.T) {
-	t.Run("non_rpc_mode_passes", func(t *testing.T) {
-		if err := validateRpcInput("text", []string{"hello"}, nil); err != nil {
-			t.Errorf("validateRpcInput(text) = %v, want nil", err)
-		}
-		if err := validateRpcInput("json", []string{"hello"}, nil); err != nil {
-			t.Errorf("validateRpcInput(json) = %v, want nil", err)
-		}
-	})
-	t.Run("rpc_with_no_input_passes", func(t *testing.T) {
-		if err := validateRpcInput("rpc", nil, nil); err != nil {
-			t.Errorf("validateRpcInput(rpc, nil, nil) = %v, want nil", err)
-		}
-	})
-	t.Run("rpc_rejects_positional_prompts", func(t *testing.T) {
-		err := validateRpcInput("rpc", []string{"hello"}, nil)
-		if err == nil {
-			t.Fatal("validateRpcInput = nil, want error")
-		}
-		if !strings.Contains(err.Error(), "positional prompts") {
-			t.Errorf("error %q does not mention positional prompts", err.Error())
-		}
-	})
-	t.Run("rpc_rejects_file_images_even_without_prompts", func(t *testing.T) {
-		// A bare @file arg expands into fileImages only; the prompts list
-		// is empty in this case. The guard must still fire.
-		err := validateRpcInput("rpc", nil, []ai.ContentBlock{{Type: "image"}})
-		if err == nil {
-			t.Fatal("validateRpcInput = nil, want error")
-		}
-		if !strings.Contains(err.Error(), "@file") {
-			t.Errorf("error %q does not mention @file", err.Error())
-		}
-	})
-	t.Run("rpc_prompts_rejected_before_file_images", func(t *testing.T) {
-		// When both are present, the prompt error wins so the user
-		// sees the more fundamental issue first.
-		err := validateRpcInput("rpc", []string{"hello"}, []ai.ContentBlock{{Type: "image"}})
-		if err == nil {
-			t.Fatal("validateRpcInput = nil, want error")
-		}
-		if !strings.Contains(err.Error(), "positional prompts") {
-			t.Errorf("error %q should mention positional prompts first", err.Error())
-		}
-	})
-}
-
-// TestRpcCommand_ActionIsRunRPC verifies that the rpcCmd's Action
-// function is the same as runRPC. This is the structural guarantee
-// that "tau rpc" and "tau --mode rpc" both invoke the same RPC server:
-// rpcCmd.Action is runRPC, and runRoot's mode switch routes "rpc" to
-// runRPC. Either side drifting makes the two commands behave
-// differently, which would be a contract break.
-func TestRpcCommand_ActionIsRunRPC(t *testing.T) {
-	for _, c := range Commands {
-		if c.Name != "rpc" {
-			continue
-		}
-		if c.Action == nil {
-			t.Fatal("rpcCmd.Action is nil")
-		}
-		got := reflect.ValueOf(c.Action).Pointer()
-		want := reflect.ValueOf(runRPC).Pointer()
-		if got != want {
-			t.Errorf("rpcCmd.Action pointer = %#x, want runRPC pointer %#x", got, want)
-		}
-		return
-	}
-	t.Fatal("rpc command not registered")
 }
 
 // TestListModelsSearchOperand covers the optional [search] operand for
@@ -1798,7 +1718,7 @@ func TestPrintPostTUIExitMessageEmpty(t *testing.T) {
 
 func TestPrintResumeInstructions(t *testing.T) {
 	var b strings.Builder
-	printResumeInstructions(&b, "sess-123")
+	require.NoError(t, printResumeInstructions(&b, "sess-123", ""))
 	got := b.String()
 	for _, want := range []string{"Session ID: sess-123", "tau --resume sess-123"} {
 		if !strings.Contains(got, want) {
@@ -1809,7 +1729,7 @@ func TestPrintResumeInstructions(t *testing.T) {
 
 func TestPrintResumeInstructionsEmptyID(t *testing.T) {
 	var b strings.Builder
-	printResumeInstructions(&b, "")
+	require.NoError(t, printResumeInstructions(&b, "", ""))
 	if b.Len() != 0 {
 		t.Fatalf("empty session id printed %q, want nothing", b.String())
 	}
@@ -3505,63 +3425,6 @@ func TestThemeNamesTracksResourceReload(t *testing.T) {
 	assert.Contains(t, names(), "project-theme")
 	register("reloaded-theme")
 	assert.Equal(t, []string{"system", "reloaded-theme"}, names())
-}
-
-func TestForwardRPCSignalsSettlesOnCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	signals := make(chan os.Signal, 3)
-	signals <- syscall.SIGTERM
-	signals <- syscall.SIGINT
-	notified := make(chan struct{}, 1)
-	done := make(chan struct{})
-	go func() { forwardRPCSignals(ctx, signals, func() { notified <- struct{}{} }); close(done) }()
-	defer close(signals)
-	select {
-	case <-notified:
-	case <-time.After(time.Second):
-		t.Fatal("SIGINT did not reach RPC")
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("RPC signal forwarding outlived its server")
-	}
-	select {
-	case <-notified:
-		t.Fatal("non-interrupt signal was forwarded")
-	default:
-	}
-}
-
-func TestForwardRPCSignalsSettlesOnClosedChannel(t *testing.T) {
-	signals := make(chan os.Signal)
-	close(signals)
-	forwardRPCSignals(context.Background(), signals, func() { t.Fatal("closed signal channel produced an interrupt") })
-}
-
-func TestRPCDiscoversExplicitExtension(t *testing.T) {
-	oldLoader, oldManager, oldCommands := sdk.GlobalArtifactLoader, GlobalPluginManager, GlobalCommandRegistry
-	t.Cleanup(func() {
-		sdk.GlobalArtifactLoader, GlobalPluginManager, GlobalCommandRegistry = oldLoader, oldManager, oldCommands
-	})
-	isolateBuildEnv(t)
-	extension := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(extension, "tau-package.toml"), []byte("not valid [toml"), 0o600))
-	cmd := &cli.Command{Flags: append(RootFlags, ConversationFlags...)}
-	require.NoError(t, cmd.Set("extension", extension))
-	input, err := os.Open(os.DevNull)
-	require.NoError(t, err)
-	previous := os.Stdin
-	os.Stdin = input
-	t.Cleanup(func() { os.Stdin = previous; require.NoError(t, input.Close()) })
-	ctx, diagnostics := withStartupDiagnostics(t.Context())
-	ctx = context.WithValue(ctx, rootCmdKey{}, cmd)
-	var result error
-	captureStdout(t, func() { result = runRPC(ctx, cmd) })
-	require.NoError(t, result)
-	require.Contains(t, strings.Join(diagnostics.Lines(), "\n"), "plugin discovery error", "RPC never inspected its explicit extension")
 }
 
 func TestSystemdQuoteEscapesUnitSyntax(t *testing.T) {

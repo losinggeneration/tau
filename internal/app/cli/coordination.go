@@ -16,7 +16,10 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/google/uuid"
+	sessionpkg "github.com/losinggeneration/tau/agent/session"
+	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/logging"
+	"github.com/losinggeneration/tau/paths"
 	"github.com/losinggeneration/tau/rpc/coord"
 	"github.com/losinggeneration/tau/rpc/server"
 	"github.com/losinggeneration/tau/sdk"
@@ -42,13 +45,32 @@ func runCoordinator(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return fmt.Errorf("resolve coordinator socket: %w", err)
 	}
+	executable, err := workerExecutable()
+	if err != nil {
+		return err
+	}
+	sessionDirectory := func(ctx context.Context, cwd string) (string, error) {
+		return daemonSessionDirectory(ctx, cfgDir, cwd)
+	}
 	launch := func(ctx context.Context, request coord.LaunchRequest) error {
-		return launchWorkerProcess(ctx, path, node, request)
+		// Resolve storage in the daemon for fresh and resumed workers, so
+		// worker-only plugin trust decisions cannot redirect persistence away
+		// from the directory shown by the local picker.
+		sessionDir, err := sessionDirectory(ctx, request.CWD)
+		if err != nil {
+			return err
+		}
+		if request.SessionID != "" {
+			if err := checkSavedSession(sessionDir, request.CWD, request.SessionID); err != nil {
+				return err
+			}
+		}
+		return launchWorkerProcess(ctx, executable, path, node, request, sessionDir)
 	}
 	// Keep recovery state outside the socket's volatile runtime directory.
 	receiptDir := filepath.Join(cfgDir, fmt.Sprintf("coordinator-%x.workers", sha256.Sum256([]byte(path))))
 	run := func(ctx context.Context, path string, launch coord.LaunchFunc) error {
-		return coord.RunRecoverable(ctx, path, receiptDir, launch)
+		return coord.RunRecoverable(ctx, path, receiptDir, launch, coord.WithSessionDirectory(sessionDirectory), coord.WithWorkerBuild(func() string { return coord.ExecutableBuildID(executable) }))
 	}
 	addr := cmd.String("websocket")
 	if addr == "" {
@@ -60,6 +82,38 @@ func runCoordinator(ctx context.Context, cmd *cli.Command) error {
 	}
 	writeLine(os.Stderr, "tau websocket bridge listening on %s/rpc\n", bridge.Addr())
 	return serveCoordinator(ctx, path, bridge, launch, run)
+}
+
+func daemonSessionDirectory(ctx context.Context, cfgDir, cwd string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	settings, err := ai.LoadTrustedSettings(ctx, cfgDir, cwd, home, ai.ProjectTrustOptions{})
+	if err != nil {
+		return "", err
+	}
+	dir := paths.Dir("TAU_SESSION_DIR", settings.SessionDir, filepath.Join(cfgDir, "sessions"))
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(cwd, dir)
+	}
+	return filepath.Clean(dir), nil
+}
+
+func checkSavedSession(dir, cwd, id string) error {
+	storage, err := sessionpkg.NewStorageAt(dir)
+	if err != nil {
+		return err
+	}
+	header, err := storage.ResolveHeader(id)
+	if err != nil {
+		return err
+	}
+	project, err := filepath.EvalSymlinks(header.CWD)
+	if err != nil || project != cwd || header.ID != id {
+		return errors.New("saved session does not belong to the requested project")
+	}
+	return storage.CheckResumeOwner(id)
 }
 
 // serveCoordinator runs the coordinator and its WebSocket bridge together.
@@ -141,9 +195,9 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	return os.Rename(tmp.Name(), path)
 }
 
-var workerLaunchVariables = []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE", "TAU_COORD_LAUNCH_REQUEST", "TAU_COORD_LIFETIME"}
+var workerLaunchVariables = []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE", "TAU_COORD_LAUNCH_REQUEST", "TAU_COORD_LIFETIME", "TAU_COORD_SESSION", "TAU_COORD_SESSION_DIR"}
 
-func workerEnvironment(env []string, node string, request coord.LaunchRequest) []string {
+func workerEnvironment(env []string, node string, request coord.LaunchRequest, sessionDir string) []string {
 	out := make([]string, 0, len(env)+len(workerLaunchVariables))
 	for _, entry := range env {
 		name, _, _ := strings.Cut(entry, "=")
@@ -157,23 +211,46 @@ func workerEnvironment(env []string, node string, request coord.LaunchRequest) [
 	if request.LaunchRequestID != "" {
 		out = append(out, "TAU_COORD_LAUNCH_REQUEST="+request.LaunchRequestID)
 	}
+	if request.SessionID != "" {
+		out = append(out, "TAU_COORD_SESSION="+request.SessionID)
+	}
+	if sessionDir != "" {
+		out = append(out, "TAU_COORD_SESSION_DIR="+sessionDir)
+	}
 	if request.Lifetime != nil {
 		out = append(out, "TAU_COORD_LIFETIME=3")
 	}
 	return out
 }
 
-func launchWorkerProcess(ctx context.Context, socket, node string, request coord.LaunchRequest) (err error) {
+// Keep the path used to launch workers, including the managed install's
+// current symlink, so replacing the installed binary does not need a daemon restart.
+func workerExecutable() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve worker executable: %w", err)
+	}
+	return workerLaunchPath(os.Getenv("TAU_MANAGED_INSTALL_ROOT"), executable)
+}
+
+func workerLaunchPath(configuredRoot, executable string) (string, error) {
+	root, err := managedInstallRoot(configuredRoot, executable)
+	if err != nil {
+		return "", err
+	}
+	if root != "" {
+		return filepath.Join(root, "current", managedBinaryName()), nil
+	}
+	return executable, nil
+}
+
+func launchWorkerProcess(ctx context.Context, executable, socket, node string, request coord.LaunchRequest, sessionDir string) (err error) {
 	instance, cwd, ready := request.InstanceID, request.CWD, request.Ready
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if !filepath.IsAbs(cwd) {
 		return errors.New("worker project directory must be absolute")
-	}
-	executable, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve worker executable: %w", err)
 	}
 	cfg, err := filepath.Abs(configDir())
 	if err != nil {
@@ -193,7 +270,7 @@ func launchWorkerProcess(ctx context.Context, socket, node string, request coord
 	defer func() { err = errors.Join(err, log.Close()) }()
 	child := exec.Command(executable, "--config-dir", cfg, "worker", "--socket", socket)
 	child.Dir = cwd
-	child.Env = workerEnvironment(os.Environ(), node, request)
+	child.Env = workerEnvironment(os.Environ(), node, request, sessionDir)
 	if request.Lifetime != nil {
 		child.ExtraFiles = []*os.File{request.Lifetime}
 	}
@@ -314,6 +391,8 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 	instance := os.Getenv("TAU_COORD_INSTANCE")
 	node := os.Getenv("TAU_COORD_NODE")
 	launchRequest := os.Getenv("TAU_COORD_LAUNCH_REQUEST")
+	sessionID := os.Getenv("TAU_COORD_SESSION")
+	sessionDir := os.Getenv("TAU_COORD_SESSION_DIR")
 	if token == "" || instance == "" || node == "" || cmd.String("socket") == "" {
 		return errors.New("worker is an internal entry point; launch through the coordinator")
 	}
@@ -335,7 +414,7 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 	defer cancel()
 	startupTimer := time.AfterFunc(15*time.Second, cancel)
 	defer startupTimer.Stop()
-	opts, mgr, loader, reg, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil)
+	opts, mgr, loader, reg, err := buildRuntimeOptions(ctx, ui.NewNoOpUI(), nil, func(cfg *runtimeBuildConfig) { cfg.sessionDir = sessionDir })
 	if err != nil {
 		return fmt.Errorf("initialize worker: %w", err)
 	}
@@ -361,7 +440,15 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 		defer stop()
 		return errors.Join(errors.New("worker initialization exceeded deadline"), runtime.Close(cleanupCtx))
 	}
+	// On Linux this describes the running executable even after the installed
+	// path is replaced. Fall back to the process path on other platforms.
+	build := coord.ExecutableBuildID("/proc/self/exe")
+	if build == "" {
+		if exe, err := os.Executable(); err == nil {
+			build = coord.ExecutableBuildID(exe)
+		}
+	}
 	return server.NewWorker(runtime, reg, mgr).Run(ctx, cmd.String("socket"), coord.Instance{
-		ID: instance, NodeID: node, CWD: cwd, PID: os.Getpid(), State: "ready", LaunchRequestID: launchRequest,
+		ID: instance, NodeID: node, CWD: cwd, SessionID: sessionID, PID: os.Getpid(), State: "ready", LaunchRequestID: launchRequest, BuildID: build,
 	}, token)
 }

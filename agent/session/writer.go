@@ -429,6 +429,32 @@ func flockOwnerFile(f *os.File) error {
 	}
 }
 
+// checkResumeOwner inspects the owner without creating or rewriting its file.
+func checkResumeOwner(path string) (err error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open session owner: %w", err)
+	}
+	defer func() { err = errors.Join(err, closeOwnerFile(f)) }()
+	if err := flockOwnerFile(f); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return ownerBusyError(f)
+		}
+		return fmt.Errorf("check session owner lock: %w", err)
+	}
+	pid, locked, err := readOwner(f)
+	if err != nil {
+		return err
+	}
+	if !locked && pid > 0 && isProcessRunning(pid) {
+		return ownerBusyError(f)
+	}
+	return nil
+}
+
 func ownerBusyError(f *os.File) error {
 	pid, _, err := readOwner(f)
 	switch {

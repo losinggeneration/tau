@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	sessionpkg "github.com/losinggeneration/tau/agent/session"
 	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/rpc/coord"
 	"github.com/losinggeneration/tau/sdk"
@@ -31,6 +33,7 @@ type workerSession struct {
 	observerReady  chan func(sdk.Event)
 	messages       []sdk.Message
 	historyFn      func() ([]sdk.HistoryEntry, string, error)
+	entryFn        func(string) (sdk.HistoryEntry, error)
 }
 
 func (s *workerSession) Send(ctx context.Context, msg sdk.Message) (<-chan sdk.Event, error) {
@@ -43,6 +46,13 @@ func (s *workerSession) History(string, int) ([]sdk.HistoryEntry, string, error)
 		return s.historyFn()
 	}
 	return nil, "", nil
+}
+
+func (s *workerSession) HistoryEntry(id string) (sdk.HistoryEntry, error) {
+	if s.entryFn != nil {
+		return s.entryFn(id)
+	}
+	return sdk.HistoryEntry{}, sdk.ErrHistoryEntryNotFound
 }
 
 func (s *workerSession) Interrupt() error        { s.interruptCount.Add(1); return nil }
@@ -125,7 +135,7 @@ func startWorkerInstance(t *testing.T, rt sdk.Runtime, reg commands.Registry, in
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version}); err != nil {
+	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: []string{coord.OperationInstancePrompts}}); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
@@ -281,6 +291,98 @@ func TestWorkerReportsRunStatusFromSameEventStream(t *testing.T) {
 			state.Instance == nil || state.Instance.SessionID != "session" || state.Instance.State != pair[1] {
 			t.Fatalf("%s frames = %+v / %+v", pair[0], chat, state)
 		}
+	}
+}
+
+func TestWorkerReportsOnlyFirstTextPromptPerSession(t *testing.T) {
+	rt := newWorkerRuntime()
+	next := newWorkerRuntime().sess
+	next.mockSession = newMockSession("next-session", "/project")
+	rt.newFn = func(opts sdk.SessionOptions) (sdk.Session, error) {
+		if opts.CWD == "" {
+			return next, nil
+		}
+		return rt.sess, nil
+	}
+	h := startWorker(t, rt, nil)
+	h.send(t, "ready", `{"type":"get_state"}`)
+	if r := h.response(t, "ready"); !r.OK {
+		t.Fatalf("ready probe: %+v", r)
+	}
+	observe := <-rt.sess.observerReady
+	message := func(role, text string) {
+		t.Helper()
+		observe(sdk.Event{Type: "message_end", SessionID: "session", Payload: map[string]any{"role": role, "content": text}})
+		if f := h.next(t); f.Type != coord.TypeEvent {
+			t.Fatalf("message = %+v", f)
+		}
+	}
+	message("assistant", "Not a user prompt")
+	message("user", " ")
+	message("user", "Fix\n the picker "+strings.Repeat("猫", 300))
+	f := h.next(t)
+	if f.Type != coord.TypeRegister || f.Instance == nil {
+		t.Fatalf("first prompt registration = %+v", f)
+	}
+	got := f.Instance.FirstPrompt
+	if !strings.HasPrefix(got, "Fix the picker 猫") || !strings.HasSuffix(got, "…") || len(got) > coord.MaxInstancePromptBytes || !utf8.ValidString(got) {
+		t.Fatalf("unexpected preview %q (%d bytes)", got, len(got))
+	}
+	message("user", "Second message")
+	h.send(t, "switch", `{"type":"new_session"}`)
+	if f := h.next(t); f.Type != coord.TypeEvent || !strings.Contains(string(f.Event), `"type":"session_end"`) {
+		t.Fatalf("expected no second prompt registration, then session_end; got %+v", f)
+	}
+	f = h.next(t)
+	if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.SessionID != "next-session" || f.Instance.FirstPrompt != "" {
+		t.Fatalf("fresh session registration = %+v", f)
+	}
+	if r := h.response(t, "switch"); !r.OK {
+		t.Fatalf("session switch: %+v", r)
+	}
+}
+
+func TestWorkerRegistersSavedSessionPreview(t *testing.T) {
+	cwd, dir := t.TempDir(), t.TempDir()
+	storage, err := sessionpkg.NewStorageAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := sessionpkg.NewHeader(cwd, nil, nil)
+	writer, err := storage.Create(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(writer.Append(sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"Original prompt"}`), nil)), writer.Close()); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := sdk.NewRuntime(sdk.RuntimeOptions{SessionsDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", CWD: cwd, SessionID: header.ID})
+	f := h.next(t)
+	if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.SessionID != header.ID || f.Instance.FirstPrompt != "Original prompt" {
+		t.Fatalf("saved session registration = %+v", f)
+	}
+}
+
+func TestWorkerRejectsRestartAfterSessionChanges(t *testing.T) {
+	rt := newWorkerRuntime()
+	var closed atomic.Bool
+	rt.sess.closeFn = func(context.Context) error { closed.Store(true); return nil }
+	h := startWorker(t, rt, nil)
+	h.send(t, "restart", `{"type":"shutdown","args":{"expected_session_id":"previous"}}`)
+	if r := h.response(t, "restart"); r.OK || r.Error == nil || r.Error.Code != coord.CodeConflict {
+		t.Fatalf("restart of the wrong session: %+v", r)
+	}
+	if closed.Load() {
+		t.Fatal("mismatched restart closed the active session")
+	}
+	// Plain stop continues to work even without the save-for-restart hook.
+	h.send(t, "stop", `{"type":"shutdown"}`)
+	if r := h.response(t, "stop"); !r.OK || !closed.Load() {
+		t.Fatalf("worker did not stop: %+v", r)
 	}
 }
 
@@ -961,7 +1063,7 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 			t.Error("worker still running after cancellation")
 		}
 	})
-	accept := func() (*coord.Link, coord.Frame) {
+	accept := func(ops ...string) (*coord.Link, coord.Frame) {
 		t.Helper()
 		if err := listener.SetDeadline(time.Now().Add(time.Second)); err != nil {
 			t.Fatal(err)
@@ -983,7 +1085,7 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version}); err != nil {
+		if err := link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: ops}); err != nil {
 			t.Fatal(err)
 		}
 		return link, hello
@@ -1005,6 +1107,11 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	read(first, coord.TypeResponse)
+	// Start with a coordinator that doesn't understand previews, then verify
+	// the worker can supply its cached prompt after a coordinator upgrade.
+	observe := <-rt.sess.observerReady
+	observe(sdk.Event{Type: "message_end", SessionID: "session", Payload: map[string]any{"role": "user", "content": "Keep this prompt"}})
+	read(first, coord.TypeEvent)
 	sessionUI := (<-rt.opts).UI
 	resolved := make(chan error, 1)
 	go func() {
@@ -1016,13 +1123,18 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 	if event.Position == nil || !strings.Contains(string(event.Event), `"type":"ui_input"`) {
 		t.Fatalf("missing input event: %+v", event)
 	}
-	read(first, coord.TypeRegister)
+	if f := read(first, coord.TypeRegister); f.Instance == nil || f.Instance.FirstPrompt != "" || f.Instance.PendingInputs != 1 {
+		t.Fatalf("legacy registration = %+v", f)
+	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	second, rejoined := accept()
+	second, rejoined := accept(coord.OperationInstancePrompts)
 	if rejoined.Instance.ID != original.Instance.ID || rejoined.Instance.SessionID != original.Instance.SessionID || rejoined.Instance.PendingInputs != 1 {
 		t.Fatalf("lost session or input: %+v", rejoined.Instance)
+	}
+	if f := read(second, coord.TypeRegister); f.Instance == nil || f.Instance.FirstPrompt != "Keep this prompt" {
+		t.Fatalf("rejoin did not republish preview: %+v", f)
 	}
 	if err := second.Send(coord.Frame{Type: coord.TypeCommand, ID: "snapshot", InstanceID: "instance", Command: json.RawMessage(`{"type":"get_snapshot"}`)}); err != nil {
 		t.Fatal(err)

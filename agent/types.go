@@ -381,6 +381,8 @@ type Message struct {
 	Model             string
 	StopReason        ai.StopReason
 	Usage             ai.Usage
+	// StaleContextUsage marks a reply whose usage includes history that was compacted away.
+	StaleContextUsage bool `json:"-"`
 	ErrorMessage      string
 	ResponseID        string
 	// ProviderThinkingLevel is the native effort an assistant turn was produced with.

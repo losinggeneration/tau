@@ -303,18 +303,34 @@ func applySettingsChange(app *App, id, value string) {
 		if value == "" || value == app.currentModel {
 			return
 		}
-		app.applyModelFromArgs(stripProviderPrefix(value))
-		if app.footer != nil && app.footer.data != nil {
-			app.footer.data.model = app.sess.State().Model()
-		}
-		app.refreshFooterStats(app.loopContext())
+		app.applyModelFromArgs(value)
 	case "settings.thinkingLevel":
 		if app.sess == nil {
-			return
-		}
-		if err := app.sess.SetThinkingLevel(value); err != nil {
+			if !app.supportsThinking() || app.settingsPath == "" {
+				return
+			}
+		} else if err := app.sess.SetThinkingLevel(value); err != nil {
 			app.conv.AddError("settings.thinkingLevel: " + err.Error())
 			app.refreshChat()
+			return
+		}
+		if err := app.persistModelThinkingSetting(app.currentModel, value); err != nil {
+			app.conv.AddError("settings.thinkingLevel: " + err.Error())
+			app.refreshChat()
+			if app.sess == nil {
+				return
+			}
+		}
+		if app.sess == nil {
+			if err := app.refreshModelDefault(); err != nil {
+				app.conv.AddError("settings.thinkingLevel: " + err.Error())
+				app.refreshChat()
+				return
+			}
+			if level := app.currentThinkingLevel(); level != value {
+				app.conv.AddSystem("Project thinking level: " + level + " (saved user level: " + value + ")")
+				app.refreshChat()
+			}
 			return
 		}
 		if app.footer != nil && app.footer.data != nil {
@@ -324,13 +340,9 @@ func applySettingsChange(app *App, id, value string) {
 		// can come back to it. Recorded here rather than in the toggle handler
 		// so every way of choosing a level feeds the same memory.
 		app.rememberThinkingLevel(value)
-		// Persist the level against the active model so starting or switching
-		// back to it restores the effort.
-		if err := app.persistModelThinkingSetting(app.currentModel, value); err != nil {
-			app.conv.AddError("settings.thinkingLevel: " + err.Error())
-		}
 		// The editor's rules are the standing thinking-level indicator.
 		app.refreshEditorChrome()
+		app.invalidateFooter(app.loopContext())
 	case "settings.autoCompaction":
 		enabled := strings.EqualFold(value, "on") || value == "true"
 		if app.footer != nil && app.footer.data != nil {
@@ -463,13 +475,6 @@ func (a *App) switchableModelIDs() []string {
 	}
 	sort.Strings(ids)
 	return ids
-}
-
-func stripProviderPrefix(value string) string {
-	if idx := strings.Index(value, "/"); idx > 0 {
-		return value[idx+1:]
-	}
-	return value
 }
 
 func boolOnOff(v bool) string {

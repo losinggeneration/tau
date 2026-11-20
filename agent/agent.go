@@ -2,6 +2,7 @@ package agent // import "github.com/losinggeneration/tau/agent"
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,8 +39,8 @@ type Agent struct {
 	nextListenerID int
 
 	// Queues
-	steeringQueue         []*Message
-	followUpQueue         []*Message
+	steeringQueue         []QueuedMessage
+	followUpQueue         []QueuedMessage
 	pendingCustomMessages []*Message
 
 	// Control
@@ -362,14 +363,14 @@ func (a *Agent) Continue(ctx context.Context) error {
 func (a *Agent) Steer(msg *Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.steeringQueue = append(a.steeringQueue, msg)
+	a.steeringQueue = append(a.steeringQueue, QueuedMessage{ID: rand.Text(), Message: msg})
 }
 
 // followUp queues a message to run only after the agent would otherwise stop.
 func (a *Agent) FollowUp(msg *Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.followUpQueue = append(a.followUpQueue, msg)
+	a.followUpQueue = append(a.followUpQueue, QueuedMessage{ID: rand.Text(), Message: msg})
 }
 
 // AppendCustomMessage appends context without starting a provider request. During a
@@ -459,7 +460,7 @@ func (a *Agent) ClearFollowUpQueue() {
 func (a *Agent) ClearAllQueues() (steering, followUp []*Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	steering, followUp = a.steeringQueue, a.followUpQueue
+	steering, followUp = queuedContents(a.steeringQueue), queuedContents(a.followUpQueue)
 	a.steeringQueue, a.followUpQueue = nil, nil
 	return steering, followUp
 }
@@ -483,7 +484,54 @@ func (a *Agent) QueueSizes() (steering, followUp int) {
 func (a *Agent) PeekQueuedMessages() (steering, followUp []*Message) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return slicesClone(a.steeringQueue), slicesClone(a.followUpQueue)
+	return queuedContents(a.steeringQueue), queuedContents(a.followUpQueue)
+}
+
+// QueuedMessage identifies one pending submission. Editing it replaces its ID.
+type QueuedMessage struct {
+	ID      string
+	Message *Message
+}
+
+func queuedContents(queue []QueuedMessage) []*Message {
+	var out []*Message
+	for _, item := range queue {
+		out = append(out, item.Message)
+	}
+	return out
+}
+
+// QueuedMessages returns the pending steering and follow-up submissions in queue order.
+func (a *Agent) QueuedMessages() (steering, followUp []QueuedMessage) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return slices.Clone(a.steeringQueue), slices.Clone(a.followUpQueue)
+}
+
+// EditQueuedText replaces the prompt text without moving the message or changing attachments.
+// It fails if the message has already been taken or changed.
+func (a *Agent) EditQueuedText(id, text string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, queue := range [][]QueuedMessage{a.steeringQueue, a.followUpQueue} {
+		for i, item := range queue {
+			if item.ID != id || !item.CanEditText() {
+				continue
+			}
+			msg := *item.Message
+			msg.Content = slices.Clone(msg.Content)
+			msg.Content[0].Text = text
+			queue[i] = QueuedMessage{ID: rand.Text(), Message: &msg}
+			return true
+		}
+	}
+	return false
+}
+
+// CanEditText reports whether the first content block is a user prompt.
+func (item QueuedMessage) CanEditText() bool {
+	msg := item.Message
+	return msg != nil && msg.Role == RoleUser && len(msg.Content) > 0 && msg.Content[0].Type == ai.ContentBlockText
 }
 
 // Signal returns the active abort signal for the current run, if any.
@@ -605,15 +653,30 @@ func (a *Agent) SetFollowUpMode(mode QueueMode) {
 	a.followUpMode = mode
 }
 
+// SteeringMode reports how queued steering messages are drained.
+func (a *Agent) SteeringMode() QueueMode {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.steeringMode
+}
+
+// FollowUpMode reports how queued follow-up messages are drained.
+func (a *Agent) FollowUpMode() QueueMode {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.followUpMode
+}
+
 // drainSteering drains the steering queue based on the current mode.
 func (a *Agent) drainSteering() []*Message {
 	if a.steeringMode == QueueModeAll {
-		messages := a.steeringQueue
+		messages := queuedContents(a.steeringQueue)
 		a.steeringQueue = nil
 		return messages
 	}
 	if len(a.steeringQueue) > 0 {
-		msg := a.steeringQueue[0]
+		msg := a.steeringQueue[0].Message
+		a.steeringQueue[0] = QueuedMessage{}
 		a.steeringQueue = a.steeringQueue[1:]
 		return []*Message{msg}
 	}
@@ -623,12 +686,13 @@ func (a *Agent) drainSteering() []*Message {
 // drainFollowUp drains the follow-up queue based on the current mode.
 func (a *Agent) drainFollowUp() []*Message {
 	if a.followUpMode == QueueModeAll {
-		messages := a.followUpQueue
+		messages := queuedContents(a.followUpQueue)
 		a.followUpQueue = nil
 		return messages
 	}
 	if len(a.followUpQueue) > 0 {
-		msg := a.followUpQueue[0]
+		msg := a.followUpQueue[0].Message
+		a.followUpQueue[0] = QueuedMessage{}
 		a.followUpQueue = a.followUpQueue[1:]
 		return []*Message{msg}
 	}

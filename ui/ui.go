@@ -667,10 +667,8 @@ func (u *JSONEventUI) Close() error {
 	return nil
 }
 
-// RPCUI implements `tau rpc` mode. Every UI call becomes a ui_* event
-// sent to the connected client; replies arrive as ui_response commands.
-// Unlike JSONEventUI which reads from stdin, RPCUI reads responses from
-// a configurable Reader (typically the RPC server's stdin).
+// RPCUI publishes UI calls as events and accepts typed replies. A coordinated
+// worker enables shared requests so any attached client can answer.
 type RPCUI struct {
 	// Writer writes JSON events. Defaults to os.Stdout.
 	Writer io.Writer
@@ -1224,9 +1222,7 @@ func (u *RPCUI) Close() error {
 }
 
 // DispatchResponse delivers a UI response that was received from the command stream.
-// This is used by tau rpc when the ui_response command comes through the same
-// JSONL stream that the server reads commands from. It dispatches to the pending
-// channel without needing to read from a separate Reader.
+// It dispatches to the pending channel without reading from a separate Reader.
 //
 // The default `Method` is `UIMethodInput` (the legacy value-channel shape);
 // callers that have the original method should call DispatchResponseTyped.

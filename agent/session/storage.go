@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/paths"
 )
@@ -192,6 +193,25 @@ func (s *Storage) Import(src, cwd string) (id string, err error) {
 		}
 		return header.ID, nil
 	}
+}
+
+// ResolveHeader reads the header for a stored ID or unique prefix.
+func (s *Storage) ResolveHeader(id string) (Header, error) {
+	path, err := s.findByID(id)
+	if err != nil {
+		return Header{}, err
+	}
+	return ReadHeader(path)
+}
+
+// CheckResumeOwner reports whether a stored session is currently owned. It
+// does not claim the session; Resume must still take the writer lock.
+func (s *Storage) CheckResumeOwner(id string) error {
+	path, err := s.findByID(id)
+	if err != nil {
+		return err
+	}
+	return checkResumeOwner(path + ownerSuffix)
 }
 
 // Open opens an existing session for reading.
@@ -570,12 +590,19 @@ func (s *Storage) SummarizeBranch(id, fromID, summary string) (err error) {
 
 // resolveID finds the session file matching an ID (supports unique prefixes).
 func (s *Storage) resolveID(id string) (string, error) {
+	// A canonical ID must not resolve to an unrelated file in the CWD.
+	parsed, parseErr := uuid.Parse(id)
+	if parseErr != nil || parsed.String() != id {
+		if st, err := os.Stat(id); err == nil && !st.IsDir() {
+			return id, nil
+		}
+	}
+	return s.findByID(id)
+}
+
+func (s *Storage) findByID(id string) (string, error) {
 	if id == "" {
 		return "", errors.New("session ID must not be empty")
-	}
-	// File paths remain supported aliases for storage callers.
-	if st, err := os.Stat(id); err == nil && !st.IsDir() {
-		return id, nil
 	}
 	files, err := s.findSessionFiles("*.jsonl")
 	if err != nil {

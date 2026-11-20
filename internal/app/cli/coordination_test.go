@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/losinggeneration/tau/agent/session"
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/rpc/coord"
 	"github.com/losinggeneration/tau/rpc/server"
+	"github.com/stretchr/testify/require"
 )
 
 func TestServeCoordinatorStopsBridgeWithCoordinator(t *testing.T) {
@@ -87,13 +89,13 @@ func TestCoordinatorNodeIdentityPersists(t *testing.T) {
 }
 
 func TestWorkerLaunchDoesNotInheritTrustOverride(t *testing.T) {
-	inherited := []string{"TAU_COORD_TOKEN=old", "TAU_COORD_INSTANCE=old", "TAU_COORD_NODE=old", "TAU_COORD_LAUNCH_REQUEST=old", "PATH=/bin"}
-	if env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"}); strings.Contains(strings.Join(env, "\n"), "TAU_COORD_LAUNCH_REQUEST") {
+	inherited := []string{"TAU_COORD_TOKEN=old", "TAU_COORD_INSTANCE=old", "TAU_COORD_NODE=old", "TAU_COORD_LAUNCH_REQUEST=old", "TAU_COORD_SESSION=old", "TAU_COORD_SESSION_DIR=old", "PATH=/bin"}
+	if env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"}, ""); strings.Contains(strings.Join(env, "\n"), "TAU_COORD_LAUNCH_REQUEST") || strings.Contains(strings.Join(env, "\n"), "TAU_COORD_SESSION") {
 		t.Fatalf("launch without a request ID inherited one: %q", env)
 	}
-	env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance", LaunchRequestID: "request"})
+	env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance", LaunchRequestID: "request", SessionID: "saved"}, "/saved/sessions")
 	joined := strings.Join(env, "\n")
-	for _, expected := range []string{"TAU_COORD_TOKEN=token", "TAU_COORD_INSTANCE=instance", "TAU_COORD_NODE=node", "TAU_COORD_LAUNCH_REQUEST=request", "PATH=/bin"} {
+	for _, expected := range []string{"TAU_COORD_TOKEN=token", "TAU_COORD_INSTANCE=instance", "TAU_COORD_NODE=node", "TAU_COORD_LAUNCH_REQUEST=request", "TAU_COORD_SESSION=saved", "TAU_COORD_SESSION_DIR=/saved/sessions", "PATH=/bin"} {
 		if !strings.Contains(joined, expected) {
 			t.Errorf("missing %q in environment", expected)
 		}
@@ -104,7 +106,7 @@ func TestWorkerLaunchDoesNotInheritTrustOverride(t *testing.T) {
 }
 
 func TestWorkerEnvironmentDropsCoordinatorPWD(t *testing.T) {
-	env := workerEnvironment([]string{"PWD=/coordinator", "TAU_WEBSOCKET_TOKEN=bridge-only", "PWDX=keep", "PATH=/bin"}, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"})
+	env := workerEnvironment([]string{"PWD=/coordinator", "TAU_WEBSOCKET_TOKEN=bridge-only", "PWDX=keep", "PATH=/bin"}, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"}, "")
 	for _, entry := range env {
 		if strings.HasPrefix(entry, "PWD=") || strings.HasPrefix(entry, "TAU_WEBSOCKET_TOKEN=") {
 			t.Fatalf("coordinator-only environment inherited: %q", env)
@@ -297,10 +299,26 @@ func TestWorkerStartEarlyExitKillsGroupBeforeReap(t *testing.T) {
 	}
 }
 
+func TestWorkerLaunchPathFollowsManagedActivation(t *testing.T) {
+	root := newManagedTestRoot(t, "1.0.0", "1.1.0")
+	old := filepath.Join(root, "releases", "1.0.0", managedBinaryName())
+	current := filepath.Join(root, "current")
+	require.NoError(t, os.Symlink(filepath.Join("releases", "1.0.0"), current))
+	launch, err := workerLaunchPath(root, old)
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(current, managedBinaryName()), launch)
+	require.Equal(t, coord.ExecutableBuildID(old), coord.ExecutableBuildID(launch))
+	pending := current + ".next"
+	require.NoError(t, os.Symlink(filepath.Join("releases", "1.1.0"), pending))
+	require.NoError(t, os.Rename(pending, current))
+	require.Equal(t, coord.ExecutableBuildID(filepath.Join(root, "releases", "1.1.0", managedBinaryName())), coord.ExecutableBuildID(launch))
+	require.NotEqual(t, coord.ExecutableBuildID(old), coord.ExecutableBuildID(launch))
+}
+
 func TestCancelledWorkerLaunchDoesNotSpawn(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if err := launchWorkerProcess(ctx, "unused", "node", coord.LaunchRequest{InstanceID: "instance", Token: "token", CWD: t.TempDir()}); err == nil {
+	if err := launchWorkerProcess(ctx, "unused", "unused", "node", coord.LaunchRequest{InstanceID: "instance", Token: "token", CWD: t.TempDir()}, ""); err == nil {
 		t.Fatal("cancelled launch succeeded")
 	}
 }
@@ -347,5 +365,28 @@ func TestWorkerLogsRejectSymlinkDirectory(t *testing.T) {
 	}
 	if _, err := workerLogDirectory(base); err == nil {
 		t.Fatal("symlink worker log directory accepted")
+	}
+}
+
+func TestCheckSavedSessionReportsWriterBeforeLaunch(t *testing.T) {
+	dir, cwd := t.TempDir(), t.TempDir()
+	storage, err := session.NewStorageAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := session.NewHeader(cwd, nil, nil)
+	writer, err := storage.Create(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := checkSavedSession(dir, cwd, header.ID)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if busy == nil || !strings.Contains(busy.Error(), "open in") {
+		t.Fatalf("preflight did not report the live writer: %v", busy)
+	}
+	if err := checkSavedSession(dir, cwd, header.ID); err != nil {
+		t.Fatalf("preflight after writer closed: %v", err)
 	}
 }

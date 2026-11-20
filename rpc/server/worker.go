@@ -6,8 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -28,7 +32,7 @@ type Worker struct {
 
 // NewWorker transfers runtime ownership to a coordinated worker.
 func NewWorker(rt sdk.Runtime, reg commands.Registry, mgr *plugins.Manager) *Worker {
-	s := NewServer(rt, reg, mgr)
+	s := newServer(rt, reg, mgr)
 	s.coordinated = true
 	return &Worker{server: s}
 }
@@ -85,7 +89,6 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 		return fmt.Errorf("initialize worker session: %w", err)
 	}
 	output.mu.Lock()
-	output.instance.SessionID = s.session.ID()
 	if output.instance.State == "" {
 		output.instance.State = coord.StateReady
 	}
@@ -115,6 +118,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	// remain serviceable even while slash commands or compaction block.
 	pending := make(chan *Command, workerAdmissionSlots)
 	reconstruction := make(chan *Command, workerAdmissionSlots)
+	var sessionChangeMu sync.Mutex
 	var (
 		handlerMu     sync.Mutex
 		cancelHandler context.CancelFunc
@@ -129,9 +133,19 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 					return
 				}
 				// Prompt, bash, and session handlers pass ctx on to work that
-				// outlives dispatch. Slash commands and compaction run inline.
-				if cmd.Type != "slash_command" && cmd.Type != "compact" {
-					w.dispatch(ctx, cmd)
+				// outlives dispatch. Slash commands, compaction, and MCP
+				// reconnects run inline and stop on interrupt.
+				if cmd.Type != "slash_command" && cmd.Type != "compact" && cmd.Type != "mcp_reconnect" {
+					switch cmd.Type {
+					case "new_session", "create_session", "resume_session", "fork":
+						sessionChangeMu.Lock()
+						if ctx.Err() == nil {
+							w.dispatch(ctx, cmd)
+						}
+						sessionChangeMu.Unlock()
+					default:
+						w.dispatch(ctx, cmd)
+					}
 					continue
 				}
 				handlerCtx, stop := context.WithCancel(ctx)
@@ -161,6 +175,8 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 					handle = output.getSnapshot
 				case "get_history":
 					handle = output.getHistory
+				case "get_entry_content":
+					handle = output.getEntryContent
 				}
 				if err := handle(cmd); err != nil {
 					workerLog("send reconstruction reply: %v", err)
@@ -194,6 +210,36 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 			}
 			cmd.ID = frame.ID
 			if cmd.Type == "shutdown" {
+				var args struct {
+					ExpectedSessionID string `json:"expected_session_id"`
+				}
+				if len(cmd.Args) != 0 {
+					if err := json.Unmarshal(cmd.Args, &args); err != nil {
+						if err := s.sendError(cmd.ID, coord.CodeInvalidFrame, "invalid shutdown arguments"); err != nil {
+							return err
+						}
+						continue
+					}
+				}
+				if args.ExpectedSessionID != "" {
+					if !sessionChangeMu.TryLock() {
+						if err := s.sendError(cmd.ID, coord.CodeBusy, "instance is switching sessions; select it again"); err != nil {
+							return err
+						}
+						continue
+					}
+					problem := s.prepareRestart(ctx, args.ExpectedSessionID, instance.CWD)
+					if problem == nil {
+						cancel()
+					}
+					sessionChangeMu.Unlock()
+					if problem != nil {
+						if err := s.sendError(cmd.ID, problem.Code, problem.Message); err != nil {
+							return err
+						}
+						continue
+					}
+				}
 				cleanupErr := cleanup()
 				if cleanupErr != nil {
 					return errors.Join(cleanupErr, s.sendErrorResult(cmd.ID, cleanupErr))
@@ -212,7 +258,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 				}
 				handlerMu.Unlock()
 				w.dispatch(ctx, &cmd)
-			case "replay_events", "get_snapshot", "get_history":
+			case "replay_events", "get_snapshot", "get_history", "get_entry_content":
 				select {
 				case reconstruction <- &cmd:
 				default:
@@ -233,6 +279,28 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 			}
 		}
 	}
+}
+
+func (s *Server) prepareRestart(ctx context.Context, expected, project string) *coord.Error {
+	if !s.sessionMu.TryLock() {
+		return &coord.Error{Code: coord.CodeBusy, Message: "instance is switching sessions; select it again"}
+	}
+	sess := s.session
+	s.sessionMu.Unlock()
+	if sess == nil || sess.ID() != expected {
+		return &coord.Error{Code: coord.CodeConflict, Message: "instance switched sessions; select it again"}
+	}
+	if sess.State().CWD() != project {
+		return &coord.Error{Code: coord.CodeConflict, Message: "active session belongs to another project; worker was not stopped"}
+	}
+	persistent, ok := sess.(interface{ PrepareRestart(context.Context) error })
+	if !ok {
+		return &coord.Error{Code: coord.CodeUnavailable, Message: "worker cannot save this session for restart"}
+	}
+	if err := persistent.PrepareRestart(ctx); err != nil {
+		return &coord.Error{Code: coord.CodeUnavailable, Message: err.Error()}
+	}
+	return nil
 }
 
 func (w *Worker) dispatch(ctx context.Context, cmd *Command) {
@@ -257,23 +325,31 @@ func (w *Worker) dispatch(ctx context.Context, cmd *Command) {
 // workerWriter adapts serialized RPC records to the bounded worker stream.
 // Link.Send itself is nonblocking and bounded.
 type workerWriter struct {
-	server   *Server
-	mu       sync.Mutex
-	link     *coord.Link
-	instance coord.Instance
-	closing  sync.WaitGroup
-	journal  eventJournal
-	live     liveSnapshot
+	server            *Server
+	bound             *eventSession
+	mu                sync.Mutex
+	link              *coord.Link
+	instancePrompts   bool
+	instanceBuild     bool
+	instance          coord.Instance
+	closing           sync.WaitGroup
+	journal           eventJournal
+	live              liveState
+	contentGeneration uint64
+	content           []entryContentCache
 }
 
 func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Link, error) {
 	w.mu.Lock()
 	inst, pos := w.instance, w.journal.position
+	hello := inst
+	hello.FirstPrompt, hello.BuildID = "", ""
 	w.mu.Unlock()
 	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	link, _, err := coord.Dial(probe, path, coord.Frame{
-		Role: coord.RoleWorker, Instance: &inst, Token: token, Position: &pos,
+	link, welcome, err := coord.Dial(probe, path, coord.Frame{
+		Role: coord.RoleWorker, Instance: &hello, Token: token, Position: &pos,
+		Operations: []string{coord.OperationInstanceRestart},
 	})
 	if err != nil {
 		return nil, err
@@ -281,10 +357,13 @@ func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Lin
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.link = link
+	w.instancePrompts = slices.Contains(welcome.Operations, coord.OperationInstancePrompts)
+	w.instanceBuild = slices.Contains(welcome.Operations, coord.OperationInstanceBuild)
+	// A hello must also work with coordinators that predate previews.
 	// Changes made during the handshake were journaled but could not be
 	// forwarded. Publish the latest summary before forwarding new events.
-	if w.instance != inst {
-		if err := link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance}); err != nil {
+	if w.instance != inst || (w.instancePrompts && inst.FirstPrompt != "") || (w.instanceBuild && inst.BuildID != "") {
+		if err := w.sendSummaryLocked(); err != nil {
 			w.disconnect(err)
 		}
 	}
@@ -373,14 +452,22 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var changedSession bool
+	var summaryChanged bool
 	if w.server != nil {
-		id, _ := w.server.eventSessionID.Load().(string)
-		if id != "" && id != w.instance.SessionID {
-			w.instance.SessionID = id
-			w.instance.State = coord.StateReady
-			w.live = liveSnapshot{}
-			changedSession = true
+		if bound := w.server.eventSession.Load(); bound != nil && bound.id != "" && bound != w.bound {
+			w.bound = bound
+			if bound.id != w.instance.SessionID {
+				w.instance.SessionID = bound.id
+				w.instance.State = coord.StateReady
+				w.live = liveState{}
+				w.content = nil
+				w.contentGeneration++
+				summaryChanged = true
+			}
+			if w.instance.FirstPrompt != bound.firstPrompt {
+				w.instance.FirstPrompt = bound.firstPrompt
+				summaryChanged = true
+			}
 		}
 	}
 	frame := coord.Frame{Type: coord.TypeEvent, InstanceID: w.instance.ID, SessionID: record.SessionID, Event: json.RawMessage(data)}
@@ -409,8 +496,12 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 			frame.Event, omitted = notice, true
 		}
 		if frame.SessionID == w.instance.SessionID {
+			if record.Type == "context_edited" {
+				w.content = nil
+				w.contentGeneration++
+			}
 			if err := w.live.update(record.Type, json.RawMessage(data)); err != nil {
-				w.live.Truncated = true
+				w.live.truncated = true
 				workerLog("%v", err)
 			}
 		}
@@ -418,8 +509,8 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 		w.journal.position = position
 		w.journal.publish(frame, size)
 	}
-	if w.link != nil && changedSession {
-		if err := w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance}); err != nil {
+	if w.link != nil && summaryChanged {
+		if err := w.sendSummaryLocked(); err != nil {
 			w.disconnect(err)
 		}
 	}
@@ -435,7 +526,7 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 		}
 	}
 	if frame.Type == coord.TypeEvent && frame.SessionID == w.instance.SessionID {
-		if err := w.publishSummaryLocked(record.Type); err != nil {
+		if err := w.publishSummaryLocked(record.Type, data); err != nil {
 			w.disconnect(err)
 		}
 	}
@@ -453,11 +544,25 @@ func isSharedUIRecord(kind string) bool {
 	return false
 }
 
-// publishSummaryLocked reports lifecycle and attention, without copying chat
-// payloads to clients watching only summaries. Caller holds mu.
-func (w *workerWriter) publishSummaryLocked(kind string) error {
+// publishSummaryLocked reports lifecycle, attention, and the first user
+// prompt preview. Caller holds mu.
+func (w *workerWriter) publishSummaryLocked(kind string, data []byte) error {
 	previous := w.instance
 	switch kind {
+	case "message_end":
+		if w.instance.FirstPrompt == "" {
+			var msg struct {
+				Role, Content string
+			}
+			if err := json.Unmarshal(data, &msg); err != nil {
+				workerLog("decode prompt preview: %v", err)
+			} else if msg.Role == "user" {
+				w.instance.FirstPrompt = instancePromptPreview(msg.Content)
+				if !w.instancePrompts {
+					return nil
+				}
+			}
+		}
 	case "agent_start":
 		w.instance.State = coord.StateBusy
 	case "agent_end", "session_shutdown":
@@ -469,7 +574,45 @@ func (w *workerWriter) publishSummaryLocked(kind string) error {
 	if w.link == nil || w.instance == previous {
 		return nil
 	}
-	return w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &w.instance})
+	return w.sendSummaryLocked()
+}
+
+func (w *workerWriter) sendSummaryLocked() error {
+	inst := w.instance
+	if !w.instancePrompts {
+		inst.FirstPrompt = ""
+	}
+	if !w.instanceBuild {
+		inst.BuildID = ""
+	}
+	return w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &inst})
+}
+
+func instancePromptPreview(prompt string) string {
+	var preview strings.Builder
+	var space bool
+	for _, r := range prompt {
+		if unicode.IsSpace(r) {
+			space = preview.Len() > 0
+			continue
+		}
+		if unicode.IsControl(r) {
+			continue
+		}
+		n := utf8.RuneLen(r)
+		if space {
+			n++
+		}
+		if preview.Len()+n > coord.MaxInstancePromptBytes-len("…") {
+			return preview.String() + "…"
+		}
+		if space {
+			preview.WriteByte(' ')
+			space = false
+		}
+		preview.WriteRune(r)
+	}
+	return preview.String()
 }
 
 func (w *workerWriter) loseLink(link *coord.Link) {

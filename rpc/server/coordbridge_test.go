@@ -594,6 +594,10 @@ func TestCoordinatedBridgeEnforcesMessageShape(t *testing.T) {
 	conn := h.dial(t, websocket.DefaultDialer, http.Header{"Authorization": {"Bearer " + h.static}})
 	relayRead(t, conn)
 
+	relaySend(t, conn, `{"type":"session_directory","id":"dir","cwd":"/tmp"}`)
+	if resp := relayResponse(t, conn, "dir"); resp["error"] == nil {
+		t.Fatalf("browser session directory lookup allowed: %v", resp)
+	}
 	relaySend(t, conn, `{"type":"hello","id":"h","role":"worker","token":"x"}`)
 	if resp := relayResponse(t, conn, "h"); resp["error"] == nil {
 		t.Fatalf("browser hello = %v, want rejection", resp)

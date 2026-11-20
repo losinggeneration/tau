@@ -78,6 +78,35 @@ func TestIndexHistoryPagesBranch(t *testing.T) {
 	require.ErrorContains(t, err, "no longer exists")
 }
 
+func TestIndexEntryReadsDisplayedEntriesByID(t *testing.T) {
+	w, err := CreateSessionFile(t.TempDir(), NewHeader("/test", nil, nil))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	root := NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"root"}`), nil)
+	require.NoError(t, w.Append(root))
+	// Two children of root: the first is off the branch the second continues.
+	side := NewMessageEntry(&root.ID, json.RawMessage(`{"role":"user","content":"side"}`), nil)
+	require.NoError(t, w.Append(side))
+	active := NewMessageEntry(&root.ID, json.RawMessage(`{"role":"user","content":"main"}`), nil)
+	require.NoError(t, w.Append(active))
+	hidden := NewModelChangeEntry("p", "m")
+	require.NoError(t, w.Append(hidden))
+
+	var x Index
+	entry, ok, err := x.Entry(w.Path(), side.ID)
+	require.NoError(t, err)
+	require.True(t, ok, "an entry off the active branch is still readable")
+	require.Equal(t, side.ID, entry.ID)
+
+	_, ok, err = x.Entry(w.Path(), hidden.ID)
+	require.NoError(t, err)
+	require.False(t, ok, "hidden entries are not displayable")
+	_, ok, err = x.Entry(w.Path(), "missing")
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
 func TestIndexHistoryPagesWithinCompactionAnchors(t *testing.T) {
 	w, err := CreateSessionFile(t.TempDir(), NewHeader("/test", nil, nil))
 	require.NoError(t, err)

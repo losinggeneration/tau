@@ -121,6 +121,26 @@ func TestSetStatus_AddsEntryAndCollapsesLayout(t *testing.T) {
 	}
 }
 
+func TestStatusHeightChangesInvalidateLayout(t *testing.T) {
+	a := newTestApp(t)
+	a.status = tauui.NewStatusEntriesView(5)
+	var layouts int
+	ctx := &tauui.Ctx{InvalidateLayout: func() { layouts++ }}
+	for _, entries := range []map[string]string{
+		{"one": "first"},
+		{"one": "first", "two": "second"},
+		{"one": "first again", "two": "second"},
+		{"one": "first again"},
+		nil,
+	} {
+		a.statusEntries = entries
+		a.refreshStatus(ctx)
+	}
+	if layouts != 4 {
+		t.Errorf("layout invalidations = %d, want 4 (one per height change)", layouts)
+	}
+}
+
 // TestSetStatus_SanitizesText ensures embedded newlines and
 // control characters don't break the layout — the same single-line
 // rule the footer uses for extension status entries.

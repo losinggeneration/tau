@@ -39,18 +39,19 @@ func TestFrameUsesSnakeCaseTags(t *testing.T) {
 func TestDecodeFrameRejects(t *testing.T) {
 	long := strings.Repeat("x", maxIDBytes+1)
 	tests := map[string]string{
-		"unknown field":     `{"type":"hello","admin":true}`,
-		"unknown type":      `{"type":"launch_missiles"}`,
-		"missing type":      `{"id":"1"}`,
-		"trailing data":     `{"type":"hello"}{"type":"hello"}`,
-		"not json":          `hello`,
-		"long id":           `{"type":"command","id":"` + long + `"}`,
-		"long token":        `{"type":"hello","token":"` + long + `"}`,
-		"long cwd":          `{"type":"start_instance","cwd":"` + strings.Repeat("x", maxTextBytes+1) + `"}`,
-		"long instance id":  `{"type":"hello","instance":{"instance_id":"` + long + `"}}`,
-		"unknown inst key":  `{"type":"hello","instance":{"instance_id":"a","secret":1}}`,
-		"long error":        `{"type":"response","error":{"code":"` + long + `"}}`,
-		"wrong field types": `{"type":"hello","version":"1"}`,
+		"unknown field":        `{"type":"hello","admin":true}`,
+		"unknown type":         `{"type":"launch_missiles"}`,
+		"missing type":         `{"id":"1"}`,
+		"trailing data":        `{"type":"hello"}{"type":"hello"}`,
+		"not json":             `hello`,
+		"long id":              `{"type":"command","id":"` + long + `"}`,
+		"long token":           `{"type":"hello","token":"` + long + `"}`,
+		"long cwd":             `{"type":"start_instance","cwd":"` + strings.Repeat("x", maxTextBytes+1) + `"}`,
+		"long instance id":     `{"type":"hello","instance":{"instance_id":"` + long + `"}}`,
+		"long instance prompt": `{"type":"register","instance":{"instance_id":"a","first_prompt":"` + strings.Repeat("x", MaxInstancePromptBytes+1) + `"}}`,
+		"unknown inst key":     `{"type":"hello","instance":{"instance_id":"a","secret":1}}`,
+		"long error":           `{"type":"response","error":{"code":"` + long + `"}}`,
+		"wrong field types":    `{"type":"hello","version":"1"}`,
 	}
 	for name, line := range tests {
 		t.Run(name, func(t *testing.T) {

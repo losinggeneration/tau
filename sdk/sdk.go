@@ -64,6 +64,9 @@ var (
 	// ErrVisionNotSupported is returned when image input is sent to a model that
 	// does not advertise vision capability.
 	ErrVisionNotSupported = errors.New("vision input not supported by active model")
+	// ErrHistoryEntryNotFound is returned when a persisted entry cannot be
+	// read back for display.
+	ErrHistoryEntryNotFound = errors.New("history entry not found")
 )
 
 // Event mirrors the JSON event types from the modes/SDK spec — same set,
@@ -356,6 +359,20 @@ type Queuer interface {
 	QueueSizes() (steering, followUp int)
 }
 
+// QueuedPrompt is a preview of one pending message, without attachment contents.
+type QueuedPrompt struct {
+	ID       string `json:"id"`
+	Text     string `json:"text"`
+	Kind     string `json:"kind"`
+	Editable bool   `json:"editable"`
+}
+
+// QueueEditor reads or edits messages that have not been taken by the agent.
+type QueueEditor interface {
+	QueuedPrompts() []QueuedPrompt
+	EditQueuedText(id, text string) bool
+}
+
 // QueueClearer removes every queued steering and follow-up message and
 // returns them, so a frontend can hand them back to the user for editing.
 type QueueClearer interface {
@@ -382,6 +399,16 @@ type RetryController interface {
 
 // CompactionController exposes runtime compaction toggles.
 type CompactionController interface{ SetAutoCompactionEnabled(enabled bool) }
+
+// SessionSettingsReader reports the toggles RetryController,
+// CompactionController and QueueModeSetter change. Queue modes are "all"
+// or "one-at-a-time".
+type SessionSettingsReader interface {
+	AutoCompactionEnabled() bool
+	AutoRetryEnabled() bool
+	SteeringMode() string
+	FollowUpMode() string
+}
 
 type Compactor interface {
 	Compact(ctx context.Context, customInstructions ...string) error
@@ -410,6 +437,14 @@ type HistoryPager interface {
 	// is empty. next is the before value for the preceding page, empty once
 	// the start of the history is reached.
 	History(before string, limit int) (entries []HistoryEntry, next string, err error)
+}
+
+// HistoryEntryReader reads one persisted display entry by ID, so a frontend
+// can load content its history page only previewed.
+type HistoryEntryReader interface {
+	// HistoryEntry returns the entry entryID, or an error wrapping
+	// ErrHistoryEntryNotFound when the session has no such displayable entry.
+	HistoryEntry(entryID string) (HistoryEntry, error)
 }
 
 // ContextEditor changes model-visible content without changing displayed history.
@@ -744,6 +779,7 @@ var (
 	_ QueueModeSetter               = (*agentSession)(nil)
 	_ RetryController               = (*agentSession)(nil)
 	_ CompactionController          = (*agentSession)(nil)
+	_ SessionSettingsReader         = (*agentSession)(nil)
 	_ MessageLister                 = (*agentSession)(nil)
 	_ FullMessageLister             = (*agentSession)(nil)
 	_ ForkMessageLister             = (*agentSession)(nil)
@@ -791,7 +827,9 @@ type agentSession struct {
 	pendingStartupCustom []*agent.Message
 	emittingSettled      bool
 	idleCustomDelivery   bool
-	deferredRuns         []deferredRun
+	// manualHistoryOperation marks admission held by Compact or Forget.
+	manualHistoryOperation bool
+	deferredRuns           []deferredRun
 	// runtime back-references the owning Runtime so the session can clear
 	// the runtime's current-session pointer on Close.
 	runtime *runtime
@@ -936,8 +974,10 @@ func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, err
 		return s.runLocked(ctx, s.agent.Continue), nil
 	}
 	isSlashCommand := strings.HasPrefix(msg.Text, "/") && s.cmdRegistry != nil
+	var interruptedRun chan struct{}
 	if s.cancelFn != nil {
-		if isSlashCommand {
+		if isSlashCommand && !s.manualHistoryOperation {
+			interruptedRun = s.runDone
 			// Interrupt the active run so the slash command can execute.
 			s.cancelFn()
 			s.agent.Abort()
@@ -951,6 +991,9 @@ func (s *agentSession) Send(ctx context.Context, msg Message) (<-chan Event, err
 			msg = resolved
 		} else if s.cmdRegistry != nil {
 			s.mu.Unlock()
+			if interruptedRun != nil {
+				ctx = context.WithValue(ctx, interruptedRunKey{}, interruptedRun)
+			}
 			return s.executeSlashCommand(ctx, msg.Text)
 		}
 	}
@@ -1011,7 +1054,7 @@ func (s *agentSession) SendCustomMessage(ctx context.Context, custom CustomMessa
 		s.mu.Unlock()
 		return err
 	}
-	if s.idleCustomDelivery && options.DeliverAs != "nextTurn" {
+	if (s.idleCustomDelivery || s.manualHistoryOperation) && options.DeliverAs != "nextTurn" {
 		s.mu.Unlock()
 		return ErrSessionBusy
 	}
@@ -1759,7 +1802,58 @@ func (s *agentSession) Compact(ctx context.Context, customInstructions ...string
 	if len(customInstructions) > 0 {
 		instructions = strings.TrimSpace(customInstructions[0])
 	}
+	ctx, release, err := s.beginManualHistoryOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	return s.compact(ctx, compactionTrigger{reason: compactionReasonManual}, instructions)
+}
+
+// interruptedRunGrace bounds the wait for a run a slash command interrupted.
+// A command issued from inside that run could otherwise wait on itself.
+const interruptedRunGrace = 2 * time.Second
+
+// interruptedRunKey carries the done channel of the run a slash command
+// interrupted, so a manual history operation can take over once it settles.
+type interruptedRunKey struct{}
+
+// beginManualHistoryOperation claims the session's run admission. Close and
+// Interrupt cancel the returned context, and Close waits for release before
+// closing the writer. Automatic compaction runs under its run's admission and
+// must not call this.
+func (s *agentSession) beginManualHistoryOperation(ctx context.Context) (context.Context, func(), error) {
+	if interrupted, ok := ctx.Value(interruptedRunKey{}).(chan struct{}); ok {
+		select {
+		case <-interrupted:
+		case <-ctx.Done():
+			return nil, nil, fmt.Errorf("wait for interrupted run: %w", errors.Join(ctx.Err(), context.Cause(ctx)))
+		case <-time.After(interruptedRunGrace):
+			return nil, nil, ErrSessionBusy
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, errors.New("session closed")
+	}
+	if s.runDone != nil || s.agent.State().IsStreaming {
+		return nil, nil, ErrSessionBusy
+	}
+	opCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.cancelFn = cancel
+	s.runDone = done
+	s.manualHistoryOperation = true
+	return opCtx, func() {
+		cancel()
+		s.mu.Lock()
+		s.cancelFn = nil
+		s.runDone = nil
+		s.manualHistoryOperation = false
+		s.mu.Unlock()
+		close(done)
+	}, nil
 }
 
 const (
@@ -1992,6 +2086,11 @@ func (s *agentSession) compact(ctx context.Context, trigger compactionTrigger, i
 		}
 	}
 	replacement = append(replacement, summaryMsg)
+	for _, message := range keptMessages {
+		if message.Role == agent.RoleAssistant {
+			message.StaleContextUsage = true
+		}
+	}
 	s.agent.ReplaceMessages(collapseSystemBaselines(append(replacement, keptMessages...)))
 
 	// Fire `compaction_end` (informational) so plugins can observe the
@@ -2554,11 +2653,15 @@ func estimateContextTokens(messages []*agent.Message) int {
 		if msg == nil || msg.ExcludeFromContext {
 			continue
 		}
+		usage := msg.Usage
+		if msg.StaleContextUsage {
+			usage = ai.Usage{}
+		}
 		compactionMessages = append(compactionMessages, &compaction.AgentMessage{
 			Role:       compaction.MessageRole(msg.Role),
 			Content:    msg.Content,
 			Sections:   msg.Sections,
-			Usage:      msg.Usage,
+			Usage:      usage,
 			StopReason: msg.StopReason,
 		})
 	}
@@ -2568,7 +2671,7 @@ func estimateContextTokens(messages []*agent.Message) int {
 func (s *agentSession) State() SessionState {
 	s.mu.Lock()
 	state := s.agent.State()
-	processing := state.IsStreaming || s.runDone != nil
+	processing := state.IsStreaming || (s.runDone != nil && !s.manualHistoryOperation)
 	// s.model may be nil when the session was created with no configured
 	// model (the TUI recovery path where the user picks a model via /model
 	// before sending). Treat it as an empty string in the public state.
@@ -2587,6 +2690,7 @@ func (s *agentSession) State() SessionState {
 		writerPath = s.sessionWriter.Path()
 	}
 	dataDir := s.sessionDataDir
+	totalTokens := s.totalTokens
 	s.mu.Unlock()
 
 	return SessionState{
@@ -2595,7 +2699,7 @@ func (s *agentSession) State() SessionState {
 		cwd:         s.cwd,
 		dataDir:     dataDir,
 		isStreaming: processing,
-		totalTokens: s.totalTokens,
+		totalTokens: totalTokens,
 		sessionPath: writerPath,
 	}
 }
@@ -2603,6 +2707,21 @@ func (s *agentSession) State() SessionState {
 // ID returns the session identifier.
 func (s *agentSession) ID() string {
 	return s.id
+}
+
+// PrepareRestart saves the session identity even if no prompt has yet been sent.
+func (s *agentSession) PrepareRestart(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	writer, err := s.ensureSessionWriter()
+	if err != nil {
+		return fmt.Errorf("save session for restart: %w", err)
+	}
+	if writer == nil {
+		return errors.New("cannot restart a session without persistent storage")
+	}
+	return nil
 }
 
 func (s *agentSession) Close(ctx context.Context) error {
@@ -3101,9 +3220,34 @@ func (s *agentSession) reloadSettingsLocked(settings *ai.Settings) error {
 // SetThinkingLevel changes the thinking level mid-session.
 // The new level takes effect on the next call to Send.
 func (s *agentSession) SetThinkingLevel(level string) error {
+	// Serialize with lazy writer initialization so a change made before the
+	// first prompt is recorded as the initial level, not lost or overwritten.
+	s.sessionInitMu.Lock()
+	defer s.sessionInitMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.setThinkingLevelLocked(level)
+}
 
+// setThinkingLevelLocked requires sessionInitMu and mu, in that order.
+func (s *agentSession) setThinkingLevelLocked(level string) error {
+	if s.closed {
+		return errors.New("session is closed")
+	}
+	level = strings.ToLower(level)
+	if !ai.IsValidThinkingLevel(level) {
+		return errors.New("invalid thinking level")
+	}
+	if level == s.thinkingLevel {
+		return nil
+	}
+	if writer := s.sessionWriter; writer != nil {
+		if err := writer.Append(sessionpkg.NewThinkingLevelChangeEntry(level)); err != nil {
+			return fmt.Errorf("append thinking level change: %w", err)
+		}
+	} else {
+		s.pendingInitialThinking = level
+	}
 	s.thinkingLevel = agent.ThinkingLevel(level)
 	s.agent.SetThinkingLevel(s.thinkingLevel)
 	return nil
@@ -3319,6 +3463,27 @@ func (s *agentSession) QueueSizes() (steering, followUp int) {
 	return s.agent.QueueSizes()
 }
 
+func (s *agentSession) QueuedPrompts() []QueuedPrompt {
+	steering, followUp := s.agent.QueuedMessages()
+	out := make([]QueuedPrompt, 0, len(steering)+len(followUp))
+	add := func(queue []agent.QueuedMessage, kind string) {
+		for _, item := range queue {
+			prompt := QueuedPrompt{ID: item.ID, Kind: kind, Editable: item.CanEditText()}
+			if prompt.Editable {
+				prompt.Text = item.Message.Content[0].Text
+			}
+			out = append(out, prompt)
+		}
+	}
+	add(steering, "steer")
+	add(followUp, "follow_up")
+	return out
+}
+
+func (s *agentSession) EditQueuedText(id, text string) bool {
+	return s.agent.EditQueuedText(id, text)
+}
+
 func (s *agentSession) GetAvailableModels(ctx context.Context) ([]*ai.Model, error) {
 	models, err := s.runtime.modelRegistry.Models()
 	if err != nil {
@@ -3327,6 +3492,16 @@ func (s *agentSession) GetAvailableModels(ctx context.Context) ([]*ai.Model, err
 	// Sessions converse with chat models; image and classifier entries are
 	// for operation-specific calls.
 	models = slices.DeleteFunc(models, func(model *ai.Model) bool { return model.Type != "" && model.Type != "chat" })
+	// List only providers the user can call, as the TUI's model picker does.
+	var refs ai.CredentialRefLister
+	if s.credStore != nil {
+		refs = s.credStore
+	}
+	allowed := ai.AuthenticatedProviderSet(ctx, refs)
+	models = slices.DeleteFunc(models, func(model *ai.Model) bool {
+		_, ok := allowed[model.Provider]
+		return !ok
+	})
 	if models, err = s.filterCopilotModels(ctx, models); err != nil {
 		return nil, err
 	}
@@ -3536,6 +3711,8 @@ func (s *agentSession) CycleModel() (*ai.Model, error) {
 }
 
 func (s *agentSession) CycleThinkingLevel() string {
+	s.sessionInitMu.Lock()
+	defer s.sessionInitMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	levels := ai.GetSupportedThinkingLevels(s.model)
@@ -3546,8 +3723,11 @@ func (s *agentSession) CycleThinkingLevel() string {
 			break
 		}
 	}
-	s.thinkingLevel = levels[idx]
-	s.agent.SetThinkingLevel(s.thinkingLevel)
+	if len(levels) > 0 && levels[idx] != s.thinkingLevel {
+		if err := s.setThinkingLevelLocked(levels[idx]); err != nil {
+			s.logger.Warn("cycle thinking level", "error", err)
+		}
+	}
 	return string(s.thinkingLevel)
 }
 
@@ -3587,6 +3767,22 @@ func (s *agentSession) SetAutoRetryEnabled(enabled bool) {
 	defer s.mu.Unlock()
 	s.autoRetryEnabled = enabled
 }
+
+func (s *agentSession) AutoCompactionEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compactionConfig.TriggerPct > 0
+}
+
+func (s *agentSession) AutoRetryEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.autoRetryEnabled
+}
+
+func (s *agentSession) SteeringMode() string { return s.agent.SteeringMode() }
+
+func (s *agentSession) FollowUpMode() string { return s.agent.FollowUpMode() }
 
 func (s *agentSession) AbortRetry() {
 	s.mu.Lock()
@@ -3672,6 +3868,34 @@ func (s *agentSession) History(before string, limit int) ([]HistoryEntry, string
 	return out, next, nil
 }
 
+// HistoryEntry reads one displayable entry through the history index.
+func (s *agentSession) HistoryEntry(entryID string) (HistoryEntry, error) {
+	s.mu.Lock()
+	writer := s.sessionWriter
+	s.mu.Unlock()
+	if writer == nil || entryID == "" {
+		return HistoryEntry{}, fmt.Errorf("%w: %q", ErrHistoryEntryNotFound, entryID)
+	}
+	s.historyMu.Lock()
+	entry, ok, err := s.historyIndex.Entry(writer.Path(), entryID)
+	s.historyMu.Unlock()
+	if err != nil {
+		return HistoryEntry{}, fmt.Errorf("read session entry: %w", err)
+	}
+	var msg *sessionpkg.Message
+	if ok {
+		msg = entry.ToAgentMessage()
+	}
+	if msg == nil {
+		return HistoryEntry{}, fmt.Errorf("%w: %q", ErrHistoryEntryNotFound, entryID)
+	}
+	agentMsg := sessionMessagesToAgentMessages([]*sessionpkg.Message{msg})[0]
+	if isInitialSystemBaseline(agentMsg) {
+		return HistoryEntry{}, fmt.Errorf("%w: %q", ErrHistoryEntryNotFound, entryID)
+	}
+	return HistoryEntry{EntryID: entry.ID, Message: sdkMessageFromAgent(agentMsg)}, nil
+}
+
 func (s *agentSession) GetUserMessagesForForking() []Message {
 	all := s.GetMessages()
 	users := make([]Message, 0, len(all))
@@ -3751,9 +3975,14 @@ func (s *agentSession) GetForgetEntries() ([]ForkEntry, error) {
 // Forget marks entryID and every later entry on the current branch deleted,
 // then reloads the agent context from what remains.
 func (s *agentSession) Forget(entryID string) error {
-	if s.agent.State().IsStreaming {
-		return fmt.Errorf("cannot forget while the agent is running")
+	ctx, release, err := s.beginManualHistoryOperation(context.Background())
+	if errors.Is(err, ErrSessionBusy) {
+		return fmt.Errorf("cannot forget while the agent is running: %w", err)
 	}
+	if err != nil {
+		return err
+	}
+	defer release()
 	s.mu.Lock()
 	writer := s.sessionWriter
 	s.mu.Unlock()
@@ -3767,6 +3996,9 @@ func (s *agentSession) Forget(entryID string) error {
 	ids, parent, err := reader.ForgetSet(entryID)
 	if err != nil {
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("cancelled before deleting entries: %w", err)
 	}
 	if err := writer.MarkDeleted(ids); err != nil {
 		return fmt.Errorf("mark entries deleted: %w", err)
@@ -6945,22 +7177,49 @@ func loadSessionHistoryAt(storage *sessionpkg.Storage, sessionID, atEntry string
 }
 
 func agentMessagesFromSessionReader(reader *sessionpkg.Reader, atEntry string) ([]*agent.Message, error) {
-	var sessionMsgs []*sessionpkg.Message
+	var entries []sessionpkg.Entry
 	if atEntry == "" {
-		sessionMsgs = reader.ToAgentMessages()
+		entries = reader.ContextEntries()
 	} else {
 		manager := sessionpkg.NewManager(reader.Header().CWD)
 		manager.LoadEntries(reader)
 		if err := manager.SetCurrentPosition(atEntry); err != nil {
 			return nil, fmt.Errorf("select session position: %w", err)
 		}
-		for _, entry := range manager.ContextEntries() {
-			if msg := entry.ToAgentMessage(); msg != nil {
-				sessionMsgs = append(sessionMsgs, msg)
+		entries = manager.ContextEntries()
+	}
+
+	// The summary is projected before the retained replies, so use file
+	// order to tell which usage reports were recorded after compaction.
+	var fresh map[string]struct{}
+	if i := slices.IndexFunc(entries, func(e sessionpkg.Entry) bool { return e.Type == sessionpkg.EntryTypeCompaction }); i >= 0 {
+		written := reader.Entries()
+		if j := slices.IndexFunc(written, func(e sessionpkg.Entry) bool { return e.ID == entries[i].ID }); j >= 0 {
+			fresh = make(map[string]struct{})
+			for _, e := range written[j+1:] {
+				if e.Type == sessionpkg.EntryTypeMessage {
+					fresh[e.ID] = struct{}{}
+				}
 			}
 		}
 	}
-	return sessionMessagesToAgentMessages(sessionMsgs), nil
+	var sessionMsgs []*sessionpkg.Message
+	var stale []int
+	for _, entry := range entries {
+		if msg := entry.ToAgentMessage(); msg != nil {
+			if fresh != nil && msg.Role == sessionpkg.MessageRoleAssistant {
+				if _, ok := fresh[entry.ID]; !ok {
+					stale = append(stale, len(sessionMsgs))
+				}
+			}
+			sessionMsgs = append(sessionMsgs, msg)
+		}
+	}
+	messages := sessionMessagesToAgentMessages(sessionMsgs)
+	for _, i := range stale {
+		messages[i].StaleContextUsage = true
+	}
+	return messages, nil
 }
 
 func sessionMessagesToAgentMessages(sessionMsgs []*sessionpkg.Message) []*agent.Message {

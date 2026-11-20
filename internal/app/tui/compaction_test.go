@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -308,6 +309,42 @@ func TestCompactionEndReportsFailedAttempts(t *testing.T) {
 		assert.False(t, running, tc.name)
 		assert.False(t, a.compactionRunning, tc.name)
 		assert.Len(t, a.conv.Snapshot().Components, tc.want, tc.name)
+	}
+}
+
+func TestFailCompactBeforeCompactionEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		startedIndicator bool
+		switchSession    bool
+		wantRunning      bool
+	}{
+		{name: "synthetic indicator clears", startedIndicator: true},
+		{name: "running compaction keeps indicator", wantRunning: true},
+		{name: "replaced session clears stale indicator", startedIndicator: true, switchSession: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestApp(t)
+			a.status = tauui.NewStatusEntriesView(5)
+			sess := a.sess
+			a.applySessionEvent(sdk.Event{Type: "compaction_start"})
+			if tc.switchSession {
+				a.sess = &fakeSession{}
+				a.wireSessionEvents()
+			}
+
+			a.failCompact(sess, tc.startedIndicator, errors.New("boom"))
+
+			_, shown := a.statusEntries[compactionStatusKey]
+			assert.Equal(t, tc.wantRunning, shown)
+			assert.Equal(t, tc.wantRunning, a.compactionRunning)
+			assert.Equal(t, tc.wantRunning, a.programStatus.compacting)
+			msgs := a.conv.Messages()
+			if assert.NotEmpty(t, msgs) {
+				assert.Equal(t, RoleError, msgs[len(msgs)-1].Role)
+				assert.Contains(t, msgs[len(msgs)-1].Text, "compact: boom")
+			}
+		})
 	}
 }
 

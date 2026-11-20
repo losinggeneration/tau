@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/losinggeneration/tau/rpc/coord"
+	"github.com/losinggeneration/tau/sdk"
 )
 
 const (
@@ -36,6 +38,7 @@ const (
 	cmdGetSnapshot  = "get_snapshot"
 	cmdReplayEvents = "replay_events"
 	cmdGetHistory   = "get_history"
+	cmdEntryContent = "get_entry_content"
 )
 
 var (
@@ -213,10 +216,11 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int, opts ...
 		clientID = o.clientID
 	}
 	link, welcome, err := coord.Dial(ctx, path, coord.Frame{
-		Type:     coord.TypeHello,
-		Version:  coord.Version,
-		Role:     coord.RoleClient,
-		ClientID: clientID,
+		Type:       coord.TypeHello,
+		Version:    coord.Version,
+		Role:       coord.RoleClient,
+		ClientID:   clientID,
+		Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceBuild},
 	})
 	if err != nil {
 		return nil, err
@@ -348,6 +352,16 @@ func (c *CoordinatedClient) Err() error {
 	return c.err
 }
 
+// SessionDirectory returns the daemon's saved-session storage for cwd.
+// The lookup is only available on the local daemon socket.
+func (c *CoordinatedClient) SessionDirectory(ctx context.Context, cwd string) (string, error) {
+	if !slices.Contains(c.welcome.Operations, coord.TypeSessionDirectory) {
+		return "", errors.New("coordinator does not support looking up saved sessions; restart it with the current Tau version")
+	}
+	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeSessionDirectory, CWD: cwd})
+	return reply.CWD, err
+}
+
 // ListInstances returns the coordinator registry, including any retained
 // disconnected or exited workers. Check LinkState before attaching.
 func (c *CoordinatedClient) ListInstances(ctx context.Context) ([]coord.Instance, error) {
@@ -392,17 +406,51 @@ func (c *CoordinatedClient) StartInstance(ctx context.Context, cwd string) (*coo
 // *OutcomeUnknownError. A new UUIDv4 intent is rejected on a recoverable
 // coordinator. Other mutations do not deduplicate.
 func (c *CoordinatedClient) StartInstanceWithRequestID(ctx context.Context, cwd, requestID string) (*coord.Instance, error) {
+	return c.startInstance(ctx, cwd, "", requestID)
+}
+
+// StartSavedSession returns the connected worker for the saved session in cwd,
+// or launches one if it has no worker. If a worker is starting or reconnecting,
+// it waits for the worker within ctx. It does not attach to the returned worker.
+func (c *CoordinatedClient) StartSavedSession(ctx context.Context, cwd, sessionID string) (*coord.Instance, error) {
+	if sessionID == "" {
+		return nil, errors.New("saved session ID required")
+	}
+	if !slices.Contains(c.welcome.Operations, coord.OperationSavedSessionLaunch) {
+		return nil, errors.New("coordinator does not support launching saved sessions; restart it with the current Tau version")
+	}
+	for {
+		inst, err := c.startInstance(ctx, cwd, sessionID, "")
+		// Busy guarantees that this request didn't start a worker. Don't
+		// retry a launch whose outcome is unknown.
+		if e, ok := errors.AsType[*coord.Error](err); !ok || e.Code != coord.CodeBusy || errors.Is(err, ErrOutcomeUnknown) {
+			return inst, err
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("waiting for saved session worker: %w", errors.Join(ctx.Err(), err))
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *CoordinatedClient) startInstance(ctx context.Context, cwd, sessionID, requestID string) (*coord.Instance, error) {
 	if requestID == "" {
 		requestID = c.NewStartRequestID()
 	} else if !coord.ValidLaunchRequestID(requestID) {
 		return nil, ErrInvalidRequestID
 	}
-	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeStartInstance, CWD: cwd, RequestID: requestID})
+	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeStartInstance, CWD: cwd, SessionID: sessionID, RequestID: requestID})
 	if err != nil {
 		return nil, err
 	}
 	if reply.Instance == nil {
 		return nil, fmt.Errorf("start instance: %w: reply missing instance", coord.ErrInvalidFrame)
+	}
+	if sessionID != "" && reply.Instance.SessionID != sessionID {
+		return nil, fmt.Errorf("start saved session: %w: reply names a different session", coord.ErrInvalidFrame)
 	}
 	return reply.Instance, nil
 }
@@ -439,7 +487,7 @@ func (c *CoordinatedClient) Detach(ctx context.Context, instanceID string) error
 	return err
 }
 
-// Command sends a tau rpc command to instanceID and returns the instance's
+// Command sends a tau command to instanceID and returns the instance's
 // response. A missing cmd.ID is filled in, and a fresh request ID is sent;
 // see CommandWithRequestID. Routing failures are returned as *coord.Error;
 // command failures are reported in the Response.
@@ -476,6 +524,22 @@ func (c *CoordinatedClient) StopInstance(ctx context.Context, instanceID string)
 // StopInstanceWithRequestID is StopInstance under the caller's request ID,
 // which must be a random UUID; empty generates one.
 func (c *CoordinatedClient) StopInstanceWithRequestID(ctx context.Context, instanceID, requestID string) error {
+	return c.stopInstance(ctx, instanceID, "", requestID)
+}
+
+// StopInstanceForRestart gracefully stops the worker after it saves sessionID
+// or the coordinator verifies an existing save for an older worker.
+func (c *CoordinatedClient) StopInstanceForRestart(ctx context.Context, instanceID, sessionID string) error {
+	if sessionID == "" {
+		return errors.New("restart requires a session ID")
+	}
+	if !slices.Contains(c.welcome.Operations, coord.OperationInstanceRestart) {
+		return errors.New("coordinator does not support session-preserving restart")
+	}
+	return c.stopInstance(ctx, instanceID, sessionID, "")
+}
+
+func (c *CoordinatedClient) stopInstance(ctx context.Context, instanceID, sessionID, requestID string) error {
 	if instanceID == "" {
 		return ErrTargetRequired
 	}
@@ -483,7 +547,7 @@ func (c *CoordinatedClient) StopInstanceWithRequestID(ctx context.Context, insta
 	if err != nil {
 		return err
 	}
-	reply, err := c.targeted(ctx, coord.Frame{Type: coord.TypeStopInstance, InstanceID: instanceID, RequestID: requestID})
+	reply, err := c.targeted(ctx, coord.Frame{Type: coord.TypeStopInstance, InstanceID: instanceID, SessionID: sessionID, RequestID: requestID})
 	if err != nil {
 		return err
 	}
@@ -529,7 +593,10 @@ type SnapshotState struct {
 	Model         json.RawMessage `json:"model,omitempty"`
 	ThinkingLevel string          `json:"thinking_level,omitempty"`
 	IsStreaming   bool            `json:"is_streaming"`
-	Queue         json.RawMessage `json:"queue,omitempty"`
+	// IsCompacting reflects the compaction events through Snapshot.Position.
+	IsCompacting bool              `json:"is_compacting,omitempty"`
+	Queue        json.RawMessage   `json:"queue,omitempty"`
+	Stats        *sdk.SessionStats `json:"stats,omitempty"`
 }
 
 // History is one page of persisted conversation, newest last. Pass Before
@@ -539,12 +606,14 @@ type History struct {
 	Before  string         `json:"before"`
 }
 
-// HistoryEntry is one persisted message. Omitted entries exceeded the page
-// bound and carry no message.
+// HistoryEntry is one persisted message. Truncated entries exceeded the page
+// bound and carry a bounded preview; use EntryContent to read the rest.
+// Omitted entries could not fit even a preview and carry no message.
 type HistoryEntry struct {
-	EntryID string          `json:"entry_id"`
-	Message json.RawMessage `json:"message,omitempty"`
-	Omitted bool            `json:"omitted,omitempty"`
+	EntryID   string          `json:"entry_id"`
+	Message   json.RawMessage `json:"message,omitempty"`
+	Omitted   bool            `json:"omitted,omitempty"`
+	Truncated bool            `json:"truncated,omitempty"`
 }
 
 // ReplayPage is one contiguous page of events after a cursor.
@@ -571,11 +640,20 @@ type Handoff struct {
 // Snapshot fetches instanceID's current baseline without attaching. Use
 // AttachSnapshot to continue it with live events.
 func (c *CoordinatedClient) Snapshot(ctx context.Context, instanceID string) (*Snapshot, error) {
+	return c.snapshot(ctx, instanceID, Command{Type: cmdGetSnapshot})
+}
+
+// SnapshotPreview fetches a snapshot whose history references images by entry ID.
+func (c *CoordinatedClient) SnapshotPreview(ctx context.Context, instanceID string) (*Snapshot, error) {
+	return c.snapshot(ctx, instanceID, Command{Type: cmdGetSnapshot, Args: map[string]bool{"preview": true}})
+}
+
+func (c *CoordinatedClient) snapshot(ctx context.Context, instanceID string, cmd Command) (*Snapshot, error) {
 	if instanceID == "" {
 		return nil, ErrTargetRequired
 	}
 	var s Snapshot
-	if err := c.call(ctx, instanceID, Command{Type: cmdGetSnapshot}, &s); err != nil {
+	if err := c.call(ctx, instanceID, cmd, &s); err != nil {
 		return nil, err
 	}
 	if s.Position.InstanceID != instanceID || s.Position.Epoch == "" || (s.Instance.ID != "" && s.Instance.ID != instanceID) {
@@ -587,6 +665,15 @@ func (c *CoordinatedClient) Snapshot(ctx context.Context, instanceID string) (*S
 // History fetches the page of sessionID's persisted conversation before the
 // entry ID before; empty fetches the newest page.
 func (c *CoordinatedClient) History(ctx context.Context, instanceID, sessionID, before string) (*History, error) {
+	return c.history(ctx, instanceID, sessionID, before, false)
+}
+
+// HistoryPreview fetches a history page whose images are referenced by entry ID.
+func (c *CoordinatedClient) HistoryPreview(ctx context.Context, instanceID, sessionID, before string) (*History, error) {
+	return c.history(ctx, instanceID, sessionID, before, true)
+}
+
+func (c *CoordinatedClient) history(ctx context.Context, instanceID, sessionID, before string, preview bool) (*History, error) {
 	if instanceID == "" {
 		return nil, ErrTargetRequired
 	}
@@ -596,12 +683,50 @@ func (c *CoordinatedClient) History(ctx context.Context, instanceID, sessionID, 
 	args := struct {
 		SessionID string `json:"session_id"`
 		Before    string `json:"before,omitempty"`
-	}{sessionID, before}
+		Preview   bool   `json:"preview,omitempty"`
+	}{sessionID, before, preview}
 	var h History
 	if err := c.call(ctx, instanceID, Command{Type: cmdGetHistory, Args: args}, &h); err != nil {
 		return nil, err
 	}
 	return &h, nil
+}
+
+// EntryContentRequest selects a saved entry or a live item. LiveKind can be
+// "message", "tool", or "bash". ImageIndex selects a zero-based saved image.
+// To continue a read, pass the previous Revision and the total bytes read.
+type EntryContentRequest struct {
+	SessionID  string `json:"session_id"`
+	EntryID    string `json:"entry_id"`
+	LiveKind   string `json:"live_kind,omitempty"`
+	ImageIndex *int   `json:"image_index,omitempty"`
+	Offset     int64  `json:"offset,omitempty"`
+	Revision   string `json:"revision,omitempty"`
+}
+
+// EntryContentChunk contains bytes of a JSON message or live item, or the
+// base64 of a selected image. More indicates another chunk is available.
+type EntryContentChunk struct {
+	Data     []byte `json:"data"`
+	Revision string `json:"revision"`
+	More     bool   `json:"more"`
+}
+
+// EntryContent reads a bounded chunk from the named instance. If the read
+// expired, the worker returns CodeResyncRequired, and the caller can restart
+// at offset zero rather than combining bytes from different reads.
+func (c *CoordinatedClient) EntryContent(ctx context.Context, instanceID string, req EntryContentRequest) (*EntryContentChunk, error) {
+	if instanceID == "" {
+		return nil, ErrTargetRequired
+	}
+	var chunk EntryContentChunk
+	if err := c.call(ctx, instanceID, Command{Type: cmdEntryContent, Args: req}, &chunk); err != nil {
+		return nil, err
+	}
+	if chunk.More && (chunk.Revision == "" || len(chunk.Data) == 0) || req.Offset > 0 && req.Revision != chunk.Revision {
+		return nil, fmt.Errorf("%s: %w: invalid content chunk", cmdEntryContent, coord.ErrInvalidFrame)
+	}
+	return &chunk, nil
 }
 
 // ReplayEvents fetches the page of events after the position after, from
@@ -962,7 +1087,7 @@ func (c *CoordinatedClient) command(ctx context.Context, instanceID, requestID s
 	return reply, cmd.ID, err
 }
 
-// commandResponse accepts either a full tau rpc response or a bare result
+// commandResponse accepts either a full worker response or a bare result
 // object from the instance.
 func commandResponse(id string, result json.RawMessage) (*Response, error) {
 	resp := &Response{Type: "response", ID: id, OK: true}

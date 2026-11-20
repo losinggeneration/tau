@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,8 +21,8 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test harness: runs Server in-process with injected reader/writer.
-// No subprocess, no binary build, no sleeps for synchronization.
+// Test harness: feeds JSONL commands to the worker's shared handlers
+// in-process. No subprocess, no binary build, no sleeps for synchronization.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type testHarness struct {
@@ -55,20 +54,21 @@ func sdkNewSessionState(id, model, cwd string) sdk.SessionState {
 
 func newTestHarness(t *testing.T, rt sdk.Runtime, reg commands.Registry) *testHarness {
 	t.Helper()
+	return startTestHarness(t, newServer(rt, reg, nil))
+}
+
+func startTestHarness(t *testing.T, srv *Server) *testHarness {
+	t.Helper()
 
 	stdinR, stdinW := io.Pipe()
 	stdoutR, stdoutW := io.Pipe()
 
-	srv := &Server{
-		runtime:         rt,
-		reader:          bufio.NewReader(stdinR),
-		writer:          stdoutW,
-		interrupt:       make(chan struct{}, 1),
-		shutdown:        make(chan struct{}),
-		commandRegistry: reg,
-	}
+	srv.writer = stdoutW
 	srv.ui = ui.NewRPCUI()
 	srv.ui.Writer = stdoutW
+	if srv.pluginManager != nil {
+		srv.pluginManager.SetUI(srv.ui)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &testHarness{
@@ -83,14 +83,38 @@ func newTestHarness(t *testing.T, rt sdk.Runtime, reg commands.Registry) *testHa
 	go func() {
 		defer close(h.done)
 		defer stdoutW.Close()
-		_ = srv.Run(ctx)
+		serveTestCommands(ctx, srv, bufio.NewReader(stdinR))
 	}()
-
-	// Drain the meta event synchronously.
-	if !h.stdout.Scan() {
-		t.Fatalf("server emitted no meta event: %v", h.stdout.Err())
-	}
 	return h
+}
+
+// serveTestCommands dispatches each JSONL command the way a worker dispatches
+// coordinator frames, including its shutdown handling, until EOF.
+func serveTestCommands(ctx context.Context, s *Server, r *bufio.Reader) {
+	w := &Worker{server: s}
+	for ctx.Err() == nil {
+		line, err := r.ReadString('\n')
+		if err != nil && (!errors.Is(err, io.EOF) || line == "") {
+			break
+		}
+		var cmd Command
+		if decodeErr := json.Unmarshal([]byte(line), &cmd); decodeErr != nil {
+			if sendErr := s.sendError("", "invalid_command", decodeErr.Error()); sendErr != nil {
+				break
+			}
+			continue
+		}
+		if cmd.Type == "shutdown" {
+			if cleanupErr := s.cleanup(ctx); cleanupErr != nil {
+				_ = s.sendErrorResult(cmd.ID, cleanupErr)
+				return
+			}
+			_ = s.sendResult(cmd.ID, map[string]any{"ok": true})
+			return
+		}
+		w.dispatch(ctx, &cmd)
+	}
+	_ = s.cleanup(ctx)
 }
 
 func (h *testHarness) send(t *testing.T, cmd string) {
@@ -134,22 +158,15 @@ func (h *testHarness) readUntil(t *testing.T, dur time.Duration, match func(stri
 	}
 }
 
-func (h *testHarness) triggerInterrupt() {
-	select {
-	case h.srv.interrupt <- struct{}{}:
-	default:
-	}
-}
-
 func (h *testHarness) close() {
 	// Close stdin so the server's blocking ReadString returns EOF,
-	// then drain any remaining output (session_end event etc.) so the
+	// then drain any remaining output (session_shutdown etc.) so the
 	// server doesn't block writing to a full pipe.
 	if w, ok := h.stdin.(io.Closer); ok {
 		_ = w.Close()
 	}
 	// Drain remaining lines with a short timeout. This lets the server
-	// emit its final events (session_end on disconnect) without blocking.
+	// emit its final cleanup events without blocking.
 	drainDone := make(chan struct{})
 	go func() {
 		defer close(drainDone)
@@ -436,46 +453,6 @@ func registerBuiltinCommands(reg *commands.InMemoryRegistry) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Small helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-// readCloserPipes returns a connected (read, write) io.ReadCloser pair for
-// the test to inject as a Server's reader.
-func readCloserPipes() (*os.File, *os.File) {
-	r, w, err := os.Pipe()
-	if err != nil {
-		panic(err)
-	}
-	return r, w
-}
-
-// writeCloserPipes returns a connected (read, write) io.WriteCloser pair for
-// the test to inject as a Server's writer.
-func writeCloserPipes() (*os.File, *os.File) {
-	r, w, err := os.Pipe()
-	if err != nil {
-		panic(err)
-	}
-	return r, w
-}
-
-// readLineWithTimeout reads one line from r, returning the line and the
-// error. It bounds the wait so a hung server cannot wedge the test.
-func readLineWithTimeout(r *bufio.Reader, d time.Duration) (string, error) {
-	type result struct {
-		line string
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		line, err := r.ReadString('\n')
-		ch <- result{line: line, err: err}
-	}()
-	select {
-	case res := <-ch:
-		return res.line, res.err
-	case <-time.After(d):
-		return "", fmt.Errorf("timeout after %v", d)
-	}
-}
 
 func readSessionFile(t *testing.T, dir string) string {
 	t.Helper()

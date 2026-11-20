@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -167,6 +168,9 @@ const (
 	// dialog is open and the last reply otherwise. External id
 	// "app.message.copy".
 	AppActionMessageCopy
+
+	// AppActionInstances opens the worker picker without replacing the draft.
+	AppActionInstances
 )
 
 // selectorMode enumerates the modes the inline Selector can be in. The
@@ -208,11 +212,19 @@ const EditorHeight = 5
 //	| footer                       |
 //	+------------------------------+
 type App struct {
-	app    *tauui.App
-	sess   sdk.Session
-	conv   *ConversationModel
-	chat   *ChatLog
-	scroll *widgets.ScrollView
+	app                    *tauui.App
+	coordinated            *CoordinatedSession
+	instanceAction         func(action, arg, draft string)
+	coordinatedPendingSend bool
+	coordinatedDialog      string
+	coordinatedEntries     map[string]struct{}
+	coordinatedBash        string
+	coordinatedReply       string
+	coordinatedSessionID   string
+	sess                   sdk.Session
+	conv                   *ConversationModel
+	chat                   *ChatLog
+	scroll                 *widgets.ScrollView
 	// followChat records app-loop-owned follow-the-tail intent, consumed by a
 	// current render result.
 	followChat bool
@@ -372,7 +384,8 @@ type App struct {
 	authStore CredentialStore
 	// settingsPath is where /model persists the selected default model.
 	// Empty means /model only changes the active session model.
-	settingsPath string
+	settingsPath          string
+	reloadDisplaySettings func(context.Context) (*ai.Settings, error)
 
 	// emptyResponseCount tracks consecutive empty assistant responses. Empty
 	// responses are summarized in one system row instead of appending one blank
@@ -495,6 +508,11 @@ type App struct {
 	sessionSelectorCacheValid bool
 	forkEntries               []sdk.ForkEntry
 	forkShowAll               bool
+	// messageSelectorFailed is the /fork or /forget picker that failed to
+	// open for the command being typed. Typing doesn't retry it until the
+	// editor leaves that command, so each keypress doesn't repeat the error.
+	messageSelectorFailed    selectorMode
+	coordinatedForgetLoading bool
 	// renameSession renames a persisted session from the workspace UI.
 	renameSession func(context.Context, string, string) error
 	// pinSession and unpinSession update workspace pin state.
@@ -573,7 +591,11 @@ func appTerminalTitle(sessionID string, streaming bool) string {
 }
 
 type Options struct {
-	// Session is the agent session that receives prompts. Required.
+	// DisplaySettings supplies locally admitted presentation settings for a coordinator client.
+	DisplaySettings *ai.Settings
+	// ReloadDisplaySettings reads the same settings after saving a user default.
+	ReloadDisplaySettings func(context.Context) (*ai.Settings, error)
+	// Session is required unless InstanceAction manages an unattached composer.
 	Session sdk.Session
 	// Version is shown in the header.
 	Version string
@@ -623,13 +645,19 @@ type Options struct {
 	RefreshTheme func(string) (bool, error)
 	// StartupMessages are shown under the startup header before the first turn.
 	StartupMessages []string
+	// InitialDraft restores unsent text when switching workers.
+	InitialDraft string
+	// InitialNotice reports a startup failure even when existing history hides the header.
+	InitialNotice string
+	// InstanceAction leaves the current view to manage workers, keeping the draft.
+	InstanceAction func(action, arg, draft string)
 }
 
 // New builds the toolkit app and assembles the layout region stack:
 // header, chat log, prompt editor, optional pending view, inline
 // selector, and footer. It does not start the event loop; call Run.
 func New(opts Options) (*App, error) {
-	if opts.Session == nil {
+	if opts.Session == nil && opts.InstanceAction == nil {
 		return nil, fmt.Errorf("tui: Options.Session is required")
 	}
 
@@ -670,37 +698,38 @@ func New(opts Options) (*App, error) {
 	widgetsBelow := NewWidgetContainer(widgetPlacementBelow)
 
 	a := &App{
-		conv:            conv,
-		chat:            chatLog,
-		scroll:          scroll,
-		editor:          editor,
-		footer:          footer,
-		cmds:            cmds,
-		sess:            opts.Session,
-		selector:        selector,
-		dialogPicker:    dialogPicker,
-		pending:         pending,
-		status:          status,
-		widgetsAbove:    widgetsAbove,
-		widgetsBelow:    widgetsBelow,
-		initialPrompt:   opts.InitialPrompt,
-		sessionFactory:  opts.SessionFactory,
-		sessionLister:   opts.ListSessions,
-		renameSession:   opts.RenameSession,
-		pinSession:      opts.PinSession,
-		unpinSession:    opts.UnpinSession,
-		deleteSession:   opts.DeleteSession,
-		importSession:   opts.ImportSession,
-		authStore:       opts.CredentialStore,
-		credentialStore: opts.CredentialStore,
-		settingsPath:    opts.SettingsPath,
-		themeColors:     opts.ThemeColors,
-		themeLookup:     opts.ThemeLookup,
-		themeNames:      opts.ThemeNames,
-		refreshTheme:    opts.RefreshTheme,
-		header:          header,
-		extensions:      extensions.New(),
-		pluginRenderers: newPluginRenderers(),
+		conv:                  conv,
+		chat:                  chatLog,
+		scroll:                scroll,
+		editor:                editor,
+		footer:                footer,
+		cmds:                  cmds,
+		sess:                  opts.Session,
+		selector:              selector,
+		dialogPicker:          dialogPicker,
+		pending:               pending,
+		status:                status,
+		widgetsAbove:          widgetsAbove,
+		widgetsBelow:          widgetsBelow,
+		initialPrompt:         opts.InitialPrompt,
+		sessionFactory:        opts.SessionFactory,
+		sessionLister:         opts.ListSessions,
+		renameSession:         opts.RenameSession,
+		pinSession:            opts.PinSession,
+		unpinSession:          opts.UnpinSession,
+		deleteSession:         opts.DeleteSession,
+		importSession:         opts.ImportSession,
+		authStore:             opts.CredentialStore,
+		credentialStore:       opts.CredentialStore,
+		settingsPath:          opts.SettingsPath,
+		reloadDisplaySettings: opts.ReloadDisplaySettings,
+		themeColors:           opts.ThemeColors,
+		themeLookup:           opts.ThemeLookup,
+		themeNames:            opts.ThemeNames,
+		refreshTheme:          opts.RefreshTheme,
+		header:                header,
+		extensions:            extensions.New(),
+		pluginRenderers:       newPluginRenderers(),
 	}
 	a.conversationEvents = newConversationEventAdapter(a)
 	// A manual scroll suspends follow-the-tail until the user returns to the
@@ -727,6 +756,9 @@ func New(opts Options) (*App, error) {
 	// Subscribe to the session's out-of-band events (compaction). These do not
 	// arrive on a prompt's event channel because they happen without a prompt
 	// in flight; see sdk.EventObserver.
+	a.coordinated, _ = opts.Session.(*CoordinatedSession)
+	a.instanceAction = opts.InstanceAction
+	a.registerInstanceCommands()
 	a.wireSessionEvents()
 	// Wire the registry's on-change callbacks so plugin-initiated
 	// theme/editor-text/tool-expansion edits propagate to the live UI
@@ -748,14 +780,19 @@ func New(opts Options) (*App, error) {
 	}
 	if opts.Session != nil {
 		a.currentModel = opts.Session.State().Model()
-		a.seedChatFromSession(opts.Session, "")
+		if a.coordinated == nil {
+			a.seedChatFromSession(opts.Session, "")
+		}
 		a.refreshChat()
 	}
 	// Seed the plugin extension registry with the App's theme. The
 	// extensions package's SetTheme defensively copies the values
 	// map, so the caller can safely mutate their working copy.
 	initialTheme := systemThemeName
-	loadedSettings := sessionSettings(opts.Session)
+	loadedSettings := opts.DisplaySettings
+	if loadedSettings == nil {
+		loadedSettings = sessionSettings(opts.Session)
+	}
 	if loadedSettings == nil && opts.SettingsPath != "" {
 		settings, err := ai.LoadSettings(opts.SettingsPath)
 		if err != nil {
@@ -769,7 +806,9 @@ func New(opts Options) (*App, error) {
 			initialTheme = settings.Theme
 		}
 	}
-	a.applyDefaultSteeringMode(loadedSettings)
+	if a.coordinated == nil {
+		a.applyDefaultSteeringMode(loadedSettings)
+	}
 	if len(opts.ModelScope) > 0 {
 		a.scopedModelKeys = []string{}
 		a.scopedThinking = map[string]string{}
@@ -892,6 +931,9 @@ func New(opts Options) (*App, error) {
 	}
 	a.app = app
 	a.applyDisplaySettings(loadedSettings)
+	if a.sess == nil {
+		a.showModelDefault(loadedSettings)
+	}
 	app.AddInputListener(func(e tauui.Event) (tauui.Event, bool) {
 		if a.dialogInputActive.Load() {
 			return e, false
@@ -947,6 +989,12 @@ func New(opts Options) (*App, error) {
 		}
 	})
 
+	if opts.InitialDraft != "" {
+		a.editor.SetText(nil, opts.InitialDraft)
+	}
+	if opts.InitialNotice != "" {
+		a.setStatus("startup", opts.InitialNotice)
+	}
 	return a, nil
 }
 
@@ -965,6 +1013,7 @@ func (a *App) Run(ctx context.Context) (err error) {
 	a.ctx, a.cancelRun = context.WithCancel(ctx)
 	defer func() {
 		a.cancelRun()
+		a.stopThrobber()
 		a.stopExtensionDialogs()
 		a.stopLoginWorkers()
 		if a.sess != nil {
@@ -984,6 +1033,9 @@ func (a *App) Run(ctx context.Context) (err error) {
 	}
 	defer func() { a.terminalTheme.started = false }()
 	defer a.startThemeFileWatcher(a.ctx)()
+	if a.coordinated != nil {
+		go a.forwardCoordinatedEvents(a.ctx, a.coordinated.Events())
+	}
 
 	// If an initial prompt was passed on the command line, submit it on the
 	// first loop iteration so the editor is clear and the run streams in.
@@ -1561,6 +1613,12 @@ func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
 		return true
 	case AppActionPaste:
 		return r.app.requestClipboardPaste(ctx)
+	case AppActionInstances:
+		if r.app.instanceAction != nil {
+			r.app.leaveInstance("instances", "")
+			return true
+		}
+		return false
 	case AppActionMessageCopy:
 		if d := r.app.loginDialog; d != nil {
 			d.copyURL()
@@ -1578,6 +1636,10 @@ func (r *Root) HandleAction(act tauui.Action, ctx *tauui.Ctx) bool {
 		// we swallow the key so it does not fall through to anything
 		// else.
 		if r.app.dismissSelectorIfVisibleCtx(ctx) {
+			return true
+		}
+		if r.app.coordinatedBash != "" || r.app.coordinated != nil && r.app.userBashCancel != nil {
+			r.app.abortCoordinatedBash()
 			return true
 		}
 		if r.app.userBashCancel != nil {
@@ -1704,6 +1766,9 @@ var scopedModelsActionIDs = map[string]struct{}{
 }
 
 func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Action, bool) {
+	if k.app != nil && k.app.instanceAction != nil && ks.Key == tauui.KeyF8 && ks.Mod == 0 {
+		return AppActionInstances, true
+	}
 	if k.app != nil && k.app.dialogPicker != nil && k.app.dialogPicker.Shown() {
 		if _, settings := k.app.dialogPicker.Component().(*settingsOverlay); settings {
 			if action, ok := k.resolveAppAction(ks, func(id string) bool { return id == actionIDPaste }); ok {
@@ -1714,7 +1779,7 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 	}
 	// Hosted login and extension inputs own editing keys that the global
 	// keymap assigns to activation or quitting.
-	if k.app != nil && (k.app.extensionDialog != nil || k.app.loginDialog != nil) {
+	if k.app != nil && (k.app.extensionDialog != nil || k.app.loginDialog != nil || k.app.coordinatedDialog != "") {
 		if k.app.hostedDialogInput() != nil || k.app.loginDialog != nil {
 			if ks.Key == tauui.KeyCtrlC || ks.Mod == tauui.ModCtrl && ks.Key == tauui.KeyRune && (ks.Rune == 'c' || ks.Rune == 'C') {
 				return AppActionExit, true
@@ -1873,6 +1938,9 @@ func (k appKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Acti
 
 // quit tears down the session and stops the toolkit loop.
 func (a *App) quit() {
+	if a.waitingForCoordinatedSend() {
+		return
+	}
 	a.stopExtensionDialogs()
 	if a.loginDialog != nil {
 		a.dismissDialog()
@@ -1906,6 +1974,15 @@ const confirmQuitTimeout = 1500 * time.Millisecond
 //
 // Must be called on the app loop.
 func (a *App) confirmOrQuit(ctx *tauui.Ctx) {
+	if a.waitingForCoordinatedSend() {
+		return
+	}
+	if a.coordinatedDialog != "" {
+		// Ctrl+C detaches without answering a shared request. Esc explicitly
+		// cancels the request for all clients.
+		a.quit()
+		return
+	}
 	// When a modal picker (history search, settings, scoped models) is open,
 	// Ctrl+C closes the picker rather than quitting the app. Reaching for the
 	// confirm-to-quit flow while a dialog is up means an accidental keystroke
@@ -2103,13 +2180,14 @@ func (a *App) refreshFooterStats(ctx *tauui.Ctx) {
 	stats := s.Stats()
 	d := a.footer.data
 	d.model = stats.Model
-	// The footer needs the provider name (for the "(provider) " prefix) and
-	// whether the model reasons (to decide whether a thinking suffix belongs
-	// at all). Both come from the model id, which carries "provider/id".
 	d.provider = providerFromModelSpec(stats.Model)
-	d.supportsReasoning = stats.ThinkingLevel != ""
-	if d.thinkingLevel != stats.ThinkingLevel {
-		d.thinkingLevel = stats.ThinkingLevel
+	d.supportsReasoning = modelSupportsReasoning(stats.Model, stats.ThinkingLevel)
+	level := stats.ThinkingLevel
+	if !d.supportsReasoning {
+		level = ""
+	}
+	if d.thinkingLevel != level {
+		d.thinkingLevel = level
 		a.refreshEditorChrome()
 	}
 	d.contextUsed = stats.TotalTokens
@@ -2134,12 +2212,40 @@ func (a *App) refreshFooterStats(ctx *tauui.Ctx) {
 		d.queueCount = followUp
 	}
 
+	a.invalidateFooter(ctx)
+}
+
+func (a *App) invalidateFooter(ctx *tauui.Ctx) {
 	if ctx != nil && ctx.Invalidate != nil && a.footer != nil {
-		r := a.footer.Rect()
-		if r.W > 0 && r.H > 0 {
+		if r := a.footer.Rect(); r.W > 0 && r.H > 0 {
 			ctx.Invalidate(r)
 		}
 	}
+}
+
+func modelSupportsReasoning(key, thinkingLevel string) bool {
+	if provider, id, ok := strings.Cut(key, "/"); ok {
+		if model, err := ai.GetModel(provider, id); err == nil {
+			return model.Reasoning
+		}
+	}
+	return key != "" && thinkingLevel != ""
+}
+
+func (a *App) showModelDefault(settings *ai.Settings) {
+	key := ai.NewModelResolver(settings).ResolveDefaultModel().String()
+	a.currentModel = key
+	d := a.footer.data
+	d.model = key
+	d.provider = providerFromModelSpec(key)
+	d.thinkingLevel = ""
+	d.supportsReasoning = modelSupportsReasoning(key, "")
+	if d.supportsReasoning {
+		d.thinkingLevel = cmp.Or(settings.ThinkingLevelFor(key), ai.DefaultThinkingLevel)
+		a.rememberThinkingLevel(d.thinkingLevel)
+	}
+	a.refreshEditorChrome()
+	a.invalidateFooter(a.loopContext())
 }
 
 // providerFromModelSpec splits "provider/model-id" into its provider. Model ids
@@ -2254,6 +2360,14 @@ func (a *App) consumeStreamingForInterrupt() bool {
 	if !a.isStreaming() {
 		return false
 	}
+	if a.coordinated != nil {
+		go func() {
+			if err := a.coordinated.Interrupt(); err != nil {
+				a.post(func(*tauui.UpdateCtx) { a.setStatus("coordinator-action", "Interrupt: "+err.Error()) })
+			}
+		}()
+		return true
+	}
 	_ = a.sess.Interrupt()
 	a.conv.EndAssistantMessage()
 	a.setStreaming(false)
@@ -2336,6 +2450,9 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 	if ctx == nil || ctx.FocusedID != a.editor.ID() {
 		return false
 	}
+	if a.waitingForCoordinatedSend() {
+		return true
+	}
 	text := a.editorTextForSubmit()
 	if text == "" {
 		a.editor.Reset(ctx)
@@ -2351,6 +2468,7 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 		// id the user typed (or pre-filled by Tab), and we resolve the
 		// id to a provider/id key and switch the session's model.
 		if name == "forget" {
+			a.messageSelectorFailed = selectorModeNone
 			a.editor.SetText(ctx, "/forget ")
 			a.refreshSelector("/forget ", ctx)
 			return true
@@ -2429,11 +2547,20 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 			a.refreshSelector("/resume ", ctx)
 			return true
 		}
+		cmd, found := a.cmds.Lookup(name)
+		if found && cmd.Handler == nil && a.sess == nil && a.instanceAction != nil {
+			a.setStatus("coordinator", "No worker attached. Start one with /new or join one with F8 before running /"+name+".")
+			return true
+		}
+		if a.coordinated != nil && (found && cmd.Handler == nil || !found && a.sessionSlashCommandExists(name)) {
+			a.sendCoordinatedDraft(text, false)
+			return true
+		}
 		a.editor.Model().AddHistory(text)
 		a.editor.Reset(ctx)
 		a.clearPendingAttachments(ctx)
 		a.dismissSelector()
-		if cmd, found := a.cmds.Lookup(name); found {
+		if found {
 			if cmd.Handler != nil {
 				cmd.Handler(a, args)
 				return true
@@ -2461,6 +2588,10 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 	}
 
 	if command, excluded, ok := parseUserBash(text); ok {
+		if a.sess == nil && a.instanceAction != nil {
+			a.setStatus("coordinator", "No worker attached. Start one with /new or join one with F8 before running a shell command.")
+			return true
+		}
 		if a.userBashCancel != nil {
 			a.conv.AddError("a bash command is already running; press Esc to cancel it first")
 			a.refreshChat()
@@ -2470,6 +2601,16 @@ func (a *App) trySubmit(ctx *tauui.Ctx) bool {
 		a.editor.Reset(ctx)
 		a.dismissSelector()
 		a.runUserBash(command, excluded)
+		return true
+	}
+
+	if a.sess == nil && a.instanceAction != nil {
+		a.leaveInstance("prompt", text)
+		return true
+	}
+
+	if a.coordinated != nil {
+		a.sendCoordinatedDraft(text, false)
 		return true
 	}
 
@@ -2800,6 +2941,10 @@ func (a *App) handleFollowUpAction(ctx *tauui.Ctx) {
 	}
 
 	text := a.editorTextForSubmit()
+	if a.coordinated != nil {
+		a.sendCoordinatedDraft(text, true)
+		return
+	}
 	a.editor.SetText(ctx, "")
 	a.dismissSelector()
 	a.enqueueFollowUp(text, ctx)
@@ -3067,20 +3212,24 @@ func (a *App) refreshStatus(ctx *tauui.Ctx) {
 	if a.status == nil {
 		return
 	}
-	prevShown := a.status.MinSize().H > 0
+	prevHeight := a.status.MinSize().H
 	a.status.SetEntries(a.statusEntries)
-	nowShown := a.status.MinSize().H > 0
-	if ctx != nil && ctx.Invalidate != nil {
-		if prevShown != nowShown {
-			if a.root != nil && a.root.Rect().W > 0 {
-				ctx.Invalidate(a.root.Rect())
-			}
-		} else {
-			r := a.status.Rect()
-			if r.W > 0 && r.H > 0 {
-				ctx.Invalidate(r)
-			}
+	if ctx == nil {
+		return
+	}
+	if prevHeight != a.status.MinSize().H {
+		if ctx.InvalidateLayout != nil {
+			ctx.InvalidateLayout()
 		}
+		if ctx.InvalidateAll != nil {
+			ctx.InvalidateAll()
+		} else if ctx.Invalidate != nil && a.root != nil && a.root.Rect().W > 0 {
+			ctx.Invalidate(a.root.Rect())
+		}
+		return
+	}
+	if r := a.status.Rect(); ctx.Invalidate != nil && r.W > 0 && r.H > 0 {
+		ctx.Invalidate(r)
 	}
 }
 
@@ -3749,20 +3898,13 @@ func fuzzyMatch(s, pattern string) bool {
 	return idx == len(pattern)
 }
 
-// applyModelFromArgs resolves a model id (the args after `/model `) to
-// a full provider/id key, then hops back to the loop to call
-// sess.SetModel. Returns true when the id uniquely matches a known
-// model — ambiguous or unknown ids return false so the caller can fall
-// back to the picker for the user to disambiguate. Side effect: posts
-// an update-message on the conversation log so the change is visible.
+// applyModelFromArgs selects a known provider/id or an unambiguous bare id.
 func (a *App) applyModelFromArgs(modelID string) bool {
 	models := a.availableModels()
-	// Lookup the entered id in the registry. We match by id (not
-	// provider/id) since that's what the user typed in the editor.
-	lowerID := strings.ToLower(strings.TrimSpace(modelID))
+	modelID = strings.TrimSpace(modelID)
 	var matches []string
 	for _, m := range models {
-		if strings.EqualFold(m.ID, lowerID) {
+		if strings.EqualFold(m.ID, modelID) || strings.EqualFold(m.Provider+"/"+m.ID, modelID) {
 			matches = append(matches, m.Provider+"/"+m.ID)
 			continue
 		}
@@ -3797,9 +3939,6 @@ func (a *App) applyModelFromKey(key string) {
 // selectModel switches to key and then applies thinkingLevel, or the saved
 // per-model level when thinkingLevel is empty.
 func (a *App) selectModel(key, thinkingLevel string) {
-	if a.sess == nil {
-		return
-	}
 	provider, _, ok := strings.Cut(key, "/")
 	if !ok || provider == "" {
 		a.conv.AddError("model: invalid id \"" + key + "\"")
@@ -3808,6 +3947,19 @@ func (a *App) selectModel(key, thinkingLevel string) {
 	}
 	if !a.isProviderAuthenticated(provider) {
 		a.conv.AddError("model: provider is not authenticated: " + provider)
+		a.refreshChat()
+		return
+	}
+	if a.sess == nil {
+		if err := a.saveModelDefault(key); err != nil {
+			a.conv.AddError("model: " + err.Error())
+		} else if err := a.refreshModelDefault(); err != nil {
+			a.conv.AddError("model: " + err.Error())
+		} else if a.currentModel != key {
+			a.conv.AddSystem("Project default: " + a.currentModel + " (saved user default: " + key + ")")
+		} else {
+			a.conv.AddSystem("Default for new instances: " + key)
+		}
 		a.refreshChat()
 		return
 	}
@@ -3831,7 +3983,9 @@ func (a *App) selectModel(key, thinkingLevel string) {
 
 // commitModel switches the session to key and saves it as the default model.
 func (a *App) commitModel(key string) error {
-	provider, _, _ := strings.Cut(key, "/")
+	if a.sess == nil {
+		return errors.New("no active session")
+	}
 	if err := a.sess.SetModel(key); err != nil {
 		return err
 	}
@@ -3846,9 +4000,33 @@ func (a *App) commitModel(key string) error {
 	}
 	a.refreshFooterStats(a.loopContext())
 	if a.settingsPath != "" {
-		if err := ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{"defaultProvider": provider, "defaultModel": strings.TrimPrefix(key, provider+"/")}); err != nil {
+		if err := a.saveModelDefault(key); err != nil {
 			return fmt.Errorf("selected %s but failed to save default: %w", key, err)
 		}
+	}
+	return nil
+}
+
+func (a *App) refreshModelDefault() error {
+	load := a.reloadDisplaySettings
+	if load == nil {
+		load = func(context.Context) (*ai.Settings, error) { return ai.LoadSettings(a.settingsPath) }
+	}
+	settings, err := load(a.ctxOrBackground())
+	if err != nil {
+		return fmt.Errorf("reload defaults: %w", err)
+	}
+	a.showModelDefault(settings)
+	return nil
+}
+
+func (a *App) saveModelDefault(key string) error {
+	if a.settingsPath == "" {
+		return errors.New("no settings file for the default model")
+	}
+	provider, id, _ := strings.Cut(key, "/")
+	if err := ai.UpdateSettings(a.ctxOrBackground(), a.settingsPath, map[string]any{"defaultProvider": provider, "defaultModel": id}); err != nil {
+		return fmt.Errorf("save default %s: %w", key, err)
 	}
 	return nil
 }
@@ -3920,7 +4098,7 @@ func (a *App) applyDisplaySettings(settings *ai.Settings) {
 // values are reported rather than silently ignored: a typo in settings.json
 // should not quietly leave the queue on a mode the user did not ask for.
 func (a *App) applyQueueModeSettings(settings *ai.Settings) {
-	if a == nil || settings == nil || a.sess == nil {
+	if a == nil || settings == nil || a.sess == nil || a.coordinated != nil {
 		return
 	}
 	setter, ok := a.sess.(sdk.QueueModeSetter)
@@ -3995,6 +4173,9 @@ func (a *App) refreshEditorChrome() {
 // selector's rect is empty — so the selector never appears even
 // though Shown() is true.
 func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
+	if a.messageSelectorFailed != selectorModeNone && !messageSelectorCommand(text, a.messageSelectorFailed) {
+		a.messageSelectorFailed = selectorModeNone
+	}
 	if a.forcedCompletion && a.selectorVisible() {
 		a.requestCompletion(ctx, true, false)
 		return
@@ -4077,15 +4258,19 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 	// Fork picker mode. Triggered by typing `/fork ` (with trailing
 	// whitespace). It uses the same inline selector as /model and /resume;
 	// Tab switches between prompts and all messages.
-	if strings.HasPrefix(text, "/fork") && len(text) > 5 && (text[5] == ' ' || text[5] == '\t') {
-		a.openForkSelector(ctx)
+	if messageSelectorCommand(text, selectorModeFork) {
+		if a.messageSelectorFailed != selectorModeFork {
+			a.openForkSelector(ctx)
+		}
 		return
 	}
 
 	// Forget picker mode. Same picker as /fork, but a selection is required:
 	// `/forget` alone also lands here via trySubmit.
-	if strings.HasPrefix(text, "/forget") && len(text) > 7 && (text[7] == ' ' || text[7] == '\t') {
-		a.openForgetSelector(ctx)
+	if messageSelectorCommand(text, selectorModeForget) {
+		if a.messageSelectorFailed != selectorModeForget {
+			a.openForgetSelector(ctx)
+		}
 		return
 	}
 
@@ -4638,7 +4823,12 @@ func (a *App) dismissDialogCtx(ctx *tauui.Ctx) {
 	if a.app != nil {
 		_ = a.app.Post(func(_ *tauui.UpdateCtx) {
 			if !a.dialogPicker.Shown() {
-				a.app.SetFocus(a.editor.ID())
+				if a.coordinated != nil {
+					a.refreshCoordinatedDialogs()
+				}
+				if !a.dialogPicker.Shown() {
+					a.app.SetFocus(a.editor.ID())
+				}
 			}
 		})
 	}
@@ -4765,6 +4955,14 @@ func (a *App) handleEvent(ev sdk.Event) {
 			a.conversationEvents = newConversationEventAdapter(a)
 		}
 		a.conversationEvents.handle(ev)
+	case "agent_start":
+		if a.coordinated != nil {
+			if a.conversationEvents == nil {
+				a.conversationEvents = newConversationEventAdapter(a)
+			}
+			a.conversationEvents.beginRun()
+			a.setStreaming(true)
+		}
 	case "agent_end":
 		if a.conversationEvents == nil {
 			a.conversationEvents = newConversationEventAdapter(a)

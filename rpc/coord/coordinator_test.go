@@ -3,6 +3,7 @@
 package coord
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	sessionpkg "github.com/losinggeneration/tau/agent/session"
 	"golang.org/x/sys/unix"
 )
 
@@ -36,7 +39,7 @@ type harness struct {
 	cwd     string
 }
 
-func startCoordinator(t *testing.T, launch func(*harness) LaunchFunc, timeout time.Duration) *harness {
+func startCoordinator(t *testing.T, launch func(*harness) LaunchFunc, timeout time.Duration, opts ...RecoverableOption) *harness {
 	t.Helper()
 	h := &harness{t: t, path: filepath.Join(socketDir(t), "c.sock"), workers: make(chan *fakeWorker, 8), cwd: t.TempDir()}
 	if launch == nil {
@@ -44,7 +47,7 @@ func startCoordinator(t *testing.T, launch func(*harness) LaunchFunc, timeout ti
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, h.path, launch(h), timeout) }()
+	go func() { done <- runWithReceipts(ctx, h.path, launch(h), timeout, "", opts...) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -61,10 +64,14 @@ func startCoordinator(t *testing.T, launch func(*harness) LaunchFunc, timeout ti
 
 // spawnWorker models a detached worker: it dials back with the launch token.
 func (h *harness) spawnWorker() LaunchFunc {
+	return h.spawnWorkerWithPID(42)
+}
+
+func (h *harness) spawnWorkerWithPID(pid int) LaunchFunc {
 	return func(_ context.Context, req LaunchRequest) error {
 		go func() {
 			hello := Frame{Role: RoleWorker, Token: req.Token, Instance: &Instance{
-				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: "session-" + req.InstanceID, PID: 42,
+				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: cmp.Or(req.SessionID, "session-"+req.InstanceID), PID: pid,
 				LaunchRequestID: req.LaunchRequestID,
 			}}
 			link, welcome, err := Dial(context.Background(), h.path, hello)
@@ -481,6 +488,229 @@ func TestWatchInstancesOnlyDeliversSummaries(t *testing.T) {
 	third, _ := h.start(actor, "third")
 	if reply := request(t, watcher, Frame{Type: TypeListInstances, ID: "list"}); reply.ID != "list" || !slices.ContainsFunc(reply.Instances, func(i Instance) bool { return i.ID == third.ID }) {
 		t.Fatalf("after unwatch = %+v", reply)
+	}
+}
+
+func TestInstanceWatchCachesFirstPrompt(t *testing.T) {
+	h := startCoordinator(t, nil, launchTimeout)
+	legacy, _ := h.client()
+	watcher, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstancePrompts}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := watcher.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	inst, w := h.start(legacy, "start")
+	request(t, legacy, Frame{Type: TypeWatchInstances, ID: "legacy"})
+	request(t, watcher, Frame{Type: TypeWatchInstances, ID: "watch"})
+	inst.FirstPrompt = "Fix the picker"
+	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
+	for _, tc := range []struct {
+		link *Link
+		want string
+	}{{watcher, "Fix the picker"}, {legacy, ""}} {
+		f := readFrame(t, tc.link)
+		if f.Type != TypeInstanceUpdate || f.Instance == nil || f.Instance.FirstPrompt != tc.want {
+			t.Fatalf("watch update = %+v, want prompt %q", f, tc.want)
+		}
+		f = request(t, tc.link, Frame{Type: TypeListInstances, ID: "list"})
+		if len(f.Instances) != 1 || f.Instances[0].FirstPrompt != tc.want {
+			t.Fatalf("cached list = %+v, want prompt %q", f, tc.want)
+		}
+	}
+	inst.FirstPrompt = ""
+	inst.State = StateBusy
+	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
+	if f := readFrame(t, watcher); f.Instance == nil || f.Instance.FirstPrompt != "Fix the picker" || f.Instance.State != StateBusy {
+		t.Fatalf("status update lost cached preview: %+v", f.Instance)
+	}
+	inst.SessionID = "next-session"
+	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
+	if f := readFrame(t, watcher); f.Instance == nil || f.Instance.SessionID != "next-session" || f.Instance.FirstPrompt != "" {
+		t.Fatalf("session switch retained old preview: %+v", f.Instance)
+	}
+	if err := w.link.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFrame(t, watcher); f.Instance != nil || f.InstanceID != inst.ID {
+		t.Fatalf("removed worker = %+v", f)
+	}
+	if f := request(t, watcher, Frame{Type: TypeListInstances, ID: "removed"}); len(f.Instances) != 0 {
+		t.Fatalf("removed worker still cached: %+v", f.Instances)
+	}
+}
+
+func TestOutdatedIndicatorTracksLaunchBuild(t *testing.T) {
+	var build atomic.Value
+	build.Store("build-a")
+	h := startCoordinator(t, nil, launchTimeout, WithWorkerBuild(func() string { return build.Load().(string) }))
+	legacy, _ := h.client()
+	watcher, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceBuild}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := watcher.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	inst, w := h.start(legacy, "start")
+	request(t, watcher, Frame{Type: TypeWatchInstances, ID: "watch"})
+	for _, buildID := range []string{"", "build-a"} {
+		inst.BuildID = buildID
+		mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
+		if f := readFrame(t, watcher); f.Instance == nil || f.Instance.Outdated || f.Instance.BuildID != "" {
+			t.Fatalf("unexpected update for %q: %+v", buildID, f.Instance)
+		}
+	}
+	build.Store("build-b")
+	mustSend(t, watcher, Frame{Type: TypeListInstances, ID: "list"}) // refresh without a timer
+	update, list := readFrame(t, watcher), readFrame(t, watcher)
+	if update.Type != TypeInstanceUpdate || update.Instance == nil || !update.Instance.Outdated || update.Instance.BuildID != "" {
+		t.Fatalf("outdated update = %+v, instance = %+v", update, update.Instance)
+	}
+	if len(list.Instances) != 1 || !list.Instances[0].Outdated || list.Instances[0].BuildID != "" {
+		t.Fatalf("outdated list = %+v", list.Instances)
+	}
+	if list := request(t, legacy, Frame{Type: TypeListInstances, ID: "legacy"}); len(list.Instances) != 1 || list.Instances[0].Outdated || list.Instances[0].BuildID != "" {
+		t.Fatalf("legacy list = %+v", list.Instances)
+	}
+}
+
+func TestOutdatedIndicatorForLegacyLocalWorker(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux Unix peer credentials and procfs")
+	}
+	if _, err := os.Stat("/proc/self/exe"); err != nil {
+		t.Skipf("cannot inspect process executable: %v", err)
+	}
+	installed := filepath.Join(t.TempDir(), "tau")
+	if err := os.Symlink("/proc/self/exe", installed); err != nil {
+		t.Fatal(err)
+	}
+	// The test process is the Unix peer, simulating a worker built before
+	// build reporting existed. Its executable will not change on update.
+	launchBuild := func() string { return ExecutableBuildID(installed) }
+	h := startCoordinator(t, func(h *harness) LaunchFunc { return h.spawnWorkerWithPID(os.Getpid()) }, launchTimeout, WithWorkerBuild(launchBuild))
+	h.client() // wait for the coordinator to accept connections
+	c, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceBuild}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	h.start(c, "start")
+	if f := request(t, c, Frame{Type: TypeWatchInstances, ID: "before"}); len(f.Instances) != 1 || f.Instances[0].Outdated {
+		t.Fatalf("current legacy worker marked outdated: %+v", f.Instances)
+	}
+	newExe := installed + ".next"
+	if err := os.WriteFile(newExe, []byte("updated"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(newExe, installed); err != nil {
+		t.Fatal(err)
+	}
+	mustSend(t, c, Frame{Type: TypeListInstances, ID: "after"})
+	f := readFrame(t, c)
+	if f.Type != TypeInstanceUpdate || f.Instance == nil || !f.Instance.Outdated {
+		t.Fatalf("legacy worker must be marked outdated after update, got %s: %+v %+v", f.Type, f.Instance, f.Instances)
+	}
+	if f := readFrame(t, c); f.ID != "after" || len(f.Instances) != 1 || !f.Instances[0].Outdated {
+		t.Fatalf("legacy worker not marked outdated in list: %+v", f.Instances)
+	}
+}
+
+func TestLegacyRestartRequiresSavedSession(t *testing.T) {
+	dir := t.TempDir()
+	h := startCoordinator(t, nil, launchTimeout, WithSessionDirectory(func(context.Context, string) (string, error) { return dir, nil }))
+	c, _ := h.client()
+	inst, w := h.start(c, "start")
+	storage, err := sessionpkg.NewStorageAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := sessionpkg.NewHeader(inst.CWD, nil, nil)
+	inst.SessionID = header.ID
+	mustSend(t, w.link, Frame{Type: TypeRegister, ID: "bind", Instance: &inst})
+	if f := w.next(t); f.ID != "bind" || f.Error != nil {
+		t.Fatalf("register saved session: %+v", f)
+	}
+	stop := Frame{Type: TypeStopInstance, ID: "restart", InstanceID: inst.ID, SessionID: header.ID}
+	if f := request(t, c, stop); f.Error == nil || !strings.Contains(f.Error.Message, "no resumable save") {
+		t.Errorf("unsaved legacy session should be left running: %+v (%v)", f, f.Error)
+	}
+	invalid := header
+	invalid.Type = sessionpkg.EntryTypeMessage
+	invalidSave, err := storage.Create(invalid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := invalidSave.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if f := request(t, c, stop); f.Error == nil || f.Error.Code != CodeUnavailable {
+		t.Fatalf("invalid saved header should leave the worker running: %+v (%v)", f, f.Error)
+	}
+	if err := os.Remove(invalidSave.Path()); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := storage.Create(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	// A lost caller does not cancel a switch already queued at an old worker.
+	other, _ := h.client()
+	switchSession := Frame{Type: TypeCommand, ID: "switch", InstanceID: inst.ID, Command: json.RawMessage(`{"type":"fork"}`)}
+	mustSend(t, other, switchSession)
+	pendingSwitch := w.next(t)
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantError(t, request(t, c, stop), "restart", CodeBusy)
+	mustSend(t, w.link, Frame{Type: TypeResponse, ID: pendingSwitch.ID, Result: json.RawMessage(`{"ok":false}`)})
+	mustSend(t, w.link, Frame{Type: TypeRegister, ID: "ready", Instance: &inst})
+	if f := w.next(t); f.ID != "ready" || f.Error != nil {
+		t.Fatalf("worker ready: %+v", f)
+	}
+	mustSend(t, c, stop)
+	type routed struct {
+		f   Frame
+		err error
+	}
+	worker, caller := make(chan Frame, 1), make(chan routed, 1)
+	go func() { worker <- <-w.frames }()
+	go func() { f, err := c.Read(); caller <- routed{f, err} }()
+	select {
+	case r := <-caller:
+		t.Fatalf("saved legacy worker refused restart: %v / %v", r.f.Error, r.err)
+	case f := <-worker:
+		if string(f.Command) != `{"type":"shutdown"}` || f.SessionID != header.ID {
+			t.Fatalf("not a legacy graceful shutdown: %+v", f)
+		}
+		other, _ := h.client()
+		wantError(t, request(t, other, switchSession), "switch", CodeBusy)
+		mustSend(t, w.link, Frame{Type: TypeResponse, ID: f.ID, Result: json.RawMessage(`{"ok":true}`)})
+	case <-time.After(testTimeout):
+		t.Fatal("restart neither routed nor rejected")
+	}
+	select {
+	case r := <-caller:
+		if r.err != nil || r.f.ID != stop.ID || r.f.Error != nil {
+			t.Fatalf("shutdown response: %+v / %v", r.f, r.err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("shutdown response was not forwarded")
 	}
 }
 
@@ -966,10 +1196,10 @@ func TestWorkerQueueOverflowReportsLostLink(t *testing.T) {
 	c := &client{link: clientLink, pending: make(map[string]pendingRef), subs: map[string]struct{}{w.instance.ID: {}}}
 	co := &coordinator{clients: map[string]*client{"client": c}, workers: map[string]*worker{w.instance.ID: w}}
 	for i := range maxQueuedFrames - 1 {
-		co.forward(c, Frame{ID: fmt.Sprintf("request-%d", i), InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`))
+		co.forward(c, Frame{ID: fmt.Sprintf("request-%d", i), InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`), "get_state")
 	}
 	mustSend(t, workerLink, Frame{Type: TypeResponse})
-	co.forward(c, Frame{ID: "overflow", InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`))
+	co.forward(c, Frame{ID: "overflow", InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`), "get_state")
 	wantError(t, readFrame(t, clientReader), "overflow", CodeUnavailable)
 	if err := workerLink.Err(); !errors.Is(err, ErrSlowConsumer) {
 		t.Fatalf("worker link error = %v, want overflow", err)
@@ -1100,7 +1330,7 @@ func TestLegacyFirstFrameGetsCompatibleRejection(t *testing.T) {
 				t.Fatal(err)
 			}
 			if resp.Type != "response" || resp.ID != tc.wantID || resp.OK || resp.Error == nil ||
-				resp.Error.Code == "" || !strings.Contains(resp.Error.Message, "tau daemon --legacy") {
+				resp.Error.Code == "" || !strings.Contains(resp.Error.Message, "has been removed") {
 				t.Fatalf("legacy reply = %+v (error %+v)", resp, resp.Error)
 			}
 		})
@@ -1299,5 +1529,73 @@ func TestEmbeddedRunRemovesAnEpochWorkerOnDisconnect(t *testing.T) {
 		if f := request(t, c, Frame{Type: TypeListInstances, ID: "list"}); len(f.Instances) != 0 {
 			t.Fatalf("closed embedded workers remain in registry: %+v", f)
 		}
+	}
+}
+
+func TestStartSavedSessionBindsWorkerRegistration(t *testing.T) {
+	wrong := make(chan error, 1)
+	h := startCoordinator(t, func(h *harness) LaunchFunc {
+		return func(ctx context.Context, req LaunchRequest) error {
+			if req.SessionID == "" {
+				return errors.New("launcher did not receive saved session ID")
+			}
+			instance := &Instance{ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: uuid.NewString(), PID: 42}
+			link, _, err := Dial(ctx, h.path, Frame{Role: RoleWorker, Token: req.Token, Instance: instance})
+			if err == nil {
+				wrong <- errors.Join(errors.New("registered with wrong session"), link.Close())
+				return errors.New("wrong session accepted")
+			}
+			wrong <- err
+			return h.spawnWorker()(ctx, req)
+		}
+	}, launchTimeout)
+	c, _ := h.client()
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "bad", CWD: h.cwd, SessionID: "/tmp/file"}), "bad", CodeInvalidFrame)
+	id := uuid.NewString()
+	resp := request(t, c, Frame{Type: TypeStartInstance, ID: "resume", CWD: h.cwd, SessionID: id})
+	if resp.Error != nil || resp.Instance == nil || resp.Instance.SessionID != id {
+		t.Fatalf("start saved session: %+v", resp)
+	}
+	var conflict *Error
+	if err := <-wrong; !errors.As(err, &conflict) || conflict.Code != CodeConflict {
+		t.Fatalf("wrong session registration: %v", err)
+	}
+}
+
+func TestSavedSessionLaunchReservesOwner(t *testing.T) {
+	started := make(chan struct{}, 2)
+	allow := make(chan struct{})
+	h := startCoordinator(t, func(h *harness) LaunchFunc {
+		return func(ctx context.Context, req LaunchRequest) error {
+			started <- struct{}{}
+			select {
+			case <-allow:
+				return h.spawnWorker()(ctx, req)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}, time.Second)
+	a, _ := h.client()
+	b, _ := h.client()
+	id := uuid.NewString()
+	launch := Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd, SessionID: id}
+	mustSend(t, a, launch)
+	select {
+	case <-started:
+	case <-time.After(testTimeout):
+		t.Fatal("first launch did not reach the launcher")
+	}
+	wantError(t, request(t, b, launch), "start", CodeBusy)
+	close(allow)
+	first := readFrame(t, a)
+	if first.Instance == nil || first.Instance.SessionID != id {
+		t.Fatalf("first launch lost its reservation: %+v", first)
+	}
+	if got := request(t, b, launch); got.Error != nil || got.Instance == nil || got.Instance.ID != first.Instance.ID {
+		t.Fatalf("second resume did not return the first worker: %+v", got)
+	}
+	if len(started) != 0 {
+		t.Fatal("second resume launched another worker")
 	}
 }

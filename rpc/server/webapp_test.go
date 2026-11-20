@@ -10,20 +10,17 @@ import (
 	"github.com/dop251/goja"
 )
 
-func TestWebAppServesControllerAndAssets(t *testing.T) {
-	bridge, err := NewWebSocketBridge("127.0.0.1:0", "secret", &mockRuntime{}, newTestRegistry(), nil)
-	if err != nil {
-		t.Fatalf("new bridge: %v", err)
-	}
-	defer func() { _ = bridge.listener.Close() }()
+func TestCoordinatedWebAppServesAssets(t *testing.T) {
+	mux := http.NewServeMux()
+	registerCoordinatedWebApp(mux)
 
 	cases := []struct {
 		path        string
 		contentType string
 		want        []string
 	}{
-		{"/", "text/html", []string{"tau remote", "machine", "width:auto"}},
-		{"/app.js", "text/javascript", []string{"list_sessions", "pin_session", "unpin_session", "hostname", "Notification", "ui_response", "Open a session first"}},
+		{"/", "text/html", []string{"tau remote", `id="token"`, "manifest.webmanifest"}},
+		{"/app.js", "text/javascript", []string{"watch_instances"}},
 		{"/manifest.webmanifest", "application/manifest+json", []string{"standalone"}},
 		{"/sw.js", "text/javascript", []string{"tau-remote-v1"}},
 	}
@@ -33,7 +30,7 @@ func TestWebAppServesControllerAndAssets(t *testing.T) {
 			t.Fatalf("new request: %v", err)
 		}
 		rec := newResponseRecorder()
-		bridge.server.Handler.ServeHTTP(rec, req)
+		mux.ServeHTTP(rec, req)
 		if rec.status != http.StatusOK {
 			t.Fatalf("%s status = %d, want 200", tc.path, rec.status)
 		}

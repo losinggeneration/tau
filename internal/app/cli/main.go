@@ -6,6 +6,7 @@ package cli
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -40,7 +40,6 @@ import (
 	"github.com/losinggeneration/tau/ai/store"
 	"github.com/losinggeneration/tau/commands"
 	"github.com/losinggeneration/tau/internal/app/tui"
-	"github.com/losinggeneration/tau/logging"
 	"github.com/losinggeneration/tau/paths"
 	rpcclient "github.com/losinggeneration/tau/rpc/client"
 	"github.com/losinggeneration/tau/rpc/coord"
@@ -555,6 +554,7 @@ var GlobalPluginManager *plugins.Manager
 type runtimeBuildConfig struct {
 	trustPrompt ui.UI
 	skipPlugins bool
+	sessionDir  string
 }
 
 // runtimeBuildOption configures buildRuntimeOptions.
@@ -644,6 +644,7 @@ func buildRuntimeOptions(ctx context.Context, uiImpl ui.UI, cmd *cli.Command, bu
 	if cmd != nil && cmd.String("session-dir") != "" {
 		sessDir = cmd.String("session-dir")
 	}
+	sessDir = cmp.Or(cfg.sessionDir, sessDir)
 	opts.SessionsDir = sessDir
 	sessionStorage, err := session.NewStorageAt(sessDir)
 	if err != nil {
@@ -2534,70 +2535,6 @@ func copyToClipboardWithXsel(text string) bool {
 
 // --- Other Commands ---
 
-// runRPC handles the `tau rpc` command.
-func runRPC(ctx context.Context, cmd *cli.Command) error {
-	uiImpl := choosePrintModeUI()
-
-	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, rootCmdFromContext(ctx))
-	if err != nil {
-		return cli.Exit(err.Error(), ExitUserError)
-	}
-	GlobalCommandRegistry = reg
-	GlobalPluginManager = pluginMgr
-	if loader != nil {
-		sdk.GlobalArtifactLoader = loader
-		rtOpts.ArtifactLoader = loader
-	}
-	rtOpts.PluginManager = pluginMgr
-
-	rt, err := sdk.NewRuntime(rtOpts)
-	if err != nil {
-		return cli.Exit(fmt.Sprintf("create runtime: %v", err), ExitSubsystemError)
-	}
-	defer func() { reportShutdownError(rt.Close(ctx)) }()
-
-	srv := server.NewServer(rt, reg, pluginMgr)
-
-	// Reset SIGINT handling so we can manage it ourselves for RPC interrupt events.
-	// The default SIGINT from signal.NotifyContext in cli() would cancel our context.
-	signal.Reset(os.Interrupt)
-
-	// Signal handler goroutine for SIGINT -> interrupt event translation.
-	// Uses its own signal.Notify after resetting the inherited handler.
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT)
-	defer signal.Stop(sigChan)
-	signalCtx, stopSignals := context.WithCancel(context.Background())
-	signalsDone := make(chan struct{})
-	go func() { defer close(signalsDone); forwardRPCSignals(signalCtx, sigChan, srv.SendInterrupt) }()
-	defer func() { stopSignals(); <-signalsDone }()
-
-	// Use a background context for the server so SIGINT is only handled by the
-	// goroutine above (which emits interrupt events). The parent ctx is for CLI
-	// lifecycle and must not be cancelled before the server finishes.
-	if err := srv.Run(context.Background()); err != nil {
-		return cli.Exit(fmt.Sprintf("rpc server error: %v", err), ExitSubsystemError)
-	}
-
-	return nil
-}
-
-func forwardRPCSignals(ctx context.Context, signals <-chan os.Signal, interrupt func()) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case sig, ok := <-signals:
-			if !ok {
-				return
-			}
-			if sig == syscall.SIGINT {
-				interrupt()
-			}
-		}
-	}
-}
-
 // choosePrintModeUI returns the appropriate UI for print mode.
 func choosePrintModeUI() ui.UI {
 	if isTTY() {
@@ -2610,53 +2547,7 @@ func runDaemon(ctx context.Context, cmd *cli.Command) error {
 	if cmd.Bool("systemd-user-unit") {
 		return printDaemonSystemdUnit(cmd.String("socket"))
 	}
-	if !cmd.Bool("legacy") {
-		return runCoordinator(ctx, cmd)
-	}
-
-	uiImpl := ui.NewNoOpUI()
-	rtOpts, pluginMgr, loader, reg, err := buildRuntimeOptions(ctx, uiImpl, nil)
-	if err != nil {
-		return cli.Exit(err.Error(), ExitUserError)
-	}
-	GlobalCommandRegistry = reg
-	GlobalPluginManager = pluginMgr
-	if loader != nil {
-		sdk.GlobalArtifactLoader = loader
-		rtOpts.ArtifactLoader = loader
-	}
-	rtOpts.PluginManager = pluginMgr
-	rtOpts.Logger = logging.NewText(os.Stderr, slog.LevelInfo)
-
-	rt, err := sdk.NewRuntime(rtOpts)
-	if err != nil {
-		return cli.Exit(fmt.Sprintf("create runtime: %v", err), ExitSubsystemError)
-	}
-	defer func() { reportShutdownError(rt.Close(ctx)) }()
-
-	path := cmd.String("socket")
-	if path == "" {
-		path = server.SocketPath()
-	}
-
-	if addr := cmd.String("websocket"); addr != "" {
-		bridge, err := server.NewWebSocketBridge(addr, cmd.String("websocket-token"), rt, reg, pluginMgr, server.WithTokenStore(remoteTokenStore()))
-		if err != nil {
-			return cli.Exit(fmt.Sprintf("websocket bridge: %v", err), ExitUserError)
-		}
-		go func() {
-			if err := bridge.Run(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "tau websocket bridge error: %v\n", err)
-			}
-		}()
-		fmt.Fprintf(os.Stderr, "tau websocket bridge listening on %s/rpc\n", bridge.Addr())
-	}
-
-	fmt.Fprintf(os.Stderr, "tau daemon listening on %s\n", path)
-	if err := server.RunUnix(ctx, path, rt, reg, pluginMgr); err != nil {
-		return cli.Exit(fmt.Sprintf("daemon error: %v", err), ExitSubsystemError)
-	}
-	return nil
+	return runCoordinator(ctx, cmd)
 }
 
 const daemonSystemdUnitTemplate = `# Generated by: tau daemon --systemd-user-unit
@@ -4010,12 +3901,18 @@ func printPostTUIExitMessage(w io.Writer, message string) error {
 	return nil
 }
 
-func printResumeInstructions(w io.Writer, sessionID string) {
+func printResumeInstructions(w io.Writer, sessionID, project string) error {
 	if sessionID == "" {
-		return
+		return nil
 	}
-	writeLine(w, "\nSession ID: %s\n", sessionID)
-	writeLine(w, "Resume this session with: tau --resume %s\n", sessionID)
+	var prefix string
+	if project != "" {
+		prefix = "cd -- '" + strings.ReplaceAll(project, "'", `'"'"'`) + "' && "
+	}
+	if _, err := fmt.Fprintf(w, "\nSession ID: %s\nResume this session with: %stau --resume %s\n", sessionID, prefix, sessionID); err != nil {
+		return fmt.Errorf("write resume instructions: %w", err)
+	}
+	return nil
 }
 
 func printResumeInstructionsIfWritten(w io.Writer, sessionDir, sessionID string) error {
@@ -4032,8 +3929,7 @@ func printResumeInstructionsIfWritten(w io.Writer, sessionDir, sessionID string)
 		}
 		return fmt.Errorf("open session %q: %w", sessionID, err)
 	}
-	printResumeInstructions(w, sessionID)
-	return nil
+	return printResumeInstructions(w, sessionID, "")
 }
 
 // doExport exports a session to a file with optional format override.
@@ -4123,6 +4019,17 @@ type SessionFlags struct {
 //   - --session has highest priority among session-targeting flags
 //   - --continue and --resume are mutually exclusive; last one wins with a warning
 //   - --fork can be combined with --session, --continue, or --resume (creates fork of target)
+//
+// Read the process default on the standalone runtime path, not during flag
+// parsing: TAU_OFFLINE in a client shell does not configure a running worker.
+func offlineConversation(cmd *cli.Command) bool {
+	if cmd.IsSet("offline") {
+		return cmd.Bool("offline")
+	}
+	offline, err := strconv.ParseBool(os.Getenv("TAU_OFFLINE"))
+	return err == nil && offline
+}
+
 func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) SessionFlags {
 	sessionFlags := SessionFlags{}
 	if cmd.String("provider") != "" && len(cmd.StringSlice("models")) == 0 {
@@ -4226,7 +4133,7 @@ func applyConversationFlags(rtOpts *sdk.RuntimeOptions, cmd *cli.Command) Sessio
 		rtOpts.Verbose = true
 		sessionFlags.Verbose = true
 	}
-	if cmd.Bool("offline") {
+	if offlineConversation(cmd) {
 		rtOpts.Offline = true
 		sessionFlags.Offline = true
 	}
@@ -5091,7 +4998,7 @@ Plugin/extension options:
   --session-dir       Override session directory
 
 Output modes:
-  --mode <text|json|rpc>  Run mode (default: interactive for TTY, text for non-TTY)
+  --mode <text|json>      Run mode (default: interactive for TTY, text for non-TTY)
   --print, -p        Single-shot text output (no TTY needed)
   --json, -j         Alias for --mode json (legacy)
   --list-models      List available models [search]

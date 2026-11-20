@@ -425,7 +425,14 @@ func cmdHelp(app *App, _ string) {
 }
 
 func cmdNew(app *App, _ string) {
-	if app == nil || app.sess == nil {
+	if app == nil {
+		return
+	}
+	if app.instanceAction != nil {
+		app.leaveInstance("new", "")
+		return
+	}
+	if app.sess == nil {
 		return
 	}
 	state := app.sess.State()
@@ -587,6 +594,10 @@ func cmdResume(app *App, args string) {
 	if id == "" {
 		app.conv.AddError("resume: usage: /resume <session-id>")
 		app.refreshChat()
+		return
+	}
+	if app.instanceAction != nil {
+		app.leaveInstance("resume", id)
 		return
 	}
 	if app.sessionFactory == nil {
@@ -1060,18 +1071,32 @@ func cmdCompact(app *App, args string) {
 		return
 	}
 	instructions := strings.TrimSpace(args)
+	sess := app.sess
+	startedIndicator := !app.programStatus.compacting
 	app.conv.AddSystem("compact: history compaction requested")
 	app.applySessionEvent(sdk.Event{Type: "compaction_start"})
 	app.refreshChat()
 
 	ctx := app.ctxOrBackground()
 	go func() {
-		if err := app.sess.Compact(ctx, instructions); err != nil {
+		if err := sess.Compact(ctx, instructions); err != nil {
 			app.post(func(_ *tauui.UpdateCtx) {
-				app.clearStatus(compactionStatusKey)
-				app.conv.AddError("compact: " + err.Error())
-				app.refreshChat()
+				app.failCompact(sess, startedIndicator, err)
 			})
 		}
 	}()
+}
+
+// failCompact reports a /compact that returned an error. Compact can fail
+// before any compaction_end, so the indicator /compact raised is cleared here.
+// A compaction that was already running keeps its indicator until its own end
+// event, and a replacement session's state is left alone.
+func (a *App) failCompact(sess sdk.Session, startedIndicator bool, err error) {
+	if startedIndicator && a.sess == sess {
+		a.programStatus.compacting = false
+	}
+	a.refreshCompactionIndicator()
+	a.refreshProgramStatus()
+	a.conv.AddError("compact: " + err.Error())
+	a.refreshChat()
 }

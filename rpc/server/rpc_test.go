@@ -1,11 +1,13 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +18,6 @@ import (
 	"github.com/losinggeneration/tau/sdk"
 	"github.com/losinggeneration/tau/ui"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // ─── protocol-level envelope tests ─────────────────────────────────────────
@@ -98,31 +99,6 @@ func TestRPCFraming(t *testing.T) {
 	}
 }
 
-func TestRPCMetaIncludesHostname(t *testing.T) {
-	var buf bytes.Buffer
-	s := &Server{writer: &buf}
-	if err := s.emitMeta(); err != nil {
-		t.Fatalf("emitMeta: %v", err)
-	}
-	var meta struct {
-		Hostname      string `json:"hostname"`
-		SchemaVersion int    `json:"schema_version"`
-	}
-	if err := json.Unmarshal(buf.Bytes(), &meta); err != nil {
-		t.Fatalf("parse meta %q: %v", buf.String(), err)
-	}
-	if meta.SchemaVersion != 1 {
-		t.Fatalf("schema_version = %d, want 1", meta.SchemaVersion)
-	}
-	want, err := os.Hostname()
-	if err != nil || want == "" {
-		t.Skipf("hostname unavailable: %v", err)
-	}
-	if meta.Hostname != want {
-		t.Fatalf("meta hostname = %q, want %q", meta.Hostname, want)
-	}
-}
-
 func TestRPCResponseEnvelope(t *testing.T) {
 	h := newTestHarness(t, &mockRuntime{}, nil)
 	defer h.close()
@@ -201,14 +177,6 @@ func TestRPCUIPromptRoundTrip(t *testing.T) {
 	if resp["id"] != "prompt-1" {
 		t.Errorf("expected id=prompt-1, got %v", resp["id"])
 	}
-}
-
-func TestRPCJSONSchemaCompliance(t *testing.T) {
-	h := newTestHarness(t, &mockRuntime{}, nil)
-	defer h.close()
-
-	// Meta event was already drained by newTestHarness. Verify it's well-formed.
-	// We can't check it directly here; instead verify the harness didn't error.
 }
 
 func TestRPCNoGlobExpansion(t *testing.T) {
@@ -346,16 +314,6 @@ func TestRPCCommandInterface(t *testing.T) {
 	}
 }
 
-func TestRPCUIResponseInterface(t *testing.T) {
-	resp := UIResponse{ID: "ui-confirm-1", Value: "true"}
-	data, _ := json.Marshal(resp)
-	var parsed UIResponse
-	json.Unmarshal(data, &parsed)
-	if parsed.ID != "ui-confirm-1" || parsed.Value != "true" {
-		t.Errorf("unexpected: %+v", parsed)
-	}
-}
-
 // ─── command ID correlation ────────────────────────────────────────────────
 
 func TestRPCCommandIDCorrelation(t *testing.T) {
@@ -396,32 +354,6 @@ func TestRPCCommandIDCorrelation(t *testing.T) {
 
 // ─── session and shutdown tests ────────────────────────────────────────────
 
-func TestRPCSessionEndDisconnected(t *testing.T) {
-	rt := &mockRuntime{}
-	h := newTestHarness(t, rt, nil)
-
-	h.send(t, `{"id":"disc-1","type":"new_session","args":{"cwd":"/tmp"}}`)
-	// Read events until response (new_session emits session_start event).
-	lines := h.readUntil(t, timeout, func(line string) bool {
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			return false
-		}
-		return obj["type"] == "response" && obj["id"] == "disc-1"
-	})
-	if len(lines) == 0 {
-		t.Fatal("no new_session response")
-	}
-
-	// Close stdin — server should emit session_end with reason=disconnected
-	// and exit. Closing the stdin pipe triggers EOF on readCommand.
-	h.close()
-
-	// Verify disconnected session_end event was emitted before close.
-	// We can't read after close, so this is implicitly tested by the server
-	// returning cleanly (the harness waitOrFail on h.done).
-}
-
 func TestRPCShutdownGraceful(t *testing.T) {
 	h := newTestHarness(t, &mockRuntime{}, nil)
 
@@ -435,8 +367,7 @@ func TestRPCShutdownGraceful(t *testing.T) {
 		t.Errorf("expected id='shutdown-1', got %v", resp["id"])
 	}
 
-	// Server should return from Run() after shutdown.
-	waitOrFail(t, h.done, timeout, "server Run after shutdown")
+	waitOrFail(t, h.done, timeout, "handlers after shutdown")
 }
 
 func TestRPCConsumerStdinResponse(t *testing.T) {
@@ -485,8 +416,16 @@ func TestRPCSetThinkingLevelAffectsNextTurn(t *testing.T) {
 		return obj["type"] == "response" && obj["id"] == "thinking-1"
 	})
 
+	h.send(t, `{"id":"invalid","type":"set_thinking_level","args":{"level":"unknown"}}`)
+	invalid := h.readUntil(t, timeout, func(line string) bool {
+		return strings.Contains(line, `"id":"invalid"`) && strings.Contains(line, `"type":"response"`)
+	})
+	if len(invalid) == 0 || parseResp(t, invalid[len(invalid)-1])["ok"] != false {
+		t.Fatalf("invalid thinking level not rejected: %v", invalid)
+	}
+
 	// 2. Set thinking level.
-	h.send(t, `{"id":"thinking-2","type":"set_thinking_level","args":{"level":"high"}}`)
+	h.send(t, `{"id":"thinking-2","type":"set_thinking_level","args":{"level":"HIGH"}}`)
 	lines := h.readUntil(t, timeout, func(line string) bool {
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
@@ -524,6 +463,23 @@ func TestRPCSetThinkingLevelAffectsNextTurn(t *testing.T) {
 		}
 	} else {
 		t.Errorf("expected result object in get_state response, got %v", stateResp)
+	}
+}
+
+func TestRPCSetThinkingLevelKeepsSameSession(t *testing.T) {
+	rt := &mockRuntime{}
+	h := newTestHarness(t, rt, nil)
+	h.send(t, `{"id":"new","type":"new_session","args":{"cwd":"/tmp"}}`)
+	h.readUntil(t, timeout, func(line string) bool {
+		return strings.Contains(line, `"id":"new"`) && strings.Contains(line, `"type":"response"`)
+	})
+	h.send(t, `{"id":"set","type":"set_thinking_level","args":{"level":"high"}}`)
+	h.readUntil(t, timeout, func(line string) bool {
+		return strings.Contains(line, `"id":"set"`) && strings.Contains(line, `"type":"response"`)
+	})
+	h.close()
+	if rt.resumeCount != 0 || rt.newCount != 1 || rt.session.thinking != "high" {
+		t.Fatalf("thinking change replaced session or did not apply: creates=%d resumes=%d level=%q", rt.newCount, rt.resumeCount, rt.session.thinking)
 	}
 }
 
@@ -694,48 +650,7 @@ func TestRPCSetModelAcceptsClaudeAgent(t *testing.T) {
 	}
 }
 
-// ─── interrupt tests (trigger channel directly, no OS signal) ─────────────
-
-func TestRPCInterruptEvent(t *testing.T) {
-	rt := &mockRuntime{}
-	h := newTestHarness(t, rt, nil)
-	defer h.close()
-
-	// Trigger interrupt — the server's main loop reads s.interrupt channel.
-	h.triggerInterrupt()
-
-	lines := h.readUntil(t, timeout, func(line string) bool {
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			return false
-		}
-		return obj["type"] == "interrupt"
-	})
-	if !containsLine(lines, `"type":"interrupt"`) {
-		t.Fatalf("no interrupt event in output: %v", lines)
-	}
-}
-
-func TestRPCTranslateSIGINT(t *testing.T) {
-	rt := &mockRuntime{}
-	h := newTestHarness(t, rt, nil)
-	defer h.close()
-
-	// Simulate SIGINT by sending to the interrupt channel directly.
-	// The server's main loop receives from this channel and calls emitInterruptEvent.
-	h.triggerInterrupt()
-
-	lines := h.readUntil(t, timeout, func(line string) bool {
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
-			return false
-		}
-		return obj["type"] == "interrupt"
-	})
-	if !containsLine(lines, `"type":"interrupt"`) {
-		t.Fatalf("expected interrupt event after SIGINT simulation, got: %v", lines)
-	}
-}
+// ─── interrupt tests ───────────────────────────────────────────────────────
 
 func TestRPCInterruptCommand(t *testing.T) {
 	rt := &mockRuntime{}
@@ -1037,7 +952,12 @@ func TestRPCMultimodalPayloadForwarding(t *testing.T) {
 		return obj["type"] == "response" && obj["id"] == "multi-1"
 	})
 
-	cmdJSON := `{"id":"multi-2","type":"send_message","args":{"text":"analyze this","images":["data:image/png;base64,iVBORw0KGgo="],"attach_files":["` + attachedFile + `"]}}`
+	var jpegData bytes.Buffer
+	if err := jpeg.Encode(&jpegData, image.NewRGBA(image.Rect(0, 0, 1, 1)), nil); err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(jpegData.Bytes())
+	cmdJSON := fmt.Sprintf(`{"id":"multi-2","type":"send_message","args":{"text":"analyze this","images":[%q,"iVBORw0KGgo="],"attach_files":[%q]}}`, encoded, attachedFile)
 	h.send(t, cmdJSON)
 	lines := h.readUntil(t, timeout, func(line string) bool {
 		var obj map[string]any
@@ -1052,6 +972,10 @@ func TestRPCMultimodalPayloadForwarding(t *testing.T) {
 	resp := parseResp(t, lines[len(lines)-1])
 	if resp["ok"] != true {
 		t.Fatalf("send_message failed: %v", resp)
+	}
+	images := rt.session.sent[0].Images
+	if len(images) != 2 || images[0].MimeType != "image/jpeg" || images[0].Data != encoded || images[1].MimeType != "image/png" {
+		t.Fatalf("unexpected forwarded images: %+v", images)
 	}
 }
 
@@ -1181,44 +1105,22 @@ func TestRPCFork_FiresSessionBeforeForkEvent(t *testing.T) {
 		},
 	})
 
-	rt := &mockRuntime{}
-	stdinR, stdinW := readCloserPipes()
-	_ = stdinR
-	stdoutR, stdoutW := writeCloserPipes()
-
-	srv := &Server{
-		runtime:         rt,
-		pluginManager:   mgr,
-		reader:          bufio.NewReader(stdinR),
-		writer:          stdoutW,
-		interrupt:       make(chan struct{}, 1),
-		shutdown:        make(chan struct{}),
-		commandRegistry: newTestRegistry(),
-	}
-	srv.ui = ui.NewRPCUI()
-	srv.ui.Writer = stdoutW
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = srv.Run(ctx) }()
-
-	// Send a fork command.
-	_, _ = stdinW.Write([]byte(`{"id":"fork-1","type":"fork","args":{"entry_id":"msg-0"}}` + "\n"))
-
-	// Read lines until we see the response for fork-1 (the server emits a
-	// meta event first, then the response).
-	reader := bufio.NewReader(stdoutR)
-	var resp map[string]any
-	for {
-		line, err := readLineWithTimeout(reader, 2*time.Second)
-		require.NoError(t, err)
-		var m map[string]any
-		require.NoError(t, json.Unmarshal([]byte(line), &m))
-		if m["type"] == "response" && m["id"] == "fork-1" {
-			resp = m
-			break
+	h := startTestHarness(t, newServer(&mockRuntime{}, newTestRegistry(), mgr))
+	defer h.close()
+	response := func(id string) map[string]any {
+		t.Helper()
+		lines := h.readUntil(t, 2*time.Second, func(line string) bool {
+			var obj map[string]any
+			return json.Unmarshal([]byte(line), &obj) == nil && obj["type"] == "response" && obj["id"] == id
+		})
+		if len(lines) == 0 {
+			t.Fatalf("no response for %s", id)
 		}
+		return parseResp(t, lines[len(lines)-1])
 	}
+
+	h.send(t, `{"id":"fork-1","type":"fork","args":{"entry_id":"msg-0"}}`)
+	resp := response("fork-1")
 	assert.Equal(t, "response", resp["type"])
 	assert.Equal(t, "fork-1", resp["id"])
 	// First fork: not blocked, so OK.
@@ -1228,18 +1130,8 @@ func TestRPCFork_FiresSessionBeforeForkEvent(t *testing.T) {
 	// Second fork: block. The mock's NewSession returns the same id, but
 	// the block verdict fires before NewSession is called, so this works.
 	blockOnce = true
-	_, _ = stdinW.Write([]byte(`{"id":"fork-2","type":"fork","args":{"entry_id":"msg-0"}}` + "\n"))
-	var resp2 map[string]any
-	for {
-		line2, err := readLineWithTimeout(reader, 2*time.Second)
-		require.NoError(t, err)
-		var m map[string]any
-		require.NoError(t, json.Unmarshal([]byte(line2), &m))
-		if m["type"] == "response" && m["id"] == "fork-2" {
-			resp2 = m
-			break
-		}
-	}
+	h.send(t, `{"id":"fork-2","type":"fork","args":{"entry_id":"msg-0"}}`)
+	resp2 := response("fork-2")
 	assert.Equal(t, "response", resp2["type"])
 	assert.Equal(t, "fork-2", resp2["id"])
 	assert.Equal(t, false, resp2["ok"])
@@ -1249,10 +1141,6 @@ func TestRPCFork_FiresSessionBeforeForkEvent(t *testing.T) {
 		t.Fatalf("expected error info in response, got: %v", resp2)
 	}
 	assert.Equal(t, []string{"session_before_fork", "session_before_fork"}, seen)
-
-	cancel()
-	_ = stdinW.Close()
-	_ = stdoutW.Close()
 }
 
 func TestControlAPICommandSurface(t *testing.T) {

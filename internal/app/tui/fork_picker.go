@@ -12,6 +12,7 @@ func (a *App) openForkSelector(ctx *tauui.Ctx) {
 		return
 	}
 	if a.sessionFactory == nil {
+		a.messageSelectorFailed = selectorModeFork
 		a.conv.AddError("fork: session switching is unavailable")
 		a.refreshChat()
 		return
@@ -29,19 +30,48 @@ func (a *App) openForgetSelector(ctx *tauui.Ctx) {
 	if a == nil || a.selector == nil {
 		return
 	}
-	a.openMessageSelector(ctx, selectorModeForget, func() ([]sdk.ForkEntry, error) {
+	if sess := a.coordinated; sess != nil && a.selectorMode != selectorModeForget {
+		a.loadCoordinatedForgetEntries(sess)
+		return
+	}
+	a.showForgetSelector(ctx, func() ([]sdk.ForkEntry, error) {
 		f, ok := a.sess.(sdk.Forgetter)
 		if !ok {
 			return nil, nil
 		}
 		return f.GetForgetEntries()
 	})
+}
+
+func (a *App) showForgetSelector(ctx *tauui.Ctx, load func() ([]sdk.ForkEntry, error)) {
+	a.openMessageSelector(ctx, selectorModeForget, load)
 	if a.selectorMode == selectorModeForget && len(a.forkEntries) == 0 {
 		a.dismissSelector()
 		a.invalidateSelectorLayout(true, false, ctx)
+		a.messageSelectorFailed = selectorModeForget
 		a.conv.AddError("forget: no messages to forget")
 		a.refreshChat()
 	}
+}
+
+// loadCoordinatedForgetEntries asks the worker for entries off the UI loop.
+// The picker opens if the editor is still on /forget when they arrive.
+func (a *App) loadCoordinatedForgetEntries(sess *CoordinatedSession) {
+	if a.coordinatedForgetLoading {
+		return
+	}
+	a.coordinatedForgetLoading = true
+	go func() {
+		entries, err := sess.GetForgetEntries()
+		a.post(func(*tauui.UpdateCtx) {
+			a.coordinatedForgetLoading = false
+			text := a.editor.Text()
+			if a.coordinated != sess || text != "/forget" && !messageSelectorCommand(text, selectorModeForget) {
+				return
+			}
+			a.showForgetSelector(a.loopContext(), func() ([]sdk.ForkEntry, error) { return entries, err })
+		})
+	}()
 }
 
 // openMessageSelector shows the message picker shared by /fork and /forget,
@@ -50,6 +80,7 @@ func (a *App) openMessageSelector(ctx *tauui.Ctx, mode selectorMode, load func()
 	if a.selectorMode != mode {
 		entries, err := load()
 		if err != nil {
+			a.messageSelectorFailed = mode
 			a.conv.AddError(selectorModeName(mode) + ": " + err.Error())
 			a.refreshChat()
 			return
@@ -66,7 +97,15 @@ func (a *App) openMessageSelector(ctx *tauui.Ctx, mode selectorMode, load func()
 	a.selector.SetFocused(len(a.selector.Items()) - 1)
 	a.selector.SetShown(true)
 	a.selectorMode = mode
+	a.messageSelectorFailed = selectorModeNone
 	a.invalidateSelectorLayout(wasShown, wasShown && a.selector.MinSize() != wasSize, ctx)
+}
+
+// messageSelectorCommand reports whether text is mode's command followed by
+// whitespace, which opens its picker while typing.
+func messageSelectorCommand(text string, mode selectorMode) bool {
+	command := "/" + selectorModeName(mode)
+	return len(text) > len(command) && strings.HasPrefix(text, command) && (text[len(command)] == ' ' || text[len(command)] == '\t')
 }
 
 func selectorModeName(mode selectorMode) string {

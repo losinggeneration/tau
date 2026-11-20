@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -241,6 +242,9 @@ func (b *CoordinatedBridge) relay(conn *websocket.Conn, link *coord.Link, welcom
 			sock.closeWith(websocket.ClosePolicyViolation, "token revoked")
 			return
 		}
+		welcome.Operations = slices.DeleteFunc(welcome.Operations, func(op string) bool {
+			return op == coord.TypeSessionDirectory || op == coord.OperationSavedSessionLaunch || op == coord.OperationInstanceRestart
+		})
 		if err := sock.send(welcome); err != nil {
 			return
 		}

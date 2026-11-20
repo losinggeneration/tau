@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/losinggeneration/rovel"
 	"github.com/losinggeneration/rovel/backend/headless"
@@ -2049,4 +2050,39 @@ func TestRunQuitRemovesUnsentSessionImages(t *testing.T) {
 	require.NoError(t, app.Run(context.Background()))
 	_, err = os.Stat(dataDir)
 	assert.True(t, os.IsNotExist(err), "unsent session data remains: %v", err)
+}
+
+func TestUnattachedDefaultsRespectProjectOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	credentials := appCredentialStore(t)
+	require.NoError(t, credentials.Set(t.Context(), ai.ProviderOpenAICodex, ai.NewOAuthCredential("fixture-access", "fixture-refresh", time.Now().Add(time.Hour), "")))
+	const model = "openai-codex/gpt-5.6-luna"
+	project := &ai.Settings{DefaultProvider: ai.ProviderOpenAICodex, DefaultModel: "gpt-5.6-luna", Models: map[string]ai.ModelSettings{model: {ThinkingLevel: "high"}}}
+	a, err := New(Options{
+		SettingsPath: path, CredentialStore: credentials, DisplaySettings: project,
+		ReloadDisplaySettings: func(context.Context) (*ai.Settings, error) {
+			user, err := ai.LoadSettings(path)
+			if err != nil {
+				return nil, err
+			}
+			return ai.MergeSettings(user, project), nil
+		},
+		InstanceAction: func(string, string, string) { t.Fatal("changing defaults launched a worker") },
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, a.chat.Close()) })
+
+	a.applyModelFromKey("openai-codex/gpt-5.6-sol")
+	got, _ := a.footer.render(160)
+	require.Contains(t, got, model+" • high")
+	require.Contains(t, convText(a), "Project default: "+model)
+
+	a.setThinkingLevel("low")
+	got, _ = a.footer.render(160)
+	require.Contains(t, got, model+" • high")
+	require.Contains(t, convText(a), "Project thinking level: high (saved user level: low)")
+	saved, err := ai.LoadSettings(path)
+	require.NoError(t, err)
+	require.Equal(t, "gpt-5.6-sol", saved.DefaultModel)
+	require.Equal(t, "low", saved.ThinkingLevelFor(model))
 }

@@ -56,16 +56,10 @@ func (a *App) applySessionEvent(e sdk.Event) {
 	a.refreshProgramStatus()
 	switch e.Type {
 	case "compaction_start":
-		a.compactionRunning = true
-		a.setStatus(compactionStatusKey, a.throbberFrame()+" "+compactionRunningMessage)
-		a.startThrobber()
+		a.refreshCompactionIndicator()
 	case "compaction_end":
+		a.refreshCompactionIndicator()
 		summary, tokensBefore, fallback, fallbackErr := compactionPayload(e.Payload)
-		a.compactionRunning = false
-		a.clearStatus(compactionStatusKey)
-		if !a.isStreaming() {
-			a.stopThrobber()
-		}
 		fields, _ := e.Payload.(map[string]any)
 		aborted, _ := fields["aborted"].(bool)
 		errorMessage, _ := fields["error_message"].(string)
@@ -86,6 +80,22 @@ func (a *App) applySessionEvent(e sdk.Event) {
 		a.refreshFooterStats(a.loopContext())
 	default:
 		a.handleEvent(e)
+	}
+}
+
+func (a *App) refreshCompactionIndicator() {
+	a.compactionRunning = a.programStatus.compacting
+	if a.compactionRunning {
+		if a.throbberTimer == nil {
+			a.startThrobber()
+		}
+		a.setStatus(compactionStatusKey, a.throbberFrame()+" "+compactionRunningMessage)
+		return
+	}
+
+	a.clearStatus(compactionStatusKey)
+	if !a.isStreaming() {
+		a.stopThrobber()
 	}
 }
 

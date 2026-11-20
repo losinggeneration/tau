@@ -252,6 +252,21 @@ func forgetFrom(app *App, entry string) {
 	if ctx := app.loopContext(); ctx != nil && app.editor != nil {
 		app.editor.SetText(ctx, "")
 	}
+	if sess := app.coordinated; sess != nil {
+		// The worker's context_edited event redraws the chat from a new snapshot.
+		app.setStatus("coordinator-forget", "Forgetting messages…")
+		go func() {
+			err := sess.Forget(entry)
+			app.post(func(*tauui.UpdateCtx) {
+				app.clearStatus("coordinator-forget")
+				if err != nil {
+					app.conv.AddError("forget: " + err.Error())
+					app.refreshChat()
+				}
+			})
+		}()
+		return
+	}
 	f, ok := app.sess.(sdk.Forgetter)
 	if !ok {
 		app.conv.AddError("forget: session does not support forgetting messages")

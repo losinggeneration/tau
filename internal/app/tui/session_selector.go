@@ -14,24 +14,57 @@ import (
 // the shared DialogPicker widget so the picker owns its search line, separator,
 // filtered result list, and selected-row marker.
 func SelectSession(ctx context.Context, sessions []sdk.SessionInfo) (string, error) {
+	return selectTerminalItem(ctx, "/resume", "tau — select session", func(filter string) []tauui.DialogPickerItem {
+		return sessionInfoDialogPickerItems(sessions, filter)
+	}, nil)
+}
+
+func selectTerminalItem(ctx context.Context, header, title string, items func(string) []tauui.DialogPickerItem, start func(*sessionSelectorRoot) func()) (string, error) {
+	root, err := runTerminalSelector(ctx, terminalSelector{header: header, title: title, items: items, start: start})
+	if err != nil {
+		return "", err
+	}
+	return root.selected, nil
+}
+
+// terminalSelector configures a standalone picker. filter and focus restore
+// a previous position; keys and onAction add picker-specific shortcuts.
+type terminalSelector struct {
+	header, title string
+	items         func(string) []tauui.DialogPickerItem
+	start         func(*sessionSelectorRoot) func()
+	filter        string
+	focus         func([]tauui.DialogPickerItem) int
+	keys          func(tauui.Keystroke) (tauui.Action, bool)
+	onAction      func(*sessionSelectorRoot, tauui.Action, *tauui.Ctx) bool
+	canSelect     func(tauui.DialogPickerItem) bool
+}
+
+func runTerminalSelector(ctx context.Context, s terminalSelector) (*sessionSelectorRoot, error) {
+	items := s.items
 	picker := tauui.NewDialogPicker()
-	picker.SetHeader("/resume")
+	picker.SetHeader(s.header)
 	picker.SetVisible(20)
-	picker.SetItems(sessionInfoDialogPickerItems(sessions, ""))
+	picker.SetFilter(s.filter)
+	initial := items(s.filter)
+	picker.SetItems(initial)
+	if s.focus != nil {
+		picker.SetFocused(s.focus(initial))
+	}
 	picker.SetShown(true)
 
-	root := &sessionSelectorRoot{id: tauui.NewID(), picker: picker, sessions: append([]sdk.SessionInfo(nil), sessions...)}
+	root := &sessionSelectorRoot{id: tauui.NewID(), picker: picker, onAction: s.onAction}
 	app, err := tauui.New(tauui.Opts{
 		Root:           root,
-		Title:          "tau — select session",
+		Title:          s.title,
 		Theme:          appTheme(),
-		Keymap:         sessionSelectorKeymap{},
+		Keymap:         sessionSelectorKeymap{keys: s.keys},
 		Mouse:          true,
 		BracketedPaste: boolPtr(true),
 		ClearOnExit:    true,
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	root.app = app
 	if err := app.Post(func(ctx *tauui.UpdateCtx) {
@@ -43,9 +76,12 @@ func SelectSession(ctx context.Context, sessions []sdk.SessionInfo) (string, err
 			ctx.InvalidateAll()
 		}
 	}); err != nil {
-		return "", fmt.Errorf("focus session selector: %w", err)
+		return nil, fmt.Errorf("focus selector: %w", err)
 	}
 	picker.SetOnSelect(func(_ int, item tauui.DialogPickerItem) {
+		if s.canSelect != nil && !s.canSelect(item) {
+			return
+		}
 		root.selected = item.Value
 		if root.selected == "" {
 			root.selected = item.Name
@@ -53,17 +89,20 @@ func SelectSession(ctx context.Context, sessions []sdk.SessionInfo) (string, err
 		app.Quit()
 	})
 	picker.SetOnChange(func(filter string) {
-		picker.SetItems(sessionInfoDialogPickerItems(sessions, filter))
+		picker.SetItems(items(filter))
 	})
 	picker.SetOnCancel(func() {
 		app.Quit()
 	})
 
+	if s.start != nil {
+		defer s.start(root)()
+	}
 	defer quitOnContextCancel(ctx, app.Quit)()
 	if err := app.Run(); err != nil {
-		return "", err
+		return nil, err
 	}
-	return root.selected, nil
+	return root, nil
 }
 
 func sessionInfoDialogPickerItems(sessions []sdk.SessionInfo, filter string) []tauui.DialogPickerItem {
@@ -91,8 +130,8 @@ type sessionSelectorRoot struct {
 	id       tauui.ID
 	picker   *tauui.DialogPicker
 	app      *tauui.App
-	sessions []sdk.SessionInfo
 	selected string
+	onAction func(*sessionSelectorRoot, tauui.Action, *tauui.Ctx) bool
 }
 
 func (r *sessionSelectorRoot) ID() tauui.ID { return r.id }
@@ -150,6 +189,9 @@ func (r *sessionSelectorRoot) HandleAction(act tauui.Action, ctx *tauui.Ctx) boo
 	if r.picker == nil {
 		return false
 	}
+	if r.onAction != nil && r.onAction(r, act, ctx) {
+		return true
+	}
 	if act == tauui.ActionQuit {
 		if r.app != nil {
 			r.app.Quit()
@@ -159,9 +201,16 @@ func (r *sessionSelectorRoot) HandleAction(act tauui.Action, ctx *tauui.Ctx) boo
 	return r.picker.HandleAction(int(act), ctx)
 }
 
-type sessionSelectorKeymap struct{}
+type sessionSelectorKeymap struct {
+	keys func(tauui.Keystroke) (tauui.Action, bool)
+}
 
-func (sessionSelectorKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Action, bool) {
+func (k sessionSelectorKeymap) Resolve(ctx tauui.KeyContext, ks tauui.Keystroke) (tauui.Action, bool) {
+	if k.keys != nil {
+		if act, ok := k.keys(ks); ok {
+			return act, true
+		}
+	}
 	switch ks.Key {
 	case tauui.KeyEsc, tauui.KeyCtrlC:
 		return tauui.ActionQuit, true

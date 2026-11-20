@@ -1,9 +1,8 @@
-// Package server implements the tau rpc daemon mode.
-// JSONL on stdio with typed commands and event streams.
+// Package server hosts coordinated tau workers and the authenticated
+// WebSocket bridge to the local coordinator.
 package server // import "github.com/losinggeneration/tau/rpc/server"
 
 import (
-	"bufio"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -48,29 +47,20 @@ type ErrorInfo struct {
 	Message string `json:"message"`
 }
 
-// UIResponse is a client reply to a ui_* event.
-type UIResponse struct {
-	ID    string `json:"id"`
-	Value string `json:"value"`
-}
-
-// Server handles the tau rpc protocol.
+// Server holds the command handlers a worker runs against its runtime.
 type Server struct {
 	runtime         sdk.Runtime
 	pluginManager   *plugins.Manager
 	ui              *ui.RPCUI
-	reader          *bufio.Reader
 	writer          io.Writer
 	session         sdk.Session
 	sessionMu       sync.Mutex
 	sessionCtx      context.Context
 	sessionCancel   context.CancelFunc
 	interrupt       chan struct{}
-	shutdown        chan struct{}
 	mu              sync.Mutex
 	seq             int64 // next monotonic sequence number for the active event stream
 	seqSessionID    string
-	interrupted     bool // true after interrupt event emitted, cleared after client sends interrupt command
 	commandRegistry commands.Registry
 	modelOverride   string
 	thinkingLevel   string
@@ -85,97 +75,25 @@ type Server struct {
 	writeMu sync.Mutex
 	// eventMu keeps sequence assignment and publication in the same order.
 	eventMu sync.Mutex
-	// eventSessionID can be read by observers while sessionMu is held during Close.
-	eventSessionID    atomic.Value
+	// eventSession can be read by observers while sessionMu is held during Close.
+	eventSession      atomic.Pointer[eventSession]
 	sessionGeneration atomic.Uint64
 	coordinated       bool
-	shutdownOnce      sync.Once
 }
 
-// NewServer creates a new RPC server with the given runtime and optional
-// command registry for slash-command handling.
-func NewServer(runtime sdk.Runtime, cmdRegistry commands.Registry, pluginManager *plugins.Manager) *Server {
-	s := &Server{
+type eventSession struct {
+	id, firstPrompt string
+}
+
+// newServer creates handlers for runtime with an optional command registry
+// for slash commands. The caller sets the writer before dispatching.
+func newServer(runtime sdk.Runtime, cmdRegistry commands.Registry, pluginManager *plugins.Manager) *Server {
+	return &Server{
 		runtime:         runtime,
 		pluginManager:   pluginManager,
-		reader:          bufio.NewReader(os.Stdin),
-		writer:          os.Stdout,
 		interrupt:       make(chan struct{}, 1),
-		shutdown:        make(chan struct{}),
 		commandRegistry: cmdRegistry,
 	}
-	return s
-}
-
-// Run starts the RPC server loop.
-func (s *Server) Run(ctx context.Context) error {
-	// Set up RPCUI for UI event emission
-	s.ui = ui.NewRPCUI()
-	s.ui.Writer = rpcUIWriter{server: s}
-	if s.pluginManager != nil {
-		s.pluginManager.SetUI(s.ui)
-	}
-	// Note: we do NOT start ReadResponse here because ui_response commands
-	// come through the same stdin that we read commands from. Instead,
-	// handleUIResponse dispatches directly via s.ui.DispatchResponse().
-
-	// Emit meta event
-	if err := s.emitMeta(); err != nil {
-		return fmt.Errorf("emit meta: %w", err)
-	}
-
-	// Main command loop
-	for {
-		select {
-		case <-ctx.Done():
-			return s.cleanup(ctx)
-		case <-s.shutdown:
-			return s.cleanup(ctx)
-		case <-s.interrupt:
-			// SIGINT received from tau process - translate to interrupt event for client
-			s.emitInterruptEvent()
-		default:
-		}
-
-		// Check if we need to skip reading (we had a pending interrupt)
-		if s.isInterrupted() {
-			continue
-		}
-
-		cmd, err := s.readCommand()
-		if err != nil {
-			if err == io.EOF || errors.Is(err, io.ErrClosedPipe) {
-				// Client disconnected or the transport input was closed.
-				s.emitDisconnectedSessionEnd()
-				return s.cleanup(ctx)
-			}
-			if err := s.sendError("", "read_error", fmt.Sprintf("read command: %v", err)); err != nil {
-				return fmt.Errorf("send read error: %w", err)
-			}
-			continue
-		}
-
-		if err := s.handleCommand(ctx, cmd); err != nil {
-			if sendErr := s.sendError(cmd.ID, "handler_error", fmt.Sprintf("handle command: %v", err)); sendErr != nil {
-				return fmt.Errorf("send handler error: %w", sendErr)
-			}
-		}
-	}
-}
-
-// readCommand reads and parses a command from stdin.
-func (s *Server) readCommand() (*Command, error) {
-	line, err := s.reader.ReadString('\n')
-	if err != nil && (!errors.Is(err, io.EOF) || len(line) == 0) {
-		return nil, err
-	}
-
-	var cmd Command
-	if err := json.Unmarshal([]byte(line), &cmd); err != nil {
-		return nil, fmt.Errorf("unmarshal command: %w", err)
-	}
-
-	return &cmd, nil
 }
 
 // handleCommand dispatches the command to the appropriate handler.
@@ -211,8 +129,6 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleNewSession(ctx, cmd)
 	case "compact":
 		return s.handleCompact(ctx, cmd)
-	case "shutdown":
-		return s.handleShutdown(ctx, cmd)
 	case "ui_response":
 		return s.handleUIResponse(ctx, cmd)
 	case "get_ui_requests":
@@ -221,6 +137,8 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleSteer(ctx, cmd)
 	case "follow_up":
 		return s.handleFollowUp(ctx, cmd)
+	case "edit_queued_text":
+		return s.handleEditQueuedText(ctx, cmd)
 	case "cycle_model":
 		return s.handleCycleModel(ctx, cmd)
 	case "cycle_thinking_level":
@@ -249,12 +167,36 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleFork(ctx, cmd)
 	case "get_fork_messages":
 		return s.handleGetForkMessages(ctx, cmd)
+	case "get_fork_entries":
+		return s.handleGetForkEntries(ctx, cmd)
+	case "get_forget_entries":
+		return s.handleGetForgetEntries(ctx, cmd)
+	case "forget":
+		return s.handleForget(ctx, cmd)
 	case "bash", "execute_bash":
 		return s.startBash(ctx, cmd)
 	case "abort_bash":
 		return s.handleAbortBash(ctx, cmd)
 	case "get_available_models":
 		return s.handleGetAvailableModels(ctx, cmd)
+	case "get_scoped_models":
+		return s.handleGetScopedModels(ctx, cmd)
+	case "get_plugins":
+		return s.handleGetPlugins(ctx, cmd)
+	case "enable_plugin":
+		return s.handleEnablePlugin(ctx, cmd)
+	case "disable_plugin":
+		return s.handleDisablePlugin(ctx, cmd)
+	case "get_mcp_servers":
+		return s.handleGetMCPServers(ctx, cmd)
+	case "mcp_reconnect":
+		return s.handleMCPReconnect(ctx, cmd)
+	case "mcp_configure":
+		return s.handleMCPConfigure(ctx, cmd)
+	case "mcp_sign_in":
+		return s.handleMCPSignIn(ctx, cmd)
+	case "mcp_sign_out":
+		return s.handleMCPSignOut(ctx, cmd)
 	case "get_last_assistant_text":
 		return s.handleGetLastAssistantText(ctx, cmd)
 	case "set_session_name":
@@ -365,6 +307,10 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 
 	events, err := sess.Send(ctx, msg)
 	if errors.Is(err, sdk.ErrSessionBusy) {
+		// A queued /retry would reach the model as plain text.
+		if behavior != "" && strings.TrimSpace(args.Text) == "/retry" {
+			return s.sendError(cmd.ID, "busy", "Tau is still working; retry when the run finishes.")
+		}
 		if behavior == "steer" {
 			return s.queueMessage(cmd.ID, sess, "steer", msg)
 		}
@@ -378,7 +324,7 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 	}
 
 	s.promptWG.Go(func() {
-		if err := s.streamPrompt(cmd.ID, sess.ID(), events); err != nil {
+		if err := s.streamPrompt(cmd.ID, sess, events); err != nil {
 			if sendErr := s.sendError(cmd.ID, "handler_error", fmt.Sprintf("handle command: %v", err)); sendErr != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "warning: send prompt error: %v\n", errors.Join(err, sendErr))
 			}
@@ -390,7 +336,7 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 // streamPrompt answers an accepted prompt with its disposition, then streams
 // its events. The disposition is "started" once the run emits its first event
 // after session_start, and "handled" when a slash command produced the result.
-func (s *Server) streamPrompt(id, sessionID string, events <-chan sdk.Event) (err error) {
+func (s *Server) streamPrompt(id string, sess sdk.Session, events <-chan sdk.Event) (err error) {
 	defer func() {
 		for range events {
 		}
@@ -414,7 +360,13 @@ func (s *Server) streamPrompt(id, sessionID string, events <-chan sdk.Event) (er
 	}
 	for event := range events {
 		if event.SessionID == "" {
-			event.SessionID = sessionID
+			event.SessionID = sess.ID()
+		}
+		if s.coordinated {
+			switch event.Type {
+			case "message_end", "usage", "agent_end", "command_result":
+				event = withSessionStats(sess, event)
+			}
 		}
 		if responded {
 			if err := s.emitEvent(event); err != nil {
@@ -636,19 +588,30 @@ func (s *Server) handleGetState(ctx context.Context, cmd *Command) error {
 		model = s.modelOverride
 	}
 	steering, followUp := queueSizes(s.session)
-	return s.sendResult(cmd.ID, map[string]any{
+	thinking := s.thinkingLevel
+	if statser, ok := s.session.(sdk.Statser); ok {
+		thinking = cmp.Or(statser.Stats().ThinkingLevel, thinking)
+	}
+	result := map[string]any{
 		"session_id":     state.SessionID(),
 		"model":          model,
 		"cwd":            state.CWD(),
 		"position":       state.Position(),
 		"tokens":         state.TotalTokens(),
-		"thinking_level": s.thinkingLevel,
+		"thinking_level": thinking,
 		"is_streaming":   state.IsStreaming(),
 		"queue": map[string]any{
 			"steering":  steering,
 			"follow_up": followUp,
 		},
-	})
+	}
+	if reader, ok := s.session.(sdk.SessionSettingsReader); ok {
+		result["auto_compaction"] = reader.AutoCompactionEnabled()
+		result["auto_retry"] = reader.AutoRetryEnabled()
+		result["steering_mode"] = reader.SteeringMode()
+		result["follow_up_mode"] = reader.FollowUpMode()
+	}
+	return s.sendResult(cmd.ID, result)
 }
 
 // handleSetModel switches the active model for future turns without replacing
@@ -686,7 +649,7 @@ func (s *Server) handleSetModel(ctx context.Context, cmd *Command) error {
 	if err := current.SetModel(modelSpec); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-	if err := s.emitEvent(sdk.Event{Type: "model_change", SessionID: current.ID(), Payload: map[string]any{"model": modelSpec}}); err != nil {
+	if err := s.emitEvent(withSessionStats(current, sdk.Event{Type: "model_change", SessionID: current.ID(), Payload: map[string]any{"model": modelSpec}})); err != nil {
 		return fmt.Errorf("emit model change: %w", err)
 	}
 
@@ -735,41 +698,31 @@ func (s *Server) handleSetThinkingLevel(ctx context.Context, cmd *Command) error
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
+	args.Level = strings.ToLower(args.Level)
 	if args.Level == "" {
 		return s.sendErrorResult(cmd.ID, fmt.Errorf("thinking level cannot be empty"))
 	}
+	if !ai.IsValidThinkingLevel(args.Level) {
+		return s.sendErrorResult(cmd.ID, fmt.Errorf("invalid thinking level"))
+	}
 
-	// Update server-side thinking level
 	s.sessionMu.Lock()
-	s.thinkingLevel = args.Level
 	current := s.session
 	s.sessionMu.Unlock()
-
-	if current == nil {
-		if err := s.emitEvent(sdk.Event{Type: "thinking_level_change", Payload: map[string]any{"level": args.Level}}); err != nil {
-			return fmt.Errorf("emit thinking level change: %w", err)
+	event := sdk.Event{Type: "thinking_level_change", Payload: map[string]any{"level": args.Level}}
+	if current != nil {
+		if err := current.SetThinkingLevel(args.Level); err != nil {
+			return s.sendErrorResult(cmd.ID, err)
 		}
-		return s.sendResult(cmd.ID, map[string]any{"ok": true, "level": args.Level})
+		event.SessionID = current.ID()
+		event = withSessionStats(current, event)
 	}
-
-	// Replace the session to apply the new thinking level
-	if err := s.replaceSession(ctx, sdk.SessionOptions{
-		CWD:           current.State().CWD(),
-		Model:         s.modelOverride,
-		SessionID:     current.State().SessionID(),
-		ThinkingLevel: s.thinkingLevel,
-	}, "thinking_level_change"); err != nil {
-		return s.sendErrorResult(cmd.ID, err)
-	}
-
-	// Write thinking_level_change entry to session
-	if err := s.writeThinkingLevelChangeEntry(ctx, s.session, args.Level); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: write thinking_level_change entry: %v\n", err)
-	}
-	if err := s.emitEvent(sdk.Event{Type: "thinking_level_change", SessionID: s.session.ID(), Payload: map[string]any{"level": args.Level}}); err != nil {
+	s.sessionMu.Lock()
+	s.thinkingLevel = args.Level
+	s.sessionMu.Unlock()
+	if err := s.emitEvent(event); err != nil {
 		return fmt.Errorf("emit thinking level change: %w", err)
 	}
-
 	return s.sendResult(cmd.ID, map[string]any{"ok": true, "level": args.Level})
 }
 
@@ -814,7 +767,7 @@ func (s *Server) handleListSessions(ctx context.Context, cmd *Command) error {
 	return s.sendResult(cmd.ID, map[string]any{"sessions": result})
 }
 
-// handleResumeSession switches to an existing session.
+// handlePinSession pins a saved session.
 func (s *Server) handlePinSession(ctx context.Context, cmd *Command) error {
 	var args struct {
 		ID string `json:"id"`
@@ -920,12 +873,6 @@ func (s *Server) handleCompact(ctx context.Context, cmd *Command) error {
 	return s.sendResult(cmd.ID, map[string]any{"ok": true})
 }
 
-// handleShutdown gracefully exits.
-func (s *Server) handleShutdown(ctx context.Context, cmd *Command) error {
-	defer s.shutdownOnce.Do(func() { close(s.shutdown) })
-	return s.sendResult(cmd.ID, map[string]any{"ok": true})
-}
-
 // handleUIResponse processes client reply to a ui_* event.
 //
 // The args payload may carry either a typed `UIResponse` (with `method`,
@@ -983,7 +930,7 @@ func (s *Server) ensureSession(ctx context.Context) (sdk.Session, error) {
 
 	s.session = sess
 	s.sessionGeneration.Add(1)
-	s.eventSessionID.Store(sess.ID())
+	s.eventSession.Store(&eventSession{id: sess.ID()})
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.observeSessionEvents(sess)
 	return sess, nil
@@ -1040,10 +987,14 @@ func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, re
 		return err
 	}
 
+	bound := eventSession{id: sess.ID()}
+	if opts.SessionID != "" || opts.ForkFrom != "" {
+		bound = s.sessionEventMetadata(sess)
+	}
 	s.sessionMu.Lock()
 	s.session = sess
 	s.sessionGeneration.Add(1)
-	s.eventSessionID.Store(sess.ID())
+	s.eventSession.Store(&bound)
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.sessionMu.Unlock()
 	s.observeSessionEvents(sess)
@@ -1057,6 +1008,24 @@ func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, re
 			"model": sess.State().Model(),
 		},
 	})
+}
+
+// sessionEventMetadata seeds resumed or forked sessions before publishing a
+// session switch. Fresh Tau sessions have no file until their first prompt.
+func (s *Server) sessionEventMetadata(sess sdk.Session) eventSession {
+	metadata := eventSession{id: sess.ID()}
+	if !s.coordinated || metadata.id == "" {
+		return metadata
+	}
+	if storage := s.runtime.GetSessionStorage(); storage != nil {
+		reader, err := storage.Open(metadata.id)
+		if err != nil {
+			workerLog("read first prompt for %s: %v", metadata.id, err)
+		} else if reader.Header().ID == metadata.id {
+			metadata.firstPrompt = instancePromptPreview(reader.FirstPrompt())
+		}
+	}
+	return metadata
 }
 
 // writeModelChangeEntry writes a model_change entry to the previous session.
@@ -1089,46 +1058,7 @@ func (s *Server) writeModelChangeEntry(ctx context.Context, prev sdk.Session, mo
 	return w.Append(session.NewModelChangeEntry(provider, model))
 }
 
-// writeThinkingLevelChangeEntry writes a thinking_level_change entry to the session.
-func (s *Server) writeThinkingLevelChangeEntry(ctx context.Context, sess sdk.Session, level string) (err error) {
-	sid := sess.ID()
-	if sid == "" {
-		return nil // Ephemeral session
-	}
-
-	w, err := s.runtime.GetSessionStorage().Resume(sid)
-	if err != nil {
-		return fmt.Errorf("resume session for thinking_level_change entry: %w", err)
-	}
-	defer func() {
-		if closeErr := w.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close session writer: %w", closeErr)
-		}
-	}()
-
-	return w.Append(session.NewThinkingLevelChangeEntry(level))
-}
-
-func (s *Server) emitMeta() error {
-	meta := map[string]any{
-		"type":           "meta",
-		"schema_version": 1,
-		"tau_version":    "0.1.0",
-	}
-	// Let remote clients show which machine they are controlling.
-	if host, err := os.Hostname(); err == nil && host != "" {
-		meta["hostname"] = host
-	}
-	data, err := json.Marshal(meta)
-	if err != nil {
-		return fmt.Errorf("marshal meta: %w", err)
-	}
-	data = append(data, '\n')
-	err = s.write(data)
-	return err
-}
-
-// emitEvent writes an event to stdout as JSONL.
+// emitEvent writes an event to the worker stream as one JSON record.
 func (s *Server) emitEvent(event sdk.Event) error {
 	if event.Type == "meta" {
 		return nil
@@ -1136,8 +1066,8 @@ func (s *Server) emitEvent(event sdk.Event) error {
 	s.eventMu.Lock()
 	defer s.eventMu.Unlock()
 	// Observers must not take sessionMu: session Close can wait for them.
-	if event.SessionID == "" {
-		event.SessionID, _ = s.eventSessionID.Load().(string)
+	if bound := s.eventSession.Load(); event.SessionID == "" && bound != nil {
+		event.SessionID = bound.id
 	}
 
 	// RPC owns the emitted event sequence so SDK-originated events and
@@ -1219,6 +1149,9 @@ func (s *Server) sendErrorResult(id string, err error) error {
 	if errors.Is(err, errSessionChanged) {
 		return s.sendError(id, "session_changed", err.Error())
 	}
+	if errors.Is(err, errNotSupported) {
+		return s.sendError(id, "not_supported", err.Error())
+	}
 	return s.sendError(id, "error", err.Error())
 }
 
@@ -1229,7 +1162,7 @@ func (s *Server) write(data []byte) error {
 	return err
 }
 
-// sendResponse writes a response to stdout.
+// sendResponse writes a response to the worker stream.
 func (s *Server) sendResponse(resp Response) error {
 	data, err := json.Marshal(resp)
 	if err != nil {
@@ -1255,15 +1188,7 @@ func (s *Server) handleSteer(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	content := make([]ai.ContentBlock, 0, len(args.Images))
-	for _, img := range args.Images {
-		content = append(content, ai.ContentBlock{
-			Type:     ai.ContentBlockImage,
-			Data:     img,
-			MimeType: "image/png",
-		})
-	}
-	return s.queueMessage(cmd.ID, sess, "steer", sdk.Message{Role: "user", Text: args.Text, Images: content})
+	return s.queueMessage(cmd.ID, sess, "steer", sdk.Message{Role: "user", Text: args.Text, Images: rpcImageBlocks(args.Images)})
 }
 
 // handleFollowUp adds a follow-up message to the queue.
@@ -1287,6 +1212,32 @@ func (s *Server) handleFollowUp(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 	return s.queueMessage(cmd.ID, sess, "follow_up", sdk.Message{Role: "user", Text: args.Text, Images: content, AttachmentIDs: ids})
+}
+
+func (s *Server) handleEditQueuedText(ctx context.Context, cmd *Command) error {
+	var args struct {
+		Session string `json:"expected_session_id"`
+		ID      string `json:"id"`
+		Text    string `json:"text"`
+	}
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	if args.Session == "" || args.ID == "" || strings.TrimSpace(args.Text) == "" {
+		return s.sendError(cmd.ID, "invalid_args", "Choose a queued message and enter its new text.")
+	}
+	sess, err := s.draftSession(ctx, args.Session)
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	queue, ok := sess.(sdk.QueueEditor)
+	if !ok {
+		return s.sendError(cmd.ID, "not_supported", "This session doesn't support queue editing.")
+	}
+	if !queue.EditQueuedText(args.ID, args.Text) {
+		return s.sendError(cmd.ID, "queue_changed", "That message has already left the queue or changed. Your edit was not sent.")
+	}
+	return s.sendResult(cmd.ID, map[string]any{"ok": true})
 }
 
 // queueMessage queues msg as a steering ("steer") or follow-up message and
@@ -1332,6 +1283,12 @@ func (s *Server) handleCycleModel(ctx context.Context, cmd *Command) error {
 			return s.sendResult(cmd.ID, map[string]any{"model": nil})
 		}
 		s.modelOverride = model.Provider + "/" + model.ID
+		if s.coordinated {
+			event := sdk.Event{Type: "model_change", SessionID: sess.ID(), Payload: map[string]any{"model": s.modelOverride}}
+			if err := s.emitEvent(withSessionStats(sess, event)); err != nil {
+				return fmt.Errorf("emit model change: %w", err)
+			}
+		}
 		return s.sendResult(cmd.ID, map[string]any{
 			"model": map[string]any{
 				"id":       model.ID,
@@ -1356,7 +1313,7 @@ func (s *Server) handleCycleThinkingLevel(ctx context.Context, cmd *Command) err
 		s.thinkingLevel = level
 		s.sessionMu.Unlock()
 		if s.coordinated {
-			if err := s.emitEvent(sdk.Event{Type: "thinking_level_change", SessionID: sess.ID(), Payload: map[string]any{"level": level}}); err != nil {
+			if err := s.emitEvent(withSessionStats(sess, sdk.Event{Type: "thinking_level_change", SessionID: sess.ID(), Payload: map[string]any{"level": level}})); err != nil {
 				return err
 			}
 		}
@@ -1575,16 +1532,41 @@ func (s *Server) handleGetSessionStats(ctx context.Context, cmd *Command) error 
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
+	s.sessionMu.Lock()
+	thinking := s.thinkingLevel
+	s.sessionMu.Unlock()
+	return s.sendResult(cmd.ID, sessionStats(sess, thinking))
+}
+
+func sessionStats(sess sdk.Session, fallbackThinking string) sdk.SessionStats {
 	if statser, ok := sess.(sdk.Statser); ok {
-		return s.sendResult(cmd.ID, statser.Stats())
+		return statser.Stats()
 	}
 	state := sess.State()
-	return s.sendResult(cmd.ID, sdk.SessionStats{
+	return sdk.SessionStats{
 		SessionID:     state.SessionID(),
 		TotalTokens:   state.TotalTokens(),
 		Model:         state.Model(),
-		ThinkingLevel: s.thinkingLevel,
-	})
+		ThinkingLevel: fallbackThinking,
+	}
+}
+
+func withSessionStats(sess sdk.Session, ev sdk.Event) sdk.Event {
+	statser, ok := sess.(sdk.Statser)
+	if !ok {
+		return ev
+	}
+	payload, _ := ev.Payload.(map[string]any)
+	if ev.Payload != nil && payload == nil {
+		return ev
+	}
+	fields := make(map[string]any, len(payload)+1)
+	for key, value := range payload {
+		fields[key] = value
+	}
+	fields["stats"] = statser.Stats()
+	ev.Payload = fields
+	return ev
 }
 
 // handleExportHTML exports the session to HTML.
@@ -1615,6 +1597,7 @@ func (s *Server) handleExportHTML(ctx context.Context, cmd *Command) error {
 // handleFork forks the session from a specific entry point.
 func (s *Server) handleFork(ctx context.Context, cmd *Command) error {
 	var args struct {
+		Session       string `json:"expected_session_id,omitempty"`
 		EntryID       string `json:"entry_id,omitempty"`
 		ForkFromEntry string `json:"fork_from_entry,omitempty"`
 	}
@@ -1631,7 +1614,7 @@ func (s *Server) handleFork(ctx context.Context, cmd *Command) error {
 		forkEntryID = args.ForkFromEntry
 	}
 
-	current, err := s.ensureSession(ctx)
+	current, err := s.draftSession(ctx, args.Session)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
@@ -1698,6 +1681,62 @@ func (s *Server) handleGetForkMessages(ctx context.Context, cmd *Command) error 
 	}
 
 	return s.sendError(cmd.ID, "not_supported", "get_fork_messages not supported in this session")
+}
+
+// handleGetForgetEntries lists the entries forget can drop from, oldest first.
+func (s *Server) handleGetForgetEntries(ctx context.Context, cmd *Command) error {
+	var args struct {
+		Session string `json:"expected_session_id"`
+	}
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	_, f, err := sessionAs[sdk.Forgetter](ctx, s, args.Session, "forgetting messages")
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	entries, err := f.GetForgetEntries()
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	type entry struct {
+		EntryID string `json:"entry_id"`
+		Role    string `json:"role"`
+		Text    string `json:"text"`
+	}
+	out := make([]entry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, entry{e.EntryID, e.Role, e.Text})
+	}
+	return s.sendResult(cmd.ID, map[string]any{"entries": out})
+}
+
+// handleForget drops entry_id and everything after it. Coordinated clients
+// redraw from a fresh snapshot when they see context_edited.
+func (s *Server) handleForget(ctx context.Context, cmd *Command) error {
+	var args struct {
+		Session string `json:"expected_session_id"`
+		EntryID string `json:"entry_id"`
+	}
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	if args.EntryID == "" {
+		return s.sendError(cmd.ID, "invalid_args", "entry_id is required")
+	}
+	sess, f, err := sessionAs[sdk.Forgetter](ctx, s, args.Session, "forgetting messages")
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	if err := f.Forget(args.EntryID); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	if s.coordinated {
+		if err := s.emitEvent(sdk.Event{Type: "context_edited", SessionID: sess.ID()}); err != nil {
+			return err
+		}
+	}
+	return s.sendResult(cmd.ID, map[string]any{"ok": true})
 }
 
 // handleBash executes a bash command and returns the result.
@@ -1822,12 +1861,13 @@ func (s *Server) handleAbortBash(ctx context.Context, cmd *Command) error {
 
 // rebindSession rebinds the server to a new session.
 func (s *Server) rebindSession(ctx context.Context, newSess sdk.Session) error {
+	bound := s.sessionEventMetadata(newSess)
 	s.sessionMu.Lock()
 	prev := s.session
 	prevCancel := s.sessionCancel
 	s.session = newSess
 	s.sessionGeneration.Add(1)
-	s.eventSessionID.Store(newSess.ID())
+	s.eventSession.Store(&bound)
 	s.sessionCtx, s.sessionCancel = context.WithCancel(ctx)
 	s.sessionMu.Unlock()
 	s.observeSessionEvents(newSess)
@@ -1890,96 +1930,42 @@ func (s *Server) cleanup(ctx context.Context) (err error) {
 	return err
 }
 
-// SendInterrupt interrupts the in-flight run and emits an interrupt event.
-// This is called when tau receives SIGINT in RPC mode, translating it into an
-// interrupt event for the connected client.
-func (s *Server) SendInterrupt() {
-	s.emitInterruptEvent()
-}
-
-// isInterrupted returns true if an interrupt is pending and clears the flag.
-func (s *Server) isInterrupted() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.interrupted {
-		s.interrupted = false
-		return true
-	}
-	return false
-}
-
-// emitInterruptEvent emits an "interrupt" event to the client.
-func (s *Server) emitInterruptEvent() {
-	// Mark that we've emitted an interrupt
-	s.mu.Lock()
-	s.interrupted = true
-	s.mu.Unlock()
-
-	// Cancel the in-flight session if any
-	var sessionID string
-	s.sessionMu.Lock()
-	if s.session != nil {
-		_ = s.session.Interrupt()
-		sessionID = s.session.ID()
-	}
-	s.sessionMu.Unlock()
-
-	event := map[string]any{
-		"type": "interrupt",
-	}
-	_ = s.emitEvent(sdk.Event{Type: "interrupt", SessionID: sessionID, Payload: event})
-}
-
-// emitDisconnectedSessionEnd emits a session_end event with disconnected reason
-// when the client disconnects without sending shutdown.
-func (s *Server) emitDisconnectedSessionEnd() {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-
-	if s.session == nil {
-		return
-	}
-
-	// Create an event channel to receive the session_end event
-	events := make(chan sdk.Event, 1)
-
-	if agentSess, ok := s.session.(sdk.DisconnectedSessionEndEmitter); ok {
-		agentSess.EmitDisconnectedSessionEnd(events)
-		// Drain the event and emit it
-		select {
-		case event := <-events:
-			if err := s.emitEvent(event); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "warning: emit disconnected session end: %v\n", err)
-			}
-		default:
-		}
-	}
-}
-
 // handleGetAvailableModels returns the list of models known to the SDK.
 // Pi-compatible: clients can call this to discover what models the server
 // can serve without consulting any external catalog.
 func (s *Server) handleGetAvailableModels(ctx context.Context, cmd *Command) error {
-	models := ai.ListModels("")
 	s.sessionMu.Lock()
 	sess := s.session
 	s.sessionMu.Unlock()
-	if lister, ok := sess.(sdk.ModelLister); ok {
-		var err error
-		models, err = lister.GetAvailableModels(ctx)
-		if err != nil {
-			return s.sendErrorResult(cmd.ID, err)
-		}
+	models, err := availableModels(ctx, sess)
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
 	}
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
+		if m == nil {
+			continue
+		}
 		out = append(out, map[string]any{
-			"id":       m.ID,
-			"provider": m.Provider,
-			"api":      m.API,
+			"id":              m.ID,
+			"provider":        m.Provider,
+			"api":             m.API,
+			"name":            m.Name,
+			"context_window":  m.ContextWindow,
+			"reasoning":       m.Reasoning,
+			"thinking_levels": ai.GetSupportedThinkingLevels(m),
 		})
 	}
 	return s.sendResult(cmd.ID, map[string]any{"models": out})
+}
+
+// availableModels lists the session's credential-scoped models, or the
+// whole catalog when there is no session to ask.
+func availableModels(ctx context.Context, sess sdk.Session) ([]*ai.Model, error) {
+	if lister, ok := sess.(sdk.ModelLister); ok {
+		return lister.GetAvailableModels(ctx)
+	}
+	return ai.ListModels(""), nil
 }
 
 // handleGetLastAssistantText returns the text content of the most recent

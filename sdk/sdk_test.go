@@ -151,8 +151,16 @@ func (m *mockCredStore) Delete(_ context.Context, _ string) error {
 	return nil
 }
 
+// List reports the credential Get returns as stored for every provider.
 func (m *mockCredStore) List(_ context.Context) ([]ai.CredentialRef, error) {
-	return nil, nil
+	if m.getErr != nil || m.getCred.Type == "" {
+		return nil, nil
+	}
+	var refs []ai.CredentialRef
+	for _, provider := range ai.ListProviders() {
+		refs = append(refs, ai.CredentialRef{Provider: provider, Type: m.getCred.Type})
+	}
+	return refs, nil
 }
 
 func (m *mockCredStore) RefreshOAuth(_ context.Context, _ string, _ oauth.Provider) (ai.Credential, error) {
@@ -1642,6 +1650,42 @@ func TestSessionStatsUseCurrentContextTokensNotCumulativeUsage(t *testing.T) {
 	assert.InDelta(t, float64(120)/float64(stats.ContextWindow)*100, stats.ContextUsedPct, 0.0001)
 }
 
+func TestSessionStatsReestimateRetainedContextAfterCompaction(t *testing.T) {
+	provider, model := registerRecordingProvider(t, "short summary")
+	provider.usage = ai.Usage{Input: 63_900, Output: 100, TotalTokens: 64_000}
+	rt, err := NewRuntime(RuntimeOptions{
+		SessionsDir:     t.TempDir(),
+		Settings:        compactAllSettings(),
+		Compaction:      &CompactionSettings{Disabled: true},
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")},
+		ExplicitModel:   model,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rt.Close(testContext(t))) }()
+	sess, err := rt.NewSession(testContext(t), SessionOptions{CWD: t.TempDir()})
+	require.NoError(t, err)
+	sendAndDrain(t, sess, strings.Repeat("old context ", 100))
+	sendAndDrain(t, sess, "keep this turn")
+	before := sess.(Statser).Stats()
+	require.Equal(t, 64_000, before.TotalTokens)
+	require.Equal(t, 50.0, before.ContextUsedPct)
+
+	require.NoError(t, sess.Compact(testContext(t)))
+	after := sess.(Statser).Stats()
+	assert.Less(t, after.TotalTokens, 5_000, "retained assistant usage still counts the original prompt")
+	assert.Less(t, after.ContextUsedPct, 4.0)
+	assert.Equal(t, before.ContextWindow, after.ContextWindow)
+	assert.Equal(t, before.Usage, after.Usage, "compaction does not erase billed usage")
+
+	id := sess.ID()
+	require.NoError(t, sess.Close(testContext(t)))
+	sess, err = rt.NewSession(testContext(t), SessionOptions{SessionID: id})
+	require.NoError(t, err)
+	assert.Equal(t, after.TotalTokens, sess.(Statser).Stats().TotalTokens, "resuming uses the same compacted context estimate")
+	sendAndDrain(t, sess, "new turn after compaction")
+	assert.Equal(t, 64_000, sess.(Statser).Stats().TotalTokens, "fresh provider usage supersedes estimates")
+}
+
 // TestNewSession_SkillsCatalogInSystemPrompt verifies progressive disclosure:
 // at session start the skill registry's catalog (name+description+location)
 // is appended to the system prompt addendum so the model can decide to read
@@ -2441,6 +2485,34 @@ func TestNewSessionDefersSessionFileUntilFirstMessage(t *testing.T) {
 
 	files = sessionJSONLFiles(t, sessionsDir)
 	require.Len(t, files, 1, "first message should materialize the session file")
+}
+
+func TestThinkingChangesPersistBeforeAndAfterFirstPrompt(t *testing.T) {
+	_, model := registerRecordingProvider(t, "ok")
+	dir := t.TempDir()
+	rt, err := NewRuntime(RuntimeOptions{CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")}, ExplicitModel: model, SessionsDir: dir})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	require.NoError(t, sess.SetThinkingLevel("high"))
+	require.Empty(t, sessionJSONLFiles(t, dir), "changing thinking must not create an empty session")
+	events, err := sess.Send(testContext(t), Message{Text: "hello"})
+	require.NoError(t, err)
+	_ = collectSessionEvents(t, events)
+	require.NoError(t, sess.SetThinkingLevel("HIGH"))
+	require.ErrorContains(t, sess.SetThinkingLevel("unknown"), "invalid thinking level")
+	require.Equal(t, "high", sess.(Statser).Stats().ThinkingLevel)
+	cycled := sess.(ThinkingCycler).CycleThinkingLevel()
+	require.NotEqual(t, "high", cycled)
+	path := sessionJSONLFiles(t, dir)
+	require.Len(t, path, 1)
+	reader, err := sessionpkg.ReadFile(path[0])
+	require.NoError(t, err)
+	entries := reader.EntriesByType(sessionpkg.EntryTypeThinkingChange)
+	require.Len(t, entries, 2)
+	require.Equal(t, "high", *entries[0].Level)
+	require.Equal(t, cycled, *entries[1].Level)
 }
 
 func TestNewSessionPersistsMediumThinkingModelAndDefaultCodingTools(t *testing.T) {
@@ -5803,6 +5875,17 @@ func TestForget(t *testing.T) {
 	msgs := ml.GetMessages()
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "one", msgs[0].Text)
+	// Coordinated clients redraw from history pages rather than GetMessages.
+	historyTexts := func() []string {
+		history, _, err := sess.(HistoryPager).History("", 10)
+		require.NoError(t, err)
+		var texts []string
+		for _, entry := range history {
+			texts = append(texts, entry.Message.Text)
+		}
+		return texts
+	}
+	assert.Equal(t, []string{"one", "final response"}, historyTexts())
 
 	// New turns continue from the kept history, not the forgotten branch.
 	events, err := sess.Send(testContext(t), Message{Text: "three"})
@@ -5815,6 +5898,7 @@ func TestForget(t *testing.T) {
 		texts = append(texts, e.Text)
 	}
 	assert.Equal(t, []string{"one", "final response", "three", "final response"}, texts)
+	assert.Equal(t, texts, historyTexts())
 
 	id := sess.ID()
 	require.NoError(t, sess.Close(testContext(t)))
@@ -5824,6 +5908,34 @@ func TestForget(t *testing.T) {
 	msgs = resumed.(MessageLister).GetMessages()
 	require.Len(t, msgs, 4)
 	assert.Equal(t, "three", msgs[2].Text)
+}
+
+func TestForgetFirstEntryEmptiesHistory(t *testing.T) {
+	_, explicitModel := registerRecordingProvider(t, "final response")
+	rt, err := NewRuntime(RuntimeOptions{
+		SessionsDir:     t.TempDir(),
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		ExplicitModel:   explicitModel,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rt.Close(testContext(t)) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	events, err := sess.Send(testContext(t), Message{Text: "one"})
+	require.NoError(t, err)
+	_ = collectSessionEvents(t, events)
+
+	f := sess.(Forgetter)
+	entries, err := f.GetForgetEntries()
+	require.NoError(t, err)
+	require.NoError(t, f.Forget(entries[0].EntryID))
+	assert.Empty(t, sess.(MessageLister).GetMessages())
+	history, _, err := sess.(HistoryPager).History("", 10)
+	require.NoError(t, err)
+	assert.Empty(t, history)
+	entries, err = f.GetForgetEntries()
+	require.NoError(t, err)
+	assert.Empty(t, entries)
 }
 
 func TestGetForkEntries(t *testing.T) {
@@ -6320,6 +6432,33 @@ func TestSummaryRetriesTransientFailures(t *testing.T) {
 	assert.Equal(t, 1, calls)
 }
 
+func TestSessionSettingsReaderReportsToggles(t *testing.T) {
+	_, spec := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{Settings: &ai.Settings{}, CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: spec})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
+	reader, ok := sess.(SessionSettingsReader)
+	require.True(t, ok)
+	s := sess.(*agentSession)
+
+	assert.True(t, reader.AutoRetryEnabled())
+	s.SetAutoRetryEnabled(false)
+	assert.False(t, reader.AutoRetryEnabled())
+	s.SetAutoCompactionEnabled(false)
+	assert.False(t, reader.AutoCompactionEnabled())
+	s.SetAutoCompactionEnabled(true)
+	assert.True(t, reader.AutoCompactionEnabled())
+	require.NoError(t, s.SetSteeringMode("all"))
+	require.NoError(t, s.SetFollowUpMode("one-at-a-time"))
+	assert.Equal(t, "all", reader.SteeringMode())
+	assert.Equal(t, "one-at-a-time", reader.FollowUpMode())
+	require.NoError(t, s.SetFollowUpMode("all"))
+	assert.Equal(t, "all", reader.FollowUpMode())
+}
+
 func TestOpenRouterCatalogRetainsKeyScopedOfflineResult(t *testing.T) {
 	t.Setenv("TAU_CONFIG_DIR", t.TempDir())
 	fail := false
@@ -6780,6 +6919,166 @@ func TestCompactCancellationPreservesHistory(t *testing.T) {
 			}
 		})
 	}
+}
+
+func newManualHistorySession(t *testing.T, complete func(context.Context) (*ai.AssistantMessage, error)) (*agentSession, string) {
+	t.Helper()
+	model := &ai.Model{ID: "manual-history", ContextWindow: 128000}
+	storage, err := sessionpkg.NewStorageAt(t.TempDir())
+	require.NoError(t, err)
+	writer, err := storage.Create(sessionpkg.NewHeader(".", nil, nil))
+	require.NoError(t, err)
+	user := sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"preserve this history"}`), nil)
+	require.NoError(t, writer.Append(user))
+	reply := sessionpkg.NewMessageEntry(&user.ID, json.RawMessage(`{"role":"assistant","content":[{"type":"text","text":"recent reply"}]}`), nil)
+	require.NoError(t, writer.Append(reply))
+	s := &agentSession{
+		model:         model,
+		settings:      compactAllSettings(),
+		logger:        logging.NewText(&bytes.Buffer{}, slog.LevelWarn),
+		sessionWriter: writer,
+		parentMsgID:   &reply.ID,
+		clientFactory: func(*ai.Model) (ai.Client, error) {
+			return &mockClient{completeFn: func(ctx context.Context, _ *ai.Model, _ *ai.Context, _ ...ai.Option) (*ai.AssistantMessage, error) {
+				return complete(ctx)
+			}}, nil
+		},
+	}
+	s.agent = mustNewAgentForTest(t, model)
+	s.agent.ReplaceMessages([]*agent.Message{agent.NewUserMessage("preserve this history"), {Role: agent.RoleAssistant, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "recent reply"}}}})
+	t.Cleanup(func() { require.NoError(t, s.Close(context.Background())) })
+	return s, reply.ID
+}
+
+func manualHistorySummary() *ai.AssistantMessage {
+	return &ai.AssistantMessage{Role: "assistant", StopReason: ai.StopReasonStop, Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "summary"}}}
+}
+
+func TestManualHistoryOperationsRejectActiveRunButOwnerCanCompact(t *testing.T) {
+	var calls int
+	s, replyID := newManualHistorySession(t, func(context.Context) (*ai.AssistantMessage, error) {
+		calls++
+		return manualHistorySummary(), nil
+	})
+	path := s.sessionWriter.Path()
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	s.mu.Lock()
+	s.runDone = make(chan struct{})
+	s.cancelFn = func() {}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.runDone = nil
+		s.cancelFn = nil
+		s.mu.Unlock()
+	}()
+
+	require.ErrorIs(t, s.Compact(t.Context()), ErrSessionBusy)
+	require.ErrorIs(t, s.Forget(replyID), ErrSessionBusy)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+	assert.Zero(t, calls)
+
+	require.NoError(t, s.compact(t.Context(), compactionTrigger{reason: compactionReasonThreshold}, ""))
+	assert.Equal(t, 1, calls)
+}
+
+func TestManualCompactOwnsAdmissionUntilFinished(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s, replyID := newManualHistorySession(t, func(context.Context) (*ai.AssistantMessage, error) {
+		close(entered)
+		<-release
+		return manualHistorySummary(), nil
+	})
+	registry := commands.NewInMemoryRegistry()
+	require.NoError(t, registry.Register(commands.Info{Name: "noop", Description: "noop", Source: commands.Builtin}, func(context.Context, string, commands.CommandUI, commands.CommandSession) (commands.Result, error) {
+		return commands.Result{}, nil
+	}))
+	s.cmdRegistry = registry
+	compacted := make(chan error, 1)
+	go func() { compacted <- s.Compact(context.Background()) }()
+	<-entered
+
+	_, sendErr := s.SendText(t.Context(), "concurrent")
+	assert.ErrorIs(t, sendErr, ErrSessionBusy)
+	_, slashErr := s.SendText(t.Context(), "/noop")
+	assert.ErrorIs(t, slashErr, ErrSessionBusy, "a slash command must not cancel manual compaction")
+	assert.ErrorIs(t, s.Compact(t.Context()), ErrSessionBusy)
+	assert.ErrorIs(t, s.Forget(replyID), ErrSessionBusy)
+	assert.ErrorIs(t, s.SendCustomMessage(t.Context(), CustomMessage{CustomType: "concurrent"}, CustomMessageOptions{}), ErrSessionBusy)
+	assert.False(t, s.State().IsStreaming(), "manual compaction is not an agent turn")
+
+	close(release)
+	require.NoError(t, <-compacted)
+	assert.False(t, s.State().IsStreaming())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	assert.Nil(t, s.cancelFn)
+	assert.False(t, s.manualHistoryOperation)
+}
+
+func TestCloseCancelsAndJoinsManualCompact(t *testing.T) {
+	entered := make(chan struct{})
+	s, replyID := newManualHistorySession(t, func(ctx context.Context) (*ai.AssistantMessage, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	path := s.sessionWriter.Path()
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	compacted := make(chan error, 1)
+	go func() { compacted <- s.Compact(context.Background()) }()
+	<-entered
+
+	require.NoError(t, s.Close(t.Context()))
+	require.ErrorIs(t, <-compacted, context.Canceled)
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+	assert.ErrorContains(t, s.Compact(t.Context()), "session closed")
+	assert.ErrorContains(t, s.Forget(replyID), "session closed")
+}
+
+func TestSlashCompactWaitsForInterruptedRun(t *testing.T) {
+	var calls int
+	s, _ := newManualHistorySession(t, func(context.Context) (*ai.AssistantMessage, error) {
+		calls++
+		return manualHistorySummary(), nil
+	})
+	registry := commands.NewInMemoryRegistry()
+	require.NoError(t, registry.Register(commands.Info{Name: "compact", Description: "compact", Source: commands.Builtin}, func(ctx context.Context, _ string, _ commands.CommandUI, sess commands.CommandSession) (commands.Result, error) {
+		return commands.Result{Output: "compacted"}, sess.Compact(ctx)
+	}))
+	s.cmdRegistry = registry
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.runDone = done
+	s.cancelFn = func() {
+		go func() {
+			s.mu.Lock()
+			s.cancelFn = nil
+			s.runDone = nil
+			s.mu.Unlock()
+			close(done)
+		}()
+	}
+	s.mu.Unlock()
+
+	events, err := s.SendText(t.Context(), "/compact")
+	require.NoError(t, err)
+	var result map[string]any
+	for _, event := range collectSessionEvents(t, events) {
+		if event.Type == "command_result" {
+			result = event.Payload.(map[string]any)
+		}
+	}
+	require.NotNil(t, result)
+	assert.Equal(t, false, result["is_error"], result["output"])
+	assert.Equal(t, 1, calls)
 }
 
 func TestPluginAgentToolRetainsMetadataAndRejectsMalformedSchema(t *testing.T) {
@@ -9062,6 +9361,26 @@ func TestGetAvailableModelsListsOnlyChatModels(t *testing.T) {
 	require.NotEmpty(t, models)
 	for _, listed := range models {
 		require.True(t, listed.Type == "" || listed.Type == "chat", "%s/%s is %s", listed.Provider, listed.ID, listed.Type)
+	}
+}
+
+func TestGetAvailableModelsListsOnlyAuthenticatedProviders(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	credentials := store.NewMemoryBackend(store.Options{})
+	require.NoError(t, credentials.Set(testContext(t), ai.ProviderAnthropic, ai.NewAPIKeyCredential("key")))
+	rt, err := NewRuntime(RuntimeOptions{ModelRegistry: ai.NewModelRegistry(), ExplicitModel: model, CredentialStore: credentials, IgnoreEnv: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{NoSession: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
+	models, err := sess.(*agentSession).GetAvailableModels(testContext(t))
+	require.NoError(t, err)
+	allowed := ai.AuthenticatedProviderSet(testContext(t), credentials)
+	require.True(t, slices.ContainsFunc(models, func(m *ai.Model) bool { return m.Provider == ai.ProviderAnthropic }), "signed-in provider missing")
+	for _, listed := range models {
+		_, ok := allowed[listed.Provider]
+		require.True(t, ok, "%s/%s is listed without credentials", listed.Provider, listed.ID)
 	}
 }
 

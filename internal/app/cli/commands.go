@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/rpc/server"
 	"github.com/urfave/cli/v3"
 )
 
@@ -289,13 +290,6 @@ var sessionsCmd = &cli.Command{
 	},
 }
 
-// RPC command.
-var rpcCmd = &cli.Command{
-	Name:   "rpc",
-	Usage:  "Start RPC server",
-	Action: runRPC,
-}
-
 var workerCmd = &cli.Command{
 	Name:   "worker",
 	Hidden: true,
@@ -324,15 +318,10 @@ var daemonCmd = &cli.Command{
 		A token grants the coordinator user's full instance access, not a separate
 		account or sandbox. Project paths and trust are evaluated on the host.
 		Use 'tau daemon token revoke laptop' to deny further traffic from a
-		device. A static token is changed by restarting the bridge.
-
-		--legacy is a separate connection-owned protocol. It does not support
-		coordinated instances. Run 'tau' or 'tau rpc' without a daemon for
-		standalone TUI or stdio RPC.`,
+		device. A static token is changed by restarting the bridge.`,
 	Flags: []cli.Flag{
 		&cli.StringFlag{Name: "socket", Usage: "Unix socket path"},
-		&cli.BoolFlag{Name: "legacy", Usage: "Use connection-owned legacy RPC instead of coordinated instances"},
-		&cli.StringFlag{Name: "websocket", Usage: "Opt-in WebSocket bridge address (host:port; loopback-only unless --legacy)"},
+		&cli.StringFlag{Name: "websocket", Usage: "Opt-in WebSocket bridge address (loopback host:port)"},
 		&cli.StringFlag{Name: "websocket-token", Usage: "Static bearer token for the WebSocket bridge", Sources: cli.EnvVars("TAU_WEBSOCKET_TOKEN")},
 		&cli.BoolFlag{Name: "systemd-user-unit", Usage: "Print a systemd user unit"},
 	},
@@ -477,7 +466,6 @@ var Commands = []*cli.Command{
 	updateCmd,
 	packagesCmd,
 	sessionsCmd,
-	rpcCmd,
 	daemonCmd,
 	workerCmd,
 	doctorCmd,
@@ -614,6 +602,10 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 		return nil
 	}
 
+	// Do not silently send a prompt when old callers invoke the removed command.
+	if len(args) > 0 && args[0] == "rpc" && !rootPromptDelimiterFromContext(ctx) && !explicitPromptMode(cmd) {
+		return cli.Exit("tau rpc has been removed; use the coordinated client with tau daemon", ExitUserError)
+	}
 	if err := rejectCommandShapedRootArgs(ctx, cmd, args); err != nil {
 		return err
 	}
@@ -624,18 +616,9 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 	messages := cmd.StringSlice("message")
 
 	mode := resolveAppMode(cmd, stdinIsTTY)
-	var prompts []string
-	var fileImages []ai.ContentBlock
-	if mode == "rpc" {
-		if err := validateRpcInput(mode, append(append([]string(nil), args...), messages...), nil); err != nil {
-			return cli.Exit(err.Error(), ExitUserError)
-		}
-	} else {
-		var err error
-		prompts, fileImages, err = buildPromptSequenceWithFiles(args, messages, os.Stdin, stdinIsTTY, cmd.Bool("stdin"))
-		if err != nil {
-			return cli.Exit(fmt.Sprintf("read stdin: %v", err), ExitUserError)
-		}
+	prompts, fileImages, err := buildPromptSequenceWithFiles(args, messages, os.Stdin, stdinIsTTY, cmd.Bool("stdin"))
+	if err != nil {
+		return cli.Exit(fmt.Sprintf("read stdin: %v", err), ExitUserError)
 	}
 
 	// --fork targets an existing session and is mutually exclusive with
@@ -646,9 +629,6 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	switch mode {
-	case "rpc":
-		// --mode rpc routes to the same RPC server as `tau rpc`.
-		return runRPC(ctx, cmd)
 	case "json":
 		code := runConversationJSONWithSignal(ctx, nil, prompts, fileImages)
 		if code != 0 {
@@ -662,7 +642,16 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 		}
 		return nil
 	default:
-		// mode == "interactive"
+		if !cmd.Bool("standalone") {
+			socket := server.SocketPath()
+			client, err := findInteractiveCoordinator(ctx, socket)
+			if err != nil {
+				return cli.Exit(err.Error(), ExitSubsystemError)
+			}
+			if client != nil {
+				return runCoordinatedInteractive(ctx, cmd, client, socket, prompts, fileImages)
+			}
+		}
 		code := runInteractive(ctx, cmd, prompts)
 		if code != 0 {
 			return cli.Exit("", code)
@@ -674,11 +663,9 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 // resolveAppMode returns the AppMode selected by the parsed flags.
 // Precedence:
 //
-//  1. --mode rpc   -> rpc
-//  2. --mode json  -> json
-//  3. --print, or non-TTY stdin (or --stdin), with no explicit --mode,
-//     selects print/text. --json is an alias for --mode json.
-//  4. else (TTY with no --print) -> interactive.
+//  1. --mode text/json, or its --print/--json alias, selects output mode.
+//  2. Non-TTY stdin or --stdin selects text, unless choosing a saved session.
+//  3. Otherwise, use the interactive TUI.
 //
 // Invalid --mode values are rejected by the flag validator at parse time.
 // --json is honored only when --mode is unset, so an explicit --mode text
@@ -686,8 +673,6 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 func resolveAppMode(cmd *cli.Command, stdinIsTTY bool) string {
 	if mode := cmd.String("mode"); mode != "" {
 		switch mode {
-		case "rpc":
-			return "rpc"
 		case "json":
 			return "json"
 		case "text":
@@ -729,32 +714,6 @@ func validateForkConflict(cmd *cli.Command) error {
 	}
 	if cmd.Bool("no-session") {
 		return fmt.Errorf("--fork cannot be combined with --no-session")
-	}
-	return nil
-}
-
-// validateRpcInput returns an error if the resolved mode is rpc and the
-// caller has supplied input that RPC cannot consume. RPC is a long-lived
-// server: positional prompts are dropped on the floor (no completion is
-// running to deliver them to), and @file attachments cannot be expanded
-// because clients should send content through JSON-RPC commands rather
-// than CLI arguments. Both classes of input are user errors and must be
-// reported before the server starts.
-func validateRpcInput(mode string, prompts []string, fileImages []ai.ContentBlock) error {
-	if mode != "rpc" {
-		return nil
-	}
-	if len(prompts) > 0 {
-		return fmt.Errorf(
-			"--mode rpc does not accept positional prompts; " +
-				"send prompts via JSON-RPC after the server starts",
-		)
-	}
-	if len(fileImages) > 0 {
-		return fmt.Errorf(
-			"--mode rpc does not accept @file attachments; " +
-				"send content via JSON-RPC after the server starts",
-		)
 	}
 	return nil
 }

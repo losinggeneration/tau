@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -113,25 +112,7 @@ func TestEditContextRequiresExplicitReplacement(t *testing.T) {
 	}
 }
 
-type responseWriter struct{ responses chan []byte }
-
-func (w *responseWriter) Write(p []byte) (int, error) {
-	w.responses <- bytes.Clone(p)
-	return len(p), nil
-}
-
-func TestRunAdmitsBashAbortAndJoins(t *testing.T) {
-	input, writer := io.Pipe()
-	defer func() {
-		if err := input.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-	defer func() {
-		if err := writer.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
+func TestBashAdmitsAbortAndShutdownJoins(t *testing.T) {
 	started, settled := make(chan struct{}), make(chan struct{})
 	sess := newMockSession("s", "/")
 	sess.bash = func(ctx context.Context, _ string, _ sdk.BashOptions) (sdk.BashExecution, error) {
@@ -140,74 +121,49 @@ func TestRunAdmitsBashAbortAndJoins(t *testing.T) {
 		close(settled)
 		return sdk.BashExecution{Cancelled: true, CancelReason: string(agent.BashCancelUserAbort)}, nil
 	}
-	output := &responseWriter{responses: make(chan []byte, 16)}
-	server := NewServer(nil, nil, nil)
-	server.reader = bufio.NewReader(input)
-	server.writer = output
-	server.session = sess
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- server.Run(ctx) }()
-	send := func(command string) {
+	h := newTestHarness(t, &mockRuntime{}, nil)
+	defer h.close()
+	h.srv.session = sess
+	response := func(id string) Response {
 		t.Helper()
-		written := make(chan error, 1)
-		go func() { _, err := io.WriteString(writer, command+"\n"); written <- err }()
-		select {
-		case err := <-written:
-			if err != nil {
-				t.Fatal(err)
-			}
-		case <-time.After(200 * time.Millisecond):
-			cancel()
-			t.Fatal("RPC input loop blocked command admission")
+		lines := h.readUntil(t, timeout, func(line string) bool {
+			var r Response
+			return json.Unmarshal([]byte(line), &r) == nil && r.Type == "response" && r.ID == id
+		})
+		if len(lines) == 0 {
+			t.Fatalf("no response for %s", id)
 		}
+		var r Response
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &r); err != nil {
+			t.Fatal(err)
+		}
+		return r
 	}
-	send(`{"id":"shell","type":"bash","args":{"command":"wait"}}`)
+
+	h.send(t, `{"id":"shell","type":"bash","args":{"command":"wait"}}`)
 	select {
 	case <-started:
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(time.Second):
 		t.Fatal("shell did not start")
 	}
-	send(`{"id":"second","type":"bash","args":{"command":"wait"}}`)
-	send(`{"id":"abort","type":"abort_bash"}`)
+	h.send(t, `{"id":"second","type":"bash","args":{"command":"wait"}}`)
+	if r := response("second"); r.OK || r.Error == nil || r.Error.Code != "busy" {
+		t.Fatalf("second shell = %+v, want busy", r)
+	}
+	h.send(t, `{"id":"abort","type":"abort_bash"}`)
+	if r := response("abort"); !r.OK || r.Result.(map[string]any)["aborted"] != true {
+		t.Fatalf("abort = %+v", r)
+	}
 	select {
 	case <-settled:
-	case <-time.After(200 * time.Millisecond):
-		cancel()
-		t.Fatal("RPC input loop could not deliver abort while shell was running")
+	case <-time.After(time.Second):
+		t.Fatal("abort did not reach the running shell")
 	}
-	send(`{"id":"shutdown","type":"shutdown"}`)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("server did not join shell")
+	h.send(t, `{"id":"shutdown","type":"shutdown"}`)
+	if r := response("shutdown"); !r.OK {
+		t.Fatalf("shutdown = %+v", r)
 	}
-	var aborted, busy bool
-	for len(output.responses) > 0 {
-		var response struct {
-			ID     string     `json:"id"`
-			Error  *ErrorInfo `json:"error"`
-			Result struct {
-				Aborted bool `json:"aborted"`
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(<-output.responses, &response); err != nil {
-			t.Fatal(err)
-		}
-		switch response.ID {
-		case "abort":
-			aborted = response.Result.Aborted
-		case "second":
-			busy = response.Error != nil && response.Error.Code == "busy"
-		}
-	}
-	if !aborted || !busy {
-		t.Fatalf("aborted=%v busy=%v", aborted, busy)
-	}
+	waitOrFail(t, h.done, timeout, "shutdown joining the shell")
 }
 
 type closeErrorSession struct {
@@ -226,7 +182,7 @@ func (s *closeErrorSession) Close(ctx context.Context) error {
 
 func TestCleanupGivesSessionBoundedLiveContextAfterCancellation(t *testing.T) {
 	sess := &closeErrorSession{Session: newMockSession("cleanup", "/")}
-	s := NewServer(nil, nil, nil)
+	s := newServer(nil, nil, nil)
 	s.session = sess
 	s.writer = io.Discard
 	ctx, cancel := context.WithCancel(t.Context())
@@ -252,7 +208,7 @@ func (w shutdownErrorWriter) Write([]byte) (int, error) { return 0, w.err }
 func TestCleanupReportsSessionAndEventErrors(t *testing.T) {
 	closeErr, writeErr := errors.New("close failed"), errors.New("write failed")
 	sess := &closeErrorSession{Session: newMockSession("cleanup", "/"), err: closeErr}
-	s := NewServer(nil, nil, nil)
+	s := newServer(nil, nil, nil)
 	s.session = sess
 	s.writer = shutdownErrorWriter{err: writeErr}
 	err := s.cleanup(t.Context())
@@ -267,7 +223,7 @@ func TestCleanupReportsSessionAndEventErrors(t *testing.T) {
 func TestRebindSessionReportsPreviousCloseError(t *testing.T) {
 	closeErr := errors.New("close failed")
 	sess := &closeErrorSession{Session: newMockSession("previous", "/"), err: closeErr}
-	s := NewServer(nil, nil, nil)
+	s := newServer(nil, nil, nil)
 	s.session = sess
 	next := newMockSession("next", "/")
 	if err := s.rebindSession(t.Context(), next); !errors.Is(err, closeErr) {
@@ -358,85 +314,6 @@ func TestPromptDispositionsAdmitCommandsWhileRunning(t *testing.T) {
 	h.readUntil(t, timeout, func(line string) bool { return strings.Contains(line, `"agent_end"`) })
 }
 
-func TestSendInterruptCancelsARunWithoutWaitingForInput(t *testing.T) {
-	run := make(chan sdk.Event, 2)
-	sess := newMockSession("s", "/")
-	sess.send = func(context.Context, sdk.Message) (<-chan sdk.Event, error) {
-		run <- sdk.Event{Type: "agent_start"}
-		return run, nil
-	}
-	h := newTestHarness(t, &mockRuntime{}, nil)
-	defer h.close()
-	h.srv.session = sess
-	h.send(t, `{"id":"run","type":"prompt","args":{"text":"work"}}`)
-	h.readUntil(t, timeout, func(line string) bool { return strings.Contains(line, `"agent_start"`) })
-
-	interrupted := make(chan struct{})
-	go func() {
-		defer close(interrupted)
-		h.readUntil(t, timeout, func(line string) bool { return strings.Contains(line, `"type":"interrupt"`) })
-	}()
-	h.srv.SendInterrupt()
-	select {
-	case <-interrupted:
-	case <-time.After(time.Second):
-		t.Fatal("SIGINT waited for the next RPC command before interrupting the run")
-	}
-	if sess.interrupts != 1 {
-		t.Fatalf("interrupts = %d", sess.interrupts)
-	}
-	close(run)
-}
-
-func TestReadCommandProcessesFinalRecordWithoutLF(t *testing.T) {
-	for _, end := range []string{"", "\n", "\r\n"} {
-		s := &Server{reader: bufio.NewReader(strings.NewReader("{\"id\":\"a\u2028b\u2029界\",\"type\":\"get_state\"}" + end))}
-		cmd, err := s.readCommand()
-		if err != nil {
-			t.Fatalf("end %q: %v", end, err)
-		}
-		if cmd.ID != "a\u2028b\u2029界" || cmd.Type != "get_state" {
-			t.Fatalf("command=%+v", cmd)
-		}
-		if _, err := s.readCommand(); !errors.Is(err, io.EOF) {
-			t.Fatalf("expected EOF, got %v", err)
-		}
-	}
-}
-
-func TestReadCommandReportsMalformedFinalRecord(t *testing.T) {
-	s := &Server{reader: bufio.NewReader(strings.NewReader("{\"type\":"))}
-	if _, err := s.readCommand(); err == nil || errors.Is(err, io.EOF) {
-		t.Fatalf("expected JSON error, got %v", err)
-	}
-	if _, err := s.readCommand(); !errors.Is(err, io.EOF) {
-		t.Fatalf("expected EOF, got %v", err)
-	}
-}
-
-func TestRunHandlesFinalCommandBeforeDisconnect(t *testing.T) {
-	var output bytes.Buffer
-	s := NewServer(&mockRuntime{}, nil, nil)
-	s.reader = bufio.NewReader(strings.NewReader(`{"id":"last","type":"unknown"}`))
-	s.writer = &output
-	if err := s.Run(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	var response Response
-	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
-		var r Response
-		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			t.Fatal(err)
-		}
-		if r.ID == "last" {
-			response = r
-		}
-	}
-	if response.ID != "last" || response.OK || response.Error == nil || response.Error.Code != "unknown_command" {
-		t.Fatalf("response=%+v output=%s", response, output.String())
-	}
-}
-
 type reloadableRPCSession struct {
 	sdk.Session
 	called bool
@@ -470,23 +347,8 @@ func TestRPCCommandSessionForwardsResourceReload(t *testing.T) {
 	}
 }
 
-func TestShutdownCommandIsIdempotent(t *testing.T) {
-	s := NewServer(nil, nil, nil)
-	s.writer = io.Discard
-	for range 2 {
-		if err := s.handleShutdown(t.Context(), &Command{ID: "shutdown"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	select {
-	case <-s.shutdown:
-	default:
-		t.Fatal("shutdown was not signaled")
-	}
-}
-
 func TestRPCCommandUIRegistersBeforePublishing(t *testing.T) {
-	s := NewServer(nil, nil, nil)
+	s := newServer(nil, nil, nil)
 	s.ui = ui.NewRPCUI()
 	s.ui.Writer = rpcUIWriter{server: s}
 	// An immediate reply during Write used to arrive before WaitForResponse
@@ -506,11 +368,11 @@ func TestRPCCommandUIRegistersBeforePublishing(t *testing.T) {
 	}
 }
 
-// Stdio keeps its connection-owned reply shape; shared snapshots are
-// coordinated-only.
+// Without a coordinated worker, ui_response keeps its direct reply shape;
+// shared snapshots are coordinated-only.
 func TestLegacyUIResponseKeepsReplyShape(t *testing.T) {
 	var out bytes.Buffer
-	s := NewServer(nil, nil, nil)
+	s := newServer(nil, nil, nil)
 	s.writer = &out
 	s.ui = ui.NewRPCUI()
 	if err := s.handleCommand(t.Context(), &Command{ID: "reply", Type: "ui_response", Args: json.RawMessage(`{"id":"unknown","value":"x"}`)}); err != nil {
@@ -531,7 +393,7 @@ func TestLegacyUIResponseKeepsReplyShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	if list.OK || list.Error == nil || list.Error.Code != "not_supported" {
-		t.Fatalf("stdio get_ui_requests = %+v", list)
+		t.Fatalf("uncoordinated get_ui_requests = %+v", list)
 	}
 }
 
@@ -550,16 +412,16 @@ func (w immediateUIReplyWriter) Write(data []byte) (int, error) {
 }
 
 func TestEmitEventSessionSnapshotDoesNotTakeSessionLock(t *testing.T) {
-	s := NewServer(nil, nil, nil)
+	s := newServer(nil, nil, nil)
 	s.writer = io.Discard
-	s.eventSessionID.Store("initial")
+	s.eventSession.Store(&eventSession{id: "initial"})
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	var wg sync.WaitGroup
 	for range 4 {
 		wg.Go(func() {
 			for range 50 {
-				s.eventSessionID.Store("next")
+				s.eventSession.Store(&eventSession{id: "next"})
 				if err := s.emitEvent(sdk.Event{Type: "queue_update"}); err != nil {
 					t.Error(err)
 				}
@@ -624,7 +486,167 @@ func TestStaleSessionRejectsDraftSubmission(t *testing.T) {
 	}
 }
 
+func TestSendMessageRefusesRetryWhileBusy(t *testing.T) {
+	sess := newMockSession("s", "/")
+	sess.send = func(context.Context, sdk.Message) (<-chan sdk.Event, error) {
+		return nil, fmt.Errorf("send: %w", sdk.ErrSessionBusy)
+	}
+	var output bytes.Buffer
+	s := &Server{writer: &output, session: sess, coordinated: true}
+	send := func(text string) Response {
+		t.Helper()
+		output.Reset()
+		args, err := json.Marshal(map[string]string{"text": text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.handleCommand(t.Context(), &Command{ID: "prompt", Type: "send_message", Args: args}); err != nil {
+			t.Fatal(err)
+		}
+		var reply Response
+		if err := json.Unmarshal(lastResponseLine(output.Bytes()), &reply); err != nil {
+			t.Fatal(err)
+		}
+		return reply
+	}
+	reply := send(" /retry \n")
+	if reply.OK || reply.Error == nil || reply.Error.Code != "busy" || sess.steeringCount != 0 || sess.followUpCount != 0 {
+		t.Fatalf("reply = %+v, queued %d/%d", reply, sess.steeringCount, sess.followUpCount)
+	}
+	if reply := send("/retry please"); !reply.OK || sess.steeringCount != 1 {
+		t.Fatalf("ordinary busy prompt was not steered: reply=%+v queue=%d", reply, sess.steeringCount)
+	}
+}
+
+func TestGetStateReportsSessionSettings(t *testing.T) {
+	sess := newSettingsMockSession("s")
+	sess.autoCompaction, sess.steeringMode, sess.followUpMode, sess.thinkingLevel = true, "one-at-a-time", "all", "medium"
+	var output bytes.Buffer
+	s := &Server{writer: &output, session: sess}
+	var state map[string]any
+	if err := json.Unmarshal(runCommand(t, s, &output, "get_state", `{}`).Result, &state); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]any{
+		"auto_compaction": true,
+		"auto_retry":      false,
+		"steering_mode":   "one-at-a-time",
+		"follow_up_mode":  "all",
+		"thinking_level":  "medium",
+	} {
+		if got, ok := state[key]; !ok || got != want {
+			t.Errorf("%s = %v (present %v), want %v", key, got, ok, want)
+		}
+	}
+
+	s = &Server{writer: &output, session: newMockSession("plain", "/"), thinkingLevel: "low"}
+	state = nil
+	if err := json.Unmarshal(runCommand(t, s, &output, "get_state", `{}`).Result, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["thinking_level"] != "low" {
+		t.Errorf("thinking_level = %v, want the RPC level", state["thinking_level"])
+	}
+	for _, key := range []string{"auto_compaction", "auto_retry", "steering_mode", "follow_up_mode"} {
+		if _, ok := state[key]; ok {
+			t.Errorf("%s reported for a session without settings", key)
+		}
+	}
+}
+
+func TestGetAvailableModelsReportsCapabilities(t *testing.T) {
+	sess := newSettingsMockSession("s")
+	sess.models = []*ai.Model{nil, {ID: "m", Provider: "p", API: "openai-completions", Name: "Model", ContextWindow: 1000}}
+	var output bytes.Buffer
+	s := &Server{writer: &output, session: sess}
+	wantResult(t, runCommand(t, s, &output, "get_available_models", `{}`), `{"models":[{"api":"openai-completions","context_window":1000,"id":"m","name":"Model","provider":"p","reasoning":false,"thinking_levels":["off"]}]}`)
+}
+
 func lastResponseLine(output []byte) []byte {
 	output = bytes.TrimSpace(output)
 	return output[bytes.LastIndexByte(output, '\n')+1:]
+}
+
+type forgetMockSession struct {
+	*mockSession
+	forgot []string
+}
+
+func (s *forgetMockSession) GetForgetEntries() ([]sdk.ForkEntry, error) {
+	return []sdk.ForkEntry{{EntryID: "e1", Role: "user", Text: "first"}}, nil
+}
+
+func (s *forgetMockSession) Forget(entryID string) error {
+	s.forgot = append(s.forgot, entryID)
+	return nil
+}
+
+func TestForkGuardsExpectedSession(t *testing.T) {
+	var out bytes.Buffer
+	rt := &mockRuntime{}
+	original := newMockSession("s", "/")
+	s := &Server{writer: &out, runtime: rt, session: original}
+
+	wantErrorCode(t, runCommand(t, s, &out, "fork", `{"expected_session_id":"previous","entry_id":"e1"}`), "session_changed")
+	if rt.newCount != 0 || s.session != sdk.Session(original) {
+		t.Fatalf("stale fork created %d sessions, active %q", rt.newCount, s.session.ID())
+	}
+
+	wantResult(t, runCommand(t, s, &out, "fork", `{"expected_session_id":"s","entry_id":"e1"}`), `{"ok":true,"session_id":"test-session"}`)
+	if rt.newCount != 1 {
+		t.Fatalf("guarded fork created %d sessions, want 1", rt.newCount)
+	}
+
+	wantResult(t, runCommand(t, s, &out, "fork", `{"entry_id":"e1"}`), `{"ok":true,"session_id":"test-session"}`)
+	if rt.newCount != 2 {
+		t.Fatalf("unguarded fork created %d sessions, want 2", rt.newCount)
+	}
+}
+
+func TestForgetCommands(t *testing.T) {
+	sess := &forgetMockSession{mockSession: newMockSession("s", t.TempDir())}
+	var output bytes.Buffer
+	s := &Server{writer: &output, session: sess, coordinated: true}
+	run := func(typ, args string) []byte {
+		t.Helper()
+		output.Reset()
+		if err := s.handleCommand(t.Context(), &Command{ID: typ, Type: typ, Args: json.RawMessage(args)}); err != nil {
+			t.Fatal(err)
+		}
+		return output.Bytes()
+	}
+
+	var listed struct {
+		Response
+		Result struct {
+			Entries []map[string]string `json:"entries"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(lastResponseLine(run("get_forget_entries", `{"expected_session_id":"s"}`)), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if want := []map[string]string{{"entry_id": "e1", "role": "user", "text": "first"}}; !listed.OK || fmt.Sprint(listed.Result.Entries) != fmt.Sprint(want) {
+		t.Fatalf("entries reply = %s", &output)
+	}
+
+	out := run("forget", `{"expected_session_id":"previous","entry_id":"e1"}`)
+	var reply Response
+	if err := json.Unmarshal(lastResponseLine(out), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.OK || reply.Error == nil || reply.Error.Code != "session_changed" || len(sess.forgot) != 0 {
+		t.Fatalf("stale forget reply = %s, forgot %v", out, sess.forgot)
+	}
+
+	out = run("forget", `{"expected_session_id":"s","entry_id":"e1"}`)
+	lines := bytes.Split(bytes.TrimSpace(out), []byte("\n"))
+	if len(lines) != 2 || !bytes.Contains(lines[0], []byte(`"type":"context_edited"`)) {
+		t.Fatalf("forget output = %s, want context_edited before the reply", out)
+	}
+	if err := json.Unmarshal(lines[1], &reply); err != nil {
+		t.Fatal(err)
+	}
+	if !reply.OK || !slices.Equal(sess.forgot, []string{"e1"}) {
+		t.Fatalf("forget reply = %s, forgot %v", out, sess.forgot)
+	}
 }
