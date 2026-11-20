@@ -10,6 +10,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -22,13 +24,14 @@ const (
 // ErrSlowConsumer reports a peer that stopped draining its outbound queue.
 var ErrSlowConsumer = errors.New("slow consumer: outbound queue full")
 
-// Link is a bounded, bidirectional JSONL frame connection.
+// Link is a bounded, bidirectional frame connection for JSONL or WebSocket.
 //
 // Read must be called from a single goroutine. Send is safe for concurrent
 // use and never blocks: frames queue for a serialized writer, and exceeding
 // the queue bound closes the link rather than dropping frames.
 type Link struct {
 	conn    net.Conn
+	ws      *websocket.Conn
 	scanner *bufio.Scanner
 	out     chan []byte
 	stop    chan struct{}
@@ -48,15 +51,29 @@ type Link struct {
 func NewLink(conn net.Conn) *Link {
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, 4096), MaxFrameBytes)
-	l := &Link{
-		conn:    conn,
-		scanner: scanner,
-		out:     make(chan []byte, maxQueuedFrames),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
-	}
+	l := newLink(conn)
+	l.scanner = scanner
 	go l.writeLoop()
 	return l
+}
+
+// NewWebSocketLink takes ownership of a connected WebSocket. Each text
+// message is one frame; the authenticated bridge sends welcome first.
+func NewWebSocketLink(ws *websocket.Conn) *Link {
+	ws.SetReadLimit(MaxFrameBytes - 1)
+	l := newLink(ws.NetConn())
+	l.ws = ws
+	go l.writeLoop()
+	return l
+}
+
+func newLink(conn net.Conn) *Link {
+	return &Link{
+		conn: conn,
+		out:  make(chan []byte, maxQueuedFrames),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
 }
 
 // Dial connects to the coordinator at path and performs the hello/welcome
@@ -132,6 +149,18 @@ func (l *Link) Read() (Frame, error) {
 // readLine returns the next undecoded line, valid until the next read. A
 // transport error closes the link.
 func (l *Link) readLine() ([]byte, error) {
+	if l.ws != nil {
+		kind, data, err := l.ws.ReadMessage()
+		if err == nil && kind != websocket.TextMessage {
+			err = fmt.Errorf("%w: expected a WebSocket text message", ErrInvalidFrame)
+		} else if errors.Is(err, websocket.ErrReadLimit) {
+			err = ErrFrameTooLarge
+		}
+		if err != nil {
+			l.fail(err)
+		}
+		return data, err
+	}
 	if !l.scanner.Scan() {
 		err := l.scanner.Err()
 		switch {
@@ -264,11 +293,17 @@ func (l *Link) writeLoop() {
 }
 
 func (l *Link) write(data []byte, deadline time.Time) bool {
-	if err := l.conn.SetWriteDeadline(deadline); err != nil {
-		l.fail(fmt.Errorf("set write deadline: %w", err))
-		return false
+	var err error
+	if l.ws == nil {
+		if err := l.conn.SetWriteDeadline(deadline); err != nil {
+			l.fail(fmt.Errorf("set write deadline: %w", err))
+			return false
+		}
+		_, err = l.conn.Write(data)
+	} else if err = l.ws.SetWriteDeadline(deadline); err == nil {
+		err = l.ws.WriteMessage(websocket.TextMessage, data[:len(data)-1])
 	}
-	if _, err := l.conn.Write(data); err != nil {
+	if err != nil {
 		l.fail(fmt.Errorf("write frame: %w", err))
 		return false
 	}

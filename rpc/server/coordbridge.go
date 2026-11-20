@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +45,7 @@ type CoordinatedBridge struct {
 	listener net.Listener
 	server   *http.Server
 	upgrader websocket.Upgrader
+	dial     func(ctx context.Context, socket string, hello coord.Frame) (*coord.Link, coord.Frame, error)
 	// slots bounds concurrent /rpc handlers, including live relays.
 	slots chan struct{}
 	// ctx is set by Run before serving starts and is canceled on shutdown.
@@ -92,6 +92,7 @@ func NewCoordinatedBridge(addr, socket, token string, store *TokenStore) (*Coord
 		addr:     listener.Addr().String(),
 		listener: listener,
 		slots:    make(chan struct{}, maxCoordBridgeClients),
+		dial:     coord.Dial,
 	}
 	b.upgrader = websocket.Upgrader{
 		HandshakeTimeout: coordBridgeIOTimeout,
@@ -182,21 +183,33 @@ func (b *CoordinatedBridge) serveRPC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "websocket upgrade required", http.StatusBadRequest)
 		return
 	}
+	guard := b.guard(token)
 	dialCtx, cancel := context.WithTimeout(b.ctx, coordBridgeIOTimeout)
-	link, welcome, err := coord.Dial(dialCtx, b.socket, coord.Frame{Role: coord.RoleClient})
+	link, welcome, err := b.dial(dialCtx, b.socket, coord.Frame{Role: coord.RoleClient})
 	cancel()
 	if err != nil {
 		http.Error(w, "coordinator unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	conn, err := b.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		if closeErr := link.Close(); closeErr != nil {
-			coordBridgeLog("close coordinator link: %v", closeErr)
-		}
+	// A device revoked while the coordinator dial was pending must not be
+	// upgraded or shown the welcome.
+	if guard != nil && !guard() {
+		closeCoordLink(link)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	b.relay(conn, link, welcome, b.guard(token))
+	conn, err := b.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		closeCoordLink(link)
+		return
+	}
+	b.relay(conn, link, welcome, guard)
+}
+
+func closeCoordLink(link *coord.Link) {
+	if err := link.Close(); err != nil {
+		coordBridgeLog("close coordinator link: %v", err)
+	}
 }
 
 // relay pumps frames both ways until either side closes, the token is
@@ -224,6 +237,10 @@ func (b *CoordinatedBridge) relay(conn *websocket.Conn, link *coord.Link, welcom
 	go func() {
 		defer close(outbound)
 		defer closeAll()
+		if guard != nil && !guard() {
+			sock.closeWith(websocket.ClosePolicyViolation, "token revoked")
+			return
+		}
 		if err := sock.send(welcome); err != nil {
 			return
 		}
@@ -343,18 +360,30 @@ func (s *relaySocket) closeWith(code int, reason string) {
 	}
 }
 
-// coordBridgeToken accepts the legacy bearer header or query token, or a
-// token offered as a subprotocol.
+// coordBridgeToken returns the one credential carried by a bearer header or
+// a token subprotocol. Query tokens are refused so secrets stay out of URLs
+// and logs, and ambiguous or non-bearer credentials yield no token.
 func coordBridgeToken(r *http.Request) string {
-	if token := bearerToken(r); token != "" {
-		return token
+	if r.URL.Query().Has("token") {
+		return ""
+	}
+	var tokens []string
+	for _, header := range r.Header.Values("Authorization") {
+		token, ok := strings.CutPrefix(header, "Bearer ")
+		if !ok {
+			return ""
+		}
+		tokens = append(tokens, token)
 	}
 	for _, protocol := range websocket.Subprotocols(r) {
 		if token, ok := strings.CutPrefix(protocol, CoordTokenSubprotocolPrefix); ok {
-			return token
+			tokens = append(tokens, token)
 		}
 	}
-	return ""
+	if len(tokens) != 1 {
+		return ""
+	}
+	return tokens[0]
 }
 
 func (b *CoordinatedBridge) authorized(token string) bool {
@@ -402,18 +431,30 @@ func loopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// sameOrigin admits clients without an Origin, such as local tools, and
-// browsers only from the page this bridge serves.
+// sameOrigin admits native clients that send no Origin header, and browsers
+// only when exactly one Origin names the canonical loopback origin of the
+// page this bridge serves: same scheme, host and port, with no path or
+// other decoration. Opaque ("null"), empty and repeated origins fail.
 func sameOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
 		return true
 	}
-	u, err := url.Parse(origin)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+	if len(origins) != 1 {
 		return false
 	}
-	return strings.EqualFold(u.Host, r.Host)
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host
+	}
+	if !loopbackHost(host) {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return origins[0] == scheme+"://"+r.Host
 }
 
 func coordBridgeLog(format string, args ...any) {

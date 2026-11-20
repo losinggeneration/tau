@@ -24,6 +24,7 @@ var (
 	errExpiredLaunchIntent = errNoReceipts
 	errLegacyLaunchIntent  = errNoReceipts
 	errFutureLaunchIntent  = errNoReceipts
+	errStaleLaunchIntent   = errNoReceipts
 	errReceiptLimit        = errNoReceipts
 )
 

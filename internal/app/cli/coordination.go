@@ -148,7 +148,7 @@ func workerEnvironment(env []string, node string, request coord.LaunchRequest) [
 	for _, entry := range env {
 		name, _, _ := strings.Cut(entry, "=")
 		// PWD describes the coordinator's directory, not the worker's.
-		if name == "PWD" || slices.Contains(workerLaunchVariables, name) {
+		if name == "PWD" || name == "TAU_WEBSOCKET_TOKEN" || slices.Contains(workerLaunchVariables, name) {
 			continue
 		}
 		out = append(out, entry)

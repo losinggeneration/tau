@@ -306,6 +306,29 @@ var workerCmd = &cli.Command{
 var daemonCmd = &cli.Command{
 	Name:  "daemon",
 	Usage: "Start the local instance coordinator",
+	Description: `The coordinator uses a private Unix socket by default. To use the
+		browser or Go client over SSH, start the bridge and create a device token
+		on the coordinator host:
+
+		  tau daemon --websocket 127.0.0.1:8765
+		  tau daemon token add laptop
+
+		From the client, forward a loopback port over SSH with host-key checking:
+
+		  ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8765:127.0.0.1:8765 user@host
+
+		Open http://127.0.0.1:8765/ and enter the token. The browser's Origin
+		must match the bridge page's scheme, host and port exactly. Native clients
+		can omit Origin and use a bearer header at ws://127.0.0.1:8765/rpc.
+		Tokens in URLs are not accepted. Keep both ends bound to loopback.
+		A token grants the coordinator user's full instance access, not a separate
+		account or sandbox. Project paths and trust are evaluated on the host.
+		Use 'tau daemon token revoke laptop' to deny further traffic from a
+		device. A static token is changed by restarting the bridge.
+
+		--legacy is a separate connection-owned protocol. It does not support
+		coordinated instances. Run 'tau' or 'tau rpc' without a daemon for
+		standalone TUI or stdio RPC.`,
 	Flags: []cli.Flag{
 		&cli.StringFlag{Name: "socket", Usage: "Unix socket path"},
 		&cli.BoolFlag{Name: "legacy", Usage: "Use connection-owned legacy RPC instead of coordinated instances"},

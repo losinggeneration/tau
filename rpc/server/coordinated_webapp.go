@@ -24,9 +24,21 @@ function uuid4() {
     b[8] = (b[8] & 0x3f) | 0x80;
     return uuidString(b);
 }
+// launchClock anchors launch IDs to the coordinator's welcome time plus local
+// monotonic elapsed time, so a wrong browser clock cannot push them outside
+// the coordinator's receipt window. Older coordinators omit the time.
+let launchClock = null;
+function monotonic() { return globalThis.performance?.now ? performance.now() : Date.now(); }
+function anchorLaunchClock(at) {
+    launchClock = Number.isSafeInteger(at) && at > 0 ? {at, mono: monotonic()} : null;
+}
+function launchNow() {
+    if (!launchClock) return Date.now();
+    return launchClock.at + Math.max(0, Math.floor(monotonic() - launchClock.mono));
+}
 function launchRequestID() {
     const b = crypto.getRandomValues(new Uint8Array(16));
-    let ms = Date.now();
+    let ms = launchNow();
     for (let i = 5; i >= 0; i--, ms = Math.floor(ms / 256)) b[i] = ms % 256;
     b[6] = (b[6] & 0x0f) | 0x70;
     b[8] = (b[8] & 0x3f) | 0x80;
@@ -134,10 +146,8 @@ function open() {
     fatal = "";
     const url = new URL("/rpc", location.href);
     url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const proto = ["tau.coord.v1"];
-    if (/^[A-Za-z0-9!#$%&'*+.^_+-]+$/.test(token)) proto.push("tau.token." + token);
-    else url.searchParams.set("token", token);
-    const socket = ws = new WebSocket(url, proto);
+    if (!/^[A-Za-z0-9!#$%&'*+.^_+-]+$/.test(token)) throw new Error("Use a device token or a browser-compatible static token");
+    const socket = ws = new WebSocket(url, ["tau.coord.v1", "tau.token." + token]);
     status("Connecting…");
     socket.onclose = e => {
         if (ws !== socket) return;
@@ -168,6 +178,7 @@ function frame(f, socket, size) {
     if (f.type === "welcome") {
         if (f.role !== "client" || f.version !== 1) { fatal = "Unsupported coordinator protocol"; socket.close(); return; }
         launchIDVersion = f.launch_request_version;
+        anchorLaunchClock(f.coordinator_time_unix_ms);
         ready = true;
         status("Connected");
         // A watch lost to a close is retried by reconnecting; keep that status.
@@ -779,6 +790,8 @@ on("start", async () => {
             noteOutcome(request_id, "Start in " + cwd + ": outcome unknown (request " + request_id + "). It was not retried; it is reported here if it appears.");
             reconcileStarts();
         }
+        // A clock refusal is definite: the ID was never recorded and nothing started.
+        if (err.code === "clock_skew") throw failure("Start refused: " + err.message + ". No instance was started.", {code: err.code, rejected: true});
         throw err;
     }
     await select(r.instance.instance_id);

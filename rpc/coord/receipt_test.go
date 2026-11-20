@@ -77,6 +77,61 @@ func TestNewReceiptStoreRejectsIntentsFromBeforeItExisted(t *testing.T) {
 	}
 }
 
+func TestLaunchReceiptClockRefusalsOnlyCoverUnrecordedIntents(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "receipts")
+	store, err := openReceiptStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	old := now.Add(-3 * launchReceiptTTL).Truncate(time.Millisecond)
+	if err := store.saveCutoff(old); err != nil {
+		t.Fatal(err)
+	}
+	if store, err = openReceiptStore(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		issued time.Time
+		want   error
+	}{
+		{"before durable cutoff", old.Add(-time.Hour), errExpiredLaunchIntent},
+		{"at durable cutoff", old, errExpiredLaunchIntent},
+		{"stale after cutoff", now.Add(-2 * launchReceiptTTL), errStaleLaunchIntent},
+		{"future", now.Add(launchClockSkew + time.Minute), errFutureLaunchIntent},
+	} {
+		if err := store.check(receiptKey("", launchIDAt(tc.issued)), now); !errors.Is(err, tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.name, err, tc.want)
+		}
+	}
+
+	// A recorded intent never reports a clock refusal, before or after pruning.
+	key := receiptKey("", launchIDAt(now))
+	life, err := store.create(key, launchReceipt{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(2 * launchReceiptTTL)
+	if err := store.check(key, later); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("recorded intent after the window: %v", err)
+	}
+	if err := store.check(key, now.Add(-time.Hour)); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("recorded intent seen from a slow clock: %v", err)
+	}
+	if err := life.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.prune(later); err != nil {
+		t.Fatal(err)
+	}
+	for _, at := range []time.Time{later, now, now.Add(-time.Hour)} {
+		if err := store.check(key, at); !errors.Is(err, errExpiredLaunchIntent) {
+			t.Fatalf("pruned intent at %v: %v", at, err)
+		}
+	}
+}
+
 func launchIDAt(now time.Time) string {
 	id := uuid.Must(uuid.NewV7())
 	ms := now.UnixMilli()

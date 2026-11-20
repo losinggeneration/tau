@@ -78,6 +78,10 @@ const (
 	CodeWorkerLinkLost     = "worker_link_lost"
 	CodeConflict           = "conflict"
 	CodeBusy               = "busy"
+	// CodeClockSkew definitely refuses a launch request ID whose timestamp is
+	// outside the receipt window although it was never recorded. Nothing was
+	// started; a new ID from a corrected clock may be used.
+	CodeClockSkew = "clock_skew"
 	// CodeLegacyProtocol answers a legacy RPC command sent in place of hello.
 	CodeLegacyProtocol = "unsupported_protocol"
 )
@@ -150,6 +154,11 @@ type Frame struct {
 	// LaunchRequestVersion advertises the preferred UUID version for new starts.
 	// An absent value means UUIDv4.
 	LaunchRequestVersion int `json:"launch_request_version,omitempty"`
+	// CoordinatorTimeUnixMS is the coordinator's wall clock when it sent a
+	// client welcome. Clients derive UUIDv7 launch IDs from it plus their own
+	// monotonic elapsed time, so their wall clock does not matter. An absent
+	// value means an older coordinator; use the local clock.
+	CoordinatorTimeUnixMS int64 `json:"coordinator_time_unix_ms,omitempty"`
 }
 
 // Position identifies a point in one worker's event stream. Offset zero is
@@ -277,6 +286,9 @@ func (f *Frame) validate() error {
 	}
 	if len(f.CWD) > maxTextBytes {
 		return fmt.Errorf("%w: cwd exceeds %d bytes", ErrInvalidFrame, maxTextBytes)
+	}
+	if f.CoordinatorTimeUnixMS < 0 {
+		return fmt.Errorf("%w: negative coordinator time", ErrInvalidFrame)
 	}
 	if f.Error != nil && (len(f.Error.Code) > maxIDBytes || len(f.Error.Message) > maxTextBytes) {
 		return fmt.Errorf("%w: error exceeds limits", ErrInvalidFrame)

@@ -6,10 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 
 	"github.com/losinggeneration/tau/rpc/coord"
 )
@@ -175,6 +180,7 @@ type CoordinatedClient struct {
 	link     *coord.Link
 	clientID string
 	welcome  coord.Frame
+	welcomed time.Time
 	events   chan coord.Frame
 	done     chan struct{}
 
@@ -222,10 +228,73 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int, opts ...
 		}
 		return nil, err
 	}
+	return newCoordinatedClient(link, welcome, clientID, eventBuffer), nil
+}
+
+// NewCoordinatedWebSocketClient connects to the authenticated bridge's /rpc
+// endpoint. Use ws on loopback through an SSH forward, or wss with a trusted
+// TLS certificate. The bridge assigns a new client identity on each dial.
+func NewCoordinatedWebSocketClient(ctx context.Context, endpoint, token string) (_ *CoordinatedClient, err error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Path != "/rpc" || u.Hostname() == "" {
+		return nil, errors.New("expected a WebSocket /rpc endpoint without credentials, query or fragment")
+	}
+	if u.Scheme == "ws" {
+		host := u.Hostname()
+		ip, err := netip.ParseAddr(host)
+		if !strings.EqualFold(host, "localhost") && (err != nil || !ip.IsLoopback()) {
+			return nil, errors.New("plaintext WebSocket requires a loopback endpoint; use an SSH forward or wss")
+		}
+	} else if u.Scheme != "wss" {
+		return nil, errors.New("expected a ws or wss endpoint")
+	}
+	if strings.TrimSpace(token) == "" || strings.ContainsAny(token, "\r\n") {
+		return nil, errors.New("a valid WebSocket bearer token is required")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	dialer := websocket.Dialer{Subprotocols: []string{"tau.coord.v1"}}
+	ws, response, err := dialer.DialContext(ctx, u.String(), http.Header{"Authorization": {"Bearer " + token}})
+	if err != nil {
+		if response != nil {
+			return nil, errors.Join(fmt.Errorf("WebSocket upgrade failed (HTTP %d): %w", response.StatusCode, err), response.Body.Close())
+		}
+		return nil, fmt.Errorf("dial coordinated WebSocket: %w", err)
+	}
+	link := coord.NewWebSocketLink(ws)
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, link.Close())
+		}
+	}()
+	if ws.Subprotocol() != "tau.coord.v1" {
+		return nil, fmt.Errorf("%w: missing coordinated WebSocket subprotocol", coord.ErrInvalidFrame)
+	}
+	stop := context.AfterFunc(ctx, func() {
+		if err := ws.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			return // Read reports the connection failure.
+		}
+	})
+	defer stop()
+	welcome, err := link.Read()
+	if !stop() {
+		return nil, fmt.Errorf("read WebSocket welcome: %w", ctx.Err())
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read WebSocket welcome: %w", err)
+	}
+	if welcome.Type != coord.TypeWelcome || welcome.Version != coord.Version || welcome.Role != coord.RoleClient || welcome.ClientID == "" {
+		return nil, fmt.Errorf("%w: unexpected WebSocket welcome", coord.ErrInvalidFrame)
+	}
+	return newCoordinatedClient(link, welcome, welcome.ClientID, coordinatedEventBuffer), nil
+}
+
+func newCoordinatedClient(link *coord.Link, welcome coord.Frame, clientID string, eventBuffer int) *CoordinatedClient {
 	c := &CoordinatedClient{
 		link:     link,
 		clientID: clientID,
 		welcome:  welcome,
+		welcomed: time.Now(),
 		events:   make(chan coord.Frame, eventBuffer),
 		done:     make(chan struct{}),
 		closed:   make(chan struct{}),
@@ -233,10 +302,10 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int, opts ...
 		stages:   make(map[string]*liveStage),
 	}
 	go c.readLoop()
-	return c, nil
+	return c
 }
 
-// ClientID returns the ID this client announced in its hello.
+// ClientID returns the identity announced by a local client or assigned by the bridge.
 func (c *CoordinatedClient) ClientID() string {
 	return c.clientID
 }
@@ -314,7 +383,7 @@ func (c *CoordinatedClient) StartInstance(ctx context.Context, cwd string) (*coo
 }
 
 // StartInstanceWithRequestID is StartInstance under the caller's request ID,
-// which should come from NewLaunchRequestID on a recoverable coordinator.
+// which should come from c.NewStartRequestID.
 // An empty ID uses the UUID version advertised at handshake. The started
 // instance reports it as LaunchRequestID. A recoverable coordinator records
 // the ID before spawning. Reusing it can return the matching live worker,
@@ -324,11 +393,7 @@ func (c *CoordinatedClient) StartInstance(ctx context.Context, cwd string) (*coo
 // coordinator. Other mutations do not deduplicate.
 func (c *CoordinatedClient) StartInstanceWithRequestID(ctx context.Context, cwd, requestID string) (*coord.Instance, error) {
 	if requestID == "" {
-		if c.welcome.LaunchRequestVersion == 7 {
-			requestID = NewLaunchRequestID()
-		} else {
-			requestID = NewRequestID()
-		}
+		requestID = c.NewStartRequestID()
 	} else if !coord.ValidLaunchRequestID(requestID) {
 		return nil, ErrInvalidRequestID
 	}
@@ -340,6 +405,26 @@ func (c *CoordinatedClient) StartInstanceWithRequestID(ctx context.Context, cwd,
 		return nil, fmt.Errorf("start instance: %w: reply missing instance", coord.ErrInvalidFrame)
 	}
 	return reply.Instance, nil
+}
+
+// NewStartRequestID makes a launch ID using the format and clock advertised
+// in Welcome. Persist it before sending if you may need to reconcile a lost reply.
+func (c *CoordinatedClient) NewStartRequestID() string {
+	if c.welcome.LaunchRequestVersion != 7 {
+		return NewRequestID()
+	}
+	ms := c.welcome.CoordinatorTimeUnixMS
+	if ms == 0 {
+		return NewLaunchRequestID()
+	}
+	ms += time.Since(c.welcomed).Milliseconds()
+	id := uuid.New()
+	for i := 5; i >= 0; i-- {
+		id[i] = byte(ms)
+		ms >>= 8
+	}
+	id[6] = id[6]&0x0f | 0x70
+	return id.String()
 }
 
 // Attach subscribes to events from instanceID.

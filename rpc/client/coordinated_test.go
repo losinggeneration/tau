@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/losinggeneration/tau/rpc/coord"
 )
 
@@ -119,6 +123,69 @@ func testContext(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+func TestCoordinatedWebSocketClient(t *testing.T) {
+	const token = "device-token"
+	const serverMS int64 = 1735689600000
+	upgrader := websocket.Upgrader{Subprotocols: []string{"tau.coord.v1"}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rpc" || r.URL.RawQuery != "" || r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() {
+			if err := ws.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if err := ws.WriteJSON(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, ClientID: "bridge-assigned", Generation: "generation", LaunchRequestVersion: 7, CoordinatorTimeUnixMS: serverMS}); err != nil {
+			t.Error(err)
+			return
+		}
+		var frame coord.Frame
+		if err := ws.ReadJSON(&frame); err != nil {
+			t.Error(err)
+			return
+		}
+		u, err := uuid.Parse(frame.RequestID)
+		sec, ns := u.Time().UnixTime()
+		issued := time.Unix(sec, ns).UnixMilli()
+		if frame.Type != coord.TypeStartInstance || frame.CWD != "/project" || frame.ID == "" || err != nil || u.Version() != 7 || issued < serverMS || issued > serverMS+2_000 {
+			t.Errorf("unexpected start frame: %+v (issued %d)", frame, issued)
+		}
+		inst := coord.Instance{ID: "worker", LaunchRequestID: frame.RequestID, CWD: frame.CWD}
+		if err := ws.WriteJSON(coord.Frame{Type: coord.TypeResponse, ID: frame.ID, InstanceID: inst.ID, Instance: &inst}); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer srv.Close()
+	endpoint := "ws" + strings.TrimPrefix(srv.URL, "http") + "/rpc"
+	ctx := testContext(t)
+	if _, err := NewCoordinatedWebSocketClient(ctx, endpoint, "wrong-token"); err == nil || strings.Contains(err.Error(), "wrong-token") {
+		t.Fatalf("unauthorized dial error: %v", err)
+	}
+	c, err := NewCoordinatedWebSocketClient(ctx, endpoint, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if c.ClientID() != "bridge-assigned" || c.Generation() != "generation" {
+		t.Fatalf("welcome: %+v", c.Welcome())
+	}
+	inst, err := c.StartInstance(ctx, "/project")
+	if err != nil || inst.ID != "worker" {
+		t.Fatalf("start: %+v, %v", inst, err)
+	}
 }
 
 func TestCoordinatedClientHandshakeSendsStableClientID(t *testing.T) {

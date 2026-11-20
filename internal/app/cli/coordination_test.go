@@ -104,10 +104,10 @@ func TestWorkerLaunchDoesNotInheritTrustOverride(t *testing.T) {
 }
 
 func TestWorkerEnvironmentDropsCoordinatorPWD(t *testing.T) {
-	env := workerEnvironment([]string{"PWD=/coordinator", "PWDX=keep", "PATH=/bin"}, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"})
+	env := workerEnvironment([]string{"PWD=/coordinator", "TAU_WEBSOCKET_TOKEN=bridge-only", "PWDX=keep", "PATH=/bin"}, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"})
 	for _, entry := range env {
-		if strings.HasPrefix(entry, "PWD=") {
-			t.Fatalf("coordinator PWD inherited: %q", env)
+		if strings.HasPrefix(entry, "PWD=") || strings.HasPrefix(entry, "TAU_WEBSOCKET_TOKEN=") {
+			t.Fatalf("coordinator-only environment inherited: %q", env)
 		}
 	}
 	if !slices.Contains(env, "PWDX=keep") {

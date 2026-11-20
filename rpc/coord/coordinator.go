@@ -318,7 +318,7 @@ func (co *coordinator) serveClient(link *Link, identity string) {
 	if co.receipts != nil {
 		launchVersion = 7
 	}
-	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleClient, LaunchRequestVersion: launchVersion, Generation: co.generation, PID: os.Getpid(), ClientID: c.identity, Operations: []string{TypeListInstances, TypeWatchInstances, TypeUnwatchInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance}, Limits: protocolLimits()})
+	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleClient, LaunchRequestVersion: launchVersion, CoordinatorTimeUnixMS: time.Now().UnixMilli(), Generation: co.generation, PID: os.Getpid(), ClientID: c.identity, Operations: []string{TypeListInstances, TypeWatchInstances, TypeUnwatchInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance}, Limits: protocolLimits()})
 	co.mu.Unlock()
 	defer co.dropClient(c)
 
@@ -814,7 +814,8 @@ func (co *coordinator) runLaunch(c *client, f Frame, id string) {
 
 func (co *coordinator) replyReceiptError(c *client, f Frame, err error) {
 	switch {
-	case errors.Is(err, os.ErrExist), errors.Is(err, errExpiredLaunchIntent):
+	case errors.Is(err, os.ErrExist), errors.Is(err, errExpiredLaunchIntent),
+		errors.Is(err, errFutureLaunchIntent), errors.Is(err, errStaleLaunchIntent):
 		// Registration may have completed while the receipt was being checked.
 		if f.RequestID != "" {
 			for _, w := range co.workers {
@@ -824,8 +825,14 @@ func (co *coordinator) replyReceiptError(c *client, f Frame, err error) {
 				}
 			}
 		}
+	}
+	switch {
+	case errors.Is(err, os.ErrExist), errors.Is(err, errExpiredLaunchIntent):
 		replyError(c, f, CodeOutcomeUnknown, "launch intent was recorded or is outside the receipt window; check the registry")
-	case errors.Is(err, errFutureLaunchIntent), errors.Is(err, errLegacyLaunchIntent):
+	case errors.Is(err, errFutureLaunchIntent), errors.Is(err, errStaleLaunchIntent):
+		// No receipt exists and the durable cutoff proves none was pruned.
+		replyError(c, f, CodeClockSkew, err.Error())
+	case errors.Is(err, errLegacyLaunchIntent):
 		replyError(c, f, CodeInvalidFrame, err.Error())
 	case errors.Is(err, errReceiptLimit):
 		replyError(c, f, CodeLimitExceeded, err.Error())

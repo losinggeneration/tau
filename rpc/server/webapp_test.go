@@ -70,6 +70,7 @@ func TestCoordinatedWebAppServesInstanceController(t *testing.T) {
 				"event_omitted", "worker_link_lost", "STAGE_FRAMES", "STAGE_BYTES", "HISTORY_MAX",
 				"textRevision", "filesRevision", "uploads.delete(file)",
 				"link_state", "f.generation", "RECONNECT_MAX_MS", "RECONNECT_ATTEMPTS",
+				"coordinator_time_unix_ms", "clock_skew",
 			},
 			[]string{`"get_messages"`, `"get_ui_requests"`, `"get_state"`},
 		},
@@ -204,6 +205,41 @@ func TestCoordinatedWebAppLaunchIntentUsesUUIDv7(t *testing.T) {
  const id = launch.request_id;
  check(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id), "not a UUIDv7");
  check(Math.abs(Date.now() - parseInt(id.slice(0, 8) + id.slice(9, 13), 16)) < 5000, "missing issuance timestamp");`)
+}
+
+func TestCoordinatedWebAppLaunchIntentUsesCoordinatorClock(t *testing.T) {
+	step := runCoordinatedWebApp(t)
+	step(`var mono = 1000; globalThis.performance = {now: () => mono}; var coordMS = Date.now() - 3 * 24 * 3600 * 1000;`)
+	step(`$el("token").value = "tok"; $el("connect").onclick();`)
+	step(`sock().readyState = 1; deliver({type: "welcome", version: 1, role: "client", generation: "gen", launch_request_version: 7, coordinator_time_unix_ms: coordMS});`)
+	step(`answer(op("watch_instances"), {generation: "gen", instances: []});`)
+	step(`mono = 6250.7; $el("cwd").value = "/project"; $el("start").onclick();`)
+	step(`
+		var idTime = id => parseInt(id.slice(0, 8) + id.slice(9, 13), 16);
+		var first = mutations().at(-1);
+		check(first && first.type === "start_instance", "start not sent");
+		check(idTime(first.request_id) === coordMS + 5250, "launch ID not from coordinator time: " + (idTime(first.request_id) - coordMS));
+		answer(op("start_instance"), {error: {code: "clock_skew", message: "launch intent is older than the receipt window and was never recorded"}});
+	`)
+	step(`
+		check($el("status").textContent.includes("No instance was started"), "clock refusal not reported as definite");
+		check(!$el("outcomes").textContent.includes(first.request_id), "definite refusal reported as unknown");
+		mono = 7000; $el("start").onclick();
+	`)
+	step(`
+		var second = mutations().at(-1);
+		check(second.request_id !== first.request_id && idTime(second.request_id) === coordMS + 6000, "retry after refusal did not use a fresh coordinator-time ID");
+		answer(op("start_instance"), {error: {code: "outcome_unknown", message: "launch intent already recorded"}});
+	`)
+	step(`
+		check($el("outcomes").textContent.includes(second.request_id), "unknown start lost its original request ID");
+		check(mutations().filter(op("start_instance")).length === 2, "unknown start was resent");
+	`)
+	// A reconnect to an older coordinator falls back to the local clock.
+	step(`drop(1001); fireTimers();`)
+	step(`sock().readyState = 1; deliver({type: "welcome", version: 1, role: "client", generation: "gen", launch_request_version: 7});`)
+	step(`answer(op("watch_instances"), {generation: "gen", instances: []}); $el("start").onclick();`)
+	step(`check(Math.abs(Date.now() - idTime(mutations().at(-1).request_id)) < 5000, "old coordinator did not use the local clock");`)
 }
 
 func TestCoordinatedWebAppReattachesAfterCoordinatorRestart(t *testing.T) {

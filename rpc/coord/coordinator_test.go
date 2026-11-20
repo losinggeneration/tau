@@ -1175,7 +1175,12 @@ func TestRecoveredLaunchDoesNotSpawnAgain(t *testing.T) {
 	if welcome.LaunchRequestVersion != 7 {
 		t.Fatalf("recoverable coordinator advertised launch ID version %d", welcome.LaunchRequestVersion)
 	}
+	if skew := time.Since(time.UnixMilli(welcome.CoordinatorTimeUnixMS)); skew < 0 || skew > testTimeout {
+		t.Fatalf("welcome coordinator time is %v from now", skew)
+	}
 	wantError(t, request(t, first, Frame{Type: TypeStartInstance, ID: "v4", RequestID: uuid.NewString(), CWD: alias}), "v4", CodeInvalidFrame)
+	future := launchIDAt(time.Now().Add(launchClockSkew + time.Hour))
+	wantError(t, request(t, first, Frame{Type: TypeStartInstance, ID: "future", RequestID: future, CWD: alias}), "future", CodeClockSkew)
 	reqID := launchIDAt(time.Now().Add(time.Second))
 	mustSend(t, first, Frame{Type: TypeStartInstance, ID: "start", RequestID: reqID, CWD: alias})
 	var hello Frame

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +55,12 @@ func relaySocketDir(t *testing.T) string {
 // fake worker, plus a coordinated bridge in front of it.
 func startRelay(t *testing.T) *relayHarness {
 	t.Helper()
+	return startRelayWith(t, nil)
+}
+
+// startRelayWith lets configure adjust the bridge before it serves.
+func startRelayWith(t *testing.T, configure func(*relayHarness)) *relayHarness {
+	t.Helper()
 	h := &relayHarness{
 		socket:  filepath.Join(relaySocketDir(t), "c.sock"),
 		cwd:     t.TempDir(),
@@ -103,6 +110,9 @@ func startRelay(t *testing.T) *relayHarness {
 		t.Fatalf("new coordinated bridge: %v", err)
 	}
 	h.bridge = bridge
+	if configure != nil {
+		configure(h)
+	}
 	bridgeCtx, stopBridge := context.WithCancel(context.Background())
 	bridgeDone := make(chan error, 1)
 	go func() { bridgeDone <- bridge.Run(bridgeCtx) }()
@@ -384,8 +394,13 @@ func TestCoordinatedBridgeRejectsUnauthorizedRequests(t *testing.T) {
 		want   int
 	}{
 		{"no token", h.url(), nil, http.StatusUnauthorized},
-		{"wrong token", h.url() + "?token=nope", nil, http.StatusUnauthorized},
+		{"wrong token", h.url(), http.Header{"Authorization": {"Bearer nope"}}, http.StatusUnauthorized},
+		{"valid query token", h.url() + "?token=" + h.static, nil, http.StatusUnauthorized},
+		{"query token beside header", h.url() + "?token=" + h.static, http.Header{"Authorization": {"Bearer " + h.static}}, http.StatusUnauthorized},
 		{"foreign origin", h.url(), http.Header{"Authorization": {"Bearer " + h.static}, "Origin": {"http://evil.example"}}, http.StatusForbidden},
+		{"cross-scheme origin", h.url(), http.Header{"Authorization": {"Bearer " + h.static}, "Origin": {"https://" + h.bridge.Addr()}}, http.StatusForbidden},
+		{"null origin", h.url(), http.Header{"Authorization": {"Bearer " + h.static}, "Origin": {"null"}}, http.StatusForbidden},
+		{"repeated origin", h.url(), http.Header{"Authorization": {"Bearer " + h.static}, "Origin": {"http://" + h.bridge.Addr(), "http://" + h.bridge.Addr()}}, http.StatusForbidden},
 		{"rebound host", h.url(), http.Header{"Authorization": {"Bearer " + h.static}, "Host": {"evil.example"}}, http.StatusForbidden},
 	}
 	for _, tc := range cases {
@@ -402,8 +417,9 @@ func TestCoordinatedBridgeRejectsUnauthorizedRequests(t *testing.T) {
 			}
 		})
 	}
-	// A same-origin page using the existing query credential still connects.
-	conn, resp, err := websocket.DefaultDialer.Dial(h.url()+"?token="+h.static, http.Header{"Origin": {"http://" + h.bridge.Addr()}})
+	// A same-origin page offering its credential as a subprotocol connects.
+	dialer := &websocket.Dialer{Subprotocols: []string{CoordSubprotocol, CoordTokenSubprotocolPrefix + h.static}}
+	conn, resp, err := dialer.Dial(h.url(), http.Header{"Origin": {"http://" + h.bridge.Addr()}})
 	if err != nil {
 		t.Fatalf("same-origin dial: %v (%v)", err, resp)
 	}
@@ -414,6 +430,115 @@ func TestCoordinatedBridgeRejectsUnauthorizedRequests(t *testing.T) {
 	}()
 	if welcome, _ := relayRead(t, conn); welcome["type"] != coord.TypeWelcome {
 		t.Fatalf("same-origin connection received %v", welcome)
+	}
+}
+
+func TestCoordinatedBridgeOriginPolicy(t *testing.T) {
+	cases := []struct {
+		name    string
+		host    string
+		origins []string
+		want    bool
+	}{
+		{"native client without origin", "127.0.0.1:8080", nil, true},
+		{"same origin", "127.0.0.1:8080", []string{"http://127.0.0.1:8080"}, true},
+		{"same localhost origin", "localhost:8080", []string{"http://localhost:8080"}, true},
+		{"same ipv6 origin", "[::1]:8080", []string{"http://[::1]:8080"}, true},
+		{"https scheme", "127.0.0.1:8080", []string{"https://127.0.0.1:8080"}, false},
+		{"websocket scheme", "127.0.0.1:8080", []string{"ws://127.0.0.1:8080"}, false},
+		{"uppercase scheme", "127.0.0.1:8080", []string{"HTTP://127.0.0.1:8080"}, false},
+		{"other port", "127.0.0.1:8080", []string{"http://127.0.0.1:8081"}, false},
+		{"missing port", "127.0.0.1:8080", []string{"http://127.0.0.1"}, false},
+		{"other loopback name", "127.0.0.1:8080", []string{"http://localhost:8080"}, false},
+		{"foreign host", "127.0.0.1:8080", []string{"http://evil.example:8080"}, false},
+		{"trailing slash", "127.0.0.1:8080", []string{"http://127.0.0.1:8080/"}, false},
+		{"path", "127.0.0.1:8080", []string{"http://127.0.0.1:8080/rpc"}, false},
+		{"query", "127.0.0.1:8080", []string{"http://127.0.0.1:8080?x=1"}, false},
+		{"userinfo", "127.0.0.1:8080", []string{"http://user@127.0.0.1:8080"}, false},
+		{"padded", "127.0.0.1:8080", []string{" http://127.0.0.1:8080"}, false},
+		{"null", "127.0.0.1:8080", []string{"null"}, false},
+		{"empty", "127.0.0.1:8080", []string{""}, false},
+		{"comma list", "127.0.0.1:8080", []string{"http://127.0.0.1:8080, http://127.0.0.1:8080"}, false},
+		{"repeated", "127.0.0.1:8080", []string{"http://127.0.0.1:8080", "http://127.0.0.1:8080"}, false},
+		{"non-loopback host", "example.com:8080", []string{"http://example.com:8080"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "http://"+tc.host+"/rpc", nil)
+			if tc.origins != nil {
+				r.Header["Origin"] = tc.origins
+			}
+			if got := sameOrigin(r); got != tc.want {
+				t.Fatalf("sameOrigin(%q on %s) = %t, want %t", tc.origins, tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCoordinatedBridgeTokenSources(t *testing.T) {
+	protocol := "Sec-WebSocket-Protocol"
+	cases := []struct {
+		name   string
+		target string
+		header http.Header
+		want   string
+	}{
+		{"bearer header", "/rpc", http.Header{"Authorization": {"Bearer secret"}}, "secret"},
+		{"token subprotocol", "/rpc", http.Header{protocol: {CoordSubprotocol + ", " + CoordTokenSubprotocolPrefix + "secret"}}, "secret"},
+		{"none", "/rpc", nil, ""},
+		{"query token", "/rpc?token=secret", nil, ""},
+		{"query token beside header", "/rpc?token=secret", http.Header{"Authorization": {"Bearer secret"}}, ""},
+		{"non-bearer header", "/rpc", http.Header{"Authorization": {"Basic secret"}}, ""},
+		{"repeated header", "/rpc", http.Header{"Authorization": {"Bearer secret", "Bearer secret"}}, ""},
+		{"header and subprotocol", "/rpc", http.Header{"Authorization": {"Bearer secret"}, protocol: {CoordTokenSubprotocolPrefix + "secret"}}, ""},
+		{"two subprotocol tokens", "/rpc", http.Header{protocol: {CoordTokenSubprotocolPrefix + "a, " + CoordTokenSubprotocolPrefix + "b"}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+tc.target, nil)
+			for k, v := range tc.header {
+				r.Header[http.CanonicalHeaderKey(k)] = v
+			}
+			if got := coordBridgeToken(r); got != tc.want {
+				t.Fatalf("token = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCoordinatedBridgeRechecksDeviceAfterDial(t *testing.T) {
+	h := startRelayWith(t, func(h *relayHarness) {
+		h.bridge.dial = func(ctx context.Context, socket string, hello coord.Frame) (*coord.Link, coord.Frame, error) {
+			link, welcome, err := coord.Dial(ctx, socket, hello)
+			if _, revokeErr := h.store.Revoke("phone"); revokeErr != nil {
+				t.Errorf("revoke during dial: %v", revokeErr)
+			}
+			return link, welcome, err
+		}
+	})
+	phone, err := h.store.Add("phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := &websocket.Dialer{Subprotocols: []string{CoordSubprotocol, CoordTokenSubprotocolPrefix + phone.Token}}
+	conn, resp, err := dialer.Dial(h.url(), nil)
+	if err == nil {
+		if closeErr := conn.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+		t.Fatal("device revoked during dial was upgraded")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("response = %v, want %d", resp, http.StatusUnauthorized)
+	}
+	if h.store.Contains(phone.Token) {
+		t.Fatal("dial hook did not revoke the device")
+	}
+
+	// The static token cannot be revoked, so it still connects.
+	static := h.dial(t, websocket.DefaultDialer, http.Header{"Authorization": {"Bearer " + h.static}})
+	if welcome, _ := relayRead(t, static); welcome["type"] != coord.TypeWelcome {
+		t.Fatalf("static connection received %v", welcome)
 	}
 }
 
@@ -500,7 +625,7 @@ func TestCoordinatedBridgeWithoutCoordinatorRefusesUpgrade(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- bridge.Run(ctx) }()
-	_, resp, err := websocket.DefaultDialer.Dial("ws://"+bridge.Addr()+"/rpc?token=secret", nil)
+	_, resp, err := websocket.DefaultDialer.Dial("ws://"+bridge.Addr()+"/rpc", http.Header{"Authorization": {"Bearer secret"}})
 	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("dial = %v, %v; want 503", resp, err)
 	}

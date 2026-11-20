@@ -36,7 +36,8 @@ const (
 var (
 	errExpiredLaunchIntent = errors.New("launch intent predates the current receipt window")
 	errLegacyLaunchIntent  = errors.New("new recoverable launches require a UUIDv7 request_id")
-	errFutureLaunchIntent  = errors.New("launch intent is too far in the future; check the system clocks")
+	errFutureLaunchIntent  = errors.New("launch intent is too far in the future and was not recorded; check the system clocks")
+	errStaleLaunchIntent   = errors.New("launch intent is older than the receipt window and was never recorded; check the system clocks")
 	errReceiptLimit        = errors.New("launch receipt limit reached; retry after receipts expire")
 )
 
@@ -123,8 +124,14 @@ func (s *receiptStore) checkLocked(key string, now time.Time) error {
 			}
 			return errLegacyLaunchIntent
 		}
-		if !issued.After(s.cutoff) || !issued.After(now.Add(-launchReceiptTTL)) {
+		// Pruning raises the durable cutoff to every removed intent before
+		// deleting it, so only intents at or before the cutoff can have been
+		// recorded and forgotten. A later one with no receipt never was.
+		if !issued.After(s.cutoff) {
 			return errExpiredLaunchIntent
+		}
+		if !issued.After(now.Add(-launchReceiptTTL)) {
+			return errStaleLaunchIntent
 		}
 	}
 	if issued.After(now.Add(launchClockSkew)) {
