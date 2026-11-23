@@ -41,6 +41,8 @@ type Agent struct {
 	// Queues
 	steeringQueue         []QueuedMessage
 	followUpQueue         []QueuedMessage
+	steeringPaused        bool
+	followUpPaused        bool
 	pendingCustomMessages []*Message
 
 	// Control
@@ -336,21 +338,11 @@ func (a *Agent) Continue(ctx context.Context) error {
 	lastMsg := a.state.Messages[len(a.state.Messages)-1]
 
 	if lastMsg.Role == RoleAssistant {
-		// Check steering queue first
-		if len(a.steeringQueue) > 0 {
-			messages := a.drainSteering()
-			a.mu.Unlock()
-			return a.runPromptMessages(ctx, messages, true, nil, "")
-		}
-
-		// Check follow-up queue
-		if len(a.followUpQueue) > 0 {
-			messages := a.drainFollowUp()
-			a.mu.Unlock()
-			return a.runPromptMessages(ctx, messages, false, nil, "")
-		}
-
+		messages, steering := a.drainNext()
 		a.mu.Unlock()
+		if len(messages) > 0 {
+			return a.runPromptMessages(ctx, messages, steering, nil, "")
+		}
 		return ErrCannotContinueAssistant
 	}
 
@@ -442,18 +434,123 @@ func (a *Agent) emitCustomMessages(messages []*Message) error {
 	return errors.Join(errs...)
 }
 
-// ClearSteeringQueue removes all queued steering messages.
-func (a *Agent) ClearSteeringQueue() {
+// ClearSteeringQueue removes all queued steering messages and returns them.
+func (a *Agent) ClearSteeringQueue() []*Message {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	messages := queuedContents(a.steeringQueue)
 	a.steeringQueue = nil
+	return messages
 }
 
-// ClearFollowUpQueue removes all queued follow-up messages.
-func (a *Agent) ClearFollowUpQueue() {
+// ClearFollowUpQueue removes all queued follow-up messages and returns them.
+func (a *Agent) ClearFollowUpQueue() []*Message {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	messages := queuedContents(a.followUpQueue)
 	a.followUpQueue = nil
+	return messages
+}
+
+// TakePlainTextQueued removes queued messages that are only a text prompt and
+// returns them. Messages carrying attachments stay queued and are counted in kept.
+func (a *Agent) TakePlainTextQueued() (steering, followUp []*Message, kept int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	steering, a.steeringQueue = takePlainText(a.steeringQueue)
+	followUp, a.followUpQueue = takePlainText(a.followUpQueue)
+	return steering, followUp, len(a.steeringQueue) + len(a.followUpQueue)
+}
+
+func takePlainText(queue []QueuedMessage) (taken []*Message, remaining []QueuedMessage) {
+	for _, item := range queue {
+		if item.CanEditText() && len(item.Message.Content) == 1 {
+			taken = append(taken, item.Message)
+			continue
+		}
+		remaining = append(remaining, item)
+	}
+	return taken, remaining
+}
+
+// QueueKind names one of the agent's message queues.
+type QueueKind string
+
+const (
+	QueueSteering QueueKind = "steer"
+	QueueFollowUp QueueKind = "follow_up"
+)
+
+func (a *Agent) queuePausedFlag(kind QueueKind) (*bool, error) {
+	switch kind {
+	case QueueSteering:
+		return &a.steeringPaused, nil
+	case QueueFollowUp:
+		return &a.followUpPaused, nil
+	default:
+		return nil, fmt.Errorf("invalid queue %q", kind)
+	}
+}
+
+// PauseQueue stops the agent taking messages from one queue. Paused messages
+// stay queued and can still be edited or cleared.
+func (a *Agent) PauseQueue(kind QueueKind) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	paused, err := a.queuePausedFlag(kind)
+	if err != nil {
+		return fmt.Errorf("pause queue: %w", err)
+	}
+	*paused = true
+	return nil
+}
+
+// ResumeQueue lets the agent take messages from one queue again and reports
+// whether the queue was paused.
+func (a *Agent) ResumeQueue(kind QueueKind) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	paused, err := a.queuePausedFlag(kind)
+	if err != nil {
+		return false, fmt.Errorf("resume queue: %w", err)
+	}
+	wasPaused := *paused
+	*paused = false
+	return wasPaused, nil
+}
+
+// QueuesPaused reports which queues are paused.
+func (a *Agent) QueuesPaused() (steering, followUp bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.steeringPaused, a.followUpPaused
+}
+
+// HasDeliverableMessages reports whether an unpaused queue has pending messages.
+func (a *Agent) HasDeliverableMessages() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return (!a.steeringPaused && len(a.steeringQueue) > 0) || (!a.followUpPaused && len(a.followUpQueue) > 0)
+}
+
+// RunQueued starts a run from the next deliverable queued messages. It does
+// nothing when no unpaused queue has messages.
+func (a *Agent) RunQueued(ctx context.Context) error {
+	a.mu.Lock()
+	if a.activeRun != nil {
+		a.mu.Unlock()
+		return ErrAlreadyProcessing
+	}
+	if err := ctx.Err(); err != nil {
+		a.mu.Unlock()
+		return errors.Join(err, context.Cause(ctx))
+	}
+	messages, steering := a.drainNext()
+	a.mu.Unlock()
+	if len(messages) == 0 {
+		return nil
+	}
+	return a.runPromptMessages(ctx, messages, steering, nil, "")
 }
 
 // ClearAllQueues removes all queued messages and returns what was queued.
@@ -618,6 +715,7 @@ func (a *Agent) Reset() error {
 	a.state.ErrorMessage = ""
 	a.steeringQueue = nil
 	a.followUpQueue = nil
+	a.steeringPaused, a.followUpPaused = false, false
 	a.pendingCustomMessages = nil
 	return nil
 }
@@ -667,8 +765,20 @@ func (a *Agent) FollowUpMode() QueueMode {
 	return a.followUpMode
 }
 
+// drainNext takes from the steering queue, then the follow-up queue, and
+// reports whether the messages came from steering.
+func (a *Agent) drainNext() (messages []*Message, steering bool) {
+	if messages = a.drainSteering(); len(messages) > 0 {
+		return messages, true
+	}
+	return a.drainFollowUp(), false
+}
+
 // drainSteering drains the steering queue based on the current mode.
 func (a *Agent) drainSteering() []*Message {
+	if a.steeringPaused {
+		return nil
+	}
 	if a.steeringMode == QueueModeAll {
 		messages := queuedContents(a.steeringQueue)
 		a.steeringQueue = nil
@@ -685,6 +795,9 @@ func (a *Agent) drainSteering() []*Message {
 
 // drainFollowUp drains the follow-up queue based on the current mode.
 func (a *Agent) drainFollowUp() []*Message {
+	if a.followUpPaused {
+		return nil
+	}
 	if a.followUpMode == QueueModeAll {
 		messages := queuedContents(a.followUpQueue)
 		a.followUpQueue = nil

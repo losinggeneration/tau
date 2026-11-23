@@ -2982,8 +2982,19 @@ func (a *App) enqueueFollowUp(text string, ctx *tauui.Ctx) {
 // of the session and puts their text back in the editor ahead of the current
 // draft, so the user can edit, resend, or drop them.
 func (a *App) restoreQueuedMessages(ctx *tauui.Ctx) {
-	var queued []string
-	if qc, ok := a.sess.(sdk.QueueClearer); ok {
+	if a.coordinated != nil {
+		a.restoreCoordinatedQueue()
+		return
+	}
+	var (
+		queued []string
+		kept   int
+	)
+	if restorer, ok := a.sess.(sdk.QueueRestorer); ok {
+		var steering, followUp []string
+		steering, followUp, kept = restorer.TakeQueuedText()
+		queued = append(steering, followUp...)
+	} else if qc, ok := a.sess.(sdk.QueueClearer); ok {
 		steering, followUp := qc.ClearQueue()
 		for _, msg := range append(steering, followUp...) {
 			queued = append(queued, msg.Text)
@@ -2993,18 +3004,32 @@ func (a *App) restoreQueuedMessages(ctx *tauui.Ctx) {
 	}
 	a.steeringQueue, a.pendingQueue = nil, nil
 	a.refreshPending(ctx)
-	if len(queued) == 0 {
+	if kept > 0 {
+		a.syncPendingFromSession(ctx)
+	}
+	a.restoreQueuedText(ctx, queued, kept)
+}
+
+func (a *App) restoreQueuedText(ctx *tauui.Ctx, queued []string, kept int) {
+	if len(queued)+kept == 0 {
 		a.conv.AddSystem("No queued messages to restore")
 		a.refreshChat()
 		return
 	}
-	parts := slices.DeleteFunc(append(queued, a.editor.Text()), func(s string) bool { return strings.TrimSpace(s) == "" })
-	a.editor.SetText(ctx, strings.Join(parts, "\n\n"))
-	noun := "message"
-	if len(queued) > 1 {
-		noun = "messages"
+	plural := func(n int) string {
+		if n == 1 {
+			return "message"
+		}
+		return "messages"
 	}
-	a.conv.AddSystem(fmt.Sprintf("Restored %d queued %s to editor", len(queued), noun))
+	if len(queued) > 0 {
+		parts := slices.DeleteFunc(append(queued, a.editor.Text()), func(s string) bool { return strings.TrimSpace(s) == "" })
+		a.editor.SetText(ctx, strings.Join(parts, "\n\n"))
+		a.conv.AddSystem(fmt.Sprintf("Restored %d queued %s to editor", len(queued), plural(len(queued))))
+	}
+	if kept > 0 {
+		a.conv.AddSystem(fmt.Sprintf("Left %d queued %s with attachments in the queue", kept, plural(kept)))
+	}
 	a.refreshChat()
 }
 

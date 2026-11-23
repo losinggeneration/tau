@@ -650,3 +650,198 @@ func TestForgetCommands(t *testing.T) {
 		t.Fatalf("forget reply = %s, forgot %v", out, sess.forgot)
 	}
 }
+
+type queueControlSession struct {
+	*mockSession
+	steerPaused, followPaused bool
+	steer, follow             []sdk.Message
+	run                       <-chan sdk.Event
+}
+
+func (s *queueControlSession) PauseQueue(kind sdk.QueueKind) error {
+	if kind == sdk.QueueSteering {
+		s.steerPaused = true
+	} else {
+		s.followPaused = true
+	}
+	return nil
+}
+
+func (s *queueControlSession) ResumeQueue(_ context.Context, kind sdk.QueueKind) (<-chan sdk.Event, error) {
+	if kind == sdk.QueueSteering {
+		s.steerPaused = false
+	} else {
+		s.followPaused = false
+	}
+	return s.run, nil
+}
+
+func (s *queueControlSession) QueuesPaused() (steering, followUp bool) {
+	return s.steerPaused, s.followPaused
+}
+
+func (s *queueControlSession) ClearQueuedMessages(kind sdk.QueueKind) ([]sdk.Message, error) {
+	queue := &s.steer
+	if kind == sdk.QueueFollowUp {
+		queue = &s.follow
+	}
+	cleared := *queue
+	*queue = nil
+	return cleared, nil
+}
+
+func TestQueueControlCommands(t *testing.T) {
+	run := make(chan sdk.Event, 1)
+	run <- sdk.Event{Type: "agent_start"}
+	close(run)
+	sess := &queueControlSession{
+		mockSession: newMockSession("s", "/"),
+		steer:       []sdk.Message{{Text: "steer"}},
+		follow:      []sdk.Message{{Text: "follow one"}},
+	}
+	h := newTestHarness(t, &mockRuntime{}, nil)
+	defer h.close()
+	h.srv.session = sess
+	response := func(id, command string) map[string]any {
+		t.Helper()
+		h.send(t, command)
+		lines := h.readUntil(t, timeout, func(line string) bool {
+			var obj map[string]any
+			return json.Unmarshal([]byte(line), &obj) == nil && obj["type"] == "response" && obj["id"] == id
+		})
+		if len(lines) == 0 {
+			t.Fatalf("no response for %s", id)
+		}
+		return parseResp(t, lines[len(lines)-1])
+	}
+
+	if resp := response("bad", `{"id":"bad","type":"pause_queue","args":{"queue":"nope"}}`); resp["ok"] != false {
+		t.Fatalf("invalid queue = %v", resp)
+	}
+	if resp := response("unnamed", `{"id":"unnamed","type":"pause_queue"}`); resp["ok"] != false {
+		t.Fatalf("pause without queue = %v", resp)
+	}
+	if resp := response("pause", `{"id":"pause","type":"pause_queue","args":{"queue":"follow_up"}}`); resp["ok"] != true {
+		t.Fatalf("pause = %v", resp)
+	}
+	if sess.steerPaused || !sess.followPaused {
+		t.Fatalf("paused steering=%v followUp=%v", sess.steerPaused, sess.followPaused)
+	}
+	state := response("state", `{"id":"state","type":"get_state"}`)["result"].(map[string]any)["queue"].(map[string]any)
+	if state["steering_paused"] != false || state["follow_up_paused"] != true {
+		t.Fatalf("state queue = %v", state)
+	}
+
+	cleared := response("one", `{"id":"one","type":"clear_queue","args":{"queue":"steer"}}`)["result"].(map[string]any)
+	if fmt.Sprint(cleared["steering"]) != "[steer]" || fmt.Sprint(cleared["follow_up"]) != "[]" || len(sess.follow) != 1 {
+		t.Fatalf("clear steering = %v, follow-up left %v", cleared, sess.follow)
+	}
+	cleared = response("all", `{"id":"all","type":"clear_queue"}`)["result"].(map[string]any)
+	if fmt.Sprint(cleared["followUp"]) != "[follow one]" || fmt.Sprint(cleared["follow_up"]) != "[follow one]" {
+		t.Fatalf("clear all = %v", cleared)
+	}
+
+	if got := response("idle", `{"id":"idle","type":"resume_queue","args":{"queue":"steer"}}`)["result"].(map[string]any)["disposition"]; got != "resumed" {
+		t.Fatalf("resume without run = %v", got)
+	}
+	sess.run = run
+	if got := response("resume", `{"id":"resume","type":"resume_queue","args":{"queue":"followUp"}}`)["result"].(map[string]any)["disposition"]; got != "started" {
+		t.Fatalf("resume with run = %v", got)
+	}
+	if sess.followPaused {
+		t.Fatal("follow-up queue still paused")
+	}
+}
+
+type queueEditSession struct {
+	*mockSession
+	items []sdk.QueuedPrompt
+}
+
+func (s *queueEditSession) QueuedPrompts() []sdk.QueuedPrompt { return slices.Clone(s.items) }
+
+func (s *queueEditSession) EditQueuedText(id, text string) bool {
+	for i := range s.items {
+		if s.items[i].ID == id {
+			s.items[i].ID, s.items[i].Text = id+"-edited", text
+			return true
+		}
+	}
+	return false
+}
+
+func TestEditQueuedTextPublishesQueueToOtherClients(t *testing.T) {
+	sess := &queueEditSession{
+		mockSession: newMockSession("s", "/"),
+		items:       []sdk.QueuedPrompt{{ID: "q1", Text: "before", Kind: "follow_up", Editable: true}},
+	}
+	h := newTestHarness(t, &mockRuntime{}, nil)
+	defer h.close()
+	h.srv.session = sess
+
+	h.send(t, `{"id":"edit","type":"edit_queued_text","args":{"expected_session_id":"s","id":"q1","text":"after"}}`)
+	lines := h.readUntil(t, timeout, func(line string) bool {
+		var obj map[string]any
+		return json.Unmarshal([]byte(line), &obj) == nil && obj["type"] == "response" && obj["id"] == "edit"
+	})
+	var published bool
+	for _, line := range lines {
+		published = published || (strings.Contains(line, `"queue_update"`) && strings.Contains(line, `"after"`) && strings.Contains(line, `"q1-edited"`))
+	}
+	if !published {
+		t.Fatalf("edit did not publish the changed queue: %q", lines)
+	}
+}
+
+func TestRunPublishesQueueWhenAgentTakesMessage(t *testing.T) {
+	run := make(chan sdk.Event, 4)
+	sess := newMockSession("s", "/")
+	sess.send = func(context.Context, sdk.Message) (<-chan sdk.Event, error) {
+		run <- sdk.Event{Type: "agent_start"}
+		return run, nil
+	}
+	h := newTestHarness(t, &mockRuntime{}, nil)
+	defer h.close()
+	defer close(run)
+	h.srv.session = sess
+	responded := func(id string) func(string) bool {
+		return func(line string) bool {
+			var obj map[string]any
+			return json.Unmarshal([]byte(line), &obj) == nil && obj["type"] == "response" && obj["id"] == id
+		}
+	}
+	h.send(t, `{"id":"first","type":"prompt","args":{"text":"work"}}`)
+	h.readUntil(t, timeout, responded("first"))
+	h.send(t, `{"id":"follow","type":"follow_up","args":{"text":"next"}}`)
+	h.readUntil(t, timeout, responded("follow"))
+
+	sess.followUpCount = 0
+	run <- sdk.Event{Type: "message_start"}
+	lines := h.readUntil(t, timeout, func(line string) bool {
+		return strings.Contains(line, `"queue_update"`) && strings.Contains(line, `"follow_up":0`)
+	})
+	if len(lines) == 0 || !strings.Contains(lines[len(lines)-1], `"queue_update"`) {
+		t.Fatalf("taking a queued message published no update: %q", lines)
+	}
+}
+
+type queueRestoreSession struct{ *mockSession }
+
+func (s *queueRestoreSession) TakeQueuedText() (steering, followUp []string, kept int) {
+	return []string{"steer"}, []string{"follow"}, 2
+}
+
+func TestTakeQueuedTextReportsKeptMessages(t *testing.T) {
+	h := newTestHarness(t, &mockRuntime{}, nil)
+	defer h.close()
+	h.srv.session = &queueRestoreSession{newMockSession("s", "/")}
+	h.send(t, `{"id":"take","type":"take_queued_text","args":{"expected_session_id":"s"}}`)
+	lines := h.readUntil(t, timeout, func(line string) bool {
+		var obj map[string]any
+		return json.Unmarshal([]byte(line), &obj) == nil && obj["type"] == "response" && obj["id"] == "take"
+	})
+	result, _ := parseResp(t, lines[len(lines)-1])["result"].(map[string]any)
+	if fmt.Sprint(result["steering"]) != "[steer]" || fmt.Sprint(result["follow_up"]) != "[follow]" || result["kept"] != float64(2) {
+		t.Fatalf("take result = %v", result)
+	}
+}

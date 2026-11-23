@@ -125,22 +125,25 @@ type CoordinatedSession struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	mu            sync.Mutex
-	client        *rpcclient.CoordinatedClient
-	closed        bool
-	sessionID     string
-	model         string
-	thinking      string
-	stats         sdk.SessionStats
-	cwd           string
-	streaming     bool
-	steering      int
-	followUp      int
-	history       []sdk.HistoryEntry
-	historyBefore string
-	uiRequests    []baseui.SharedRequest
-	commands      []sdk.SlashCommandInfo
-	attachments   []sdk.Attachment
+	mu             sync.Mutex
+	client         *rpcclient.CoordinatedClient
+	closed         bool
+	sessionID      string
+	model          string
+	thinking       string
+	stats          sdk.SessionStats
+	cwd            string
+	streaming      bool
+	steering       int
+	followUp       int
+	steeringPaused bool
+	followUpPaused bool
+	queued         []sdk.QueuedPrompt
+	history        []sdk.HistoryEntry
+	historyBefore  string
+	uiRequests     []baseui.SharedRequest
+	commands       []sdk.SlashCommandInfo
+	attachments    []sdk.Attachment
 }
 
 var (
@@ -474,6 +477,88 @@ func (s *CoordinatedSession) QueueSizes() (steering, followUp int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.steering, s.followUp
+}
+
+// PauseQueue stops the instance taking messages from one queue.
+func (s *CoordinatedSession) PauseQueue(kind sdk.QueueKind) error {
+	return s.queueCommand(s.ctx, "pause_queue", kind, nil)
+}
+
+// ResumeQueue lets the instance take from one queue again. Any run it starts
+// reaches this view through the instance's event stream, so the returned
+// channel is always nil.
+func (s *CoordinatedSession) ResumeQueue(ctx context.Context, kind sdk.QueueKind) (<-chan sdk.Event, error) {
+	return nil, s.queueCommand(ctx, "resume_queue", kind, nil)
+}
+
+// QueuesPaused returns the instance's last reported pause state.
+func (s *CoordinatedSession) QueuesPaused() (steering, followUp bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.steeringPaused, s.followUpPaused
+}
+
+// QueuedPrompts returns the instance's last reported queue previews.
+func (s *CoordinatedSession) QueuedPrompts() []sdk.QueuedPrompt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.queued)
+}
+
+// EditQueuedText replaces a queued message's text on the instance. It reports
+// false when the worker rejects the edit or can't be reached.
+func (s *CoordinatedSession) EditQueuedText(id, text string) bool {
+	args := struct {
+		ExpectedSessionID string `json:"expected_session_id"`
+		ID                string `json:"id"`
+		Text              string `json:"text"`
+	}{s.ID(), id, text}
+	return s.call(s.ctx, coordinatedMutationTimeout, "edit_queued_text", args, nil) == nil
+}
+
+// takeQueuedText removes the instance's plain-text queued messages and returns
+// them in delivery order, with the number left queued for their attachments.
+func (s *CoordinatedSession) takeQueuedText(ctx context.Context, sessionID string) ([]string, int, error) {
+	args := struct {
+		ExpectedSessionID string `json:"expected_session_id"`
+	}{sessionID}
+	var out struct {
+		Steering []string `json:"steering"`
+		FollowUp []string `json:"follow_up"`
+		Kept     int      `json:"kept"`
+	}
+	if err := s.call(ctx, coordinatedMutationTimeout, "take_queued_text", args, &out); err != nil {
+		return nil, 0, err
+	}
+	return append(out.Steering, out.FollowUp...), out.Kept, nil
+}
+
+// ClearQueuedMessages removes one of the instance's queues and returns its text.
+func (s *CoordinatedSession) ClearQueuedMessages(kind sdk.QueueKind) ([]sdk.Message, error) {
+	var out struct {
+		Steering []string `json:"steering"`
+		FollowUp []string `json:"follow_up"`
+	}
+	if err := s.queueCommand(s.ctx, "clear_queue", kind, &out); err != nil {
+		return nil, err
+	}
+	texts := out.Steering
+	if kind == sdk.QueueFollowUp {
+		texts = out.FollowUp
+	}
+	messages := make([]sdk.Message, 0, len(texts))
+	for _, text := range texts {
+		messages = append(messages, sdk.Message{Role: "user", Text: text})
+	}
+	return messages, nil
+}
+
+func (s *CoordinatedSession) queueCommand(ctx context.Context, command string, kind sdk.QueueKind, out any) error {
+	args := struct {
+		ExpectedSessionID string `json:"expected_session_id"`
+		Queue             string `json:"queue"`
+	}{s.ID(), string(kind)}
+	return s.call(ctx, coordinatedMutationTimeout, command, args, out)
 }
 
 // CycleModel advances the instance to its next model.
@@ -857,6 +942,8 @@ func (s *CoordinatedSession) reportWorkerExit(err error) {
 	s.mu.Lock()
 	s.streaming = false
 	s.steering, s.followUp = 0, 0
+	s.steeringPaused, s.followUpPaused = false, false
+	s.queued = nil
 	s.uiRequests = nil
 	s.mu.Unlock()
 	s.emit(coordinatedStatus(s.instanceID, CoordinatedExited, err))
@@ -961,11 +1048,15 @@ func (s *CoordinatedSession) applySnapshot(snap *rpcclient.Snapshot, reason stri
 		}
 	}
 	var queue struct {
-		Steering int `json:"steering"`
-		FollowUp int `json:"follow_up"`
+		Steering       int                `json:"steering"`
+		FollowUp       int                `json:"follow_up"`
+		SteeringPaused bool               `json:"steering_paused"`
+		FollowUpPaused bool               `json:"follow_up_paused"`
+		Items          []sdk.QueuedPrompt `json:"items"`
 	}
 	if len(snap.State.Queue) > 0 && json.Unmarshal(snap.State.Queue, &queue) != nil {
 		queue.Steering, queue.FollowUp = 0, 0
+		queue.SteeringPaused, queue.FollowUpPaused, queue.Items = false, false, nil
 	}
 	s.mu.Lock()
 	s.sessionID = reset.SessionID
@@ -981,6 +1072,8 @@ func (s *CoordinatedSession) applySnapshot(snap *rpcclient.Snapshot, reason stri
 		s.cwd = snap.Instance.CWD
 	}
 	s.steering, s.followUp = queue.Steering, queue.FollowUp
+	s.steeringPaused, s.followUpPaused = queue.SteeringPaused, queue.FollowUpPaused
+	s.queued = queue.Items
 	s.history, s.historyBefore = slices.Clone(reset.History), reset.HistoryBefore
 	s.uiRequests = slices.Clone(reset.UIRequests)
 	s.mu.Unlock()
@@ -1032,6 +1125,10 @@ func (s *CoordinatedSession) observe(ev sdk.Event) {
 		}
 	case "queue_update":
 		s.steering, s.followUp = payloadInt(p, "steering"), payloadInt(p, "follow_up")
+		steeringPaused, _ := p["steering_paused"].(bool)
+		followUpPaused, _ := p["follow_up_paused"].(bool)
+		s.steeringPaused, s.followUpPaused = steeringPaused, followUpPaused
+		s.queued = queuedPromptsFromPayload(p["items"])
 	case "ui_confirm", "ui_select", "ui_input":
 		req := baseui.SharedRequest{
 			ID:          payloadString(p, "id"),
@@ -1169,6 +1266,20 @@ func messageImages(msg sdk.Message) []string {
 func payloadString(fields map[string]any, key string) string {
 	text, _ := fields[key].(string)
 	return text
+}
+
+// queuedPromptsFromPayload decodes a queue_update's previews. A malformed list
+// reads as empty, which only makes those messages uneditable from this view.
+func queuedPromptsFromPayload(raw any) []sdk.QueuedPrompt {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var items []sdk.QueuedPrompt
+	if err := json.Unmarshal(data, &items); err != nil {
+		return nil
+	}
+	return items
 }
 
 func payloadInt(fields map[string]any, key string) int {

@@ -4021,3 +4021,84 @@ func TestRequestCredentialsRetainCancellationCause(t *testing.T) {
 	require.ErrorIs(t, err, cause)
 	require.Zero(t, calls)
 }
+
+func TestQueuesPauseResumeAndClearIndependently(t *testing.T) {
+	var prompts []string
+	client := stubClient{stream: func(ctx context.Context, model *ai.Model, prompt *ai.Context, handler ai.EventHandler, opts ...ai.Option) error {
+		blocks := prompt.Messages[len(prompt.Messages)-1].ContentBlocks()
+		prompts = append(prompts, blocks[0].Text)
+		final := ai.AssistantMessage{Role: "assistant", Content: []ai.ContentBlock{{Type: ai.ContentBlockText, Text: "ok"}}, StopReason: ai.StopReasonStop, Timestamp: time.Now().UnixMilli()}
+		handler(ctx, ai.Start{Partial: ai.AssistantMessage{Role: "assistant", Timestamp: final.Timestamp}})
+		handler(ctx, ai.Done{Reason: ai.StopReasonStop, Message: final})
+		return nil
+	}}
+	a, err := New(NewConfig(
+		WithModel(&ai.Model{ID: "test", API: ai.APIOpenAICompletions, Provider: ai.ProviderOpenAI}),
+		WithClientFactory(func(*ai.Model) (ai.Client, error) { return client, nil }),
+	))
+	require.NoError(t, err)
+	require.Error(t, a.PauseQueue("other"))
+
+	require.NoError(t, a.PauseQueue(QueueFollowUp))
+	a.Steer(NewUserMessage("steer"))
+	a.FollowUp(NewUserMessage("held"))
+	require.NoError(t, a.Prompt(context.Background(), NewUserMessage("first")))
+	require.Equal(t, []string{"steer"}, prompts, "steering joins the first turn while follow-ups stay held")
+	steering, followUp := a.QueueSizes()
+	require.Zero(t, steering)
+	require.Equal(t, 1, followUp)
+	require.False(t, a.HasDeliverableMessages())
+	require.ErrorIs(t, a.Continue(context.Background()), ErrCannotContinueAssistant)
+	require.NoError(t, a.RunQueued(context.Background()))
+	require.Len(t, prompts, 1)
+
+	_, editable := a.QueuedMessages()
+	require.True(t, a.EditQueuedText(editable[0].ID, "edited"))
+	resumed, err := a.ResumeQueue(QueueFollowUp)
+	require.NoError(t, err)
+	require.True(t, resumed)
+	require.True(t, a.HasDeliverableMessages())
+	require.NoError(t, a.RunQueued(context.Background()))
+	require.Equal(t, "edited", prompts[1])
+
+	require.NoError(t, a.PauseQueue(QueueSteering))
+	a.Steer(NewUserMessage("keep"))
+	a.FollowUp(NewUserMessage("drop"))
+	cleared := a.ClearFollowUpQueue()
+	require.Len(t, cleared, 1)
+	require.Equal(t, "drop", cleared[0].Content[0].Text)
+	steering, followUp = a.QueueSizes()
+	require.Equal(t, 1, steering)
+	require.Zero(t, followUp)
+	steeringPaused, followUpPaused := a.QueuesPaused()
+	require.True(t, steeringPaused)
+	require.False(t, followUpPaused)
+
+	require.NoError(t, a.Reset())
+	steeringPaused, _ = a.QueuesPaused()
+	require.False(t, steeringPaused)
+}
+
+func TestTakePlainTextQueuedKeepsAttachments(t *testing.T) {
+	a, err := New(Config{})
+	require.NoError(t, err)
+	withImage := NewUserMessage("look")
+	withImage.Content = append(withImage.Content, ai.ContentBlock{Type: ai.ContentBlockImage, Data: "aGk=", MimeType: "image/png"})
+	withFile := NewUserMessage("read")
+	withFile.Content = append(withFile.Content, ai.ContentBlock{Type: ai.ContentBlockText, Text: "file contents"})
+	a.Steer(NewUserMessage("steer"))
+	a.Steer(withImage)
+	a.FollowUp(withFile)
+	a.FollowUp(NewUserMessage("follow"))
+
+	steering, followUp, kept := a.TakePlainTextQueued()
+
+	require.Len(t, steering, 1)
+	require.Equal(t, "steer", steering[0].Content[0].Text)
+	require.Len(t, followUp, 1)
+	require.Equal(t, "follow", followUp[0].Content[0].Text)
+	require.Equal(t, 2, kept)
+	remainingSteering, remainingFollowUp := a.PeekQueuedMessages()
+	require.Equal(t, []*Message{withImage}, remainingSteering)
+	require.Equal(t, []*Message{withFile}, remainingFollowUp)
+}

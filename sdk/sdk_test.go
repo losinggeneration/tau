@@ -12825,3 +12825,72 @@ func TestSplitNewPluginToolsPreservesLoadoutBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestQueueControllerResumeStartsIdleRun(t *testing.T) {
+	provider, model := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
+	queues := sess.(QueueController)
+
+	events, err := queues.ResumeQueue(testContext(t), QueueFollowUp)
+	require.NoError(t, err)
+	require.Nil(t, events, "resuming an unpaused queue must not start a run")
+
+	require.NoError(t, queues.PauseQueue(QueueFollowUp))
+	require.NoError(t, sess.(FollowUpper).FollowUp(Message{Text: "held"}))
+	require.NoError(t, sess.(Steerer).Steer(Message{Text: "steer"}))
+	cleared, err := queues.ClearQueuedMessages(QueueSteering)
+	require.NoError(t, err)
+	require.Len(t, cleared, 1)
+	assert.Equal(t, "steer", cleared[0].Text)
+	_, followUpPaused := queues.QueuesPaused()
+	require.True(t, followUpPaused)
+
+	events, err = queues.ResumeQueue(testContext(t), QueueFollowUp)
+	require.NoError(t, err)
+	require.NotNil(t, events)
+	collectSessionEvents(t, events)
+	prompt := provider.LastPrompt()
+	require.NotNil(t, prompt)
+	assert.Equal(t, "held", prompt.Messages[len(prompt.Messages)-1].ContentBlocks()[0].Text)
+	_, followUp := sess.(Queuer).QueueSizes()
+	assert.Zero(t, followUp)
+}
+
+func TestParseQueueKind(t *testing.T) {
+	for name, want := range map[string]QueueKind{"steer": QueueSteering, "steering": QueueSteering, "follow_up": QueueFollowUp, "followUp": QueueFollowUp} {
+		got, err := ParseQueueKind(name)
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	}
+	_, err := ParseQueueKind("")
+	require.Error(t, err)
+}
+
+func TestTakeQueuedTextLeavesAttachmentsQueued(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sess.Close(testContext(t))) })
+	require.NoError(t, sess.(Steerer).Steer(Message{Text: "steer"}))
+	require.NoError(t, sess.(FollowUpper).FollowUp(Message{Content: []ai.ContentBlock{
+		{Type: ai.ContentBlockText, Text: "read"},
+		{Type: ai.ContentBlockText, Text: "attached file"},
+	}}))
+
+	steering, followUp, kept := sess.(QueueRestorer).TakeQueuedText()
+
+	assert.Equal(t, []string{"steer"}, steering)
+	assert.Empty(t, followUp)
+	assert.Equal(t, 1, kept)
+	gotSteering, gotFollowUp := sess.(Queuer).QueueSizes()
+	assert.Zero(t, gotSteering)
+	assert.Equal(t, 1, gotFollowUp)
+}

@@ -837,3 +837,164 @@ func TestCoordinatedCompactFailureKeepsEventAndReply(t *testing.T) {
 		t.Fatalf("compact error = %v, want the worker's error", r.err)
 	}
 }
+
+func TestCoordinatedSessionQueueControls(t *testing.T) {
+	fc := newCoordFake(t)
+	s, conn := openCoordTestSession(t, fc)
+	nextCoordEvent(t, s)
+	var _ sdk.QueueController = s
+
+	type result struct {
+		messages []sdk.Message
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		messages, err := s.ClearQueuedMessages(sdk.QueueFollowUp)
+		done <- result{messages, err}
+	}()
+	f, raw := conn.expectCommand(t, "clear_queue")
+	var args struct {
+		Session string `json:"expected_session_id"`
+		Queue   string `json:"queue"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil || args.Session != "s1" || args.Queue != "follow_up" {
+		t.Fatalf("clear args = %s (%v)", raw, err)
+	}
+	conn.reply(t, f, map[string]any{"ok": true, "steering": []string{}, "follow_up": []string{"later"}})
+	if got := <-done; got.err != nil || len(got.messages) != 1 || got.messages[0].Text != "later" {
+		t.Fatalf("clear = %+v", got)
+	}
+
+	errs := make(chan error, 1)
+	go func() { errs <- s.PauseQueue(sdk.QueueSteering) }()
+	f, _ = conn.expectCommand(t, "pause_queue")
+	conn.reply(t, f, map[string]any{"ok": true})
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		events, err := s.ResumeQueue(context.Background(), sdk.QueueSteering)
+		if events != nil {
+			err = errors.New("coordinated resume returned a local event channel")
+		}
+		errs <- err
+	}()
+	f, _ = conn.expectCommand(t, "resume_queue")
+	conn.reply(t, f, map[string]any{"ok": true, "disposition": "started"})
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+
+	conn.event(t, 3, `{"type":"queue_update","steering":1,"follow_up":0,"steering_paused":true,"follow_up_paused":false}`)
+	if ev := nextCoordEvent(t, s); ev.Type != "queue_update" {
+		t.Fatalf("event = %s", ev.Type)
+	}
+	if steering, followUp := s.QueuesPaused(); !steering || followUp {
+		t.Fatalf("paused = %v/%v", steering, followUp)
+	}
+}
+
+func TestCoordinatedSessionEditsQueuedPrompts(t *testing.T) {
+	s, conn := openCoordTestSession(t, newCoordFake(t))
+	nextCoordEvent(t, s)
+	editor, ok := any(s).(sdk.QueueEditor)
+	if !ok {
+		t.Fatal("coordinated session cannot edit queued messages")
+	}
+	conn.event(t, 3, `{"type":"queue_update","steering":0,"follow_up":1,"items":[{"id":"q1","text":"before","kind":"follow_up","editable":true}]}`)
+	nextCoordEvent(t, s)
+	if items := editor.QueuedPrompts(); len(items) != 1 || items[0].ID != "q1" || items[0].Text != "before" || !items[0].Editable {
+		t.Fatalf("queued prompts = %+v", items)
+	}
+
+	done := make(chan bool, 1)
+	go func() { done <- editor.EditQueuedText("q1", "after") }()
+	f, raw := conn.expectCommand(t, "edit_queued_text")
+	var args struct {
+		Session string `json:"expected_session_id"`
+		ID      string `json:"id"`
+		Text    string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil || args.Session != "s1" || args.ID != "q1" || args.Text != "after" {
+		t.Fatalf("edit args = %s (%v)", raw, err)
+	}
+	conn.reply(t, f, map[string]any{"ok": true})
+	if !<-done {
+		t.Fatal("edit reported failure")
+	}
+
+	go func() { done <- editor.EditQueuedText("gone", "late") }()
+	f, _ = conn.expectCommand(t, "edit_queued_text")
+	conn.send(t, coordError(f, "queue_changed", "That message has already left the queue."))
+	if <-done {
+		t.Fatal("rejected edit reported success")
+	}
+}
+
+func TestCoordinatedRestoreClearsWorkerQueue(t *testing.T) {
+	s, conn := openCoordTestSession(t, newCoordFake(t))
+	a := newTestApp(t)
+	a.sess, a.coordinated = s, s
+	a.ctx = context.Background()
+	a.status = tauui.NewStatusEntriesView(5)
+	a.dialogPicker = tauui.NewDialogPicker()
+	a.pending = NewPendingView()
+	a.editor = newPromptEditorForTest()
+	a.loopCtx = testCtx()
+	a.editor.SetText(a.loopCtx, "draft")
+	a.applyCoordinatedEvent(nextCoordEvent(t, s))
+
+	a.restoreQueuedMessages(a.loopCtx)
+	f, raw := conn.expectCommand(t, "take_queued_text")
+	var args struct {
+		Session string `json:"expected_session_id"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil || args.Session != "s1" {
+		t.Fatalf("take args = %s (%v)", raw, err)
+	}
+	conn.reply(t, f, map[string]any{"ok": true, "steering": []string{"steer"}, "follow_up": []string{"later"}, "kept": 1})
+
+	type taken struct {
+		queued []string
+		kept   int
+		err    error
+	}
+	done := make(chan taken, 1)
+	go func() {
+		queued, kept, err := s.takeQueuedText(context.Background(), "s1")
+		done <- taken{queued, kept, err}
+	}()
+	f, _ = conn.expectCommand(t, "take_queued_text")
+	conn.reply(t, f, map[string]any{"ok": true, "steering": []string{"steer"}, "follow_up": []string{"later"}, "kept": 1})
+	got := <-done
+	if got.err != nil || got.kept != 1 || !slices.Equal(got.queued, []string{"steer", "later"}) {
+		t.Fatalf("take = %+v", got)
+	}
+
+	a.finishCoordinatedRestore(got.queued, got.kept, nil)
+	if text, want := a.editor.Text(), "steer\n\nlater\n\ndraft"; text != want {
+		t.Fatalf("editor = %q, want %q", text, want)
+	}
+	msgs := a.conv.Messages()
+	if last := msgs[len(msgs)-1].Text; !strings.Contains(last, "Left 1 queued message with attachments") {
+		t.Fatalf("kept notice = %q", last)
+	}
+
+	a.pendingQueue = []string{"still queued"}
+	a.finishCoordinatedRestore(nil, 0, errors.New("worker unavailable"))
+	if text, want := a.editor.Text(), "steer\n\nlater\n\ndraft"; text != want {
+		t.Fatalf("failed restore changed editor: %q", text)
+	}
+	if len(a.pendingQueue) != 1 {
+		t.Fatalf("failed restore dropped pending view: %v", a.pendingQueue)
+	}
+}
+
+func coordError(f coord.Frame, code, message string) coord.Frame {
+	data, err := json.Marshal(map[string]any{"type": "response", "id": "worker", "ok": false, "error": map[string]string{"code": code, "message": message}})
+	if err != nil {
+		panic(err)
+	}
+	return coord.Frame{Type: coord.TypeResponse, ID: f.ID, InstanceID: coordTestInstance, Result: data}
+}

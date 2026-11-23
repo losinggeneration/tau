@@ -49,6 +49,8 @@ type ErrorInfo struct {
 
 // Server holds the command handlers a worker runs against its runtime.
 type Server struct {
+	queueUpdateMu   sync.Mutex
+	queuePublished  queuePublication
 	runtime         sdk.Runtime
 	pluginManager   *plugins.Manager
 	ui              *ui.RPCUI
@@ -139,6 +141,14 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleFollowUp(ctx, cmd)
 	case "edit_queued_text":
 		return s.handleEditQueuedText(ctx, cmd)
+	case "pause_queue":
+		return s.handlePauseQueue(ctx, cmd)
+	case "resume_queue":
+		return s.handleResumeQueue(ctx, cmd)
+	case "clear_queue":
+		return s.handleClearQueue(ctx, cmd)
+	case "take_queued_text":
+		return s.handleTakeQueuedText(ctx, cmd)
 	case "cycle_model":
 		return s.handleCycleModel(ctx, cmd)
 	case "cycle_thinking_level":
@@ -368,6 +378,11 @@ func (s *Server) streamPrompt(id string, sess sdk.Session, events <-chan sdk.Eve
 				event = withSessionStats(sess, event)
 			}
 		}
+		if event.Type == "message_start" || event.Type == "agent_end" {
+			if err := s.publishQueueIfChanged(sess); err != nil {
+				return fmt.Errorf("emit queue update: %w", err)
+			}
+		}
 		if responded {
 			if err := s.emitEvent(event); err != nil {
 				return fmt.Errorf("emit event: %w", err)
@@ -576,8 +591,10 @@ func (s *Server) handleGetState(ctx context.Context, cmd *Command) error {
 			"thinking_level": s.thinkingLevel,
 			"is_streaming":   false,
 			"queue": map[string]any{
-				"steering":  0,
-				"follow_up": 0,
+				"steering":         0,
+				"follow_up":        0,
+				"steering_paused":  false,
+				"follow_up_paused": false,
 			},
 		})
 	}
@@ -588,6 +605,7 @@ func (s *Server) handleGetState(ctx context.Context, cmd *Command) error {
 		model = s.modelOverride
 	}
 	steering, followUp := queueSizes(s.session)
+	steeringPaused, followUpPaused := queuesPaused(s.session)
 	thinking := s.thinkingLevel
 	if statser, ok := s.session.(sdk.Statser); ok {
 		thinking = cmp.Or(statser.Stats().ThinkingLevel, thinking)
@@ -601,8 +619,10 @@ func (s *Server) handleGetState(ctx context.Context, cmd *Command) error {
 		"thinking_level": thinking,
 		"is_streaming":   state.IsStreaming(),
 		"queue": map[string]any{
-			"steering":  steering,
-			"follow_up": followUp,
+			"steering":         steering,
+			"follow_up":        followUp,
+			"steering_paused":  steeringPaused,
+			"follow_up_paused": followUpPaused,
 		},
 	}
 	if reader, ok := s.session.(sdk.SessionSettingsReader); ok {
@@ -663,6 +683,13 @@ func queueSizes(sess sdk.Session) (steering, followUp int) {
 	return 0, 0
 }
 
+func queuesPaused(sess sdk.Session) (steering, followUp bool) {
+	if queues, ok := sess.(sdk.QueueController); ok {
+		return queues.QueuesPaused()
+	}
+	return false, false
+}
+
 func (s *Server) observeSessionEvents(sess sdk.Session) {
 	observer, ok := sess.(sdk.EventObserver)
 	if !ok {
@@ -676,17 +703,39 @@ func (s *Server) observeSessionEvents(sess sdk.Session) {
 }
 
 func (s *Server) emitQueueUpdate(sess sdk.Session) error {
+	s.queueUpdateMu.Lock()
+	defer s.queueUpdateMu.Unlock()
+	return s.publishQueueLocked(sess)
+}
+
+// queuePublication records the queue sizes clients last saw for a session.
+type queuePublication struct {
+	sessionID          string
+	steering, followUp int
+}
+
+func (s *Server) publishQueueLocked(sess sdk.Session) error {
+	payload := snapshotQueue(sess)
+	steering, _ := payload["steering"].(int)
+	followUp, _ := payload["follow_up"].(int)
+	s.queuePublished = queuePublication{sess.ID(), steering, followUp}
+	payload["steering_count"], payload["follow_up_count"] = steering, followUp
+	return s.emitEvent(sdk.Event{Type: "queue_update", SessionID: sess.ID(), Payload: payload})
+}
+
+// publishQueueIfChanged tells clients when a run has taken queued messages.
+func (s *Server) publishQueueIfChanged(sess sdk.Session) error {
+	s.queueUpdateMu.Lock()
+	defer s.queueUpdateMu.Unlock()
 	steering, followUp := queueSizes(sess)
-	return s.emitEvent(sdk.Event{
-		Type:      "queue_update",
-		SessionID: sess.ID(),
-		Payload: map[string]any{
-			"steering":        steering,
-			"follow_up":       followUp,
-			"steering_count":  steering,
-			"follow_up_count": followUp,
-		},
-	})
+	last := s.queuePublished
+	if last.sessionID != sess.ID() {
+		last = queuePublication{}
+	}
+	if last.steering == steering && last.followUp == followUp {
+		return nil
+	}
+	return s.publishQueueLocked(sess)
 }
 
 // handleSetThinkingLevel updates the thinking level mid-session.
@@ -1237,7 +1286,133 @@ func (s *Server) handleEditQueuedText(ctx context.Context, cmd *Command) error {
 	if !queue.EditQueuedText(args.ID, args.Text) {
 		return s.sendError(cmd.ID, "queue_changed", "That message has already left the queue or changed. Your edit was not sent.")
 	}
+	if err := s.emitQueueUpdate(sess); err != nil {
+		return fmt.Errorf("emit queue update: %w", err)
+	}
 	return s.sendResult(cmd.ID, map[string]any{"ok": true})
+}
+
+// queueCommand resolves the session and queue a queue-control command targets.
+// It answers the command itself and returns ok=false on failure.
+func (s *Server) queueCommand(ctx context.Context, cmd *Command) (sess sdk.Session, queues sdk.QueueController, kinds []sdk.QueueKind, ok bool, err error) {
+	var args struct {
+		Session string `json:"expected_session_id,omitempty"`
+		Queue   string `json:"queue,omitempty"`
+	}
+	if len(cmd.Args) > 0 {
+		if err := json.Unmarshal(cmd.Args, &args); err != nil {
+			return nil, nil, nil, false, s.sendErrorResult(cmd.ID, err)
+		}
+	}
+	if args.Queue == "" && cmd.Type == "clear_queue" {
+		kinds = []sdk.QueueKind{sdk.QueueSteering, sdk.QueueFollowUp}
+	} else {
+		kind, err := sdk.ParseQueueKind(args.Queue)
+		if err != nil {
+			return nil, nil, nil, false, s.sendError(cmd.ID, "invalid_args", err.Error())
+		}
+		kinds = []sdk.QueueKind{kind}
+	}
+	sess, err = s.draftSession(ctx, args.Session)
+	if err != nil {
+		return nil, nil, nil, false, s.sendErrorResult(cmd.ID, err)
+	}
+	queues, ok = sess.(sdk.QueueController)
+	if !ok {
+		return nil, nil, nil, false, s.sendError(cmd.ID, "not_supported", "This session doesn't support queue controls.")
+	}
+	return sess, queues, kinds, true, nil
+}
+
+func (s *Server) handlePauseQueue(ctx context.Context, cmd *Command) error {
+	sess, queues, kinds, ok, err := s.queueCommand(ctx, cmd)
+	if !ok {
+		return err
+	}
+	if err := queues.PauseQueue(kinds[0]); err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	if err := s.emitQueueUpdate(sess); err != nil {
+		return fmt.Errorf("emit queue update: %w", err)
+	}
+	return s.sendResult(cmd.ID, map[string]any{"ok": true})
+}
+
+func (s *Server) handleResumeQueue(ctx context.Context, cmd *Command) error {
+	sess, queues, kinds, ok, err := s.queueCommand(ctx, cmd)
+	if !ok {
+		return err
+	}
+	events, err := queues.ResumeQueue(ctx, kinds[0])
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	if err := s.emitQueueUpdate(sess); err != nil {
+		return fmt.Errorf("emit queue update: %w", err)
+	}
+	if events == nil {
+		return s.sendResult(cmd.ID, map[string]any{"ok": true, "disposition": "resumed"})
+	}
+	s.promptWG.Go(func() {
+		if err := s.streamPrompt(cmd.ID, sess, events); err != nil {
+			if sendErr := s.sendError(cmd.ID, "handler_error", fmt.Sprintf("handle command: %v", err)); sendErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "warning: send resume error: %v\n", errors.Join(err, sendErr))
+			}
+		}
+	})
+	return nil
+}
+
+// handleClearQueue clears one queue, or both when no queue is named, and
+// returns the removed text so a client can restore it.
+func (s *Server) handleClearQueue(ctx context.Context, cmd *Command) error {
+	sess, queues, kinds, ok, err := s.queueCommand(ctx, cmd)
+	if !ok {
+		return err
+	}
+	cleared := map[sdk.QueueKind][]string{sdk.QueueSteering: {}, sdk.QueueFollowUp: {}}
+	for _, kind := range kinds {
+		messages, err := queues.ClearQueuedMessages(kind)
+		if err != nil {
+			return s.sendErrorResult(cmd.ID, err)
+		}
+		for _, msg := range messages {
+			cleared[kind] = append(cleared[kind], msg.Text)
+		}
+	}
+	if err := s.emitQueueUpdate(sess); err != nil {
+		return fmt.Errorf("emit queue update: %w", err)
+	}
+	return s.sendResult(cmd.ID, map[string]any{
+		"ok": true, "steering": cleared[sdk.QueueSteering],
+		"follow_up": cleared[sdk.QueueFollowUp], "followUp": cleared[sdk.QueueFollowUp],
+	})
+}
+
+// handleTakeQueuedText hands plain-text queued messages back to a client's
+// editor and leaves messages with attachments queued.
+func (s *Server) handleTakeQueuedText(ctx context.Context, cmd *Command) error {
+	var args struct {
+		Session string `json:"expected_session_id,omitempty"`
+	}
+	if len(cmd.Args) > 0 {
+		if err := json.Unmarshal(cmd.Args, &args); err != nil {
+			return s.sendErrorResult(cmd.ID, err)
+		}
+	}
+	sess, err := s.draftSession(ctx, args.Session)
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	restorer, ok := sess.(sdk.QueueRestorer)
+	if !ok {
+		return s.sendError(cmd.ID, "not_supported", "This session doesn't support restoring queued messages.")
+	}
+	steering, followUp, kept := restorer.TakeQueuedText()
+	if err := s.emitQueueUpdate(sess); err != nil {
+		return fmt.Errorf("emit queue update: %w", err)
+	}
+	return s.sendResult(cmd.ID, map[string]any{"ok": true, "steering": steering, "follow_up": followUp, "kept": kept})
 }
 
 // queueMessage queues msg as a steering ("steer") or follow-up message and

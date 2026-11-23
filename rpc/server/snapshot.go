@@ -411,10 +411,11 @@ func readHistory(sess sdk.Session, before string, format historyFormat) (history
 }
 
 func snapshotQueue(sess sdk.Session) map[string]any {
+	steerPaused, followPaused := queuesPaused(sess)
 	queue, ok := sess.(sdk.QueueEditor)
 	if !ok {
 		steer, follow := queueSizes(sess)
-		return map[string]any{"steering": steer, "follow_up": follow}
+		return map[string]any{"steering": steer, "follow_up": follow, "steering_paused": steerPaused, "follow_up_paused": followPaused}
 	}
 	items := queue.QueuedPrompts()
 	steer := 0
@@ -457,7 +458,7 @@ func snapshotQueue(sess sdk.Session) map[string]any {
 		remaining -= len(data) + 1
 		visible = append(visible, item)
 	}
-	return map[string]any{"steering": steer, "follow_up": len(items) - steer, "items": visible}
+	return map[string]any{"steering": steer, "follow_up": len(items) - steer, "steering_paused": steerPaused, "follow_up_paused": followPaused, "items": visible}
 }
 
 func (w *workerWriter) getSnapshot(cmd *Command) error {

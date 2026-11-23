@@ -419,3 +419,35 @@ func (s *sessionNoFollowUp) SetModel(_ string) error                      { retu
 func (s *sessionNoFollowUp) SlashCommands() []sdkpkg.SlashCommandInfo {
 	return nil
 }
+
+type queueRestoreFake struct {
+	*fakeSession
+}
+
+func (f *queueRestoreFake) TakeQueuedText() (steering, followUp []string, kept int) {
+	steering, f.steers = f.steers, nil
+	return steering, nil, len(f.followUps)
+}
+
+func TestRestoreQueuedMessagesKeepsAttachmentsQueued(t *testing.T) {
+	a := newTestApp(t)
+	a.sess = &queueRestoreFake{&fakeSession{steers: []string{"plain"}, followUps: []string{"has attachment"}}}
+	a.pending = NewPendingView()
+	a.editor = newPromptEditorForTest()
+	ctx := testCtx()
+	a.steeringQueue = []string{"plain"}
+	a.pendingQueue = []string{"has attachment"}
+
+	a.restoreQueuedMessages(ctx)
+
+	if got := a.editor.Text(); got != "plain" {
+		t.Fatalf("editor = %q, want only the plain message", got)
+	}
+	if len(a.steeringQueue) != 0 || len(a.pendingQueue) != 1 {
+		t.Fatalf("pending mirror = %v %v, want the attachment message still shown", a.steeringQueue, a.pendingQueue)
+	}
+	msgs := a.conv.Messages()
+	if last := msgs[len(msgs)-1].Text; !strings.Contains(last, "Left 1 queued message with attachments") {
+		t.Fatalf("notice = %q", last)
+	}
+}

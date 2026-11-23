@@ -98,6 +98,41 @@ func (a *App) sendCoordinatedDraft(text string, followUp bool) {
 	}()
 }
 
+// restoreCoordinatedQueue takes the queue back from the worker without blocking
+// the app loop. Holding the pending-send guard keeps this client from leaving
+// the instance before the removed text reaches the editor.
+func (a *App) restoreCoordinatedQueue() {
+	if a.waitingForCoordinatedSend() {
+		return
+	}
+	a.coordinatedPendingSend = true
+	sess := a.coordinated
+	sessionID := a.coordinatedSessionID
+	if sessionID == "" {
+		sessionID = sess.ID()
+	}
+	go func() {
+		queued, kept, err := sess.takeQueuedText(a.ctx, sessionID)
+		a.post(func(*tauui.UpdateCtx) { a.finishCoordinatedRestore(queued, kept, err) })
+	}()
+}
+
+// finishCoordinatedRestore leaves the pending view to the worker's queue_update,
+// which stays correct if another client queued a message in the meantime.
+func (a *App) finishCoordinatedRestore(queued []string, kept int, err error) {
+	a.coordinatedPendingSend = false
+	a.clearStatus("coordinator-send")
+	if err != nil {
+		a.conv.AddError("Restore queued messages: " + err.Error())
+		if errors.Is(err, rpcclient.ErrOutcomeUnknown) {
+			a.conv.AddSystem("The queue may have been cleared. Check the shared transcript and queue before resending.")
+		}
+		a.refreshChat()
+		return
+	}
+	a.restoreQueuedText(a.loopContext(), queued, kept)
+}
+
 func (a *App) forwardCoordinatedEvents(ctx context.Context, events <-chan sdk.Event) {
 	for {
 		select {

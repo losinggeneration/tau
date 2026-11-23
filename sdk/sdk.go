@@ -379,6 +379,44 @@ type QueueClearer interface {
 	ClearQueue() (steering, followUp []Message)
 }
 
+// QueueRestorer takes plain-text messages out of the queues so a frontend can
+// put them back in its editor. Messages with attachments stay queued because
+// text can't carry them, and kept reports how many remain.
+type QueueRestorer interface {
+	TakeQueuedText() (steering, followUp []string, kept int)
+}
+
+// QueueKind names one message queue.
+type QueueKind = agent.QueueKind
+
+const (
+	QueueSteering = agent.QueueSteering
+	QueueFollowUp = agent.QueueFollowUp
+)
+
+// ParseQueueKind resolves a queue name, accepting Pi's followUp spelling.
+func ParseQueueKind(name string) (QueueKind, error) {
+	switch name {
+	case "steer", "steering":
+		return QueueSteering, nil
+	case "follow_up", "followUp":
+		return QueueFollowUp, nil
+	default:
+		return "", fmt.Errorf("invalid queue %q: use steer or follow_up", name)
+	}
+}
+
+// QueueController pauses, resumes, and clears each queue independently.
+type QueueController interface {
+	PauseQueue(kind QueueKind) error
+	// ResumeQueue returns a run's events when resuming starts one on an idle
+	// session. The channel is nil when no run started.
+	ResumeQueue(ctx context.Context, kind QueueKind) (<-chan Event, error)
+	QueuesPaused() (steering, followUp bool)
+	// ClearQueuedMessages removes and returns the messages in one queue.
+	ClearQueuedMessages(kind QueueKind) ([]Message, error)
+}
+
 // ModelCycler cycles the active model for future turns.
 type ModelCycler interface{ CycleModel() (*ai.Model, error) }
 
@@ -3461,6 +3499,67 @@ func (s *agentSession) ClearQueue() (steering, followUp []Message) {
 
 func (s *agentSession) QueueSizes() (steering, followUp int) {
 	return s.agent.QueueSizes()
+}
+
+func (s *agentSession) TakeQueuedText() (steering, followUp []string, kept int) {
+	takenSteering, takenFollowUp, kept := s.agent.TakePlainTextQueued()
+	text := func(messages []*agent.Message) []string {
+		out := make([]string, 0, len(messages))
+		for _, msg := range messages {
+			out = append(out, msg.Content[0].Text)
+		}
+		return out
+	}
+	steering, followUp = text(takenSteering), text(takenFollowUp)
+	if len(steering)+len(followUp) > 0 {
+		s.recordQueueUpdate()
+	}
+	return steering, followUp, kept
+}
+
+func (s *agentSession) PauseQueue(kind QueueKind) error {
+	return s.agent.PauseQueue(kind)
+}
+
+func (s *agentSession) ResumeQueue(ctx context.Context, kind QueueKind) (<-chan Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("resume queue: %w", err)
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, errors.New("resume queue: session closed")
+	}
+	resumed, err := s.agent.ResumeQueue(kind)
+	if err != nil || !resumed || s.cancelFn != nil || s.emittingSettled || !s.agent.HasDeliverableMessages() {
+		s.mu.Unlock()
+		return nil, err
+	}
+	return s.runLocked(ctx, s.agent.RunQueued), nil
+}
+
+func (s *agentSession) QueuesPaused() (steering, followUp bool) {
+	return s.agent.QueuesPaused()
+}
+
+func (s *agentSession) ClearQueuedMessages(kind QueueKind) ([]Message, error) {
+	var cleared []*agent.Message
+	switch kind {
+	case QueueSteering:
+		cleared = s.agent.ClearSteeringQueue()
+	case QueueFollowUp:
+		cleared = s.agent.ClearFollowUpQueue()
+	default:
+		return nil, fmt.Errorf("clear queue: invalid queue %q", kind)
+	}
+	messages := make([]Message, 0, len(cleared))
+	for _, msg := range cleared {
+		messages = append(messages, sdkMessageFromAgent(msg))
+	}
+	if len(messages) > 0 {
+		s.recordQueueUpdate()
+	}
+	return messages, nil
 }
 
 func (s *agentSession) QueuedPrompts() []QueuedPrompt {
