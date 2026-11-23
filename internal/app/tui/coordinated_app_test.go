@@ -2,12 +2,15 @@ package tui
 
 import (
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/losinggeneration/tau/ai"
 	"github.com/stretchr/testify/require"
 
+	rpcclient "github.com/losinggeneration/tau/rpc/client"
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
 )
@@ -111,4 +114,40 @@ func TestUnattachedFooterShowsConfiguredModel(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, a.chat.Close()) })
 	got, _ := a.footer.render(160)
 	require.Contains(t, got, "openai-codex/gpt-5.6-luna • high")
+}
+
+func TestCoordinatedResetRestoresUsageLimitNotice(t *testing.T) {
+	s, _ := openCoordTestSession(t, newCoordFake(t))
+	a := newTestApp(t)
+	a.sess, a.coordinated = s, s
+	a.status = tauui.NewStatusEntriesView(5)
+	a.dialogPicker = tauui.NewDialogPicker()
+	a.applyCoordinatedEvent(nextCoordEvent(t, s))
+
+	const failure = "openai codex: status 429: The usage limit has been reached"
+	until := time.Now().Add(2 * time.Hour).Round(time.Second)
+	reset := CoordinatedReset{
+		Reason:    CoordinatedResetResync,
+		SessionID: "s1",
+		History: []sdk.HistoryEntry{{EntryID: "failed", Message: sdk.Message{
+			Role: "assistant", IsError: true, ErrorMessage: failure,
+			Content: []ai.ContentBlock{{Type: ai.ContentBlockText}},
+		}}},
+		Live:     CoordinatedLive{UsageLimitWait: &CoordinatedUsageLimitWait{Provider: "openai", ResetsAt: until.Format(time.RFC3339)}},
+		Snapshot: &rpcclient.Snapshot{State: rpcclient.SnapshotState{IsStreaming: true}},
+	}
+	a.applyCoordinatedEvent(sdk.Event{Type: CoordinatedResetEvent, SessionID: "s1", Payload: reset})
+
+	if !slices.ContainsFunc(a.conv.Messages(), func(m Message) bool { return m.IsError && m.Text == failure }) {
+		t.Fatalf("usage-limit error row lost on reset: %#v", a.conv.Messages())
+	}
+	if got := a.workingMessage(); !strings.HasPrefix(got, "openai usage limit, retrying at ") {
+		t.Fatalf("workingMessage = %q, want usage-limit countdown", got)
+	}
+
+	reset.Live.UsageLimitWait = nil
+	a.applyCoordinatedEvent(sdk.Event{Type: CoordinatedResetEvent, SessionID: "s1", Payload: reset})
+	if got := a.workingMessage(); got != defaultWorkingMessage {
+		t.Fatalf("workingMessage after wait ended = %q, want %q", got, defaultWorkingMessage)
+	}
 }

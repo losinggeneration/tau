@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -690,6 +691,11 @@ func appendSDKMessageToConversation(conv *ConversationModel, msg sdk.Message) {
 		}
 	}
 
+	// Like the live event path, a failure with no reply text shows its error.
+	if role == "assistant" && msg.ErrorMessage != "" && !hasVisibleText(msg) {
+		defer conv.AddError(msg.ErrorMessage)
+	}
+
 	if len(msg.Content) > 0 {
 		appendContentBlocksToConversation(conv, role, msg.Content, msg)
 		return
@@ -711,6 +717,15 @@ func appendSDKMessageToConversation(conv *ConversationModel, msg sdk.Message) {
 	default:
 		conv.AddMessage(Role(role), text)
 	}
+}
+
+func hasVisibleText(msg sdk.Message) bool {
+	if len(msg.Content) == 0 {
+		return strings.TrimSpace(msg.Text) != ""
+	}
+	return slices.ContainsFunc(msg.Content, func(block ai.ContentBlock) bool {
+		return block.Type == ai.ContentBlockText && strings.TrimSpace(block.Text) != ""
+	})
 }
 
 func appendContentBlocksToConversation(conv *ConversationModel, role string, blocks []ai.ContentBlock, msg sdk.Message) {

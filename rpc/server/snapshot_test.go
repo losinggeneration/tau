@@ -596,3 +596,36 @@ func TestLiveTextKeepsBoundedTail(t *testing.T) {
 		t.Fatalf("set kept old content: %q %v", s, cut)
 	}
 }
+
+func TestLiveStateTracksUsageLimitWait(t *testing.T) {
+	const wait = `{"type":"usage_limit_wait","provider":"openai","resets_at":"2026-11-23T12:00:00Z"}`
+	for _, tc := range []struct{ name, kind, event string }{
+		{"retry starts", "message_start", `{"message_id":"m2","role":"assistant"}`},
+		{"run ends", "agent_end", `{}`},
+		{"session ends", "session_end", `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var l liveState
+			if err := l.update("usage_limit_wait", json.RawMessage(wait)); err != nil {
+				t.Fatal(err)
+			}
+			got := l.snapshot().UsageLimitWait
+			if got == nil || got.Provider != "openai" || got.ResetsAt != "2026-11-23T12:00:00Z" {
+				t.Fatalf("wait = %+v", got)
+			}
+			if err := l.update(tc.kind, json.RawMessage(tc.event)); err != nil {
+				t.Fatal(err)
+			}
+			if got := l.snapshot().UsageLimitWait; got != nil {
+				t.Fatalf("wait survived %s: %+v", tc.kind, got)
+			}
+		})
+	}
+}
+
+func TestHistoryPreviewKeepsErrorMessage(t *testing.T) {
+	msg := sdk.Message{Role: "assistant", IsError: true, ErrorMessage: "status 429"}
+	if got := historyPreview(msg).ErrorMessage; got != "status 429" {
+		t.Fatalf("preview error = %q", got)
+	}
+}

@@ -12919,3 +12919,10 @@ func TestTakeQueuedTextLeavesAttachmentsQueued(t *testing.T) {
 	assert.Zero(t, gotSteering)
 	assert.Equal(t, 1, gotFollowUp)
 }
+
+func TestSDKMessageFromAgentKeepsErrorMessage(t *testing.T) {
+	got := sdkMessageFromAgent(&agent.Message{Role: agent.RoleAssistant, IsError: true, ErrorMessage: "status 429"})
+	if got.ErrorMessage != "status 429" {
+		t.Fatalf("ErrorMessage = %q", got.ErrorMessage)
+	}
+}

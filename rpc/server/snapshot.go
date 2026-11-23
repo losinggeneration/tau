@@ -47,6 +47,13 @@ type liveSnapshot struct {
 	Tools     []liveItem `json:"tools"`
 	Bash      []liveItem `json:"bash"`
 	Truncated bool       `json:"truncated,omitempty"`
+	// UsageLimitWait is set while the run sleeps out a provider usage limit.
+	UsageLimitWait *liveUsageLimitWait `json:"usage_limit_wait,omitempty"`
+}
+
+type liveUsageLimitWait struct {
+	Provider string `json:"provider,omitempty"`
+	ResetsAt string `json:"resets_at"`
 }
 
 // liveText keeps the tail of one streamed field. It grows to twice
@@ -118,6 +125,7 @@ type liveState struct {
 	messages, tools, bash []*liveRecord
 	truncated             bool
 	compacting            bool
+	usageLimitWait        *liveUsageLimitWait
 }
 
 func livePreviews(records []*liveRecord) []liveItem {
@@ -131,7 +139,7 @@ func livePreviews(records []*liveRecord) []liveItem {
 func (l *liveState) snapshot() liveSnapshot {
 	return liveSnapshot{
 		Messages: livePreviews(l.messages), Tools: livePreviews(l.tools), Bash: livePreviews(l.bash),
-		Truncated: l.truncated,
+		Truncated: l.truncated, UsageLimitWait: l.usageLimitWait,
 	}
 }
 
@@ -162,7 +170,14 @@ func (l *liveState) update(kind string, raw json.RawMessage) error {
 		*l = liveState{}
 		return nil
 	case "agent_end":
-		l.messages, l.tools = nil, nil
+		l.messages, l.tools, l.usageLimitWait = nil, nil, nil
+		return nil
+	case "usage_limit_wait":
+		var wait liveUsageLimitWait
+		if err := json.Unmarshal(raw, &wait); err != nil {
+			return fmt.Errorf("decode live %s: %w", kind, err)
+		}
+		l.usageLimitWait = &wait
 		return nil
 	case "compaction_start", "compaction_end":
 		l.compacting = kind == "compaction_start"
@@ -215,6 +230,9 @@ func (l *liveState) update(kind string, raw json.RawMessage) error {
 	switch kind {
 	case "message_start":
 		r.role.set(e.Role)
+		if e.Role == "assistant" {
+			l.usageLimitWait = nil
+		}
 	case "text_delta", "bash_execution_update":
 		r.text.add(e.Delta)
 	case "thinking_delta":
@@ -321,6 +339,7 @@ func historyPreview(msg sdk.Message) sdk.Message {
 		Display: msg.Display, ExcludeFromContext: msg.ExcludeFromContext,
 	}
 	p.Text, _ = clipText(msg.Text, historyPreviewBytes)
+	p.ErrorMessage, _ = clipText(msg.ErrorMessage, historyPreviewBytes)
 	budget, argsBudget := historyPreviewBytes, historyPreviewArgsBytes
 	for _, b := range msg.Content {
 		if isImageBlock(b) {
@@ -510,7 +529,7 @@ func (w *workerWriter) getSnapshot(cmd *Command) error {
 	if len(data) > limit {
 		// Dialogs and the history cursor are needed to resume; live state
 		// is only a tail of the stream, so clients see it marked truncated.
-		result.Live = liveSnapshot{Messages: []liveItem{}, Tools: []liveItem{}, Bash: []liveItem{}, Truncated: true}
+		result.Live = liveSnapshot{Messages: []liveItem{}, Tools: []liveItem{}, Bash: []liveItem{}, Truncated: true, UsageLimitWait: live.UsageLimitWait}
 		if _, ok := queue["items"]; ok {
 			queue["items"] = []sdk.QueuedPrompt{}
 		}

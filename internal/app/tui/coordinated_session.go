@@ -91,6 +91,14 @@ type CoordinatedLive struct {
 	Tools     []CoordinatedLiveItem `json:"tools"`
 	Bash      []CoordinatedLiveItem `json:"bash"`
 	Truncated bool                  `json:"truncated,omitempty"`
+	// UsageLimitWait is set while the run sleeps out a provider usage limit.
+	UsageLimitWait *CoordinatedUsageLimitWait `json:"usage_limit_wait,omitempty"`
+}
+
+// CoordinatedUsageLimitWait names the limited provider and its RFC 3339 reset.
+type CoordinatedUsageLimitWait struct {
+	Provider string `json:"provider,omitempty"`
+	ResetsAt string `json:"resets_at"`
 }
 
 // CoordinatedLiveItem is one in-progress row; text fields hold a tail.

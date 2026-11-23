@@ -114,6 +114,8 @@ type Message struct {
 	ToolName string
 	// IsError reports whether a tool message represents an error result.
 	IsError bool
+	// ErrorMessage is the provider failure of an errored assistant message.
+	ErrorMessage string `json:",omitempty"`
 	// SystemAddendum is appended to the system prompt as additional context.
 	// Used for skill content injection.
 	SystemAddendum string
@@ -3367,12 +3369,13 @@ func agentMessageFromSDK(msg Message) *agent.Message {
 func sdkMessageFromAgent(msg *agent.Message) Message {
 	out := Message{
 		ExcludeFromContext: msg.ExcludeFromContext, CustomType: msg.CustomType, Display: msg.Display, Details: msg.Details,
-		Data:       msg.Data,
-		Role:       string(msg.Role),
-		Content:    append([]ai.ContentBlock(nil), msg.Content...),
-		ToolCallID: msg.ToolCallID,
-		ToolName:   msg.ToolName,
-		IsError:    msg.IsError,
+		Data:         msg.Data,
+		Role:         string(msg.Role),
+		Content:      append([]ai.ContentBlock(nil), msg.Content...),
+		ToolCallID:   msg.ToolCallID,
+		ToolName:     msg.ToolName,
+		IsError:      msg.IsError,
+		ErrorMessage: msg.ErrorMessage,
 	}
 	out.StructuredContent = slices.Clone(msg.StructuredContent)
 	out.NestedCalls = slices.Clone(msg.NestedCalls)

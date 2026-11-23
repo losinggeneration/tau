@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	rpcclient "github.com/losinggeneration/tau/rpc/client"
 	"github.com/losinggeneration/tau/sdk"
@@ -206,6 +207,7 @@ func (a *App) applyCoordinatedEvent(ev sdk.Event) {
 		if reset.Live.Truncated {
 			a.conv.AddSystem("Some earlier streaming output was too large to restore.")
 		}
+		a.restoreUsageLimitWait(reset.Live.UsageLimitWait)
 		streaming := reset.Snapshot != nil && reset.Snapshot.State.IsStreaming
 		a.setStreaming(streaming)
 		if streaming && a.throbberTimer == nil {
@@ -228,6 +230,7 @@ func (a *App) applyCoordinatedEvent(ev sdk.Event) {
 			a.clearStatus("coordinator")
 		case CoordinatedExited:
 			a.programStatus.compacting = false
+			a.restoreUsageLimitWait(nil)
 			a.setStreaming(false)
 			a.refreshCompactionIndicator()
 			a.refreshProgramStatus()
@@ -268,6 +271,22 @@ func (a *App) applyCoordinatedEvent(ev sdk.Event) {
 		}
 		a.applySessionEvent(ev)
 	}
+}
+
+// restoreUsageLimitWait replaces the countdown with the worker's current wait.
+// It leaves any pause notice alone.
+func (a *App) restoreUsageLimitWait(wait *CoordinatedUsageLimitWait) {
+	var (
+		provider string
+		until    time.Time
+	)
+	if wait != nil {
+		parsed, err := time.Parse(time.RFC3339, wait.ResetsAt)
+		if err == nil {
+			provider, until = wait.Provider, parsed
+		}
+	}
+	a.setUsageLimitWait(provider, until)
 }
 
 func (a *App) refreshCoordinatedModel() {
