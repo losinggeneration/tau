@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -298,8 +299,9 @@ func TestWorkerReportsOnlyFirstTextPromptPerSession(t *testing.T) {
 	rt := newWorkerRuntime()
 	next := newWorkerRuntime().sess
 	next.mockSession = newMockSession("next-session", "/project")
-	rt.newFn = func(opts sdk.SessionOptions) (sdk.Session, error) {
-		if opts.CWD == "" {
+	var launched atomic.Bool
+	rt.newFn = func(sdk.SessionOptions) (sdk.Session, error) {
+		if launched.Swap(true) {
 			return next, nil
 		}
 		return rt.sess, nil
@@ -383,6 +385,113 @@ func TestWorkerRejectsRestartAfterSessionChanges(t *testing.T) {
 	h.send(t, "stop", `{"type":"shutdown"}`)
 	if r := h.response(t, "stop"); !r.OK || !closed.Load() {
 		t.Fatalf("worker did not stop: %+v", r)
+	}
+}
+
+func TestWorkerRestartKeepsReplacedSessionInProject(t *testing.T) {
+	for _, kind := range []string{"new_session", "resume_session"} {
+		t.Run(kind, func(t *testing.T) {
+			cwd, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			storage, err := sessionpkg.NewStorageAt(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved := sessionpkg.NewHeader(cwd, nil, nil)
+			writer, err := storage.Create(saved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := errors.Join(writer.Append(sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"Saved prompt"}`), nil)), writer.Close()); err != nil {
+				t.Fatal(err)
+			}
+			rt, err := sdk.NewRuntime(sdk.RuntimeOptions{SessionsDir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", CWD: cwd})
+			command := `{"type":"new_session"}`
+			if kind == "resume_session" {
+				command = fmt.Sprintf(`{"type":"resume_session","args":{"id":%q}}`, saved.ID)
+			}
+			h.send(t, "switch", command)
+			r := h.response(t, "switch")
+			if !r.OK {
+				t.Fatalf("switch session: %+v", r.Error)
+			}
+			var switched struct {
+				SessionID string `json:"session_id"`
+			}
+			decodeResult(t, r, &switched)
+			h.send(t, "restart", fmt.Sprintf(`{"type":"shutdown","args":{"expected_session_id":%q}}`, switched.SessionID))
+			if r := h.response(t, "restart"); !r.OK {
+				t.Fatalf("restart after %s: %+v", kind, r.Error)
+			}
+			header, err := storage.ResolveHeader(switched.SessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if header.CWD != cwd {
+				t.Fatalf("saved cwd = %q, want %q", header.CWD, cwd)
+			}
+		})
+	}
+}
+
+func TestWorkerKeepsSessionsInItsProject(t *testing.T) {
+	cwd, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "project")
+	if err := os.Symlink(cwd, alias); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	storage, err := sessionpkg.NewStorageAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := sessionpkg.NewHeader(other, nil, nil)
+	writer, err := storage.Create(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := sdk.NewRuntime(sdk.RuntimeOptions{SessionsDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", CWD: cwd})
+	h.send(t, "other-dir", fmt.Sprintf(`{"type":"new_session","args":{"cwd":%q}}`, other))
+	if r := h.response(t, "other-dir"); r.OK {
+		t.Fatal("worker accepted a session in another project")
+	}
+	h.send(t, "other-save", fmt.Sprintf(`{"type":"resume_session","args":{"id":%q}}`, foreign.ID))
+	if r := h.response(t, "other-save"); r.OK {
+		t.Fatal("worker resumed a session from another project")
+	}
+	h.send(t, "alias", fmt.Sprintf(`{"type":"new_session","args":{"cwd":%q}}`, alias))
+	r := h.response(t, "alias")
+	if !r.OK {
+		t.Fatalf("symlink to the worker project: %+v", r.Error)
+	}
+	var switched struct {
+		SessionID string `json:"session_id"`
+	}
+	decodeResult(t, r, &switched)
+	h.send(t, "restart", fmt.Sprintf(`{"type":"shutdown","args":{"expected_session_id":%q}}`, switched.SessionID))
+	if r := h.response(t, "restart"); !r.OK {
+		t.Fatalf("restart after alias: %+v", r.Error)
 	}
 }
 
@@ -655,8 +764,9 @@ func TestWorkerRejectsDraftAfterQueuedSessionSwitch(t *testing.T) {
 		return ch, nil
 	}
 	rt.sess.sendFn, next.sendFn = countSend, countSend
-	rt.newFn = func(opts sdk.SessionOptions) (sdk.Session, error) {
-		if opts.CWD == "/other" {
+	var launched atomic.Bool
+	rt.newFn = func(sdk.SessionOptions) (sdk.Session, error) {
+		if launched.Swap(true) {
 			return next, nil
 		}
 		return rt.sess, nil
@@ -678,7 +788,7 @@ func TestWorkerRejectsDraftAfterQueuedSessionSwitch(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("compaction did not hold admission")
 	}
-	h.send(t, "switch", `{"type":"new_session","args":{"cwd":"/other"}}`)
+	h.send(t, "switch", `{"type":"new_session"}`)
 	h.send(t, "draft", `{"type":"send_message","args":{"text":"for the old session","expected_session_id":"session"}}`)
 	h.send(t, "barrier", `{"type":"get_ui_requests"}`)
 	for {

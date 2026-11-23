@@ -921,18 +921,14 @@ func (co *coordinator) verifyLegacyRestartSave(ctx context.Context, project, id 
 	if err != nil {
 		return err
 	}
-	header, err := storage.ResolveHeader(id)
+	header, err := storage.ProjectHeader(id, cwd)
 	if err != nil {
 		return err
 	}
 	if header.Type != sessionpkg.EntryTypeSession {
 		return errors.New("saved file does not have a session header")
 	}
-	savedProject, err := filepath.EvalSymlinks(header.CWD)
-	if err != nil {
-		return fmt.Errorf("resolve saved project: %w", err)
-	}
-	if header.ID != id || savedProject != cwd {
+	if header.ID != id {
 		return errors.New("saved session does not match the selected session and project")
 	}
 	return nil

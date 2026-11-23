@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -476,7 +477,9 @@ func TestNewSession(t *testing.T) {
 	state := sess.State()
 	assert.NotEmpty(t, state.SessionID())
 	assert.Equal(t, "anthropic/claude-sonnet-4-6", state.Model())
-	assert.Equal(t, ".", state.CWD())
+	wantCWD, err := filepath.Abs(".")
+	require.NoError(t, err)
+	assert.Equal(t, wantCWD, state.CWD())
 	assert.False(t, state.IsStreaming())
 
 	err = sess.Close(testContext(t))
@@ -504,6 +507,26 @@ func TestNewSession_WithCWD(t *testing.T) {
 
 	state := sess.State()
 	assert.Equal(t, "/tmp/test", state.CWD())
+}
+
+func TestNewSession_ResolvesRelativeCWD(t *testing.T) {
+	ai.Clear()
+	ai.Init()
+
+	rt, err := NewRuntime(RuntimeOptions{
+		CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("sk-test-key")},
+		ExplicitModel:   "anthropic/default/claude-sonnet-4-6",
+	})
+	require.NoError(t, err)
+
+	for _, cwd := range []string{"", ".", "relative/project"} {
+		want, err := filepath.Abs(cmp.Or(cwd, "."))
+		require.NoError(t, err)
+		sess, err := rt.NewSession(testContext(t), SessionOptions{CWD: cwd, NoSession: true})
+		require.NoError(t, err)
+		assert.Equal(t, want, sess.State().CWD())
+		require.NoError(t, sess.Close(testContext(t)))
+	}
 }
 
 func TestNewSession_WithSessionID(t *testing.T) {
@@ -771,7 +794,9 @@ func TestSession_Send(t *testing.T) {
 	state := sess.State()
 	assert.NotEmpty(t, state.SessionID())
 	assert.Equal(t, "anthropic/claude-sonnet-4-6", state.Model())
-	assert.Equal(t, ".", state.CWD())
+	wantCWD, err := filepath.Abs(".")
+	require.NoError(t, err)
+	assert.Equal(t, wantCWD, state.CWD())
 	assert.False(t, state.IsStreaming())
 
 	// Note: credential store is called lazily when the client factory is invoked

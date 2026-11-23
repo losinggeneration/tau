@@ -85,7 +85,8 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	if s.runtime == nil {
 		return errors.New("worker runtime required")
 	}
-	if err := s.replaceSession(ctx, sdk.SessionOptions{CWD: instance.CWD, SessionID: instance.SessionID}, "worker_start"); err != nil {
+	s.projectCWD = instance.CWD
+	if err := s.replaceSession(ctx, sdk.SessionOptions{SessionID: instance.SessionID}, "worker_start"); err != nil {
 		return fmt.Errorf("initialize worker session: %w", err)
 	}
 	output.mu.Lock()

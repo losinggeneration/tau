@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,6 +82,8 @@ type Server struct {
 	eventSession      atomic.Pointer[eventSession]
 	sessionGeneration atomic.Uint64
 	coordinated       bool
+	// projectCWD is the coordinator-resolved directory a worker is bound to.
+	projectCWD string
 }
 
 type eventSession struct {
@@ -857,6 +860,13 @@ func (s *Server) handleResumeSession(ctx context.Context, cmd *Command) error {
 	if err := json.Unmarshal(cmd.Args, &args); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
+	if s.projectCWD != "" {
+		if storage := s.runtime.GetSessionStorage(); storage != nil {
+			if _, err := storage.ProjectHeader(args.ID, s.projectCWD); errors.Is(err, session.ErrOtherProject) {
+				return s.sendErrorResult(cmd.ID, err)
+			}
+		}
+	}
 
 	if err := s.replaceSession(ctx, sdk.SessionOptions{
 		SessionID:     args.ID,
@@ -969,6 +979,7 @@ func (s *Server) ensureSession(ctx context.Context) (sdk.Session, error) {
 	}
 
 	sess, err := s.runtime.NewSession(ctx, sdk.SessionOptions{
+		CWD:           s.projectCWD,
 		UI:            s.ui,
 		Model:         s.modelOverride,
 		ThinkingLevel: s.thinkingLevel,
@@ -986,6 +997,11 @@ func (s *Server) ensureSession(ctx context.Context) (sdk.Session, error) {
 }
 
 func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, reason string) error {
+	cwd, cwdErr := s.sessionCWD(opts.CWD)
+	if cwdErr != nil {
+		return cwdErr
+	}
+	opts.CWD = cwd
 	opts.UI = s.ui
 	s.sessionMu.Lock()
 	prev := s.session
@@ -1057,6 +1073,26 @@ func (s *Server) replaceSession(ctx context.Context, opts sdk.SessionOptions, re
 			"model": sess.State().Model(),
 		},
 	})
+}
+
+// sessionCWD keeps every session of a worker in the project the coordinator
+// launched it for. Standalone servers use the requested directory.
+func (s *Server) sessionCWD(cwd string) (string, error) {
+	if s.projectCWD == "" || cwd == "" || cwd == s.projectCWD {
+		return cmp.Or(cwd, s.projectCWD), nil
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolve session directory: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve session directory: %w", err)
+	}
+	if resolved != s.projectCWD {
+		return "", fmt.Errorf("worker belongs to project %s; start another instance for %s", s.projectCWD, resolved)
+	}
+	return s.projectCWD, nil
 }
 
 // sessionEventMetadata seeds resumed or forked sessions before publishing a
@@ -1807,6 +1843,7 @@ func (s *Server) handleFork(ctx context.Context, cmd *Command) error {
 	}
 
 	opts := sdk.SessionOptions{
+		CWD:           s.projectCWD,
 		UI:            s.ui,
 		Model:         s.modelOverride,
 		ThinkingLevel: s.thinkingLevel,

@@ -193,13 +193,12 @@ func resolveSavedTUISession(ctx context.Context, c *client.CoordinatedClient, cw
 }
 
 func savedSessionHeader(storage *sessionpkg.Storage, cwd, id string) (sessionpkg.Header, error) {
-	header, err := storage.ResolveHeader(id)
+	header, err := storage.ProjectHeader(id, cwd)
+	if errors.Is(err, sessionpkg.ErrOtherProject) {
+		return sessionpkg.Header{}, errors.New("saved session belongs to another project; open Tau in that project to resume it")
+	}
 	if err != nil {
 		return sessionpkg.Header{}, err
-	}
-	project, err := filepath.EvalSymlinks(header.CWD)
-	if err != nil || project != cwd {
-		return sessionpkg.Header{}, errors.New("saved session belongs to another project; open Tau in that project to resume it")
 	}
 	return header, nil
 }

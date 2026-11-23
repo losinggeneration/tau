@@ -5975,9 +5975,11 @@ func (r *runtime) NewSession(ctx context.Context, opts SessionOptions) (ret Sess
 	sessionLogger = logging.OrDiscard(sessionLogger)
 
 	// Determine CWD early so it can be used across session setup.
-	cwd := opts.CWD
-	if cwd == "" {
-		cwd = "."
+	// Session headers outlive this process, so a relative path would later
+	// resolve against whichever directory reads it.
+	cwd, cwdErr := filepath.Abs(cmp.Or(opts.CWD, "."))
+	if cwdErr != nil {
+		return nil, fmt.Errorf("resolve session CWD: %w", cwdErr)
 	}
 
 	// Validate CWD if requested.

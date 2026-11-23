@@ -390,3 +390,33 @@ func TestCheckSavedSessionReportsWriterBeforeLaunch(t *testing.T) {
 		t.Fatalf("preflight after writer closed: %v", err)
 	}
 }
+
+func TestCheckSavedSessionUsesFiledProjectForRelativeHeader(t *testing.T) {
+	dir := t.TempDir()
+	cwd, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage, err := session.NewStorageAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := session.NewHeader(".", nil, nil)
+	writer, err := session.CreateSessionFile(storage.DirForCWD(cwd), header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkSavedSession(dir, cwd, header.ID); err != nil {
+		t.Fatalf("session filed under its project: %v", err)
+	}
+	if err := checkSavedSession(dir, other, header.ID); err == nil {
+		t.Fatal("relative session accepted for another project")
+	}
+}

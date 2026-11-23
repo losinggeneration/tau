@@ -105,13 +105,12 @@ func checkSavedSession(dir, cwd, id string) error {
 	if err != nil {
 		return err
 	}
-	header, err := storage.ResolveHeader(id)
+	header, err := storage.ProjectHeader(id, cwd)
+	if errors.Is(err, sessionpkg.ErrOtherProject) || (err == nil && header.ID != id) {
+		return errors.New("saved session does not belong to the requested project")
+	}
 	if err != nil {
 		return err
-	}
-	project, err := filepath.EvalSymlinks(header.CWD)
-	if err != nil || project != cwd || header.ID != id {
-		return errors.New("saved session does not belong to the requested project")
 	}
 	return storage.CheckResumeOwner(id)
 }

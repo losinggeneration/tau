@@ -204,6 +204,37 @@ func (s *Storage) ResolveHeader(id string) (Header, error) {
 	return ReadHeader(path)
 }
 
+// ErrOtherProject reports a saved session that belongs to a different project.
+var ErrOtherProject = errors.New("saved session belongs to another project")
+
+// ProjectHeader returns a saved session's header after checking that it
+// belongs to project, a symlink-resolved directory. Older sessions recorded a
+// relative cwd, so their project is the scoped directory they were filed in.
+func (s *Storage) ProjectHeader(id, project string) (Header, error) {
+	path, err := s.findByID(id)
+	if err != nil {
+		return Header{}, err
+	}
+	header, err := ReadHeader(path)
+	if err != nil {
+		return Header{}, err
+	}
+	if !filepath.IsAbs(header.CWD) {
+		if filepath.Dir(path) != s.DirForCWD(project) {
+			return Header{}, ErrOtherProject
+		}
+		return header, nil
+	}
+	saved, err := filepath.EvalSymlinks(header.CWD)
+	if err != nil {
+		return Header{}, fmt.Errorf("%w: %w", ErrOtherProject, err)
+	}
+	if saved != project {
+		return Header{}, ErrOtherProject
+	}
+	return header, nil
+}
+
 // CheckResumeOwner reports whether a stored session is currently owned. It
 // does not claim the session; Resume must still take the writer lock.
 func (s *Storage) CheckResumeOwner(id string) error {
