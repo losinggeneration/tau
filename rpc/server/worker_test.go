@@ -284,7 +284,7 @@ func TestWorkerReportsRunStatusFromSameEventStream(t *testing.T) {
 	if r := h.response(t, "ready"); !r.OK {
 		t.Fatalf("ready probe: %+v", r)
 	}
-	for _, pair := range [][2]string{{"agent_start", coord.StateBusy}, {"agent_end", coord.StateReady}} {
+	for _, pair := range [][2]string{{"agent_start", coord.StateWorking}, {"agent_end", coord.StateAwaitingUser}} {
 		observe(sdk.Event{Type: pair[0], SessionID: "session"})
 		chat := h.next(t)
 		state := h.next(t)
@@ -292,6 +292,74 @@ func TestWorkerReportsRunStatusFromSameEventStream(t *testing.T) {
 			state.Instance == nil || state.Instance.SessionID != "session" || state.Instance.State != pair[1] {
 			t.Fatalf("%s frames = %+v / %+v", pair[0], chat, state)
 		}
+	}
+}
+
+func TestWorkerReportsRunStateTransitions(t *testing.T) {
+	resets := time.Date(2026, 11, 24, 14, 0, 0, 0, time.UTC)
+	type step struct {
+		kind    string
+		payload map[string]any
+		state   string // empty means the event must not publish a summary
+		detail  coord.StateDetail
+	}
+	start := step{kind: "agent_start", state: coord.StateWorking}
+	failedEnd := step{kind: "agent_end", payload: map[string]any{"failed": true}}
+	for name, steps := range map[string][]step{
+		"usage limit lasts until the retried response": {
+			start,
+			{kind: "usage_limit_wait", payload: map[string]any{"provider": "codex", "resets_at": resets.Format(time.RFC3339)}, state: coord.StateUsageLimited, detail: coord.StateDetail{Provider: "codex", ResetsAt: resets}},
+			{kind: "message_start", payload: map[string]any{"role": "assistant", "message_id": "m"}, state: coord.StateWorking},
+			{kind: "agent_end", state: coord.StateAwaitingUser},
+		},
+		"retry never passes through awaiting user": {
+			start, failedEnd,
+			{kind: "auto_retry_start", payload: map[string]any{"attempt": 2, "maxAttempts": 5}, state: coord.StateRetrying, detail: coord.StateDetail{Attempt: 2, MaxAttempts: 5}},
+			start,
+			{kind: "agent_end", state: coord.StateAwaitingUser},
+		},
+		"failure stays visible until the next run": {
+			start, failedEnd,
+			{kind: "error", payload: map[string]any{"code": "agent_error", "message": "bad\nkey"}, state: coord.StateError, detail: coord.StateDetail{Message: "bad key"}},
+			start,
+		},
+		"user abort is not a failure": {
+			start, failedEnd,
+			{kind: "error", payload: map[string]any{"code": "agent_error", "message": "context canceled", "aborted": true}, state: coord.StateAwaitingUser},
+		},
+		"pause clears on the resumed response": {
+			start,
+			{kind: "paused", payload: map[string]any{"target": "codex"}, state: coord.StatePaused, detail: coord.StateDetail{Target: "codex"}},
+			{kind: "message_start", payload: map[string]any{"role": "assistant", "message_id": "m"}, state: coord.StateWorking},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rt := newWorkerRuntime()
+			h := startWorker(t, rt, nil)
+			observe := <-rt.sess.observerReady
+			h.send(t, "ready", `{"type":"get_state"}`)
+			if r := h.response(t, "ready"); !r.OK {
+				t.Fatalf("ready probe: %+v", r)
+			}
+			for i, s := range steps {
+				observe(sdk.Event{Type: s.kind, SessionID: "session", Payload: s.payload})
+				if f := h.next(t); f.Type != coord.TypeEvent {
+					t.Fatalf("step %d %s event = %+v", i, s.kind, f)
+				}
+				if s.state == "" {
+					continue
+				}
+				f := h.next(t)
+				if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.State != s.state || !f.Instance.StateDetail.ResetsAt.Equal(s.detail.ResetsAt) {
+					t.Fatalf("step %d %s summary = %+v, want %s", i, s.kind, f.Instance, s.state)
+				}
+				got := f.Instance.StateDetail
+				got.ResetsAt = s.detail.ResetsAt
+				if got != s.detail {
+					t.Fatalf("step %d %s detail = %+v, want %+v", i, s.kind, got, s.detail)
+				}
+			}
+		})
 	}
 }
 

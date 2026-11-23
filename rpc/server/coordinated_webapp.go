@@ -394,13 +394,24 @@ async function snapshot(v, link) {
     for (const d of s.ui_requests || []) v.chat.dialogs.set(d.id, {...d, method: d.method || String(d.type || "").replace(/^ui_/, "")});
     renderDialogs(v);
 }
+function stateLabel(i) {
+    if (i.pending_inputs) return "needs input (" + i.pending_inputs + ")";
+    const d = i.state_detail || {};
+    switch (i.state) {
+    case "awaiting_user": return "awaiting user";
+    case "usage_limited": return "usage limit: " + (d.provider || "provider") + (d.resets_at ? ", resets " + new Date(d.resets_at).toLocaleString() : "");
+    case "retrying": return "retrying (" + d.attempt + "/" + d.max_attempts + ")";
+    case "paused": return d.target ? "paused: " + d.target : "paused";
+    case "error": return d.message ? "error: " + d.message : "error";
+    default: return i.state || "unknown";
+    }
+}
 function renderInstances() {
     const box = $("instances");
     box.replaceChildren();
     const selected = view?.id ?? intended;
     for (const i of instances.values()) {
-        const needs = i.pending_inputs ? " — Needs input (" + i.pending_inputs + ")" : "";
-        const shown = connected(i) ? (i.state || "ready") + needs : i.link_state;
+        const shown = connected(i) ? stateLabel(i) : i.link_state;
         const b = button(i.cwd + " — " + i.session_id + " — " + shown, () => select(i.instance_id));
         b.setAttribute("aria-pressed", String(i.instance_id === selected));
         b.title = i.node_id + "/" + i.instance_id;

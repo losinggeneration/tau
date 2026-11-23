@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -91,7 +92,7 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 	}
 	output.mu.Lock()
 	if output.instance.State == "" {
-		output.instance.State = coord.StateReady
+		output.instance.State = coord.StateAwaitingUser
 	}
 	output.mu.Unlock()
 	link, err := output.dial(ctx, path, token)
@@ -333,6 +334,8 @@ type workerWriter struct {
 	instancePrompts   bool
 	instanceBuild     bool
 	instance          coord.Instance
+	run               string
+	runDetail         coord.StateDetail
 	closing           sync.WaitGroup
 	journal           eventJournal
 	live              liveState
@@ -459,7 +462,7 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 			w.bound = bound
 			if bound.id != w.instance.SessionID {
 				w.instance.SessionID = bound.id
-				w.instance.State = coord.StateReady
+				w.setRunLocked(coord.StateAwaitingUser, coord.StateDetail{})
 				w.live = liveState{}
 				w.content = nil
 				w.contentGeneration++
@@ -565,17 +568,83 @@ func (w *workerWriter) publishSummaryLocked(kind string, data []byte) error {
 			}
 		}
 	case "agent_start":
-		w.instance.State = coord.StateBusy
-	case "agent_end", "session_shutdown":
-		w.instance.State = coord.StateReady
+		w.setRunLocked(coord.StateWorking, coord.StateDetail{})
+	case "session_shutdown":
+		w.setRunLocked(coord.StateAwaitingUser, coord.StateDetail{})
+	case "agent_end", "usage_limit_wait", "auto_retry_start", "paused", "message_start", "error":
+		if err := w.applyRunEventLocked(kind, data); err != nil {
+			workerLog("decode %s: %v", kind, err)
+		}
 	}
 	if isSharedUIRecord(kind) && w.server != nil && w.server.ui != nil {
 		w.instance.PendingInputs = w.server.ui.PendingRequests()
+		w.syncStateLocked()
 	}
 	if w.link == nil || w.instance == previous {
 		return nil
 	}
 	return w.sendSummaryLocked()
+}
+
+// applyRunEventLocked maps run events onto the published state. A failed
+// agent_end changes nothing because auto_retry_start, agent_start, or error
+// always follows it and says what actually happened. Caller holds mu.
+func (w *workerWriter) applyRunEventLocked(kind string, data []byte) error {
+	var e struct {
+		Failed      bool      `json:"failed"`
+		Aborted     bool      `json:"aborted"`
+		Code        string    `json:"code"`
+		Message     string    `json:"message"`
+		Role        string    `json:"role"`
+		Provider    string    `json:"provider"`
+		ResetsAt    time.Time `json:"resets_at"`
+		Attempt     int       `json:"attempt"`
+		MaxAttempts int       `json:"maxAttempts"`
+		Target      string    `json:"target"`
+	}
+	if err := json.Unmarshal(data, &e); err != nil {
+		return err
+	}
+	switch kind {
+	case "agent_end":
+		if !e.Failed {
+			w.setRunLocked(coord.StateAwaitingUser, coord.StateDetail{})
+		}
+	case "usage_limit_wait":
+		w.setRunLocked(coord.StateUsageLimited, coord.StateDetail{Provider: e.Provider, ResetsAt: e.ResetsAt})
+	case "auto_retry_start":
+		w.setRunLocked(coord.StateRetrying, coord.StateDetail{Attempt: e.Attempt, MaxAttempts: e.MaxAttempts})
+	case "paused":
+		w.setRunLocked(coord.StatePaused, coord.StateDetail{Target: e.Target})
+	case "message_start":
+		if e.Role == "assistant" && (w.run == coord.StateUsageLimited || w.run == coord.StatePaused) {
+			w.setRunLocked(coord.StateWorking, coord.StateDetail{})
+		}
+	case "error":
+		switch {
+		case e.Code != "agent_error":
+		case e.Aborted:
+			w.setRunLocked(coord.StateAwaitingUser, coord.StateDetail{})
+		default:
+			w.setRunLocked(coord.StateError, coord.StateDetail{Message: instancePromptPreview(e.Message)})
+		}
+	}
+	return nil
+}
+
+func (w *workerWriter) setRunLocked(state string, detail coord.StateDetail) {
+	w.run, w.runDetail = state, detail
+	w.syncStateLocked()
+}
+
+// syncStateLocked lets a pending dialog outrank the run state, which returns
+// once the dialog is answered. Caller holds mu.
+func (w *workerWriter) syncStateLocked() {
+	if w.instance.PendingInputs > 0 {
+		w.instance.State, w.instance.StateDetail = coord.StateNeedsInput, coord.StateDetail{}
+		return
+	}
+	w.instance.State, w.instance.StateDetail = cmp.Or(w.run, coord.StateAwaitingUser), w.runDetail
 }
 
 func (w *workerWriter) sendSummaryLocked() error {

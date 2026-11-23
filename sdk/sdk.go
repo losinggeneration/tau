@@ -1764,6 +1764,7 @@ func (s *agentSession) runLocked(ctx context.Context, run func(context.Context) 
 						"code":        "agent_error",
 						"message":     err.Error(),
 						"recoverable": false,
+						"aborted":     errors.Is(err, context.Canceled),
 					},
 				})
 			}
@@ -4887,6 +4888,17 @@ func usagePayload(usage ai.Usage) map[string]any {
 	return payload
 }
 
+// agentEndPayload flags a run that ended on a failed response, so observers
+// can wait for the retry or error that follows instead of treating it as done.
+func agentEndPayload(messages []*agent.Message) map[string]any {
+	if len(messages) > 0 {
+		if last := messages[len(messages)-1]; last != nil && (last.StopReason == ai.StopReasonError || last.StopReason == ai.StopReasonAborted) {
+			return map[string]any{"failed": true}
+		}
+	}
+	return map[string]any{}
+}
+
 func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 	switch e := event.(type) {
 	case agent.AgentStart:
@@ -4899,7 +4911,7 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 		s.emit(ch, Event{
 			Type:      "agent_end",
 			SessionID: s.id,
-			Payload:   map[string]any{},
+			Payload:   agentEndPayload(e.Messages),
 		})
 	case agent.TurnStart:
 		s.emit(ch, Event{

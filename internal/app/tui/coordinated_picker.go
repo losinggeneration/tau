@@ -179,7 +179,7 @@ func pickerInstancesDuringJob(instances []coord.Instance, job *InstancePickerJob
 	instances = slices.Clone(instances)
 	for _, target := range job.Targets {
 		target.PendingInputs = 0
-		target.State = "working"
+		target.State = coord.StateWorking
 		target.LinkState = coord.LinkConnected
 		instances = updatePickerInstances(instances, coord.Frame{InstanceID: target.ID, Instance: &target})
 	}
@@ -318,10 +318,7 @@ func instancePickerItems(instances []coord.Instance, cwd, current, filter string
 			continue
 		}
 		label := sanitizeStatus(instance.CWD)
-		state := instance.State
-		if instance.PendingInputs > 0 {
-			state = fmt.Sprintf("%d awaiting input", instance.PendingInputs)
-		}
+		state := sanitizeStatus(instance.StatusText())
 		if instance.Outdated {
 			state += " ⟳"
 		}
@@ -375,7 +372,7 @@ func ConfirmInstanceManagement(ctx context.Context, action string, targets []coo
 func instanceManagementPrompt(action string, targets []coord.Instance) (string, bool) {
 	var active []string
 	for _, target := range targets {
-		if target.State == coord.StateBusy || target.PendingInputs > 0 {
+		if target.Active() {
 			active = append(active, sanitizeStatus(target.CWD))
 		}
 	}
@@ -386,7 +383,7 @@ func instanceManagementPrompt(action string, targets []coord.Instance) (string, 
 	if len(targets) > 1 {
 		noun = fmt.Sprintf("%d workers", len(targets))
 	}
-	return fmt.Sprintf("%s %s for all clients? Busy or awaiting input:\n%s", instanceManagementVerb(action), noun, strings.Join(active, "\n")), true
+	return fmt.Sprintf("%s %s for all clients? Working or awaiting input:\n%s", instanceManagementVerb(action), noun, strings.Join(active, "\n")), true
 }
 
 func instanceManagementVerb(action string) string {

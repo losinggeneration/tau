@@ -3587,12 +3587,12 @@ func TestDoctorReportsResponsiveCoordinator(t *testing.T) {
 
 func TestDoctorInstanceLine(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	busy := coord.Instance{ID: "a", CWD: "/p", PID: 42, State: coord.StateBusy, LinkState: "connected", LastActivity: now.Add(-90 * time.Second)}
-	assert.Equal(t, "a pid=42 status=busy link=connected last-activity=2026-01-02T03:02:35Z (1m30s ago) cwd=/p", doctorInstanceLine(busy, now))
+	busy := coord.Instance{ID: "a", CWD: "/p", PID: 42, State: coord.StateWorking, LinkState: "connected", LastActivity: now.Add(-90 * time.Second)}
+	assert.Equal(t, "a pid=42 status=working link=connected last-activity=2026-01-02T03:02:35Z (1m30s ago) cwd=/p", doctorInstanceLine(busy, now))
 
 	approval := busy
 	approval.PendingInputs = 2
-	assert.Contains(t, doctorInstanceLine(approval, now), "status=approval (2 pending)")
+	assert.Contains(t, doctorInstanceLine(approval, now), "status=needs input (2)")
 
 	assert.Equal(t, "b pid=unknown status=unknown link=unknown last-activity=unknown cwd=", doctorInstanceLine(coord.Instance{ID: "b"}, now))
 }

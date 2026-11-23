@@ -68,9 +68,30 @@ const (
 
 // Worker states reported in Instance summaries.
 const (
-	StateReady = "ready"
-	StateBusy  = "busy"
+	// StateAwaitingUser means the run finished and it's the user's turn.
+	StateAwaitingUser = "awaiting_user"
+	StateWorking      = "working"
+	// StateNeedsInput means a run is blocked on a dialog answer.
+	StateNeedsInput = "needs_input"
+	// StateUsageLimited means a run is asleep until a provider quota resets.
+	// Switching models wakes it early.
+	StateUsageLimited = "usage_limited"
+	// StateRetrying means a run is backing off after a provider failure.
+	StateRetrying = "retrying"
+	StatePaused   = "paused"
+	// StateError means the last run failed and won't continue on its own.
+	StateError = "error"
 )
+
+// StateDetail explains the current State. Fields apply only to some states.
+type StateDetail struct {
+	Provider    string    `json:"provider,omitempty"`
+	ResetsAt    time.Time `json:"resets_at,omitzero"`
+	Attempt     int       `json:"attempt,omitempty"`
+	MaxAttempts int       `json:"max_attempts,omitempty"`
+	Target      string    `json:"target,omitempty"`
+	Message     string    `json:"message,omitempty"`
+}
 
 // Worker link states are separate from the agent lifecycle.
 const (
@@ -220,19 +241,66 @@ func (e *Error) Error() string {
 
 // Instance summarizes one registered worker.
 type Instance struct {
-	ID              string    `json:"instance_id"`
-	NodeID          string    `json:"node_id,omitempty"`
-	CWD             string    `json:"cwd,omitempty"`
-	SessionID       string    `json:"session_id,omitempty"`
-	FirstPrompt     string    `json:"first_prompt,omitempty"`
-	BuildID         string    `json:"build_id,omitempty"`
-	Outdated        bool      `json:"outdated,omitempty"`
-	State           string    `json:"state,omitempty"`
-	PID             int       `json:"pid,omitempty"`
-	PendingInputs   int       `json:"pending_inputs,omitempty"`
-	LaunchRequestID string    `json:"launch_request_id,omitempty"`
-	LinkState       string    `json:"link_state,omitempty"`
-	LastActivity    time.Time `json:"last_activity,omitzero"`
+	ID              string      `json:"instance_id"`
+	NodeID          string      `json:"node_id,omitempty"`
+	CWD             string      `json:"cwd,omitempty"`
+	SessionID       string      `json:"session_id,omitempty"`
+	FirstPrompt     string      `json:"first_prompt,omitempty"`
+	BuildID         string      `json:"build_id,omitempty"`
+	Outdated        bool        `json:"outdated,omitempty"`
+	State           string      `json:"state,omitempty"`
+	StateDetail     StateDetail `json:"state_detail,omitzero"`
+	PID             int         `json:"pid,omitempty"`
+	PendingInputs   int         `json:"pending_inputs,omitempty"`
+	LaunchRequestID string      `json:"launch_request_id,omitempty"`
+	LinkState       string      `json:"link_state,omitempty"`
+	LastActivity    time.Time   `json:"last_activity,omitzero"`
+}
+
+// Active reports whether stopping the worker would interrupt a run.
+func (i *Instance) Active() bool {
+	if i.PendingInputs > 0 {
+		return true
+	}
+	switch i.State {
+	case StateWorking, StateNeedsInput, StateUsageLimited, StateRetrying, StatePaused:
+		return true
+	}
+	return false
+}
+
+// StatusText describes the state for people.
+func (i *Instance) StatusText() string {
+	if i.PendingInputs > 0 {
+		return fmt.Sprintf("needs input (%d)", i.PendingInputs)
+	}
+	d := i.StateDetail
+	switch i.State {
+	case StateAwaitingUser:
+		return "awaiting user"
+	case StateNeedsInput:
+		return "needs input"
+	case StateUsageLimited:
+		if d.ResetsAt.IsZero() {
+			return "usage limit: " + d.Provider
+		}
+		return fmt.Sprintf("usage limit: %s, resets %s", d.Provider, d.ResetsAt.Local().Format("Mon Jan 2 15:04"))
+	case StateRetrying:
+		return fmt.Sprintf("retrying (%d/%d)", d.Attempt, d.MaxAttempts)
+	case StatePaused:
+		if d.Target == "" {
+			return "paused"
+		}
+		return "paused: " + d.Target
+	case StateError:
+		if d.Message == "" {
+			return "error"
+		}
+		return "error: " + d.Message
+	case "":
+		return "unknown"
+	}
+	return i.State
 }
 
 func decodeFrame(line []byte) (Frame, error) {
@@ -342,13 +410,16 @@ func (i *Instance) validate() error {
 	if i.PendingInputs < 0 {
 		return fmt.Errorf("%w: negative pending input count", ErrInvalidFrame)
 	}
-	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State, i.LaunchRequestID, i.LinkState, i.BuildID} {
+	for _, s := range []string{i.ID, i.NodeID, i.SessionID, i.State, i.LaunchRequestID, i.LinkState, i.BuildID, i.StateDetail.Provider, i.StateDetail.Target} {
 		if len(s) > maxIDBytes {
 			return fmt.Errorf("%w: instance identifier exceeds %d bytes", ErrInvalidFrame, maxIDBytes)
 		}
 	}
 	if len(i.FirstPrompt) > MaxInstancePromptBytes {
 		return fmt.Errorf("%w: instance prompt exceeds %d bytes", ErrInvalidFrame, MaxInstancePromptBytes)
+	}
+	if len(i.StateDetail.Message) > MaxInstancePromptBytes {
+		return fmt.Errorf("%w: instance state message exceeds %d bytes", ErrInvalidFrame, MaxInstancePromptBytes)
 	}
 	if len(i.CWD) > maxTextBytes {
 		return fmt.Errorf("%w: instance cwd exceeds %d bytes", ErrInvalidFrame, maxTextBytes)

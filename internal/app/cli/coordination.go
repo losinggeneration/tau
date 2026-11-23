@@ -448,6 +448,6 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 		}
 	}
 	return server.NewWorker(runtime, reg, mgr).Run(ctx, cmd.String("socket"), coord.Instance{
-		ID: instance, NodeID: node, CWD: cwd, SessionID: sessionID, PID: os.Getpid(), State: "ready", LaunchRequestID: launchRequest, BuildID: build,
+		ID: instance, NodeID: node, CWD: cwd, SessionID: sessionID, PID: os.Getpid(), State: coord.StateAwaitingUser, LaunchRequestID: launchRequest, BuildID: build,
 	}, token)
 }

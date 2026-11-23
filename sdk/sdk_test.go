@@ -5091,10 +5091,15 @@ func TestSendProviderFailureWritesErrorEntry(t *testing.T) {
 
 	events, err := sess.Send(testContext(t), Message{Text: "hi"})
 	require.NoError(t, err)
-	var sawErrorEvent bool
+	var sawErrorEvent, sawFailedEnd bool
 	for _, e := range collectSessionEvents(t, events) {
-		if e.Type == "error" {
+		switch e.Type {
+		case "agent_end":
+			sawFailedEnd = e.Payload.(map[string]any)["failed"] == true
+		case "error":
 			sawErrorEvent = true
+			assert.True(t, sawFailedEnd, "a failed agent_end must precede the terminal error")
+			assert.Equal(t, false, e.Payload.(map[string]any)["aborted"])
 		}
 	}
 	require.True(t, sawErrorEvent, "provider failure must surface an error event")
@@ -6631,6 +6636,13 @@ func TestSendRetriesTransientAssistantFailure(t *testing.T) {
 	assert.Equal(t, 2, calls)
 	assert.Equal(t, "recovered", sess.(*agentSession).GetLastAssistantText())
 	assert.True(t, slices.ContainsFunc(collected, func(e Event) bool { return e.Type == "auto_retry_start" }))
+	var ends []bool
+	for _, e := range collected {
+		if e.Type == "agent_end" {
+			ends = append(ends, e.Payload.(map[string]any)["failed"] == true)
+		}
+	}
+	assert.Equal(t, []bool{true, false}, ends, "only the failed attempt's agent_end is flagged")
 	assert.Len(t, sess.(FullMessageLister).GetAllMessages(), 3)
 	assert.Len(t, sess.(MessageLister).GetMessages(), 2)
 	id := sess.ID()
@@ -9681,18 +9693,22 @@ func TestRunSettlementReportsAbortedRetryWithoutOuterCancellation(t *testing.T) 
 	s := sess.(*agentSession)
 	s.mu.Lock()
 	events := s.runLocked(t.Context(), func(context.Context) error { return errors.New("server_busy") })
-	var scheduled, settled bool
+	var scheduled, settled, reported bool
 	for e := range events {
 		switch e.Type {
 		case "auto_retry_start":
 			scheduled = true
 			s.AbortRetry()
+		case "error":
+			reported = true
+			assert.Equal(t, true, e.Payload.(map[string]any)["aborted"])
 		case "session_end":
 			settled = true
 			assert.Equal(t, true, e.Payload.(map[string]any)["aborted"])
 		}
 	}
 	assert.True(t, scheduled)
+	assert.True(t, reported)
 	assert.True(t, settled)
 }
 
@@ -12924,5 +12940,26 @@ func TestSDKMessageFromAgentKeepsErrorMessage(t *testing.T) {
 	got := sdkMessageFromAgent(&agent.Message{Role: agent.RoleAssistant, IsError: true, ErrorMessage: "status 429"})
 	if got.ErrorMessage != "status 429" {
 		t.Fatalf("ErrorMessage = %q", got.ErrorMessage)
+	}
+}
+
+func TestAgentEndPayloadFlagsFailedRuns(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		messages []*agent.Message
+		failed   bool
+	}{
+		{name: "no messages"},
+		{name: "completed", messages: []*agent.Message{{StopReason: ai.StopReasonStop}}},
+		{name: "recovered after an error", messages: []*agent.Message{{StopReason: ai.StopReasonError}, {StopReason: ai.StopReasonStop}}},
+		{name: "error", messages: []*agent.Message{{StopReason: ai.StopReasonError}}, failed: true},
+		{name: "aborted", messages: []*agent.Message{{StopReason: ai.StopReasonAborted}}, failed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, got := agentEndPayload(test.messages)["failed"]
+			if got != test.failed {
+				t.Fatalf("failed = %v, want %v", got, test.failed)
+			}
+		})
 	}
 }

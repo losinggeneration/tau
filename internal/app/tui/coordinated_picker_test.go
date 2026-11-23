@@ -13,14 +13,14 @@ import (
 func TestInstancePickerShowsAndFiltersFirstPrompt(t *testing.T) {
 	const cwd = "/project"
 	instances := []coord.Instance{
-		{ID: "worker-a", CWD: cwd, SessionID: "session-a", FirstPrompt: "Fix\n  the picker", State: "busy"},
-		{ID: "worker-b", CWD: cwd, SessionID: "session-b", FirstPrompt: "Review the tests", State: "ready"},
-		{ID: "worker-c", CWD: cwd, SessionID: "session-c", State: "ready"},
+		{ID: "worker-a", CWD: cwd, SessionID: "session-a", FirstPrompt: "Fix\n  the picker", State: coord.StateWorking},
+		{ID: "worker-b", CWD: cwd, SessionID: "session-b", FirstPrompt: "Review the tests", State: coord.StateAwaitingUser},
+		{ID: "worker-c", CWD: cwd, SessionID: "session-c", State: coord.StateAwaitingUser},
 	}
 	items := instancePickerItems(instances, cwd, "worker-a", "")
 	require.Len(t, items, 4)
 	require.Equal(t, "Fix the picker", items[0].Name)
-	require.Equal(t, "busy · current · worker-a · /project", items[0].Description)
+	require.Equal(t, "working · current · worker-a · /project", items[0].Description)
 	require.Equal(t, "Review the tests", items[1].Name)
 	require.Equal(t, cwd, items[2].Name)
 	require.Equal(t, NewInstanceChoice, items[3].Value)
@@ -32,14 +32,14 @@ func TestInstancePickerShowsAndFiltersFirstPrompt(t *testing.T) {
 
 func TestInstancePickerMarksOutdatedStatus(t *testing.T) {
 	instances := []coord.Instance{
-		{ID: "worker-a", CWD: "/a", State: coord.StateReady, Outdated: true},
-		{ID: "worker-b", CWD: "/b", State: coord.StateBusy, PendingInputs: 2, Outdated: true},
-		{ID: "worker-c", CWD: "/c", State: coord.StateBusy},
+		{ID: "worker-a", CWD: "/a", State: coord.StateAwaitingUser, Outdated: true},
+		{ID: "worker-b", CWD: "/b", State: coord.StateWorking, PendingInputs: 2, Outdated: true},
+		{ID: "worker-c", CWD: "/c", State: coord.StateWorking},
 	}
 	items := instancePickerItems(instances, "/a", "worker-a", "")
-	require.Equal(t, "ready ⟳ · current · worker-a", items[0].Description)
-	require.Equal(t, "2 awaiting input ⟳ · worker-b", items[1].Description)
-	require.Equal(t, "busy · worker-c", items[2].Description)
+	require.Equal(t, "awaiting user ⟳ · current · worker-a", items[0].Description)
+	require.Equal(t, "needs input (2) ⟳ · worker-b", items[1].Description)
+	require.Equal(t, "working · worker-c", items[2].Description)
 }
 
 func TestInstancePickerKeymap(t *testing.T) {
@@ -87,10 +87,10 @@ func TestInstancePickerTerminalShortcuts(t *testing.T) {
 
 func TestInstancePickerActionTargets(t *testing.T) {
 	instances := []coord.Instance{
-		{ID: "worker-a", State: coord.StateReady, Outdated: true},
-		{ID: "worker-b", State: coord.StateReady},
-		{ID: "worker-c", State: coord.StateBusy, Outdated: true, LinkState: coord.LinkConnected},
-		{ID: "worker-d", State: coord.StateReady, Outdated: true, LinkState: "disconnected"},
+		{ID: "worker-a", State: coord.StateAwaitingUser, Outdated: true},
+		{ID: "worker-b", State: coord.StateAwaitingUser},
+		{ID: "worker-c", State: coord.StateWorking, Outdated: true, LinkState: coord.LinkConnected},
+		{ID: "worker-d", State: coord.StateAwaitingUser, Outdated: true, LinkState: "disconnected"},
 	}
 
 	got, handled := instancePickerAction(instancePickerRestart, instances, "worker-b")
@@ -130,9 +130,9 @@ func TestInstancePickerFocusRestoresState(t *testing.T) {
 }
 
 func TestInstanceManagementPrompt(t *testing.T) {
-	idle := coord.Instance{ID: "a", CWD: "/idle", State: coord.StateReady}
-	busy := coord.Instance{ID: "b", CWD: "/busy", State: coord.StateBusy}
-	waiting := coord.Instance{ID: "c", CWD: "/waiting", State: coord.StateReady, PendingInputs: 1}
+	idle := coord.Instance{ID: "a", CWD: "/idle", State: coord.StateAwaitingUser}
+	busy := coord.Instance{ID: "b", CWD: "/busy", State: coord.StateWorking}
+	waiting := coord.Instance{ID: "c", CWD: "/waiting", State: coord.StateAwaitingUser, PendingInputs: 1}
 
 	_, ok := instanceManagementPrompt(InstanceActionRestartOutdated, []coord.Instance{idle, idle})
 	require.False(t, ok)
@@ -140,11 +140,18 @@ func TestInstanceManagementPrompt(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
+	for _, state := range []string{coord.StateUsageLimited, coord.StateRetrying, coord.StatePaused} {
+		_, ok = instanceManagementPrompt(InstanceActionStop, []coord.Instance{{ID: "d", CWD: "/stuck", State: state}})
+		require.True(t, ok, state)
+	}
+	_, ok = instanceManagementPrompt(InstanceActionStop, []coord.Instance{{ID: "e", CWD: "/failed", State: coord.StateError}})
+	require.False(t, ok)
+
 	prompt, ok := instanceManagementPrompt(InstanceActionStop, []coord.Instance{busy})
 	require.True(t, ok)
-	require.Equal(t, "Stop this worker for all clients? Busy or awaiting input:\n/busy", prompt)
+	require.Equal(t, "Stop this worker for all clients? Working or awaiting input:\n/busy", prompt)
 
 	prompt, ok = instanceManagementPrompt(InstanceActionRestartOutdated, []coord.Instance{idle, busy, waiting})
 	require.True(t, ok)
-	require.Equal(t, "Restart 3 workers for all clients? Busy or awaiting input:\n/busy\n/waiting", prompt)
+	require.Equal(t, "Restart 3 workers for all clients? Working or awaiting input:\n/busy\n/waiting", prompt)
 }

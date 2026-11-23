@@ -486,7 +486,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 	record.LaunchRequestID = requestID
 	record.LinkState = LinkConnected
 	if record.State == "" {
-		record.State = StateReady
+		record.State = StateAwaitingUser
 	}
 	if existing != nil {
 		buildID = cmp.Or(existing.buildID, buildID)
@@ -1303,6 +1303,7 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 		w.buildID = cmp.Or(w.buildID, f.Instance.BuildID)
 		if f.Instance.State != "" {
 			w.instance.State = f.Instance.State
+			w.instance.StateDetail = f.Instance.StateDetail
 		}
 		w.instance.PendingInputs = f.Instance.PendingInputs
 		if f.Instance.LastActivity.After(w.instance.LastActivity) {

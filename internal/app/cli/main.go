@@ -2762,20 +2762,13 @@ func writeDoctorCoordinator(ctx context.Context, w io.Writer, path string, now t
 	return nil
 }
 
-// doctorInstanceLine summarizes one worker. Status is "approval" while the
-// worker waits on user input, since that outranks ready or busy.
+// doctorInstanceLine summarizes one worker.
 func doctorInstanceLine(instance coord.Instance, now time.Time) string {
 	pid := "unknown"
 	if instance.PID > 0 {
 		pid = strconv.Itoa(instance.PID)
 	}
-	status := instance.State
-	switch {
-	case instance.PendingInputs > 0:
-		status = fmt.Sprintf("approval (%d pending)", instance.PendingInputs)
-	case status == "":
-		status = "unknown"
-	}
+	status := instance.StatusText()
 	link := instance.LinkState
 	if link == "" {
 		link = "unknown"

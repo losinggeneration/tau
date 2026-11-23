@@ -193,7 +193,7 @@ func (h *harness) start(c *Link, id string) (Instance, *fakeWorker) {
 	if resp.Type != TypeResponse || resp.ID != id || resp.Error != nil || resp.Instance == nil {
 		h.t.Fatalf("start response = %+v (error %v)", resp, resp.Error)
 	}
-	if resp.Instance.ID != w.req.InstanceID || resp.Instance.CWD != h.cwd || resp.Instance.State != StateReady {
+	if resp.Instance.ID != w.req.InstanceID || resp.Instance.CWD != h.cwd || resp.Instance.State != StateAwaitingUser {
 		h.t.Fatalf("started instance = %+v, launch %+v", resp.Instance, w.req)
 	}
 	if w.welcome.Generation == "" || w.welcome.InstanceID != w.req.InstanceID {
@@ -470,7 +470,7 @@ func TestWatchInstancesOnlyDeliversSummaries(t *testing.T) {
 	}
 	mustSend(t, w.link, Frame{Type: TypeEvent, Event: json.RawMessage(`{"type":"private_chat_update"}`)})
 	attention := second
-	attention.State = "busy"
+	attention.State = StateWorking
 	attention.PendingInputs = 2
 	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &attention})
 	if update := readFrame(t, watcher); update.Type != TypeInstanceUpdate || update.Instance == nil || update.Instance.State != attention.State || update.Instance.PendingInputs != 2 || update.Instance.LastActivity.IsZero() || update.Generation != initial.Generation || len(update.Event) != 0 {
@@ -522,9 +522,9 @@ func TestInstanceWatchCachesFirstPrompt(t *testing.T) {
 		}
 	}
 	inst.FirstPrompt = ""
-	inst.State = StateBusy
+	inst.State = StateWorking
 	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
-	if f := readFrame(t, watcher); f.Instance == nil || f.Instance.FirstPrompt != "Fix the picker" || f.Instance.State != StateBusy {
+	if f := readFrame(t, watcher); f.Instance == nil || f.Instance.FirstPrompt != "Fix the picker" || f.Instance.State != StateWorking {
 		t.Fatalf("status update lost cached preview: %+v", f.Instance)
 	}
 	inst.SessionID = "next-session"
@@ -847,9 +847,9 @@ func TestLaunchRequestIDIsRetainedByCoordinator(t *testing.T) {
 
 	summary := *resp.Instance
 	summary.LaunchRequestID = uuid.NewString()
-	summary.State = StateBusy
+	summary.State = StateWorking
 	mustSend(t, w.link, Frame{Type: TypeRegister, ID: "reg", Instance: &summary})
-	if ack := w.next(t); ack.Instance == nil || ack.Instance.LaunchRequestID != requestID || ack.Instance.State != StateBusy {
+	if ack := w.next(t); ack.Instance == nil || ack.Instance.LaunchRequestID != requestID || ack.Instance.State != StateWorking {
 		t.Fatalf("register ack = %+v", ack)
 	}
 	list := request(t, c, Frame{Type: TypeListInstances, ID: "list"})
@@ -1597,5 +1597,30 @@ func TestSavedSessionLaunchReservesOwner(t *testing.T) {
 	}
 	if len(started) != 0 {
 		t.Fatal("second resume launched another worker")
+	}
+}
+
+func TestInstanceStatus(t *testing.T) {
+	resets := time.Date(2026, 11, 24, 14, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		instance Instance
+		text     string
+		active   bool
+	}{
+		{Instance{}, "unknown", false},
+		{Instance{State: StateAwaitingUser}, "awaiting user", false},
+		{Instance{State: StateWorking}, "working", true},
+		{Instance{State: StateNeedsInput, PendingInputs: 2}, "needs input (2)", true},
+		{Instance{State: StateUsageLimited, StateDetail: StateDetail{Provider: "codex", ResetsAt: resets}}, "usage limit: codex, resets " + resets.Local().Format("Mon Jan 2 15:04"), true},
+		{Instance{State: StateRetrying, StateDetail: StateDetail{Attempt: 2, MaxAttempts: 5}}, "retrying (2/5)", true},
+		{Instance{State: StatePaused, StateDetail: StateDetail{Target: "codex"}}, "paused: codex", true},
+		{Instance{State: StateError, StateDetail: StateDetail{Message: "bad key"}}, "error: bad key", false},
+	} {
+		if got := test.instance.StatusText(); got != test.text {
+			t.Errorf("StatusText() = %q, want %q", got, test.text)
+		}
+		if got := test.instance.Active(); got != test.active {
+			t.Errorf("%s Active() = %v, want %v", test.instance.State, got, test.active)
+		}
 	}
 }
