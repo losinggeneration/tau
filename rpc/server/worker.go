@@ -332,6 +332,7 @@ type workerWriter struct {
 	mu                sync.Mutex
 	link              *coord.Link
 	instancePrompts   bool
+	instanceNames     bool
 	instanceBuild     bool
 	instance          coord.Instance
 	run               string
@@ -347,7 +348,7 @@ func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Lin
 	w.mu.Lock()
 	inst, pos := w.instance, w.journal.position
 	hello := inst
-	hello.FirstPrompt, hello.BuildID = "", ""
+	hello.FirstPrompt, hello.SessionName, hello.BuildID = "", "", ""
 	w.mu.Unlock()
 	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -362,11 +363,12 @@ func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Lin
 	defer w.mu.Unlock()
 	w.link = link
 	w.instancePrompts = slices.Contains(welcome.Operations, coord.OperationInstancePrompts)
+	w.instanceNames = slices.Contains(welcome.Operations, coord.OperationInstanceNames)
 	w.instanceBuild = slices.Contains(welcome.Operations, coord.OperationInstanceBuild)
 	// A hello must also work with coordinators that predate previews.
 	// Changes made during the handshake were journaled but could not be
 	// forwarded. Publish the latest summary before forwarding new events.
-	if w.instance != inst || (w.instancePrompts && inst.FirstPrompt != "") || (w.instanceBuild && inst.BuildID != "") {
+	if w.instance != inst || (w.instancePrompts && inst.FirstPrompt != "") || (w.instanceNames && inst.SessionName != "") || (w.instanceBuild && inst.BuildID != "") {
 		if err := w.sendSummaryLocked(); err != nil {
 			w.disconnect(err)
 		}
@@ -460,7 +462,8 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 	if w.server != nil {
 		if bound := w.server.eventSession.Load(); bound != nil && bound.id != "" && bound != w.bound {
 			w.bound = bound
-			if bound.id != w.instance.SessionID {
+			switched := bound.id != w.instance.SessionID
+			if switched {
 				w.instance.SessionID = bound.id
 				w.setRunLocked(coord.StateAwaitingUser, coord.StateDetail{})
 				w.live = liveState{}
@@ -468,8 +471,14 @@ func (w *workerWriter) Write(data []byte) (int, error) {
 				w.contentGeneration++
 				summaryChanged = true
 			}
-			if w.instance.FirstPrompt != bound.firstPrompt {
+			// Rebinding the same session can carry blank metadata, while its
+			// preview and name may only exist here.
+			if (switched || bound.firstPrompt != "") && w.instance.FirstPrompt != bound.firstPrompt {
 				w.instance.FirstPrompt = bound.firstPrompt
+				summaryChanged = true
+			}
+			if name := instancePromptPreview(bound.sessionName); (switched || name != "") && w.instance.SessionName != name {
+				w.instance.SessionName = name
 				summaryChanged = true
 			}
 		}
@@ -562,7 +571,10 @@ func (w *workerWriter) publishSummaryLocked(kind string, data []byte) error {
 				workerLog("decode prompt preview: %v", err)
 			} else if msg.Role == "user" {
 				w.instance.FirstPrompt = instancePromptPreview(msg.Content)
-				if !w.instancePrompts {
+				if w.server != nil && w.instance.FirstPrompt != "" {
+					w.refreshSessionNameLocked()
+				}
+				if !w.instancePrompts && !w.instanceNames {
 					return nil
 				}
 			}
@@ -584,6 +596,18 @@ func (w *workerWriter) publishSummaryLocked(kind string, data []byte) error {
 		return nil
 	}
 	return w.sendSummaryLocked()
+}
+
+// refreshSessionNameLocked picks up the name derived from the first prompt,
+// which the SDK saves without notifying the server. Caller holds mu.
+func (w *workerWriter) refreshSessionNameLocked() {
+	id := w.instance.SessionID
+	name := w.server.savedSessionName(id)
+	if name == "" {
+		return
+	}
+	w.server.renameEventSession(id, name)
+	w.instance.SessionName = instancePromptPreview(name)
 }
 
 // applyRunEventLocked maps run events onto the published state. A failed
@@ -651,6 +675,9 @@ func (w *workerWriter) sendSummaryLocked() error {
 	inst := w.instance
 	if !w.instancePrompts {
 		inst.FirstPrompt = ""
+	}
+	if !w.instanceNames {
+		inst.SessionName = ""
 	}
 	if !w.instanceBuild {
 		inst.BuildID = ""

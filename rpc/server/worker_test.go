@@ -108,6 +108,13 @@ type workerHarness struct {
 
 func startWorker(t *testing.T, rt *workerRuntime, reg commands.Registry) *workerHarness {
 	t.Helper()
+	if rt.storage == nil {
+		storage, err := sessionpkg.NewStorageAt(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt.storage = storage
+	}
 	return startWorkerInstance(t, rt, reg, coord.Instance{ID: "instance", CWD: "/project"})
 }
 
@@ -136,7 +143,7 @@ func startWorkerInstance(t *testing.T, rt sdk.Runtime, reg commands.Registry, in
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: []string{coord.OperationInstancePrompts}}); err != nil {
+	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames}}); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
@@ -434,6 +441,124 @@ func TestWorkerRegistersSavedSessionPreview(t *testing.T) {
 	f := h.next(t)
 	if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.SessionID != header.ID || f.Instance.FirstPrompt != "Original prompt" {
 		t.Fatalf("saved session registration = %+v", f)
+	}
+}
+
+func TestWorkerPublishesSessionName(t *testing.T) {
+	cwd, dir := t.TempDir(), t.TempDir()
+	storage, err := sessionpkg.NewStorageAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := sessionpkg.NewHeader(cwd, nil, nil)
+	writer, err := storage.Create(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(
+		writer.Append(sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"Original prompt"}`), nil)),
+		writer.Append(sessionpkg.NewSessionInfoEntry("Saved name")),
+		writer.Close(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := sdk.NewRuntime(sdk.RuntimeOptions{SessionsDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", CWD: cwd, SessionID: header.ID})
+	if h.hello.Instance.SessionName != "" {
+		t.Fatalf("hello must work with older coordinators: %+v", h.hello.Instance)
+	}
+	f := h.next(t)
+	if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.SessionName != "Saved name" {
+		t.Fatalf("saved name registration = %+v", f)
+	}
+	h.send(t, "rename", `{"type":"set_session_name","args":{"name":"New name"}}`)
+	for {
+		f = h.next(t)
+		if f.Type == coord.TypeRegister {
+			break
+		}
+		if f.Type == coord.TypeResponse && f.ID == "rename" {
+			t.Fatalf("rename replied before its registration: %s", f.Result)
+		}
+	}
+	if f.Instance == nil || f.Instance.SessionName != "New name" || f.Instance.FirstPrompt != "Original prompt" {
+		t.Fatalf("rename registration = %+v", f.Instance)
+	}
+	h.send(t, "state", `{"type":"get_state"}`)
+	var state struct {
+		Result struct {
+			SessionName string `json:"session_name"`
+		}
+	}
+	for {
+		f = h.next(t)
+		if f.Type == coord.TypeResponse && f.ID == "state" {
+			break
+		}
+	}
+	if err := json.Unmarshal(f.Result, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Result.SessionName != "New name" {
+		t.Fatalf("get_state name = %q", state.Result.SessionName)
+	}
+}
+
+func TestWorkerPublishesDerivedSessionName(t *testing.T) {
+	storage, err := sessionpkg.NewStorageAt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := sessionpkg.NewHeader("/project", nil, nil)
+	writer, err := storage.Create(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(writer.Append(sessionpkg.NewSessionInfoEntry("fix-the-picker")), writer.Close()); err != nil {
+		t.Fatal(err)
+	}
+	rt := newWorkerRuntime()
+	rt.storage = storage
+	rt.sess.mockSession = newMockSession(header.ID, "/project")
+	rt.newFn = func(sdk.SessionOptions) (sdk.Session, error) { return rt.sess, nil }
+	h := startWorker(t, rt, nil)
+	h.send(t, "ready", `{"type":"get_state"}`)
+	if r := h.response(t, "ready"); !r.OK {
+		t.Fatalf("ready probe: %+v", r)
+	}
+	observe := <-rt.sess.observerReady
+	observe(sdk.Event{Type: "message_end", SessionID: header.ID, Payload: map[string]any{"role": "user", "content": "Fix the picker"}})
+	for {
+		f := h.next(t)
+		if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.FirstPrompt == "" {
+			continue
+		}
+		if f.Instance.SessionName != "fix-the-picker" {
+			t.Fatalf("first prompt registration = %+v", f.Instance)
+		}
+		break
+	}
+	h.send(t, "state", `{"type":"get_state"}`)
+	var state struct {
+		Result struct {
+			SessionName string `json:"session_name"`
+		}
+	}
+	for {
+		f := h.next(t)
+		if f.Type != coord.TypeResponse || f.ID != "state" {
+			continue
+		}
+		if err := json.Unmarshal(f.Result, &state); err != nil {
+			t.Fatal(err)
+		}
+		break
+	}
+	if state.Result.SessionName != "fix-the-picker" {
+		t.Fatalf("get_state name = %q", state.Result.SessionName)
 	}
 }
 

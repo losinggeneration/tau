@@ -221,7 +221,7 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int, opts ...
 		Version:    coord.Version,
 		Role:       coord.RoleClient,
 		ClientID:   clientID,
-		Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceBuild},
+		Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames, coord.OperationInstanceBuild},
 	})
 	if err != nil {
 		return nil, err

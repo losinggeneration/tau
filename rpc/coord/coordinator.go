@@ -120,6 +120,7 @@ type client struct {
 	subs            map[string]struct{}
 	watching        bool
 	instancePrompts bool
+	instanceNames   bool
 	instanceBuild   bool
 }
 
@@ -141,6 +142,7 @@ type worker struct {
 	legacyChangeID   string // retained until the worker replies, even if the caller disconnects
 	instance         Instance
 	firstPrompt      string
+	sessionName      string
 	buildID          string
 	restart          bool
 	link             *Link
@@ -364,6 +366,7 @@ func (co *coordinator) serveClient(link *Link, hello Frame) {
 		pending:         make(map[string]pendingRef),
 		subs:            make(map[string]struct{}),
 		instancePrompts: slices.Contains(hello.Operations, OperationInstancePrompts),
+		instanceNames:   slices.Contains(hello.Operations, OperationInstanceNames),
 		instanceBuild:   slices.Contains(hello.Operations, OperationInstanceBuild),
 	}
 	co.clients[c.id] = c
@@ -500,7 +503,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 		}
 	}
 	record := *inst
-	record.FirstPrompt, record.BuildID, record.Outdated = "", "", false
+	record.FirstPrompt, record.SessionName, record.BuildID, record.Outdated = "", "", "", false
 	record.LaunchRequestID = requestID
 	record.LinkState = LinkConnected
 	if record.State == "" {
@@ -509,11 +512,12 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 	if existing != nil {
 		buildID = cmp.Or(existing.buildID, buildID)
 	}
-	firstPrompt := inst.FirstPrompt
+	firstPrompt, sessionName := inst.FirstPrompt, inst.SessionName
 	if existing != nil && existing.instance.SessionID == inst.SessionID {
 		firstPrompt = cmp.Or(existing.firstPrompt, firstPrompt)
+		sessionName = cmp.Or(sessionName, existing.sessionName)
 	}
-	w := &worker{instance: record, firstPrompt: firstPrompt, buildID: buildID, restart: slices.Contains(hello.Operations, OperationInstanceRestart), link: link, routes: make(map[string]route), tokenHash: hash, epoch: epoch}
+	w := &worker{instance: record, firstPrompt: firstPrompt, sessionName: sessionName, buildID: buildID, restart: slices.Contains(hello.Operations, OperationInstanceRestart), link: link, routes: make(map[string]route), tokenHash: hash, epoch: epoch}
 	if existing != nil {
 		w.legacyRestarting, w.legacyChangeID = existing.legacyRestarting, existing.legacyChangeID
 	}
@@ -528,7 +532,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 		w.lastPong = time.Now()
 	}
 	co.workers[record.ID] = w
-	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleWorker, Generation: co.generation, InstanceID: record.ID, Instance: &record, Operations: []string{TypeCommand, TypeRegister, TypeEvent, TypeResponse, OperationInstancePrompts, OperationInstanceBuild}, Limits: protocolLimits()})
+	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleWorker, Generation: co.generation, InstanceID: record.ID, Instance: &record, Operations: []string{TypeCommand, TypeRegister, TypeEvent, TypeResponse, OperationInstancePrompts, OperationInstanceNames, OperationInstanceBuild}, Limits: protocolLimits()})
 	co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: record.ID, SessionID: record.SessionID, Instance: &record})
 	if pl != nil {
 		delete(co.launches, record.ID)
@@ -889,7 +893,7 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 			return
 		}
 		c.subs[f.InstanceID] = struct{}{}
-		inst := w.instance
+		inst := co.instanceSummary(c, w)
 		send(c.link, Frame{Type: TypeResponse, ID: f.ID, InstanceID: inst.ID, SessionID: inst.SessionID, Instance: &inst})
 	case TypeDetach:
 		if f.InstanceID == "" {
@@ -1068,7 +1072,7 @@ func (co *coordinator) startInstance(c *client, f Frame) {
 				replyError(c, f, CodeBusy, "session's worker is disconnected")
 				return
 			}
-			inst := w.instance
+			inst := co.instanceSummary(c, w)
 			send(c.link, Frame{Type: TypeResponse, ID: f.ID, RequestID: f.RequestID, InstanceID: inst.ID, SessionID: inst.SessionID, Instance: &inst})
 			return
 		}
@@ -1392,6 +1396,7 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 		if w.instance.SessionID != f.Instance.SessionID || w.firstPrompt == "" {
 			w.firstPrompt = f.Instance.FirstPrompt
 		}
+		w.sessionName = f.Instance.SessionName
 		w.instance.SessionID = f.Instance.SessionID
 		w.buildID = cmp.Or(w.buildID, f.Instance.BuildID)
 		if f.Instance.State != "" {
@@ -1419,8 +1424,8 @@ func (co *coordinator) broadcast(f Frame) {
 	if f.Type == TypeInstanceUpdate {
 		f.Generation = co.generation
 	}
-	var data [4][]byte
-	var errs [4]error
+	var data [8][]byte
+	var errs [8]error
 	for _, c := range co.clients {
 		_, attached := c.subs[f.InstanceID]
 		if (f.Type == TypeInstanceUpdate && !c.watching) || (f.Type != TypeInstanceUpdate && !attached) {
@@ -1433,6 +1438,9 @@ func (co *coordinator) broadcast(f Frame) {
 			}
 			if c.instanceBuild {
 				key |= 2
+			}
+			if c.instanceNames {
+				key |= 4
 			}
 		}
 		if data[key] == nil && errs[key] == nil {
@@ -1452,6 +1460,9 @@ func (co *coordinator) instanceSummary(c *client, w *worker) Instance {
 	inst := w.instance
 	if c.instancePrompts {
 		inst.FirstPrompt = w.firstPrompt
+	}
+	if c.instanceNames {
+		inst.SessionName = w.sessionName
 	}
 	if c.instanceBuild {
 		inst.Outdated = buildOutdated(co.launchBuild, w.buildID)

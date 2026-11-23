@@ -51,6 +51,10 @@ const OperationSavedSessionLaunch = "start_saved_session"
 // the coordinator accepts prompt previews in registrations.
 const OperationInstancePrompts = "instance_prompts"
 
+// OperationInstanceNames opts clients into session names and tells workers
+// the coordinator accepts them.
+const OperationInstanceNames = "instance_names"
+
 // OperationInstanceBuild opts local clients into the outdated indicator and
 // allows workers to report their build identity in registrations.
 const OperationInstanceBuild = "instance_build"
@@ -246,6 +250,7 @@ type Instance struct {
 	NodeID          string      `json:"node_id,omitempty"`
 	CWD             string      `json:"cwd,omitempty"`
 	SessionID       string      `json:"session_id,omitempty"`
+	SessionName     string      `json:"session_name,omitempty"`
 	FirstPrompt     string      `json:"first_prompt,omitempty"`
 	BuildID         string      `json:"build_id,omitempty"`
 	Outdated        bool        `json:"outdated,omitempty"`
@@ -418,6 +423,9 @@ func (i *Instance) validate() error {
 	}
 	if len(i.FirstPrompt) > MaxInstancePromptBytes {
 		return fmt.Errorf("%w: instance prompt exceeds %d bytes", ErrInvalidFrame, MaxInstancePromptBytes)
+	}
+	if len(i.SessionName) > MaxInstancePromptBytes {
+		return fmt.Errorf("%w: instance session name exceeds %d bytes", ErrInvalidFrame, MaxInstancePromptBytes)
 	}
 	if len(i.StateDetail.Message) > MaxInstancePromptBytes {
 		return fmt.Errorf("%w: instance state message exceeds %d bytes", ErrInvalidFrame, MaxInstancePromptBytes)

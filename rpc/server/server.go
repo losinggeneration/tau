@@ -87,7 +87,7 @@ type Server struct {
 }
 
 type eventSession struct {
-	id, firstPrompt string
+	id, firstPrompt, sessionName string
 }
 
 // newServer creates handlers for runtime with an optional command registry
@@ -634,6 +634,9 @@ func (s *Server) handleGetState(ctx context.Context, cmd *Command) error {
 		result["steering_mode"] = reader.SteeringMode()
 		result["follow_up_mode"] = reader.FollowUpMode()
 	}
+	if bound := s.eventSession.Load(); s.coordinated && bound != nil && bound.id == state.SessionID() {
+		result["session_name"] = bound.sessionName
+	}
 	return s.sendResult(cmd.ID, result)
 }
 
@@ -1108,6 +1111,7 @@ func (s *Server) sessionEventMetadata(sess sdk.Session) eventSession {
 			workerLog("read first prompt for %s: %v", metadata.id, err)
 		} else if reader.Header().ID == metadata.id {
 			metadata.firstPrompt = instancePromptPreview(reader.FirstPrompt())
+			metadata.sessionName = reader.DisplayName()
 		}
 	}
 	return metadata
@@ -2251,5 +2255,39 @@ func (s *Server) handleSetSessionName(ctx context.Context, cmd *Command) error {
 	if err := w.Close(); err != nil {
 		return s.sendErrorResult(cmd.ID, fmt.Errorf("close session writer: %w", err))
 	}
+	s.renameEventSession(sid, args.Name)
 	return s.sendResult(cmd.ID, map[string]any{"ok": true, "name": args.Name})
+}
+
+// savedSessionName reads the display name from storage, empty if unavailable.
+func (s *Server) savedSessionName(id string) string {
+	storage := s.runtime.GetSessionStorage()
+	if storage == nil {
+		return ""
+	}
+	reader, err := storage.Open(id)
+	if err != nil {
+		workerLog("read session name for %s: %v", id, err)
+		return ""
+	}
+	if reader.Header().ID != id {
+		return ""
+	}
+	return reader.DisplayName()
+}
+
+// renameEventSession publishes a new name through the next worker output,
+// which is the reply to the rename. A session switched meanwhile keeps its own.
+func (s *Server) renameEventSession(id, name string) {
+	for {
+		current := s.eventSession.Load()
+		if current == nil || current.id != id {
+			return
+		}
+		next := *current
+		next.sessionName = name
+		if s.eventSession.CompareAndSwap(current, &next) {
+			return
+		}
+	}
 }

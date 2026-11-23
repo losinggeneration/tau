@@ -491,6 +491,47 @@ func TestWatchInstancesOnlyDeliversSummaries(t *testing.T) {
 	}
 }
 
+func TestInstanceWatchSendsSessionNames(t *testing.T) {
+	h := startCoordinator(t, nil, launchTimeout)
+	legacy, _ := h.client()
+	watcher, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceNames}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := watcher.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	inst, w := h.start(legacy, "start")
+	request(t, legacy, Frame{Type: TypeWatchInstances, ID: "legacy"})
+	request(t, watcher, Frame{Type: TypeWatchInstances, ID: "watch"})
+	inst.SessionName = "Auth worktree"
+	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
+	for _, tc := range []struct {
+		link *Link
+		want string
+	}{{watcher, "Auth worktree"}, {legacy, ""}} {
+		f := readFrame(t, tc.link)
+		if f.Type != TypeInstanceUpdate || f.Instance == nil || f.Instance.SessionName != tc.want {
+			t.Fatalf("watch update = %+v, want name %q", f, tc.want)
+		}
+		f = request(t, tc.link, Frame{Type: TypeListInstances, ID: "list"})
+		if len(f.Instances) != 1 || f.Instances[0].SessionName != tc.want {
+			t.Fatalf("list = %+v, want name %q", f, tc.want)
+		}
+		f = request(t, tc.link, Frame{Type: TypeAttach, ID: "attach", InstanceID: inst.ID})
+		if f.Instance == nil || f.Instance.SessionName != tc.want {
+			t.Fatalf("attach = %+v, want name %q", f.Instance, tc.want)
+		}
+	}
+	inst.SessionID, inst.SessionName = "next-session", ""
+	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
+	if f := readFrame(t, watcher); f.Instance == nil || f.Instance.SessionID != "next-session" || f.Instance.SessionName != "" {
+		t.Fatalf("session switch retained old name: %+v", f.Instance)
+	}
+}
+
 func TestInstanceWatchCachesFirstPrompt(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	legacy, _ := h.client()
