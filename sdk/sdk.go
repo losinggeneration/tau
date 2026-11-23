@@ -848,6 +848,9 @@ type agentSession struct {
 	model                *ai.Model
 	modelSpec            ai.ModelSpec
 	seq                  int64
+	nextMessageSeq       int
+	openMessageIDs       map[agent.MessageRole]string
+	assistantMessageID   string
 	totalTokens          int
 	usageTotals          ai.Usage
 	mu                   sync.Mutex
@@ -4944,15 +4947,12 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 		})
 	case agent.MessageStart:
 		if e.Message != nil {
-			var parentID string
-			if len(s.agent.State().Messages) > 0 {
-				parentID = fmt.Sprintf("msg-%d", len(s.agent.State().Messages)-1)
-			}
+			messageID, parentID := s.openMessageID(e.Message.Role)
 			s.emit(ch, Event{
 				Type:      "message_start",
 				SessionID: s.id,
 				Payload: map[string]any{
-					"message_id": fmt.Sprintf("msg-%d", len(s.agent.State().Messages)),
+					"message_id": messageID,
 					"role":       string(e.Message.Role),
 					"parent_id":  parentID,
 				},
@@ -4989,7 +4989,7 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 		s.pendingNextTurn = slices.DeleteFunc(s.pendingNextTurn, func(pending *agent.Message) bool { return pending == e.Message })
 		s.mu.Unlock()
 		if e.Message != nil {
-			msgID := s.getCurrentMessageID()
+			msgID := s.closeMessageID(e.Message.Role)
 			var tokens int
 			var usage map[string]any
 			if hasUsage(e.Message.Usage) {
@@ -5121,10 +5121,57 @@ func (s *agentSession) handleAgentEvent(ch chan<- Event, event agent.Event) {
 	}
 }
 
-// getCurrentMessageID returns an identifier for the current message being processed.
+// openMessageID assigns the ID a message keeps from message_start through
+// message_end. IDs never repeat within a session, even when retries or
+// compaction shrink the history, because clients dedupe finished messages by ID.
+// They're tracked per role since the agent swaps the assistant's partial
+// message for a new pointer at the end, and custom messages can land mid-stream.
+func (s *agentSession) openMessageID(role agent.MessageRole) (id, parentID string) {
+	count := len(s.agent.State().Messages)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openMessageIDLocked(role, count)
+}
+
+func (s *agentSession) openMessageIDLocked(role agent.MessageRole, count int) (id, parentID string) {
+	seq := max(s.nextMessageSeq, count)
+	s.nextMessageSeq = seq + 1
+	id = fmt.Sprintf("msg-%d", seq)
+	if seq > 0 {
+		parentID = fmt.Sprintf("msg-%d", seq-1)
+	}
+	if s.openMessageIDs == nil {
+		s.openMessageIDs = make(map[agent.MessageRole]string)
+	}
+	s.openMessageIDs[role] = id
+	if role == agent.RoleAssistant {
+		s.assistantMessageID = id
+	}
+	return id, parentID
+}
+
+func (s *agentSession) closeMessageID(role agent.MessageRole) string {
+	count := len(s.agent.State().Messages)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.openMessageIDs[role]
+	if !ok {
+		id, _ = s.openMessageIDLocked(role, count)
+	}
+	delete(s.openMessageIDs, role)
+	return id
+}
+
+// getCurrentMessageID returns the latest assistant message's ID, which stays
+// valid for tool calls emitted after that message ends.
 func (s *agentSession) getCurrentMessageID() string {
-	state := s.agent.State()
-	return fmt.Sprintf("msg-%d", len(state.Messages))
+	s.mu.Lock()
+	id := s.assistantMessageID
+	s.mu.Unlock()
+	if id != "" {
+		return id
+	}
+	return fmt.Sprintf("msg-%d", len(s.agent.State().Messages))
 }
 
 // executeSlashCommand routes a slash command through the command registry.

@@ -12963,3 +12963,74 @@ func TestAgentEndPayloadFlagsFailedRuns(t *testing.T) {
 		})
 	}
 }
+
+func TestMessageLifecycleKeepsOneID(t *testing.T) {
+	_, model := registerRecordingProvider(t, "reply")
+	rt, err := NewRuntime(RuntimeOptions{SessionsDir: t.TempDir(), CredentialStore: &mockCredStore{getCred: ai.NewAPIKeyCredential("key")}, ExplicitModel: model})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rt.Close(testContext(t))) })
+	sess, err := rt.NewSession(testContext(t), SessionOptions{})
+	require.NoError(t, err)
+	events, err := sess.Send(testContext(t), Message{Text: "hello"})
+	require.NoError(t, err)
+
+	var started, ended []string
+	for _, event := range collectSessionEvents(t, events) {
+		payload, ok := event.Payload.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch event.Type {
+		case "message_start":
+			started = append(started, payload["message_id"].(string))
+		case "message_end":
+			ended = append(ended, payload["message_id"].(string))
+		}
+	}
+	require.Len(t, started, 2)
+	assert.Equal(t, started, ended)
+	assert.NotEqual(t, started[0], started[1])
+}
+
+func TestMessageIDsSurviveInterleavingAndHistoryShrink(t *testing.T) {
+	a, err := agent.New(agent.NewConfig())
+	require.NoError(t, err)
+	s := &agentSession{agent: a, model: &ai.Model{}}
+	events := make(chan Event, 16)
+
+	partial := &agent.Message{Role: agent.RoleAssistant}
+	final := &agent.Message{Role: agent.RoleAssistant, StopReason: ai.StopReasonError}
+	injected := &agent.Message{Role: agent.RoleUser}
+	retry := &agent.Message{Role: agent.RoleAssistant}
+
+	s.handleAgentEvent(events, agent.MessageStart{Message: partial})
+	s.handleAgentEvent(events, agent.MessageStart{Message: injected})
+	s.handleAgentEvent(events, agent.MessageEnd{Message: injected})
+	s.handleAgentEvent(events, agent.MessageUpdate{Message: partial, AssistantMessageEvent: ai.TextDelta{Delta: "x"}})
+	a.ReplaceMessages([]*agent.Message{injected, final})
+	s.handleAgentEvent(events, agent.MessageEnd{Message: final})
+	a.ReplaceMessages([]*agent.Message{injected})
+	s.handleAgentEvent(events, agent.MessageStart{Message: retry})
+	s.handleAgentEvent(events, agent.MessageEnd{Message: retry})
+	close(events)
+
+	var got []string
+	for event := range events {
+		payload, ok := event.Payload.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, ok := payload["message_id"].(string); ok {
+			got = append(got, event.Type+":"+id)
+		}
+	}
+	assert.Equal(t, []string{
+		"message_start:msg-0",
+		"message_start:msg-1",
+		"message_end:msg-1",
+		"text_delta:msg-0",
+		"message_end:msg-0",
+		"message_start:msg-2",
+		"message_end:msg-2",
+	}, got)
+}
