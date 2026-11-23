@@ -184,23 +184,16 @@ func listSavedTUISessions(ctx context.Context, c *client.CoordinatedClient, cwd 
 	return sessions, nil
 }
 
-func resolveSavedTUISession(ctx context.Context, c *client.CoordinatedClient, cwd, id string) (sessionpkg.Header, error) {
-	storage, err := savedTUISessions(ctx, c, cwd)
-	if err != nil {
-		return sessionpkg.Header{}, err
-	}
-	return savedSessionHeader(storage, cwd, id)
+// A session ID names one session wherever the client runs, so the daemon
+// decides its project.
+func resolveSavedTUISession(ctx context.Context, c *client.CoordinatedClient, cwd, ref string) (id, project string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, coordinatorStartupTimeout)
+	defer cancel()
+	return c.LocateSession(ctx, ref, cwd)
 }
 
 func savedSessionHeader(storage *sessionpkg.Storage, cwd, id string) (sessionpkg.Header, error) {
-	header, err := storage.ProjectHeader(id, cwd)
-	if errors.Is(err, sessionpkg.ErrOtherProject) {
-		return sessionpkg.Header{}, errors.New("saved session belongs to another project; open Tau in that project to resume it")
-	}
-	if err != nil {
-		return sessionpkg.Header{}, err
-	}
-	return header, nil
+	return storage.ProjectHeader(id, cwd)
 }
 
 func runCoordinatedInteractive(ctx context.Context, cmd *cli.Command, c *client.CoordinatedClient, socket string, prompts []string, fileImages []ai.ContentBlock) (err error) {
@@ -359,7 +352,7 @@ func runCoordinatedInteractive(ctx context.Context, cmd *cli.Command, c *client.
 				}
 			}
 			if action == "resume" {
-				header, saveErr := resolveSavedTUISession(ctx, c, viewCWD, arg)
+				savedID, project, saveErr := resolveSavedTUISession(ctx, c, viewCWD, arg)
 				if saveErr != nil {
 					notice = "Resume: " + saveErr.Error()
 					if cliPrompt {
@@ -370,7 +363,7 @@ func runCoordinatedInteractive(ctx context.Context, cmd *cli.Command, c *client.
 					prompt, cliPrompt, action = "", false, ""
 					continue
 				}
-				id = header.ID
+				id, launchDir = savedID, project
 			}
 			startCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			var instance *coord.Instance

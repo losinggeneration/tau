@@ -70,7 +70,9 @@ func runCoordinator(ctx context.Context, cmd *cli.Command) error {
 	// Keep recovery state outside the socket's volatile runtime directory.
 	receiptDir := filepath.Join(cfgDir, fmt.Sprintf("coordinator-%x.workers", sha256.Sum256([]byte(path))))
 	run := func(ctx context.Context, path string, launch coord.LaunchFunc) error {
-		return coord.RunRecoverable(ctx, path, receiptDir, launch, coord.WithSessionDirectory(sessionDirectory), coord.WithWorkerBuild(func() string { return coord.ExecutableBuildID(executable) }))
+		return coord.RunRecoverable(ctx, path, receiptDir, launch, coord.WithSessionDirectory(sessionDirectory), coord.WithSessionLocator(func(ctx context.Context, ref, hint string) (string, string, error) {
+			return locateDaemonSession(ctx, sessionDirectory, ref, hint)
+		}), coord.WithWorkerBuild(func() string { return coord.ExecutableBuildID(executable) }))
 	}
 	addr := cmd.String("websocket")
 	if addr == "" {
@@ -98,6 +100,57 @@ func daemonSessionDirectory(ctx context.Context, cfgDir, cwd string) (string, er
 		dir = filepath.Join(cwd, dir)
 	}
 	return filepath.Clean(dir), nil
+}
+
+// locateDaemonSession searches the storage of the client's directory, when it
+// exists on this machine, and then the daemon's default storage.
+func locateDaemonSession(ctx context.Context, sessionDirectory coord.SessionDirectoryFunc, ref, hint string) (id, project string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	if hint != "" {
+		if hint, err = filepath.EvalSymlinks(hint); err != nil {
+			slog.Debug("locate session: ignore client directory", "error", err)
+			hint = ""
+		}
+	}
+	var searched []string
+	for _, base := range []string{hint, home} {
+		if base == "" {
+			continue
+		}
+		dir, err := sessionDirectory(ctx, base)
+		if err != nil {
+			if base == hint {
+				slog.Debug("locate session: skip client directory storage", "error", err)
+				continue
+			}
+			return "", "", err
+		}
+		if slices.Contains(searched, dir) {
+			continue
+		}
+		searched = append(searched, dir)
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return "", "", fmt.Errorf("inspect session storage: %w", err)
+		}
+		storage, err := sessionpkg.NewStorageAt(dir)
+		if err != nil {
+			return "", "", err
+		}
+		header, project, err := storage.LocateSession(ref, hint)
+		if errors.Is(err, sessionpkg.ErrSessionNotFound) {
+			continue
+		}
+		if err != nil {
+			return "", "", err
+		}
+		return header.ID, project, nil
+	}
+	return "", "", fmt.Errorf("session %q %w", ref, sessionpkg.ErrSessionNotFound)
 }
 
 func checkSavedSession(dir, cwd, id string) error {

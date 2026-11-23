@@ -80,6 +80,11 @@ var resolveProjectDir = func(dir string) (string, error) {
 // SessionDirectoryFunc resolves the daemon's saved-session storage for a project.
 type SessionDirectoryFunc func(context.Context, string) (string, error)
 
+// SessionLocatorFunc finds a saved session's canonical ID and project from an
+// ID or unique prefix. hint is the client's directory, which may not exist on
+// this machine; it only disambiguates sessions that never recorded a project.
+type SessionLocatorFunc func(ctx context.Context, ref, hint string) (id, project string, err error)
+
 type coordinator struct {
 	ctx            context.Context
 	launch         LaunchFunc
@@ -88,6 +93,7 @@ type coordinator struct {
 	receipts       *receiptStore
 	resolveDir     func(string) (string, error)
 	sessionDir     SessionDirectoryFunc
+	locateSession  SessionLocatorFunc
 	workerBuild    func() string
 	directoryReads chan struct{}
 	conns          chan struct{}
@@ -185,6 +191,11 @@ type RecoverableOption func(*coordinator)
 // WithSessionDirectory enables directory lookup for local clients.
 func WithSessionDirectory(fn SessionDirectoryFunc) RecoverableOption {
 	return func(co *coordinator) { co.sessionDir = fn }
+}
+
+// WithSessionLocator enables resuming a session by ID from any directory.
+func WithSessionLocator(fn SessionLocatorFunc) RecoverableOption {
+	return func(co *coordinator) { co.locateSession = fn }
 }
 
 // WithWorkerBuild supplies the build identity of the executable used for new workers.
@@ -364,6 +375,9 @@ func (co *coordinator) serveClient(link *Link, hello Frame) {
 	if co.sessionDir != nil {
 		ops = append(ops, TypeSessionDirectory, OperationInstanceRestart)
 	}
+	if co.locateSession != nil {
+		ops = append(ops, TypeLocateSession)
+	}
 	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleClient, LaunchRequestVersion: launchVersion, CoordinatorTimeUnixMS: time.Now().UnixMilli(), Generation: co.generation, PID: os.Getpid(), ClientID: c.identity, Operations: ops, Limits: protocolLimits()})
 	co.mu.Unlock()
 	defer co.dropClient(c)
@@ -375,6 +389,10 @@ func (co *coordinator) serveClient(link *Link, hello Frame) {
 		}
 		if f.Type == TypeSessionDirectory {
 			co.lookupSessionDirectory(c, f)
+			continue
+		}
+		if f.Type == TypeLocateSession {
+			co.lookupSession(c, f)
 			continue
 		}
 		if c.instanceBuild && (f.Type == TypeListInstances || f.Type == TypeWatchInstances) {
@@ -724,6 +742,81 @@ func (co *coordinator) lookupSessionDirectory(c *client, f Frame) {
 		send(c.link, Frame{Type: TypeResponse, ID: f.ID, CWD: r.dir})
 	case <-ctx.Done():
 		replyError(c, f, CodeUnavailable, "session directory lookup timed out")
+	}
+}
+
+// lookupSession resolves a session reference to the project that owns it. A
+// running worker is authoritative, since its session may not be saved yet.
+// Like directory lookups, the disk read is bounded and off the registry lock.
+func (co *coordinator) lookupSession(c *client, f Frame) {
+	if co.locateSession == nil {
+		replyError(c, f, CodeUnavailable, "session lookup is unavailable")
+		return
+	}
+	if f.ID == "" || f.RequestID != "" || f.SessionID == "" || (f.CWD != "" && !filepath.IsAbs(f.CWD)) {
+		replyError(c, f, CodeInvalidFrame, "request id and session reference required")
+		return
+	}
+	live := make(map[string]string)
+	co.mu.Lock()
+	_, duplicate := c.pending[f.ID]
+	for _, w := range co.workers {
+		if w.instance.LinkState != LinkExited && strings.HasPrefix(w.instance.SessionID, f.SessionID) {
+			live[w.instance.SessionID] = w.instance.CWD
+		}
+	}
+	co.mu.Unlock()
+	if duplicate {
+		replyError(c, f, CodeDuplicateID, "request id already in flight")
+		return
+	}
+	if project, ok := live[f.SessionID]; ok {
+		send(c.link, Frame{Type: TypeResponse, ID: f.ID, SessionID: f.SessionID, CWD: project})
+		return
+	}
+	select {
+	case co.directoryReads <- struct{}{}:
+	default:
+		replyError(c, f, CodeLimitExceeded, "too many session lookups")
+		return
+	}
+	ctx, cancel := context.WithTimeout(co.ctx, 5*time.Second)
+	defer cancel()
+	type result struct {
+		id, project string
+		err         error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() { <-co.directoryReads }()
+		id, project, err := co.locateSession(ctx, f.SessionID, f.CWD)
+		done <- result{id, project, err}
+	}()
+	select {
+	case r := <-done:
+		if errors.Is(r.err, sessionpkg.ErrSessionNotFound) && len(live) == 1 {
+			for id, project := range live {
+				r = result{id: id, project: project}
+			}
+		}
+		if r.err != nil {
+			replyError(c, f, CodeUnavailable, boundedText(r.err.Error()))
+			return
+		}
+		if project, ok := live[r.id]; ok {
+			r.project = project
+		}
+		if len(live) > 1 || (len(live) == 1 && live[r.id] == "") {
+			replyError(c, f, CodeConflict, "ambiguous session ID")
+			return
+		}
+		if !filepath.IsAbs(r.project) || len(r.project) > maxTextBytes || len(r.id) > maxIDBytes {
+			replyError(c, f, CodeUnavailable, "invalid saved session location")
+			return
+		}
+		send(c.link, Frame{Type: TypeResponse, ID: f.ID, SessionID: r.id, CWD: r.project})
+	case <-ctx.Done():
+		replyError(c, f, CodeUnavailable, "session lookup timed out")
 	}
 }
 

@@ -28,6 +28,7 @@ const (
 	TypeWelcome          = "welcome"
 	TypeListInstances    = "list_instances"
 	TypeSessionDirectory = "session_directory"
+	TypeLocateSession    = "locate_session"
 	TypeWatchInstances   = "watch_instances"
 	TypeUnwatchInstances = "unwatch_instances"
 	TypeInstanceUpdate   = "instance_update"
@@ -321,7 +322,7 @@ func decodeFrame(line []byte) (Frame, error) {
 
 func isFrameType(t string) bool {
 	switch t {
-	case TypeHello, TypeWelcome, TypeListInstances, TypeSessionDirectory, TypeStartInstance, TypeAttach,
+	case TypeHello, TypeWelcome, TypeListInstances, TypeSessionDirectory, TypeLocateSession, TypeStartInstance, TypeAttach,
 		TypeDetach, TypeCommand, TypeStopInstance, TypeResponse, TypeEvent, TypeRegister,
 		TypeWatchInstances, TypeUnwatchInstances, TypeInstanceUpdate, TypePing, TypePong:
 		return true

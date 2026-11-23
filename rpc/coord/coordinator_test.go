@@ -1600,6 +1600,35 @@ func TestSavedSessionLaunchReservesOwner(t *testing.T) {
 	}
 }
 
+func TestLocateSessionPrefersRunningWorker(t *testing.T) {
+	saved, other := "aaaaaaaa-0000-7000-8000-000000000001", "bbbbbbbb-0000-7000-8000-000000000002"
+	h := startCoordinator(t, nil, launchTimeout, WithSessionLocator(func(_ context.Context, ref, _ string) (string, string, error) {
+		if strings.HasPrefix(saved, ref) {
+			return saved, "/saved/project", nil
+		}
+		return "", "", fmt.Errorf("session %q %w", ref, sessionpkg.ErrSessionNotFound)
+	}))
+	c, welcome := h.client()
+	if !slices.Contains(welcome.Operations, TypeLocateSession) {
+		t.Fatalf("locate not advertised: %v", welcome.Operations)
+	}
+	if got := request(t, c, Frame{Type: TypeLocateSession, ID: "saved", SessionID: saved[:8], CWD: "/client/only"}); got.Error != nil || got.SessionID != saved || got.CWD != "/saved/project" {
+		t.Fatalf("saved lookup: %+v", got)
+	}
+	resp := request(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd, SessionID: uuid.NewString()})
+	if resp.Error != nil {
+		t.Fatalf("start: %+v", resp)
+	}
+	live := resp.Instance.SessionID
+	for _, ref := range []string{live, live[:13]} {
+		if got := request(t, c, Frame{Type: TypeLocateSession, ID: "live-" + ref, SessionID: ref, CWD: "/client/only"}); got.Error != nil || got.SessionID != live || got.CWD != resp.Instance.CWD {
+			t.Fatalf("live lookup %q: %+v", ref, got)
+		}
+	}
+	wantError(t, request(t, c, Frame{Type: TypeLocateSession, ID: "missing", SessionID: other}), "missing", CodeUnavailable)
+	wantError(t, request(t, c, Frame{Type: TypeLocateSession, ID: "relative", SessionID: saved, CWD: "relative"}), "relative", CodeInvalidFrame)
+}
+
 func TestInstanceStatus(t *testing.T) {
 	resets := time.Date(2026, 11, 24, 14, 0, 0, 0, time.UTC)
 	for _, test := range []struct {

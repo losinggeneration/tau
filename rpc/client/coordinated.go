@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -360,6 +361,27 @@ func (c *CoordinatedClient) SessionDirectory(ctx context.Context, cwd string) (s
 	}
 	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeSessionDirectory, CWD: cwd})
 	return reply.CWD, err
+}
+
+// CanLocateSession reports whether the coordinator resolves sessions by ID.
+func (c *CoordinatedClient) CanLocateSession() bool {
+	return slices.Contains(c.welcome.Operations, coord.TypeLocateSession)
+}
+
+// LocateSession asks the coordinator which project owns a session ID or
+// unique prefix. hint is the client's directory and may be empty.
+func (c *CoordinatedClient) LocateSession(ctx context.Context, ref, hint string) (id, project string, err error) {
+	if !c.CanLocateSession() {
+		return "", "", errors.New("coordinator does not support locating sessions; restart it with the current Tau version")
+	}
+	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeLocateSession, SessionID: ref, CWD: hint})
+	if err != nil {
+		return "", "", err
+	}
+	if reply.SessionID == "" || !filepath.IsAbs(reply.CWD) {
+		return "", "", fmt.Errorf("locate session: %w: incomplete reply", coord.ErrInvalidFrame)
+	}
+	return reply.SessionID, reply.CWD, nil
 }
 
 // ListInstances returns the coordinator registry, including any retained

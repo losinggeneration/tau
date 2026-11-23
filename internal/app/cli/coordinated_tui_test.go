@@ -207,6 +207,13 @@ func TestCoordinatedResumeListsDaemonStorageWithoutAWorker(t *testing.T) {
 				return "", fmt.Errorf("unexpected project %q", project)
 			}
 			return daemonDir, nil
+		}), coord.WithSessionLocator(func(_ context.Context, ref, hint string) (string, string, error) {
+			located, err := sessionpkg.NewStorageAt(daemonDir)
+			if err != nil {
+				return "", "", err
+			}
+			found, project, err := located.LocateSession(ref, hint)
+			return found.ID, project, err
 		}))
 	}()
 	t.Cleanup(func() {
@@ -225,9 +232,10 @@ func TestCoordinatedResumeListsDaemonStorageWithoutAWorker(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, saved, 1)
 	require.Equal(t, header.ID, saved[0].ID)
-	resolved, err := resolveSavedTUISession(ctx, c, cwd, header.ID[:12])
+	resolved, project, err := resolveSavedTUISession(ctx, c, cwd, header.ID[:12])
 	require.NoError(t, err)
-	require.Equal(t, header.ID, resolved.ID)
+	require.Equal(t, header.ID, resolved)
+	require.Equal(t, cwd, project)
 	dir, err := lookupSavedSessionDir(ctx, c, path, cwd)
 	require.NoError(t, err)
 	savedDir := savedSessionDir{project: cwd, path: dir}
@@ -251,6 +259,59 @@ func TestCoordinatedResumeListsDaemonStorageWithoutAWorker(t *testing.T) {
 		})
 	}
 	require.Zero(t, starts.Load())
+}
+
+func TestCoordinatedResumeByIDIgnoresClientDirectory(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	project, elsewhere, sessions := filepath.Join(root, "project"), filepath.Join(root, "elsewhere"), filepath.Join(root, "sessions")
+	require.NoError(t, os.Mkdir(project, 0o700))
+	require.NoError(t, os.Mkdir(elsewhere, 0o700))
+	t.Setenv("HOME", root)
+	storage, err := sessionpkg.NewStorageAt(sessions)
+	require.NoError(t, err)
+	header := sessionpkg.NewHeader(project, nil, nil, "saved")
+	w, err := storage.Create(header)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	sessionDirectory := func(context.Context, string) (string, error) { return sessions, nil }
+
+	ctx, cancel := context.WithCancel(t.Context())
+	socketDir := t.TempDir()
+	require.NoError(t, os.Chmod(socketDir, 0o700))
+	path := filepath.Join(socketDir, "c.sock")
+	done := make(chan error, 1)
+	go func() {
+		done <- coord.RunRecoverable(ctx, path, filepath.Join(root, "receipts"), func(context.Context, coord.LaunchRequest) error {
+			return errors.New("unexpected launch")
+		}, coord.WithSessionDirectory(sessionDirectory), coord.WithSessionLocator(func(ctx context.Context, ref, hint string) (string, string, error) {
+			return locateDaemonSession(ctx, sessionDirectory, ref, hint)
+		}))
+	}()
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, <-done)
+	})
+	var c *client.CoordinatedClient
+	require.Eventually(t, func() bool {
+		c, err = client.NewCoordinatedClient(ctx, path)
+		return err == nil
+	}, time.Second, 5*time.Millisecond)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	for name, hint := range map[string]string{
+		"other directory":         elsewhere,
+		"directory not on daemon": filepath.Join(root, "only-on-client"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			id, got, err := resolveSavedTUISession(ctx, c, hint, header.ID[:13])
+			require.NoError(t, err)
+			require.Equal(t, header.ID, id)
+			require.Equal(t, project, got)
+		})
+	}
+	_, _, err = resolveSavedTUISession(ctx, c, elsewhere, "ffffffff-missing")
+	require.ErrorContains(t, err, "not found")
 }
 
 func TestCoordinatedResumeHintAfterDaemonLoss(t *testing.T) {

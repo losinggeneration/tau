@@ -785,3 +785,56 @@ func TestStorageImportCopiesWithoutOverwriting(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
 }
+
+func TestStorageLocateSession(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, other := filepath.Join(root, "project"), filepath.Join(root, "other")
+	for _, dir := range []string{project, other} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	storage, err := NewStorageAt(filepath.Join(root, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	absolute, relative := NewHeader(project, nil, nil), NewHeader(".", nil, nil)
+	for _, file := range []struct {
+		header Header
+		dir    string
+	}{{absolute, storage.DirForCWD(project)}, {relative, storage.DirForCWD(project)}} {
+		w, err := CreateSessionFile(file.dir, file.header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		name, id, hint, want string
+		wantErr              bool
+	}{
+		{name: "recorded project ignores hint", id: absolute.ID, hint: other, want: project},
+		{name: "recorded project needs no hint", id: absolute.ID, want: project},
+		{name: "relative in its project", id: relative.ID, hint: project, want: project},
+		{name: "relative elsewhere", id: relative.ID, hint: other, want: project},
+		{name: "relative without hint", id: relative.ID, want: project},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header, got, err := storage.LocateSession(test.id, test.hint)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("LocateSession: %v", err)
+			}
+			if !test.wantErr && (got != test.want || header.ID != test.id) {
+				t.Fatalf("LocateSession = %s, %s", header.ID, got)
+			}
+		})
+	}
+	if _, _, err := storage.LocateSession("missing", ""); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("missing session: %v", err)
+	}
+}

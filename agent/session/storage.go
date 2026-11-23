@@ -235,6 +235,43 @@ func (s *Storage) ProjectHeader(id, project string) (Header, error) {
 	return header, nil
 }
 
+// ErrSessionNotFound reports that no saved session matches an ID or prefix.
+var ErrSessionNotFound = errors.New("not found")
+
+// LocateSession finds a saved session by ID or unique prefix and returns its
+// header and symlink-resolved project. Older sessions recorded a relative cwd,
+// so their project comes from the directory they were filed under. hint only
+// settles a filed name that matches more than one directory.
+func (s *Storage) LocateSession(id, hint string) (Header, string, error) {
+	path, err := s.findByID(id)
+	if err != nil {
+		return Header{}, "", err
+	}
+	header, err := ReadHeader(path)
+	if err != nil {
+		return Header{}, "", err
+	}
+	if !filepath.IsAbs(header.CWD) {
+		filed := filepath.Base(filepath.Dir(path))
+		if hint != "" && cwdDirName(hint) == filed {
+			return header, hint, nil
+		}
+		projects, err := projectsForDirName(filed)
+		if err != nil {
+			return Header{}, "", fmt.Errorf("find project of session %s: %w", header.ID, err)
+		}
+		if len(projects) != 1 {
+			return Header{}, "", fmt.Errorf("find project of session %s: %d directories match %s", header.ID, len(projects), filed)
+		}
+		return header, projects[0], nil
+	}
+	project, err := filepath.EvalSymlinks(header.CWD)
+	if err != nil {
+		return Header{}, "", fmt.Errorf("resolve project of session %s: %w", header.ID, err)
+	}
+	return header, project, nil
+}
+
 // CheckResumeOwner reports whether a stored session is currently owned. It
 // does not claim the session; Resume must still take the writer lock.
 func (s *Storage) CheckResumeOwner(id string) error {
@@ -656,13 +693,67 @@ func (s *Storage) findByID(id string) (string, error) {
 		matches = exactMatches
 	}
 	if len(matches) == 0 {
-		return "", fmt.Errorf("session %q not found", id)
+		return "", fmt.Errorf("session %q %w", id, ErrSessionNotFound)
 	}
 	if len(matches) > 1 {
 		return "", fmt.Errorf("ambiguous session ID %q matches %d sessions", id, len(matches))
 	}
 	return matches[0], nil
 }
+
+// projectsForDirName reverses cwdDirName by walking only directories whose
+// encoded names continue the filed name.
+func projectsForDirName(filed string) ([]string, error) {
+	if len(filed) <= 4 || !strings.HasPrefix(filed, "--") || !strings.HasSuffix(filed, "--") {
+		return nil, nil
+	}
+	encoded := filed[2 : len(filed)-2]
+	var (
+		found []string
+		walk  func(dir, rest string) error
+	)
+	walk = func(dir, rest string) error {
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			name := dirNameReplacer.Replace(entry.Name())
+			next, nested := strings.CutPrefix(rest, name+"-")
+			if name != rest && !nested {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			info, err := os.Stat(path)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			if name == rest {
+				found = append(found, path)
+			} else if err := walk(path, next); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(string(filepath.Separator), encoded); err != nil {
+		return nil, err
+	}
+	for i, path := range found {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, err
+		}
+		found[i] = resolved
+	}
+	slices.Sort(found)
+	return slices.Compact(found), nil
+}
+
+var dirNameReplacer = strings.NewReplacer("/", "-", `\`, "-", ":", "-")
 
 func cwdDirName(cwd string) string {
 	resolved, err := filepath.Abs(cwd)
@@ -674,8 +765,7 @@ func cwdDirName(cwd string) string {
 	if trimmed == "" || trimmed == "." {
 		return "--root--"
 	}
-	replacer := strings.NewReplacer("/", "-", `\`, "-", ":", "-")
-	return "--" + replacer.Replace(trimmed) + "--"
+	return "--" + dirNameReplacer.Replace(trimmed) + "--"
 }
 
 // MigrateToCWDDirs moves legacy flat session files from the storage root into
