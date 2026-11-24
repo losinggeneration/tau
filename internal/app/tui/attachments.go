@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/losinggeneration/tau/internal/atref"
+
 	tauui "github.com/losinggeneration/tau/tui"
 )
 
@@ -71,20 +73,7 @@ func (a *App) pendingAttachments(text string) []pendingAttachment {
 func pendingAtPaths(text string, resolve func(string) string) []string {
 	var out []string
 	seen := map[string]struct{}{}
-	for i := 0; i < len(text); {
-		if text[i] != '@' || (i > 0 && (text[i-1] == '\\' || !isFileRefBoundary(rune(text[i-1])))) {
-			i++
-			continue
-		}
-		j := i + 1
-		for j < len(text) && !isFileRefBoundary(rune(text[j])) && text[j] != '\n' {
-			j++
-		}
-		path := text[i+1 : j]
-		if path == "" {
-			i++
-			continue
-		}
+	collect := func(path string) (string, error) {
 		full := resolve(path)
 		if info, err := os.Stat(full); err == nil && !info.IsDir() {
 			if abs, err := filepath.Abs(full); err == nil {
@@ -95,7 +84,10 @@ func pendingAtPaths(text string, resolve func(string) string) []string {
 				out = append(out, full)
 			}
 		}
-		i = j
+		return "", nil
+	}
+	if _, err := atref.Replace(text, collect); err != nil {
+		return nil
 	}
 	return out
 }

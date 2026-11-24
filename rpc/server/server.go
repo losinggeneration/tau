@@ -220,6 +220,8 @@ func (s *Server) handleCommand(ctx context.Context, cmd *Command) error {
 		return s.handleAttachData(ctx, cmd)
 	case "list_attachments":
 		return s.handleListAttachments(ctx, cmd)
+	case "complete_path":
+		return s.handleCompletePath(ctx, cmd)
 	case "delete_attachment":
 		return s.handleDeleteAttachment(ctx, cmd)
 	case "subscribe_events":
@@ -283,6 +285,9 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 		Images            []string `json:"images,omitempty"`
 		AttachFiles       []string `json:"attach_files,omitempty"`
 		AttachmentIDs     []string `json:"attachment_ids,omitempty"`
+		// ExpandRefs turns @path tokens into attachments resolved in the
+		// session's working directory.
+		ExpandRefs bool `json:"expand_refs,omitempty"`
 		// StreamingBehavior queues the prompt when a run is active:
 		// "steer", or "follow_up" ("followUp" also works).
 		StreamingBehavior   string `json:"streaming_behavior,omitempty"`
@@ -306,14 +311,14 @@ func (s *Server) handleSendMessage(ctx context.Context, cmd *Command) error {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
-	content, attachmentIDs, err := messageContentBlocks(sess, args.Images, args.AttachFiles, args.AttachmentIDs)
+	text, content, attachmentIDs, err := messageContent(sess, args.Text, args.ExpandRefs, args.Images, args.AttachFiles, args.AttachmentIDs)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
 
 	msg := sdk.Message{
 		Role:          "user",
-		Text:          args.Text,
+		Text:          text,
 		Images:        content,
 		AttachmentIDs: attachmentIDs,
 	}
@@ -1265,8 +1270,10 @@ func (s *Server) sendResponse(resp Response) error {
 // handleSteer adds a steering message to the queue.
 func (s *Server) handleSteer(ctx context.Context, cmd *Command) error {
 	var args struct {
-		Text   string   `json:"text"`
-		Images []string `json:"images,omitempty"`
+		Text          string   `json:"text"`
+		Images        []string `json:"images,omitempty"`
+		AttachmentIDs []string `json:"attachment_ids,omitempty"`
+		ExpandRefs    bool     `json:"expand_refs,omitempty"`
 	}
 	if err := json.Unmarshal(cmd.Args, &args); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
@@ -1276,8 +1283,11 @@ func (s *Server) handleSteer(ctx context.Context, cmd *Command) error {
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-
-	return s.queueMessage(cmd.ID, sess, "steer", sdk.Message{Role: "user", Text: args.Text, Images: rpcImageBlocks(args.Images)})
+	text, content, ids, err := messageContent(sess, args.Text, args.ExpandRefs, args.Images, nil, args.AttachmentIDs)
+	if err != nil {
+		return s.sendErrorResult(cmd.ID, err)
+	}
+	return s.queueMessage(cmd.ID, sess, "steer", sdk.Message{Role: "user", Text: text, Images: content, AttachmentIDs: ids})
 }
 
 // handleFollowUp adds a follow-up message to the queue.
@@ -1287,6 +1297,7 @@ func (s *Server) handleFollowUp(ctx context.Context, cmd *Command) error {
 		Text              string   `json:"text"`
 		Images            []string `json:"images,omitempty"`
 		AttachmentIDs     []string `json:"attachment_ids,omitempty"`
+		ExpandRefs        bool     `json:"expand_refs,omitempty"`
 	}
 	if err := json.Unmarshal(cmd.Args, &args); err != nil {
 		return s.sendErrorResult(cmd.ID, err)
@@ -1296,11 +1307,11 @@ func (s *Server) handleFollowUp(ctx context.Context, cmd *Command) error {
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-	content, ids, err := messageContentBlocks(sess, args.Images, nil, args.AttachmentIDs)
+	text, content, ids, err := messageContent(sess, args.Text, args.ExpandRefs, args.Images, nil, args.AttachmentIDs)
 	if err != nil {
 		return s.sendErrorResult(cmd.ID, err)
 	}
-	return s.queueMessage(cmd.ID, sess, "follow_up", sdk.Message{Role: "user", Text: args.Text, Images: content, AttachmentIDs: ids})
+	return s.queueMessage(cmd.ID, sess, "follow_up", sdk.Message{Role: "user", Text: text, Images: content, AttachmentIDs: ids})
 }
 
 func (s *Server) handleEditQueuedText(ctx context.Context, cmd *Command) error {

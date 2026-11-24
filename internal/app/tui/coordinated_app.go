@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -79,7 +80,7 @@ func (a *App) sendCoordinatedDraft(text string, followUp bool) {
 	a.coordinatedPendingSend = true
 	original := a.editor.Text()
 	sess := a.coordinated
-	cwd := a.fileSelectorRoot()
+	pasted := maps.Clone(a.pastedImages)
 	sessionID := a.coordinatedSessionID
 	if sessionID == "" {
 		sessionID = sess.ID()
@@ -89,11 +90,7 @@ func (a *App) sendCoordinatedDraft(text string, followUp bool) {
 		behavior = "follow_up"
 	}
 	go func() {
-		expanded, images, err := expandTextFileReferences(text, cwd)
-		if err == nil {
-			msg := sdk.Message{Role: "user", Text: expanded, Images: images}
-			err = sess.sendDraft(a.ctx, sessionID, msg, behavior)
-		}
+		err := sess.sendComposerDraft(a.ctx, sessionID, text, pasted, behavior)
 		a.post(func(*tauui.UpdateCtx) {
 			a.coordinatedPendingSend = false
 			a.clearStatus("coordinator-send")

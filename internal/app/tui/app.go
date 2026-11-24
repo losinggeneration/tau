@@ -16,6 +16,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/losinggeneration/tau/internal/atref"
+
 	"github.com/losinggeneration/tau/ai"
 	"github.com/losinggeneration/tau/sdk"
 	tauui "github.com/losinggeneration/tau/tui"
@@ -2644,79 +2646,50 @@ func (a *App) expandInlineAttachmentReferences(text string) (string, []ai.Conten
 	if root == "" {
 		root = "."
 	}
-	if _, ok := a.sess.(sdk.AttachmentManager); !ok {
-		expanded, images, err := expandTextFileReferences(text, root)
-		return expanded, images, nil, err
-	}
 	return a.expandTextAttachmentReferences(text, root)
 }
 
 func expandTextFileReferences(text, root string) (string, []ai.ContentBlock, error) {
-	var out strings.Builder
 	var images []ai.ContentBlock
-	for i := 0; i < len(text); {
-		if text[i] != '@' || (i > 0 && (text[i-1] == '\\' || !isFileRefBoundary(rune(text[i-1])))) {
-			out.WriteByte(text[i])
-			i++
-			continue
-		}
-		j := i + 1
-		for j < len(text) && !isFileRefBoundary(rune(text[j])) && text[j] != '\n' {
-			j++
-		}
-		path := text[i+1 : j]
-		if path == "" {
-			out.WriteByte(text[i])
-			i++
-			continue
-		}
+	expanded, err := atref.Replace(text, func(path string) (string, error) {
 		expanded, image, err := expandTextFileReference(path, root)
-		if err != nil {
-			return "", nil, err
-		}
 		if image.Type == ai.ContentBlockImage {
 			images = append(images, image)
 		}
-		out.WriteString(expanded)
-		i = j
+		return expanded, err
+	})
+	if err != nil {
+		return "", nil, err
 	}
-	return out.String(), images, nil
+	return expanded, images, nil
 }
 
 func (a *App) expandTextAttachmentReferences(text, root string) (string, []ai.ContentBlock, []string, error) {
-	var out strings.Builder
-	var images []ai.ContentBlock
-	var attachmentIDs []string
-	for i := 0; i < len(text); {
-		if text[i] != '@' || (i > 0 && (text[i-1] == '\\' || !isFileRefBoundary(rune(text[i-1])))) {
-			out.WriteByte(text[i])
-			i++
-			continue
-		}
-		j := i + 1
-		for j < len(text) && !isFileRefBoundary(rune(text[j])) && text[j] != '\n' {
-			j++
-		}
-		path := text[i+1 : j]
-		if path == "" {
-			out.WriteByte(text[i])
-			i++
-			continue
-		}
-		expanded, image, id, err := a.expandTextAttachmentReference(path, root)
-		if err != nil {
-			return "", nil, nil, err
-		}
-		if image.Type == ai.ContentBlockImage {
-			images = append(images, image)
-		}
-		if id != "" {
-			attachmentIDs = append(attachmentIDs, id)
-		}
-		out.WriteString(expanded)
-		i = j
+	mgr, ok := a.sess.(sdk.AttachmentManager)
+	if !ok {
+		expanded, images, err := expandTextFileReferences(text, root)
+		return expanded, images, nil, err
 	}
-	return out.String(), images, attachmentIDs, nil
+	resolve := func(path string) string { return a.resolveAttachmentPath(path, root) }
+	expanded, records, err := atref.Attach(text, resolve, mgr.ImportAttachmentFile)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	var (
+		images        []ai.ContentBlock
+		attachmentIDs []string
+	)
+	for _, record := range records {
+		if record.Kind == "image" {
+			block, err := ai.LoadImageContentBlock(record.Path)
+			if err != nil {
+				return "", nil, nil, fmt.Errorf("@%s: %w", record.Filename, err)
+			}
+			images = append(images, block)
+		}
+		attachmentIDs = append(attachmentIDs, record.ID)
+	}
+	return expanded, images, attachmentIDs, nil
 }
 
 // resolveAttachmentPath maps an @-reference token to a file on disk.
@@ -2732,12 +2705,12 @@ func (a *App) resolveAttachmentPath(path, root string) string {
 			return abs
 		}
 	}
-	full := resolveAtReferencePath(path, root)
+	full := atref.Resolve(path, root)
 	if _, err := os.Stat(full); err == nil {
 		return full
 	}
 	if dir := a.sessionState().DataDir(); dir != "" {
-		if alt := resolveAtReferencePath(path, dir); alt != full {
+		if alt := atref.Resolve(path, dir); alt != full {
 			if _, err := os.Stat(alt); err == nil {
 				return alt
 			}
@@ -2746,54 +2719,11 @@ func (a *App) resolveAttachmentPath(path, root string) string {
 	return full
 }
 
-func (a *App) expandTextAttachmentReference(path, root string) (string, ai.ContentBlock, string, error) {
-	full := a.resolveAttachmentPath(path, root)
-	info, err := os.Stat(full)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "@" + path, ai.ContentBlock{}, "", nil
-		}
-		return "", ai.ContentBlock{}, "", fmt.Errorf("@%s: %w", path, err)
-	}
-	if info.IsDir() {
-		expanded, err := expandTextDirectoryListing(path, full)
-		if err != nil {
-			return "", ai.ContentBlock{}, "", err
-		}
-		return expanded, ai.ContentBlock{}, "", nil
-	}
-	mgr, ok := a.sess.(sdk.AttachmentManager)
-	if !ok {
-		expanded, image, err := expandTextFileReference(path, root)
-		return expanded, image, "", err
-	}
-	record, err := mgr.ImportAttachmentFile(full)
-	if err != nil {
-		return "", ai.ContentBlock{}, "", fmt.Errorf("@%s: %w", path, err)
-	}
-	if record.Kind == "image" {
-		block, err := ai.LoadImageContentBlock(record.Path)
-		if err != nil {
-			return "", ai.ContentBlock{}, "", fmt.Errorf("@%s: %w", path, err)
-		}
-		return fmt.Sprintf("<file name=%q>[image content]</file>", path), block, record.ID, nil
-	}
-	if record.ExtractedText == "" {
-		return "", ai.ContentBlock{}, "", fmt.Errorf("@%s: unsupported attachment type %s", path, record.MimeType)
-	}
-	return fmt.Sprintf("<file name=%q>[attached]</file>", path), ai.ContentBlock{}, record.ID, nil
-}
-
+// expandTextFileReference inlines a file without an attachment store.
+// Absolute paths and ".." are honored so the prompt can reach files outside
+// root without round-tripping through the shell.
 func expandTextFileReference(path, root string) (string, ai.ContentBlock, error) {
-	// Honor absolute paths and ".."; the picker lets the user type
-	// anything relative to root, but a real user also wants to reach
-	// siblings and parent dirs without round-tripping through the
-	// shell. The whole history of rejecting ".." or "/foo" here was
-	// one of the two things that made @dir balloon into the
-	// contents-of-the-whole-tree bug: callers had no way to point
-	// the prompt at a file outside root, so the "only inside cwd"
-	// guard was useless and confusing.
-	full := resolveAtReferencePath(path, root)
+	full := atref.Resolve(path, root)
 	info, err := os.Stat(full)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2802,11 +2732,8 @@ func expandTextFileReference(path, root string) (string, ai.ContentBlock, error)
 		return "", ai.ContentBlock{}, fmt.Errorf("@%s: %w", path, err)
 	}
 	if info.IsDir() {
-		expanded, err := expandTextDirectoryListing(path, full)
-		if err != nil {
-			return "", ai.ContentBlock{}, err
-		}
-		return expanded, ai.ContentBlock{}, nil
+		expanded, err := atref.Directory(path, full)
+		return expanded, ai.ContentBlock{}, err
 	}
 	if isImagePath(full) {
 		block, err := ai.LoadImageContentBlock(full)
@@ -2826,27 +2753,6 @@ func expandTextFileReference(path, root string) (string, ai.ContentBlock, error)
 	return fmt.Sprintf("<file name=%q>\n%s\n</file>", abs, string(data)), ai.ContentBlock{}, nil
 }
 
-// resolveAtReferencePath joins the picker path with root. Absolute
-// paths bypass root entirely so `@/etc/hosts` and `@~/notes` resolve
-// the way the user typed them; relative paths are anchored at root.
-func resolveAtReferencePath(path, root string) string {
-	if path == "" {
-		return root
-	}
-	if strings.HasPrefix(path, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, filepath.FromSlash(path[2:]))
-		}
-	}
-	if filepath.IsAbs(path) {
-		return filepath.FromSlash(path)
-	}
-	if root == "" {
-		root = "."
-	}
-	return filepath.Join(root, filepath.FromSlash(path))
-}
-
 func isImagePath(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
@@ -2854,30 +2760,6 @@ func isImagePath(path string) bool {
 	default:
 		return false
 	}
-}
-
-// expandTextDirectoryListing walks a directory and emits a file list,
-// never the contents. Reading every file in a moderately-sized project
-// would max out the model's context window and dump the user's source
-// tree into the prompt without consent; the model only needs to know
-// which files exist. Paths are sorted for stable output and emitted
-// relative to the directory itself, so the model can see the tree
-// shape without absolute-path noise.
-//
-// The wrapper tags the listing with an absolute directory name so the
-// model can still ground relative entries back to a real path on
-// disk. Skipped: any dotfile or dotfile directory (`.git`,
-// `node_modules`, dependency caches) at any depth — the tree
-// frequently carries dotfile noise that wasn't the user's intent,
-// and only regular files are included (no symlinks to devices,
-// FIFOs, sockets).
-func expandTextDirectoryListing(path, full string) (string, error) {
-	abs, err := filepath.Abs(full)
-	if err != nil {
-		return "", fmt.Errorf("@%s: resolve: %w", path, err)
-	}
-
-	return fmt.Sprintf("<directory name=%q>\n</directory>", abs), nil
 }
 
 // routePrompt sends text as a new prompt while idle. While an agent run is
@@ -4411,10 +4293,6 @@ func (a *App) refreshSelector(text string, ctx *tauui.Ctx) {
 	a.completionSelector = completion
 	forceLayout := wasShown && a.selector.MinSize() != wasSize
 	a.invalidateSelectorLayout(wasShown, forceLayout, ctx)
-}
-
-func isFileRefBoundary(r rune) bool {
-	return r == ' ' || r == '\t' || r == '(' || r == '[' || r == '{' || r == ',' || r == ':'
 }
 
 func shouldCheckFileSelector(text string, cursor int) bool {

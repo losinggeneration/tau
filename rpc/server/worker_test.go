@@ -842,6 +842,21 @@ func TestWorkerControlsBypassCompaction(t *testing.T) {
 	}
 }
 
+func TestWorkerCompletesPathsDuringCompaction(t *testing.T) {
+	rt := newWorkerRuntime()
+	started := make(chan struct{})
+	rt.sess.compactFn = func(ctx context.Context) error { close(started); <-ctx.Done(); return ctx.Err() }
+	h := startWorker(t, rt, nil)
+	h.send(t, "compact", `{"type":"compact"}`)
+	<-started
+	h.send(t, "complete", `{"type":"complete_path","args":{"text":"@x"}}`)
+	if r := h.response(t, "complete"); !r.OK {
+		t.Fatalf("complete_path: %+v", r.Error)
+	}
+	h.send(t, "abort", `{"type":"interrupt"}`)
+	h.response(t, "abort")
+}
+
 func TestWorkerUIAndObserverShareStream(t *testing.T) {
 	rt := newWorkerRuntime()
 	reg := commands.NewInMemoryRegistry()

@@ -289,6 +289,7 @@ type mockSession struct {
 	steeringCount int
 	followUpCount int
 	followUps     []sdk.Message
+	steers        []sdk.Message
 	observer      func(sdk.Event)
 	sent          []sdk.Message
 	attachments   map[string]sdk.Attachment
@@ -362,6 +363,7 @@ func (s *mockSession) SendText(ctx context.Context, text string) (<-chan sdk.Eve
 
 func (s *mockSession) Steer(msg sdk.Message) error {
 	s.steeringCount++
+	s.steers = append(s.steers, msg)
 	return nil
 }
 

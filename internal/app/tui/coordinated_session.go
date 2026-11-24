@@ -3,9 +3,12 @@ package tui
 import (
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -15,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/losinggeneration/tau/ai"
+	"github.com/losinggeneration/tau/internal/atref"
 	rpcclient "github.com/losinggeneration/tau/rpc/client"
 	"github.com/losinggeneration/tau/rpc/coord"
 	"github.com/losinggeneration/tau/sdk"
@@ -277,7 +281,7 @@ func (s *CoordinatedSession) RespondUI(ctx context.Context, resp baseui.UIRespon
 // Send issues msg as a prompt and returns an already-closed channel; its
 // events arrive on Events. While a turn runs the worker steers it.
 func (s *CoordinatedSession) Send(ctx context.Context, msg sdk.Message) (<-chan sdk.Event, error) {
-	if err := s.sendDraft(ctx, s.ID(), msg, ""); err != nil {
+	if err := s.sendDraft(ctx, coordinatedDraft{sessionID: s.ID(), msg: msg}); err != nil {
 		return nil, err
 	}
 	events := make(chan sdk.Event)
@@ -285,26 +289,68 @@ func (s *CoordinatedSession) Send(ctx context.Context, msg sdk.Message) (<-chan 
 	return events, nil
 }
 
-// SendInitialDraft submits the first composer message from the worker's CWD.
+// SendInitialDraft submits the first composer message.
 func (s *CoordinatedSession) SendInitialDraft(ctx context.Context, text string) error {
-	state := s.State()
-	expanded, images, err := expandTextFileReferences(text, state.CWD())
+	return s.sendComposerDraft(ctx, s.State().SessionID(), text, nil, "")
+}
+
+// sendComposerDraft leaves @path expansion to the worker so references
+// resolve on the instance's machine. Pasted images only exist here, so they
+// are uploaded as bytes first.
+func (s *CoordinatedSession) sendComposerDraft(ctx context.Context, sessionID, text string, pasted map[string]string, behavior string) error {
+	text, ids, err := s.uploadPastedImages(ctx, sessionID, text, pasted)
 	if err != nil {
 		return err
 	}
-	return s.sendDraft(ctx, state.SessionID(), sdk.Message{Role: "user", Text: expanded, Images: images}, "")
+	msg := sdk.Message{Role: "user", Text: text, AttachmentIDs: ids}
+	return s.sendDraft(ctx, coordinatedDraft{sessionID: sessionID, msg: msg, behavior: behavior, expandRefs: true})
+}
+
+func (s *CoordinatedSession) uploadPastedImages(ctx context.Context, sessionID, text string, pasted map[string]string) (string, []string, error) {
+	if len(pasted) == 0 {
+		return text, nil, nil
+	}
+	var ids []string
+	expanded, err := atref.Replace(text, func(path string) (string, error) {
+		full, ok := pasted[path]
+		if !ok {
+			return "@" + path, nil
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return "", fmt.Errorf("@%s: %w", path, err)
+		}
+		record, err := s.importData(ctx, sessionID, path, http.DetectContentType(data), base64.StdEncoding.EncodeToString(data))
+		if err != nil {
+			return "", fmt.Errorf("@%s: %w", path, err)
+		}
+		ids = append(ids, record.ID)
+		return atref.Placeholder(path, record), nil
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	return expanded, ids, nil
+}
+
+type coordinatedDraft struct {
+	sessionID  string
+	msg        sdk.Message
+	behavior   string
+	expandRefs bool
 }
 
 // sendDraft checks the session that was visible when the draft was submitted,
 // not the one that happens to be active after preparing its attachments.
-func (s *CoordinatedSession) sendDraft(ctx context.Context, sessionID string, msg sdk.Message, behavior string) error {
+func (s *CoordinatedSession) sendDraft(ctx context.Context, d coordinatedDraft) error {
 	args := struct {
 		ExpectedSessionID string   `json:"expected_session_id,omitempty"`
 		Text              string   `json:"text"`
 		Images            []string `json:"images,omitempty"`
 		AttachmentIDs     []string `json:"attachment_ids,omitempty"`
 		StreamingBehavior string   `json:"streaming_behavior,omitempty"`
-	}{sessionID, messageText(msg), messageImages(msg), msg.AttachmentIDs, behavior}
+		ExpandRefs        bool     `json:"expand_refs,omitempty"`
+	}{d.sessionID, messageText(d.msg), messageImages(d.msg), d.msg.AttachmentIDs, d.behavior, d.expandRefs}
 	return s.call(ctx, coordinatedMutationTimeout, "send_message", args, nil)
 }
 
@@ -488,9 +534,10 @@ func (s *CoordinatedSession) Forget(entryID string) error {
 // Steer queues msg for the running turn.
 func (s *CoordinatedSession) Steer(msg sdk.Message) error {
 	args := struct {
-		Text   string   `json:"text"`
-		Images []string `json:"images,omitempty"`
-	}{messageText(msg), messageImages(msg)}
+		Text          string   `json:"text"`
+		Images        []string `json:"images,omitempty"`
+		AttachmentIDs []string `json:"attachment_ids,omitempty"`
+	}{messageText(msg), messageImages(msg), msg.AttachmentIDs}
 	return s.call(s.ctx, coordinatedMutationTimeout, "steer", args, nil)
 }
 
@@ -650,31 +697,34 @@ func (s *CoordinatedSession) setMode(command, mode string) error {
 	return s.call(s.ctx, coordinatedMutationTimeout, command, args, nil)
 }
 
-// ImportAttachmentFile imports a file the worker can read. Coordinated
-// workers share this host, so local paths resolve the same way.
+// ImportAttachmentFile imports a file by a path on the worker's machine.
 func (s *CoordinatedSession) ImportAttachmentFile(path string) (sdk.Attachment, error) {
 	args := struct {
 		Path string `json:"path"`
 	}{path}
-	return s.importAttachment("attach_file", args)
+	return s.importAttachment(s.ctx, "attach_file", args)
 }
 
 // ImportAttachmentData imports inline data into the instance's session.
 func (s *CoordinatedSession) ImportAttachmentData(filename, mimeType, data string) (sdk.Attachment, error) {
+	return s.importData(s.ctx, s.ID(), filename, mimeType, data)
+}
+
+func (s *CoordinatedSession) importData(ctx context.Context, sessionID, filename, mimeType, data string) (sdk.Attachment, error) {
 	args := struct {
 		ExpectedSessionID string `json:"expected_session_id,omitempty"`
 		Filename          string `json:"filename"`
 		MimeType          string `json:"mime_type"`
 		Data              string `json:"data"`
-	}{s.ID(), filename, mimeType, data}
-	return s.importAttachment("attach_data", args)
+	}{sessionID, filename, mimeType, data}
+	return s.importAttachment(ctx, "attach_data", args)
 }
 
-func (s *CoordinatedSession) importAttachment(command string, args any) (sdk.Attachment, error) {
+func (s *CoordinatedSession) importAttachment(ctx context.Context, command string, args any) (sdk.Attachment, error) {
 	var out struct {
 		Attachment sdk.Attachment `json:"attachment"`
 	}
-	if err := s.call(s.ctx, coordinatedMutationTimeout, command, args, &out); err != nil {
+	if err := s.call(ctx, coordinatedMutationTimeout, command, args, &out); err != nil {
 		return sdk.Attachment{}, err
 	}
 	s.mu.Lock()

@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -403,6 +405,75 @@ func TestCoordinatedSessionSendOnlyIssuesCommand(t *testing.T) {
 		}
 	default:
 		t.Fatal("send channel is not closed")
+	}
+}
+
+func TestCoordinatedComposerDraftExpandsOnWorker(t *testing.T) {
+	fc := newCoordFake(t)
+	s, conn := openCoordTestSession(t, fc)
+	nextCoordEvent(t, s)
+	png := filepath.Join(t.TempDir(), "pasted.png")
+	pngBytes := []byte("\x89PNG\r\n\x1a\nrest")
+	if err := os.WriteFile(png, pngBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := coordAsync(func() (struct{}, error) {
+		return struct{}{}, s.sendComposerDraft(context.Background(), "s1", "see @pasted.png and @notes.md", map[string]string{"pasted.png": png}, "follow_up")
+	})
+	f, raw := conn.expectCommand(t, "attach_data")
+	var upload struct {
+		ExpectedSessionID string `json:"expected_session_id"`
+		Filename          string `json:"filename"`
+		MimeType          string `json:"mime_type"`
+		Data              string `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &upload); err != nil {
+		t.Fatal(err)
+	}
+	if upload.ExpectedSessionID != "s1" || upload.Filename != "pasted.png" || upload.MimeType != "image/png" || upload.Data != base64.StdEncoding.EncodeToString(pngBytes) {
+		t.Fatalf("upload = %+v", upload)
+	}
+	conn.reply(t, f, map[string]any{"attachment": sdk.Attachment{ID: "img-1", Kind: "image"}})
+
+	f, raw = conn.expectCommand(t, "send_message")
+	var args struct {
+		Text              string   `json:"text"`
+		AttachmentIDs     []string `json:"attachment_ids"`
+		StreamingBehavior string   `json:"streaming_behavior"`
+		ExpandRefs        bool     `json:"expand_refs"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		t.Fatal(err)
+	}
+	want := `see <file name="pasted.png">[image content]</file> and @notes.md`
+	if args.Text != want || !slices.Equal(args.AttachmentIDs, []string{"img-1"}) || args.StreamingBehavior != "follow_up" || !args.ExpandRefs {
+		t.Fatalf("send args = %+v", args)
+	}
+	conn.reply(t, f, map[string]any{"ok": true, "disposition": "started"})
+	if r := <-done; r.err != nil {
+		t.Fatal(r.err)
+	}
+}
+
+func TestCoordinatedSendLeavesReferencesAlone(t *testing.T) {
+	fc := newCoordFake(t)
+	s, conn := openCoordTestSession(t, fc)
+	nextCoordEvent(t, s)
+	done := coordAsync(func() (<-chan sdk.Event, error) { return s.SendText(context.Background(), "@notes.md") })
+	f, raw := conn.expectCommand(t, "send_message")
+	var args struct {
+		ExpandRefs bool `json:"expand_refs"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.ExpandRefs {
+		t.Fatal("plain Send asked the worker to expand references")
+	}
+	conn.reply(t, f, map[string]any{"ok": true, "disposition": "started"})
+	if r := <-done; r.err != nil {
+		t.Fatal(r.err)
 	}
 }
 

@@ -179,6 +179,11 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 					handle = output.getHistory
 				case "get_entry_content":
 					handle = output.getEntryContent
+				case "complete_path":
+					handle = func(cmd *Command) error {
+						w.dispatch(ctx, cmd)
+						return nil
+					}
 				}
 				if err := handle(cmd); err != nil {
 					workerLog("send reconstruction reply: %v", err)
@@ -281,7 +286,9 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 				}
 				handlerMu.Unlock()
 				w.dispatch(ctx, &cmd)
-			case "replay_events", "get_snapshot", "get_history", "get_entry_content":
+			// complete_path walks the filesystem; keeping it off the command
+			// lane means a slow walk can't hold up prompts.
+			case "replay_events", "get_snapshot", "get_history", "get_entry_content", "complete_path":
 				select {
 				case reconstruction <- &cmd:
 				default:
