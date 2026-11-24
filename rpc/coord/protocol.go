@@ -32,16 +32,19 @@ const (
 	TypeWatchInstances   = "watch_instances"
 	TypeUnwatchInstances = "unwatch_instances"
 	TypeInstanceUpdate   = "instance_update"
-	TypeStartInstance    = "start_instance"
-	TypeAttach           = "attach"
-	TypeDetach           = "detach"
-	TypeCommand          = "command"
-	TypeStopInstance     = "stop_instance"
-	TypeResponse         = "response"
-	TypeEvent            = "event"
-	TypeRegister         = "register"
-	TypePing             = "ping"
-	TypePong             = "pong"
+	// TypeInstanceReplacement tells a client attached to a restarting worker
+	// that it is going away. A second frame carries the replacement in Instance.
+	TypeInstanceReplacement = OperationInstanceReplacement
+	TypeStartInstance       = "start_instance"
+	TypeAttach              = "attach"
+	TypeDetach              = "detach"
+	TypeCommand             = "command"
+	TypeStopInstance        = "stop_instance"
+	TypeResponse            = "response"
+	TypeEvent               = "event"
+	TypeRegister            = "register"
+	TypePing                = "ping"
+	TypePong                = "pong"
 )
 
 // OperationSavedSessionLaunch advertises that start_instance honors session_id.
@@ -61,6 +64,9 @@ const OperationInstanceBuild = "instance_build"
 
 // OperationInstanceRestart advertises session-preserving shutdown support.
 const OperationInstanceRestart = "instance_restart"
+
+// OperationInstanceReplacement opts clients into instance_replacement frames.
+const OperationInstanceReplacement = "instance_replacement"
 
 // MaxInstancePromptBytes bounds a preview before JSON escaping.
 const MaxInstancePromptBytes = 256
@@ -329,7 +335,7 @@ func isFrameType(t string) bool {
 	switch t {
 	case TypeHello, TypeWelcome, TypeListInstances, TypeSessionDirectory, TypeLocateSession, TypeStartInstance, TypeAttach,
 		TypeDetach, TypeCommand, TypeStopInstance, TypeResponse, TypeEvent, TypeRegister,
-		TypeWatchInstances, TypeUnwatchInstances, TypeInstanceUpdate, TypePing, TypePong:
+		TypeWatchInstances, TypeUnwatchInstances, TypeInstanceUpdate, TypeInstanceReplacement, TypePing, TypePong:
 		return true
 	}
 	return false

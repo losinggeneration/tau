@@ -613,6 +613,63 @@ func TestCoordinatedSessionReportsWorkerExit(t *testing.T) {
 	}
 }
 
+func TestCoordinatedSessionFollowsRestartedInstance(t *testing.T) {
+	const replacement = "22222222-2222-4222-8222-222222222222"
+	fc := newCoordFake(t)
+	s, conn := openCoordTestSession(t, fc)
+	nextCoordEvent(t, s)
+
+	conn.send(t, coord.Frame{Type: coord.TypeInstanceReplacement, InstanceID: coordTestInstance})
+	expectCoordStatus(t, s, CoordinatedRestarting)
+	conn.send(t, coord.Frame{
+		Type: coord.TypeEvent, InstanceID: coordTestInstance,
+		Error: &coord.Error{Code: coord.CodeWorkerLinkLost, Message: "worker exited"},
+	})
+	conn.send(t, coord.Frame{
+		Type: coord.TypeInstanceReplacement, InstanceID: coordTestInstance,
+		Instance: &coord.Instance{ID: replacement, SessionID: "s1"},
+	})
+
+	next := fc.accept(t)
+	f := next.next(t)
+	if f.Type != coord.TypeAttach || f.InstanceID != replacement {
+		t.Fatalf("frame = %+v, want attach to replacement", f)
+	}
+	next.send(t, coord.Frame{Type: coord.TypeResponse, ID: f.ID, InstanceID: replacement})
+	f = next.next(t)
+	if commandType(f) != "get_snapshot" || f.InstanceID != replacement {
+		t.Fatalf("frame = %+v, want replacement snapshot", f)
+	}
+	snapshot := testCoordSnapshot(0, "s1")
+	snapshot["position"] = coord.Position{InstanceID: replacement, Epoch: "e2"}
+	snapshot["instance"] = coord.Instance{ID: replacement, CWD: "/work", SessionID: "s1"}
+	reply := coordResult(f, snapshot)
+	reply.InstanceID = replacement
+	next.send(t, reply)
+
+	expectCoordStatus(t, s, CoordinatedConnected)
+	ev := nextCoordEvent(t, s)
+	reset, ok := ev.Payload.(CoordinatedReset)
+	if ev.Type != CoordinatedResetEvent || !ok || reset.InstanceID != replacement {
+		t.Fatalf("event = %+v, want reset for replacement", ev)
+	}
+	if s.InstanceID() != replacement {
+		t.Fatalf("instance = %s, want %s", s.InstanceID(), replacement)
+	}
+}
+
+func TestCoordinatedSessionReportsExitWhenRestartNeverReturns(t *testing.T) {
+	previous := coordinatedRestartWait
+	coordinatedRestartWait = 10 * time.Millisecond
+	t.Cleanup(func() { coordinatedRestartWait = previous })
+	fc := newCoordFake(t)
+	s, conn := openCoordTestSession(t, fc)
+	nextCoordEvent(t, s)
+	conn.send(t, coord.Frame{Type: coord.TypeInstanceReplacement, InstanceID: coordTestInstance})
+	expectCoordStatus(t, s, CoordinatedRestarting)
+	expectCoordStatus(t, s, CoordinatedExited)
+}
+
 func TestCoordinatedSessionForgets(t *testing.T) {
 	fc := newCoordFake(t)
 	s, conn := openCoordTestSession(t, fc)

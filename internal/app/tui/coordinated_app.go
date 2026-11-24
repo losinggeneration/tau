@@ -239,6 +239,8 @@ func (a *App) applyCoordinatedEvent(ev sdk.Event) {
 			a.syncPendingFromSession(a.loopContext())
 			a.refreshCoordinatedDialogs()
 			a.setStatus("coordinator", "Worker exited. Press F8 or use /instances to switch.")
+		case CoordinatedRestarting:
+			a.setStatus("coordinator", "Instance restarting…")
 		default:
 			a.setStatus("coordinator", "Connection to worker lost; reconnecting…")
 		}

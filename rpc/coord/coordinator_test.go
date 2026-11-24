@@ -68,9 +68,13 @@ func (h *harness) spawnWorker() LaunchFunc {
 }
 
 func (h *harness) spawnWorkerWithPID(pid int) LaunchFunc {
+	return h.spawnWorkerWithOperations(pid)
+}
+
+func (h *harness) spawnWorkerWithOperations(pid int, operations ...string) LaunchFunc {
 	return func(_ context.Context, req LaunchRequest) error {
 		go func() {
-			hello := Frame{Role: RoleWorker, Token: req.Token, Instance: &Instance{
+			hello := Frame{Role: RoleWorker, Token: req.Token, Operations: operations, Instance: &Instance{
 				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: cmp.Or(req.SessionID, "session-"+req.InstanceID), PID: pid,
 				LaunchRequestID: req.LaunchRequestID,
 			}}
@@ -752,6 +756,64 @@ func TestLegacyRestartRequiresSavedSession(t *testing.T) {
 		}
 	case <-time.After(testTimeout):
 		t.Fatal("shutdown response was not forwarded")
+	}
+}
+
+func TestRestartAnnouncesReplacementToAttachedClients(t *testing.T) {
+	h := startCoordinator(t, func(h *harness) LaunchFunc {
+		return h.spawnWorkerWithOperations(42, OperationInstanceRestart)
+	}, launchTimeout)
+	restarter, _ := h.client()
+	inst, w := h.start(restarter, "start")
+	inst.SessionID = uuid.NewString()
+	mustSend(t, w.link, Frame{Type: TypeRegister, ID: "bind", Instance: &inst})
+	if f := w.next(t); f.ID != "bind" || f.Error != nil {
+		t.Fatalf("bind session: %+v", f)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	viewer, _, err := Dial(ctx, h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceReplacement}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = viewer.Close() })
+	older, _ := h.client()
+	for _, c := range []*Link{viewer, older} {
+		if f := request(t, c, Frame{Type: TypeAttach, ID: "attach", InstanceID: inst.ID}); f.Error != nil {
+			t.Fatalf("attach: %v", f.Error)
+		}
+	}
+
+	mustSend(t, restarter, Frame{Type: TypeStopInstance, ID: "stop", InstanceID: inst.ID, SessionID: inst.SessionID})
+	shutdown := w.next(t)
+	mustSend(t, w.link, Frame{Type: TypeResponse, ID: shutdown.ID, Result: json.RawMessage(`{"ok":true}`)})
+	if f := readFrame(t, restarter); f.ID != "stop" || f.Error != nil {
+		t.Fatalf("stop reply: %+v", f)
+	}
+	if err := w.link.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if f := readFrame(t, viewer); f.Type != TypeInstanceReplacement || f.InstanceID != inst.ID || f.Instance != nil {
+		t.Fatalf("restart notice = %+v", f)
+	}
+	if f := readFrame(t, viewer); f.Type != TypeEvent || f.Error == nil || f.Error.Code != CodeWorkerLinkLost {
+		t.Fatalf("link loss = %+v", f)
+	}
+	if f := readFrame(t, older); f.Type != TypeEvent || f.Error == nil {
+		t.Fatalf("older client link loss = %+v", f)
+	}
+
+	mustSend(t, restarter, Frame{Type: TypeStartInstance, ID: "restart", CWD: h.cwd, SessionID: inst.SessionID})
+	next := h.nextWorker()
+	if f := readFrame(t, restarter); f.Error != nil || f.Instance == nil {
+		t.Fatalf("restart start: %+v", f)
+	}
+	f := readFrame(t, viewer)
+	if f.Type != TypeInstanceReplacement || f.InstanceID != inst.ID || f.Instance == nil || f.Instance.ID != next.req.InstanceID {
+		t.Fatalf("replacement = %+v", f)
+	}
+	if f := request(t, older, Frame{Type: TypeListInstances, ID: "list"}); f.ID != "list" {
+		t.Fatalf("older client received %+v", f)
 	}
 }
 

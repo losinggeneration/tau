@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -85,6 +86,9 @@ type SessionDirectoryFunc func(context.Context, string) (string, error)
 // this machine; it only disambiguates sessions that never recorded a project.
 type SessionLocatorFunc func(ctx context.Context, ref, hint string) (id, project string, err error)
 
+// restartWatchTTL bounds how long a restarted session's viewers are remembered.
+const restartWatchTTL = time.Minute
+
 type coordinator struct {
 	ctx            context.Context
 	launch         LaunchFunc
@@ -107,6 +111,7 @@ type coordinator struct {
 	launches         map[string]*pendingLaunch
 	startingIDs      map[string]struct{}
 	startingSessions map[string]struct{}
+	restarts         map[string]restartWatch // by session ID
 	// validating counts starts whose directory check holds a launch slot.
 	validating int
 	stopping   int
@@ -122,6 +127,7 @@ type client struct {
 	instancePrompts bool
 	instanceNames   bool
 	instanceBuild   bool
+	replacements    bool
 }
 
 // pendingRef locates an in-flight client request. An empty routeID marks a
@@ -137,7 +143,16 @@ type route struct {
 	correlationID string
 }
 
+// restartWatch remembers who to tell when a restarting session returns.
+type restartWatch struct {
+	instanceID string
+	clients    []*client
+	expires    time.Time
+}
+
 type worker struct {
+	restarting       bool
+	restartRoute     string // pending shutdown; a refusal cancels restarting
 	legacyRestarting bool
 	legacyChangeID   string // retained until the worker replies, even if the caller disconnects
 	instance         Instance
@@ -244,6 +259,7 @@ func runWithReceipts(ctx context.Context, path string, launch LaunchFunc, timeou
 		launches:         make(map[string]*pendingLaunch),
 		startingIDs:      make(map[string]struct{}),
 		startingSessions: make(map[string]struct{}),
+		restarts:         make(map[string]restartWatch),
 		directoryReads:   make(chan struct{}, maxDirectoryReads),
 	}
 	for _, opt := range opts {
@@ -368,6 +384,7 @@ func (co *coordinator) serveClient(link *Link, hello Frame) {
 		instancePrompts: slices.Contains(hello.Operations, OperationInstancePrompts),
 		instanceNames:   slices.Contains(hello.Operations, OperationInstanceNames),
 		instanceBuild:   slices.Contains(hello.Operations, OperationInstanceBuild),
+		replacements:    slices.Contains(hello.Operations, OperationInstanceReplacement),
 	}
 	co.clients[c.id] = c
 	launchVersion := 4
@@ -534,6 +551,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 	co.workers[record.ID] = w
 	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleWorker, Generation: co.generation, InstanceID: record.ID, Instance: &record, Operations: []string{TypeCommand, TypeRegister, TypeEvent, TypeResponse, OperationInstancePrompts, OperationInstanceNames, OperationInstanceBuild}, Limits: protocolLimits()})
 	co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: record.ID, SessionID: record.SessionID, Instance: &record})
+	co.announceReplacement(w)
 	if pl != nil {
 		delete(co.launches, record.ID)
 		if pl.registered != nil {
@@ -596,6 +614,9 @@ func (co *coordinator) dropWorker(w *worker) {
 	} else if errors.Is(link.Err(), ErrSlowConsumer) {
 		message = "worker link closed: outbound queue full; the worker may still be running"
 	}
+	if w.restarting {
+		co.announceRestart(w)
+	}
 	lost := Frame{Type: TypeInstanceUpdate, InstanceID: id, SessionID: w.instance.SessionID, Error: &Error{
 		Code: CodeWorkerLinkLost, Message: message,
 	}}
@@ -609,6 +630,47 @@ func (co *coordinator) dropWorker(w *worker) {
 	for _, c := range co.clients {
 		delete(c.subs, id)
 	}
+}
+
+// announceRestart requires co.mu. It runs before the link-loss event so
+// attached clients keep their connection open for the replacement.
+func (co *coordinator) announceRestart(w *worker) {
+	now := time.Now()
+	maps.DeleteFunc(co.restarts, func(_ string, r restartWatch) bool { return now.After(r.expires) })
+	id := w.instance.ID
+	var clients []*client
+	for _, c := range co.clients {
+		if _, attached := c.subs[id]; attached && c.replacements {
+			clients = append(clients, c)
+			send(c.link, Frame{Type: TypeInstanceReplacement, InstanceID: id, SessionID: w.instance.SessionID})
+		}
+	}
+	if len(clients) != 0 {
+		co.restarts[w.instance.SessionID] = restartWatch{instanceID: id, clients: clients, expires: now.Add(restartWatchTTL)}
+	}
+}
+
+// announceReplacement requires co.mu.
+func (co *coordinator) announceReplacement(w *worker) {
+	r, ok := co.restarts[w.instance.SessionID]
+	if !ok {
+		return
+	}
+	delete(co.restarts, w.instance.SessionID)
+	if time.Now().After(r.expires) {
+		return
+	}
+	for _, c := range r.clients {
+		if co.clients[c.id] == c {
+			inst := co.instanceSummary(c, w)
+			send(c.link, Frame{Type: TypeInstanceReplacement, InstanceID: r.instanceID, SessionID: inst.SessionID, Instance: &inst})
+		}
+	}
+}
+
+func (w *worker) trackRestart(c *client, requestID string) {
+	w.restarting = true
+	w.restartRoute = c.pending[requestID].routeID
 }
 
 // monitorWorkers probes the transport, not the agent. A pending approval or
@@ -917,7 +979,9 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 		co.forward(c, f, f.Command, nested.Type)
 	case TypeStopInstance:
 		cmd := shutdownCommand
-		if w := co.workers[f.InstanceID]; f.SessionID != "" && w != nil && w.link != nil {
+		w := co.workers[f.InstanceID]
+		var restart bool
+		if f.SessionID != "" && w != nil && w.link != nil {
 			if w.instance.SessionID != f.SessionID {
 				replyError(c, f, CodeConflict, "instance switched sessions; select it again")
 				return
@@ -932,8 +996,14 @@ func (co *coordinator) handleClient(c *client, f Frame) {
 				replyError(c, f, CodeInvalidFrame, "cannot encode shutdown target")
 				return
 			}
+			restart = true
 		}
-		co.forward(c, f, cmd, "shutdown")
+		if co.forward(c, f, cmd, "shutdown") {
+			w.restarting, w.restartRoute = false, ""
+			if restart {
+				w.trackRestart(c, f.ID)
+			}
+		}
 	default:
 		replyError(c, f, CodeInvalidFrame, "unexpected frame type")
 	}
@@ -978,6 +1048,7 @@ func (co *coordinator) restartLegacyWorker(c *client, f Frame, w *worker) {
 	}
 	if co.forward(c, f, shutdownCommand, "shutdown") {
 		w.legacyRestarting = true
+		w.trackRestart(c, f.ID)
 	}
 }
 
@@ -1371,6 +1442,10 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 		if w.legacyChangeID == f.ID {
 			w.legacyChangeID = ""
 		}
+		if w.restartRoute == f.ID {
+			w.restartRoute = ""
+			w.restarting = shutdownAccepted(f)
+		}
 		r, ok := w.routes[f.ID]
 		if !ok {
 			return
@@ -1416,6 +1491,13 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 	default:
 		send(w.link, Frame{Type: TypeResponse, ID: f.ID, Error: &Error{Code: CodeInvalidFrame, Message: "unexpected frame type"}})
 	}
+}
+
+func shutdownAccepted(f Frame) bool {
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	return f.Error == nil && json.Unmarshal(f.Result, &result) == nil && result.OK
 }
 
 // broadcast runs under co.mu so replies and subscription changes are ordered

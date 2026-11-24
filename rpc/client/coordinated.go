@@ -221,7 +221,7 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int, opts ...
 		Version:    coord.Version,
 		Role:       coord.RoleClient,
 		ClientID:   clientID,
-		Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames, coord.OperationInstanceBuild},
+		Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames, coord.OperationInstanceBuild, coord.OperationInstanceReplacement},
 	})
 	if err != nil {
 		return nil, err
@@ -1229,7 +1229,7 @@ func (c *CoordinatedClient) readLoop() {
 		switch f.Type {
 		case coord.TypeResponse:
 			c.resolve(f)
-		case coord.TypeEvent, coord.TypeInstanceUpdate:
+		case coord.TypeEvent, coord.TypeInstanceUpdate, coord.TypeInstanceReplacement:
 			if f.Type == coord.TypeEvent && c.stageEvent(f) {
 				continue
 			}

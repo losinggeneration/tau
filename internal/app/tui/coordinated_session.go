@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,6 +37,7 @@ const (
 const (
 	CoordinatedConnected    = "connected"
 	CoordinatedReconnecting = "reconnecting"
+	CoordinatedRestarting   = "restarting"
 	CoordinatedExited       = "exited"
 )
 
@@ -66,6 +68,11 @@ var (
 	// ErrCoordinatedSessionClosed reports use after Close. Nothing was sent.
 	ErrCoordinatedSessionClosed = errors.New("coordinated session: closed")
 	errCoordinatedWorkerExited  = errors.New("worker exited")
+	errCoordinatedRestarted     = errors.New("worker restarted")
+
+	// coordinatedRestartWait bounds the wait for a replacement worker. It
+	// outlasts the restarting client's own 45 second budget.
+	coordinatedRestartWait = time.Minute
 )
 
 // CoordinatedReset is the Payload of a CoordinatedResetEvent.
@@ -122,7 +129,7 @@ type CoordinatedLiveItem struct {
 // keeps running.
 type CoordinatedSession struct {
 	socket     string
-	instanceID string
+	instanceID atomic.Pointer[string] // a restart moves it to the replacement
 	clientID   string
 
 	events chan sdk.Event
@@ -176,12 +183,12 @@ func OpenCoordinatedSession(ctx context.Context, socket, instanceID string) (*Co
 		return nil, rpcclient.ErrTargetRequired
 	}
 	s := &CoordinatedSession{
-		socket:     socket,
-		instanceID: instanceID,
-		clientID:   uuid.NewString(),
-		events:     make(chan sdk.Event, coordinatedEventBuffer),
-		done:       make(chan struct{}),
+		socket:   socket,
+		clientID: uuid.NewString(),
+		events:   make(chan sdk.Event, coordinatedEventBuffer),
+		done:     make(chan struct{}),
 	}
+	s.instanceID.Store(&instanceID)
 	client, handoff, err := s.connect(ctx, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("open coordinated session %s: %w", instanceID, err)
@@ -202,7 +209,9 @@ func OpenCoordinatedSession(ctx context.Context, socket, instanceID string) (*Co
 func (s *CoordinatedSession) Events() <-chan sdk.Event { return s.events }
 
 // InstanceID returns the coordinator instance this session targets.
-func (s *CoordinatedSession) InstanceID() string { return s.instanceID }
+func (s *CoordinatedSession) InstanceID() string { return s.target() }
+
+func (s *CoordinatedSession) target() string { return *s.instanceID.Load() }
 
 // ClientID returns the stable identity announced on every connection.
 func (s *CoordinatedSession) ClientID() string { return s.clientID }
@@ -351,8 +360,8 @@ func (s *CoordinatedSession) Close(ctx context.Context) error {
 		defer cancel()
 		// Closing the connection ends its subscriptions too, so a detach
 		// lost with the connection is not a failure.
-		if err := client.Detach(detachCtx, s.instanceID); err != nil && !errors.Is(err, rpcclient.ErrOutcomeUnknown) && client.Err() == nil {
-			s.closeErr = fmt.Errorf("detach %s: %w", s.instanceID, err)
+		if err := client.Detach(detachCtx, s.target()); err != nil && !errors.Is(err, rpcclient.ErrOutcomeUnknown) && client.Err() == nil {
+			s.closeErr = fmt.Errorf("detach %s: %w", s.target(), err)
 		}
 		s.closeErr = errors.Join(s.closeErr, client.Close())
 	})
@@ -415,7 +424,7 @@ func (s *CoordinatedSession) History(before string, limit int) ([]sdk.HistoryEnt
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, coordinatedReadTimeout)
 		defer cancel()
-		page, err := client.History(ctx, s.instanceID, sessionID, before)
+		page, err := client.History(ctx, s.target(), sessionID, before)
 		if err != nil {
 			return nil, "", fmt.Errorf("read session history: %w", err)
 		}
@@ -741,7 +750,7 @@ func (s *CoordinatedSession) call(ctx context.Context, timeout time.Duration, co
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	resp, err := client.Command(ctx, s.instanceID, rpcclient.Command{Type: command, Args: args})
+	resp, err := client.Command(ctx, s.target(), rpcclient.Command{Type: command, Args: args})
 	if err != nil {
 		return fmt.Errorf("%s: %w", command, err)
 	}
@@ -781,7 +790,7 @@ func (s *CoordinatedSession) connect(ctx context.Context, resume *coord.Position
 		}
 	}
 	if err == nil && handoff == nil {
-		handoff, err = client.AttachSnapshot(ctx, s.instanceID)
+		handoff, err = client.AttachSnapshot(ctx, s.target())
 	}
 	if err != nil {
 		if previousGeneration != "" {
@@ -802,7 +811,7 @@ func (s *CoordinatedSession) checkWorkerExit(ctx context.Context, client *rpccli
 		return errors.Join(err, listErr)
 	}
 	for _, inst := range instances {
-		if inst.ID == s.instanceID {
+		if inst.ID == s.target() {
 			if inst.LinkState == coord.LinkExited {
 				return errCoordinatedWorkerExited
 			}
@@ -873,7 +882,7 @@ func (s *CoordinatedSession) run(client *rpcclient.CoordinatedClient, cursor *rp
 			s.reportWorkerExit(err)
 			return
 		}
-		if !s.emit(coordinatedStatus(s.instanceID, CoordinatedReconnecting, err)) {
+		if !errors.Is(err, errCoordinatedRestarted) && !s.emit(coordinatedStatus(s.target(), CoordinatedReconnecting, err)) {
 			return
 		}
 		var resume *coord.Position
@@ -899,7 +908,10 @@ func (s *CoordinatedSession) pump(client *rpcclient.CoordinatedClient, cursor *r
 			if !ok {
 				return false, client.Err()
 			}
-			if f.Type != coord.TypeEvent || f.InstanceID != s.instanceID {
+			if f.Type == coord.TypeInstanceReplacement && f.InstanceID == s.target() {
+				return s.awaitReplacement(client, f)
+			}
+			if f.Type != coord.TypeEvent || f.InstanceID != s.target() {
 				continue
 			}
 			if f.Instance != nil && f.Instance.LinkState == coord.LinkExited {
@@ -926,7 +938,7 @@ func (s *CoordinatedSession) pump(client *rpcclient.CoordinatedClient, cursor *r
 				// The worker publishes these events before replying to the command
 				// that caused them. Keep the connection open so the reply can arrive.
 				ctx, cancel := context.WithTimeout(s.ctx, coordinatedReadTimeout)
-				snap, err := client.Snapshot(ctx, s.instanceID)
+				snap, err := client.Snapshot(ctx, s.target())
 				cancel()
 				if err != nil {
 					return true, fmt.Errorf("refresh after %s: %w", ev.Type, err)
@@ -946,6 +958,33 @@ func (s *CoordinatedSession) pump(client *rpcclient.CoordinatedClient, cursor *r
 	}
 }
 
+// awaitReplacement keeps the connection that will announce the new worker.
+// The old worker's remaining frames no longer matter.
+func (s *CoordinatedSession) awaitReplacement(client *rpcclient.CoordinatedClient, f coord.Frame) (resync bool, err error) {
+	if !s.emit(coordinatedStatus(s.target(), CoordinatedRestarting, nil)) {
+		return false, nil
+	}
+	timer := time.NewTimer(coordinatedRestartWait)
+	defer timer.Stop()
+	for {
+		if f.Type == coord.TypeInstanceReplacement && f.InstanceID == s.target() && f.Instance != nil && f.Instance.ID != "" {
+			s.instanceID.Store(&f.Instance.ID)
+			return true, errCoordinatedRestarted
+		}
+		var ok bool
+		select {
+		case <-s.ctx.Done():
+			return false, nil
+		case <-timer.C:
+			return false, errCoordinatedWorkerExited
+		case f, ok = <-client.Events():
+			if !ok {
+				return false, client.Err()
+			}
+		}
+	}
+}
+
 func (s *CoordinatedSession) reportWorkerExit(err error) {
 	s.mu.Lock()
 	s.streaming = false
@@ -954,7 +993,7 @@ func (s *CoordinatedSession) reportWorkerExit(err error) {
 	s.queued = nil
 	s.uiRequests = nil
 	s.mu.Unlock()
-	s.emit(coordinatedStatus(s.instanceID, CoordinatedExited, err))
+	s.emit(coordinatedStatus(s.target(), CoordinatedExited, err))
 }
 
 // reconnect retries until it reattaches, confirms exit, or the TUI closes.
@@ -976,7 +1015,7 @@ func (s *CoordinatedSession) reconnect(resume *coord.Position, previousGeneratio
 			}
 			var pending []sdk.Event
 			if pending, err = s.install(client, handoff, reason); err == nil {
-				status := coordinatedStatus(s.instanceID, CoordinatedConnected, nil)
+				status := coordinatedStatus(s.target(), CoordinatedConnected, nil)
 				return client, handoff.Cursor, append([]sdk.Event{status}, pending...)
 			}
 			err = errors.Join(err, client.Close())
@@ -993,7 +1032,7 @@ func (s *CoordinatedSession) reconnect(resume *coord.Position, previousGeneratio
 		}
 		if text := errorText(err); text != reported {
 			reported = text
-			if !s.emit(coordinatedStatus(s.instanceID, CoordinatedReconnecting, err)) {
+			if !s.emit(coordinatedStatus(s.target(), CoordinatedReconnecting, err)) {
 				return nil, nil, nil
 			}
 		}
@@ -1035,7 +1074,7 @@ func (s *CoordinatedSession) refreshCommands() {
 func (s *CoordinatedSession) applySnapshot(snap *rpcclient.Snapshot, reason string) sdk.Event {
 	reset := CoordinatedReset{
 		Reason:        reason,
-		InstanceID:    s.instanceID,
+		InstanceID:    s.target(),
 		SessionID:     cmp.Or(snap.State.SessionID, snap.Instance.SessionID),
 		History:       historyEntries(snap.History.Entries),
 		HistoryBefore: snap.History.Before,

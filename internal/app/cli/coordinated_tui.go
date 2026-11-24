@@ -496,7 +496,14 @@ func runCoordinatedInteractive(ctx context.Context, cmd *cli.Command, c *client.
 				defer func() { err = errors.Join(err, fresh.Close()) }()
 				return listSavedTUISessions(ctx, fresh, selectedCWD)
 			},
-			InstanceAction: func(next, value, draft string) { action, arg = next, value; drafts[current] = draft },
+			InstanceAction: func(next, value, draft string) {
+				// Another client may have restarted this worker under a new ID.
+				if sess != nil {
+					current = sess.InstanceID()
+				}
+				action, arg = next, value
+				drafts[current] = draft
+			},
 		})
 		if appErr != nil {
 			if sess != nil {
