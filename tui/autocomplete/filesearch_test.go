@@ -1,10 +1,13 @@
 package autocomplete
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestWalkFileSearcherLimitOnlyNarrowsRequestedResults(t *testing.T) {
@@ -126,5 +129,101 @@ func TestWalkFileSearcherTreatsWhitespaceQueryAsLiteral(t *testing.T) {
 				t.Fatalf("query=%q got=%+v", query, got)
 			}
 		})
+	}
+}
+
+func TestWalkFileSearcherHonorsGitInfoExclude(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, ".git", "info"))
+	mustWrite(t, filepath.Join(dir, ".git", "info", "exclude"), "/scratch/\n")
+	mustMkdir(t, filepath.Join(dir, "scratch"))
+	mustWrite(t, filepath.Join(dir, "scratch", "note.md"), "")
+	mustWrite(t, filepath.Join(dir, "note.md"), "")
+	got, err := (WalkFileSearcher{}).Search(t.Context(), dir, "note", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Value != "note.md" {
+		t.Fatalf("results=%+v", got)
+	}
+}
+
+func TestWalkFileSearcherReturnsMatchesFoundWithinBudget(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "a", "b", "c", "d"))
+	mustWrite(t, filepath.Join(dir, "a", "b", "c", "d", "target-deep.md"), "")
+	mustWrite(t, filepath.Join(dir, "target-shallow.md"), "")
+	got, err := (WalkFileSearcher{MaxEntries: 3}).Search(t.Context(), dir, "target", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Value != "target-shallow.md" {
+		t.Fatalf("results=%+v", got)
+	}
+}
+
+func TestWalkFileSearcherReadsRecentlyChangedFoldersFirst(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"old", "new"} {
+		mustMkdir(t, filepath.Join(dir, name))
+		mustWrite(t, filepath.Join(dir, name, "match.md"), "")
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "old"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (WalkFileSearcher{MaxEntries: 3}).Search(t.Context(), dir, "match", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Value != "new/match.md" {
+		t.Fatalf("results=%+v", got)
+	}
+}
+
+func TestWalkFileSearcherReadsShallowFoldersBeforeDeepOnes(t *testing.T) {
+	dir := t.TempDir()
+	deep := filepath.Join(dir, "deep", "one", "two", "three")
+	mustMkdir(t, deep)
+	mustWrite(t, filepath.Join(deep, "match.md"), "")
+	mustMkdir(t, filepath.Join(dir, "wide"))
+	mustWrite(t, filepath.Join(dir, "wide", "match.md"), "")
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "wide"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	// deep is newer, but its fourth level waits until every top-level folder
+	// has been read to the early depth.
+	got, err := (WalkFileSearcher{MaxEntries: 6}).Search(t.Context(), dir, "match", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Value != "wide/match.md" {
+		t.Fatalf("results=%+v", got)
+	}
+}
+
+func TestWalkFileSearcherStopsWhenCancelled(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a.md"), "")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := (WalkFileSearcher{}).Search(ctx, dir, "", 20); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestWalkFileSearcherSkipsSubfolderWithUnreadableIgnoreRules(t *testing.T) {
+	dir := t.TempDir()
+	mustMkdir(t, filepath.Join(dir, "broken"))
+	mustWrite(t, filepath.Join(dir, "broken", ".gitignore"), "**.sw[op]\n")
+	mustWrite(t, filepath.Join(dir, "broken", "hidden.md"), "")
+	mustWrite(t, filepath.Join(dir, "note.md"), "")
+	got, err := (WalkFileSearcher{}).Search(t.Context(), dir, ".md", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Value != "note.md" {
+		t.Fatalf("results=%+v", got)
 	}
 }

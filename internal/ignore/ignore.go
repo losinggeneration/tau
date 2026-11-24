@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/denormal/go-gitignore"
@@ -31,29 +32,67 @@ func New(dir, rootDir string) (*Matcher, error) {
 		if !pathWithin(matcher.root, current) {
 			return nil, fmt.Errorf("ignore directory %s is outside root %s", dir, rootDir)
 		}
-		for i := len(ignoreFileNames) - 1; i >= 0; i-- {
-			path := filepath.Join(current, ignoreFileNames[i])
-			data, err := os.ReadFile(path)
-			if os.IsNotExist(err) {
-				continue
-			}
-			if err != nil {
-				return nil, fmt.Errorf("read ignore file %s: %w", path, err)
-			}
-			var parseErr error
-			patterns := gitignore.NewParser(strings.NewReader(string(data)), func(err gitignore.Error) bool {
-				parseErr = errors.Join(parseErr, err)
-				return true
-			}).Parse()
-			if parseErr != nil {
-				return nil, fmt.Errorf("parse ignore file %s: %w", path, parseErr)
-			}
-			matcher.layers = append(matcher.layers, ignoreLayer{base: current, patterns: patterns})
+		layers, err := loadLayers(current)
+		if err != nil {
+			return nil, err
 		}
+		matcher.layers = append(matcher.layers, layers...)
 		if current == matcher.root {
 			return matcher, nil
 		}
 	}
+}
+
+// Child returns the rules for dir, a subdirectory of the directory m was
+// built for, reading only dir's own ignore files. m is left unchanged, so a
+// walk can build each directory's rules from its parent's.
+func (m *Matcher) Child(dir string) (*Matcher, error) {
+	layers, err := loadLayers(filepath.Clean(dir))
+	if err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return &Matcher{root: filepath.Clean(dir), layers: layers}, nil
+	}
+	return &Matcher{root: m.root, layers: slices.Concat(layers, m.layers)}, nil
+}
+
+// loadLayers reads one directory's ignore files in precedence order. A
+// repository's .git/info/exclude comes last, below its ignore files, as in git.
+func loadLayers(dir string) ([]ignoreLayer, error) {
+	var layers []ignoreLayer
+	add := func(path string) error {
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read ignore file %s: %w", path, err)
+		}
+		var parseErr error
+		patterns := gitignore.NewParser(strings.NewReader(string(data)), func(err gitignore.Error) bool {
+			parseErr = errors.Join(parseErr, err)
+			return true
+		}).Parse()
+		if parseErr != nil {
+			return fmt.Errorf("parse ignore file %s: %w", path, parseErr)
+		}
+		layers = append(layers, ignoreLayer{base: dir, patterns: patterns})
+		return nil
+	}
+	for i := len(ignoreFileNames) - 1; i >= 0; i-- {
+		if err := add(filepath.Join(dir, ignoreFileNames[i])); err != nil {
+			return nil, err
+		}
+	}
+	// A .git file (worktree or submodule) points elsewhere; only a .git
+	// directory holds info/exclude.
+	if info, err := os.Lstat(filepath.Join(dir, ".git")); err == nil && info.IsDir() {
+		if err := add(filepath.Join(dir, ".git", "info", "exclude")); err != nil {
+			return nil, err
+		}
+	}
+	return layers, nil
 }
 
 func pathWithin(root, path string) bool {

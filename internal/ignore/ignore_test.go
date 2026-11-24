@@ -52,3 +52,45 @@ func TestIgnoreRulesKeepNestedBasesAndPrecedence(t *testing.T) {
 	assert.False(t, matcher.Ignored(filepath.Join(nested, "deeper", "local.js"), false))
 	assert.False(t, matcher.Ignored(filepath.Join(root+"-outside", "drop.md"), false))
 }
+
+func TestIgnoreRulesHonorGitInfoExcludeBelowIgnoreFiles(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git", "info"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".git", "info", "exclude"), []byte("/scratch/\n*.log\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitignore"), []byte("!keep.log\n"), 0o600))
+	matcher, err := New(root, root)
+	require.NoError(t, err)
+	assert.True(t, matcher.Ignored(filepath.Join(root, "scratch"), true))
+	assert.True(t, matcher.Ignored(filepath.Join(root, "drop.log"), false))
+	assert.False(t, matcher.Ignored(filepath.Join(root, "keep.log"), false))
+}
+
+func TestIgnoreRulesSkipGitFileWithoutInfoDirectory(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: elsewhere\n"), 0o600))
+	_, err := New(root, root)
+	require.NoError(t, err)
+}
+
+func TestChildMatchesRulesLoadedFromRoot(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git", "info"), 0o700))
+	require.NoError(t, os.Mkdir(nested, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".git", "info", "exclude"), []byte("*.tmp\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*.md\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, ".gitignore"), []byte("!keep.md\n!keep.tmp\n"), 0o600))
+	parent, err := New(root, root)
+	require.NoError(t, err)
+	child, err := parent.Child(nested)
+	require.NoError(t, err)
+	direct, err := New(nested, root)
+	require.NoError(t, err)
+	for _, name := range []string{"keep.md", "drop.md", "keep.tmp", "drop.tmp"} {
+		path := filepath.Join(nested, name)
+		assert.Equal(t, direct.Ignored(path, false), child.Ignored(path, false), name)
+	}
+	assert.False(t, child.Ignored(filepath.Join(nested, "keep.md"), false))
+	assert.True(t, child.Ignored(filepath.Join(nested, "drop.tmp"), false))
+	assert.True(t, parent.Ignored(filepath.Join(nested, "keep.md"), false), "Child must not change its parent")
+}
