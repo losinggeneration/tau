@@ -292,6 +292,19 @@ func runCoordinatedInteractive(ctx context.Context, cmd *cli.Command, c *client.
 					continue
 				}
 				current = choice.Value
+			case tui.InstanceActionRename:
+				name, confirmed, promptErr := tui.PromptInstanceName(ctx, choice.Targets[0])
+				if promptErr != nil {
+					return promptErr
+				}
+				if confirmed {
+					renameCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					if renameErr := c.RenameInstance(renameCtx, choice.Targets[0].ID, name); renameErr != nil {
+						notice = "Rename failed: " + renameErr.Error()
+					}
+					cancel()
+				}
+				continue
 			case tui.InstanceActionStop, tui.InstanceActionRestart, tui.InstanceActionRestartOutdated:
 				confirmed, confirmErr := tui.ConfirmInstanceManagement(ctx, choice.Action, choice.Targets)
 				if confirmErr != nil {
@@ -706,7 +719,7 @@ func restartTUIInstance(ctx context.Context, c *client.CoordinatedClient, target
 	}
 	startCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	instance, err := c.StartSavedSession(startCtx, target.CWD, target.SessionID)
+	instance, err := c.StartNamedSavedSession(startCtx, target.CWD, target.SessionID, target.Name)
 	if err != nil {
 		return nil, true, fmt.Errorf("worker stopped but could not resume session %s: %w", target.SessionID, err)
 	}

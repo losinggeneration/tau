@@ -30,6 +30,24 @@ func (a *App) registerInstanceCommands() {
 			a.leaveInstance(entry.action, arg)
 		}})
 	}
+	a.cmds.Register(Command{Name: "instance-name", Description: "Name this instance", Handler: cmdInstanceName})
+}
+
+func cmdInstanceName(a *App, arg string) {
+	if a.coordinated == nil {
+		a.setStatus("coordinator", "No worker attached.")
+		return
+	}
+	name := strings.TrimSpace(arg)
+	if name == "" {
+		a.setStatus("coordinator", "Usage: /instance-name <name>")
+		return
+	}
+	if err := a.coordinated.RenameInstance(a.ctxOrBackground(), name); err != nil {
+		a.setStatus("coordinator", "Rename failed: "+err.Error())
+		return
+	}
+	a.setStatus("coordinator", "Instance named "+name)
 }
 
 func (a *App) leaveInstance(action, arg string) {

@@ -89,13 +89,13 @@ func TestCoordinatorNodeIdentityPersists(t *testing.T) {
 }
 
 func TestWorkerLaunchDoesNotInheritTrustOverride(t *testing.T) {
-	inherited := []string{"TAU_COORD_TOKEN=old", "TAU_COORD_INSTANCE=old", "TAU_COORD_NODE=old", "TAU_COORD_LAUNCH_REQUEST=old", "TAU_COORD_SESSION=old", "TAU_COORD_SESSION_DIR=old", "PATH=/bin"}
+	inherited := []string{"TAU_COORD_TOKEN=old", "TAU_COORD_INSTANCE=old", "TAU_COORD_NODE=old", "TAU_COORD_LAUNCH_REQUEST=old", "TAU_COORD_SESSION=old", "TAU_COORD_SESSION_DIR=old", "TAU_COORD_INSTANCE_NAME=old", "PATH=/bin"}
 	if env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance"}, ""); strings.Contains(strings.Join(env, "\n"), "TAU_COORD_LAUNCH_REQUEST") || strings.Contains(strings.Join(env, "\n"), "TAU_COORD_SESSION") {
 		t.Fatalf("launch without a request ID inherited one: %q", env)
 	}
-	env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance", LaunchRequestID: "request", SessionID: "saved"}, "/saved/sessions")
+	env := workerEnvironment(inherited, "node", coord.LaunchRequest{Token: "token", InstanceID: "instance", LaunchRequestID: "request", SessionID: "saved", Name: "api work"}, "/saved/sessions")
 	joined := strings.Join(env, "\n")
-	for _, expected := range []string{"TAU_COORD_TOKEN=token", "TAU_COORD_INSTANCE=instance", "TAU_COORD_NODE=node", "TAU_COORD_LAUNCH_REQUEST=request", "TAU_COORD_SESSION=saved", "TAU_COORD_SESSION_DIR=/saved/sessions", "PATH=/bin"} {
+	for _, expected := range []string{"TAU_COORD_TOKEN=token", "TAU_COORD_INSTANCE=instance", "TAU_COORD_NODE=node", "TAU_COORD_LAUNCH_REQUEST=request", "TAU_COORD_SESSION=saved", "TAU_COORD_SESSION_DIR=/saved/sessions", "TAU_COORD_INSTANCE_NAME=api work", "PATH=/bin"} {
 		if !strings.Contains(joined, expected) {
 			t.Errorf("missing %q in environment", expected)
 		}

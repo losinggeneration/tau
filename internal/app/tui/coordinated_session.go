@@ -399,6 +399,22 @@ func (s *CoordinatedSession) SetModel(model string) error {
 	return nil
 }
 
+// RenameInstance sets the attached instance's name for all clients.
+func (s *CoordinatedSession) RenameInstance(ctx context.Context, name string) error {
+	s.mu.Lock()
+	client, closed := s.client, s.closed
+	s.mu.Unlock()
+	if closed {
+		return fmt.Errorf("rename instance: %w", ErrCoordinatedSessionClosed)
+	}
+	if client == nil {
+		return errors.New("rename instance: reconnecting to worker")
+	}
+	ctx, cancel := context.WithTimeout(ctx, coordinatedMutationTimeout)
+	defer cancel()
+	return client.RenameInstance(ctx, s.target(), name)
+}
+
 // SlashCommands returns the instance's commands as of the last connection.
 func (s *CoordinatedSession) SlashCommands() []sdk.SlashCommandInfo {
 	s.mu.Lock()

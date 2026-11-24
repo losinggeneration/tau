@@ -247,7 +247,7 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	return os.Rename(tmp.Name(), path)
 }
 
-var workerLaunchVariables = []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE", "TAU_COORD_LAUNCH_REQUEST", "TAU_COORD_LIFETIME", "TAU_COORD_SESSION", "TAU_COORD_SESSION_DIR"}
+var workerLaunchVariables = []string{"TAU_COORD_TOKEN", "TAU_COORD_INSTANCE", "TAU_COORD_NODE", "TAU_COORD_LAUNCH_REQUEST", "TAU_COORD_LIFETIME", "TAU_COORD_SESSION", "TAU_COORD_SESSION_DIR", "TAU_COORD_INSTANCE_NAME"}
 
 func workerEnvironment(env []string, node string, request coord.LaunchRequest, sessionDir string) []string {
 	out := make([]string, 0, len(env)+len(workerLaunchVariables))
@@ -265,6 +265,9 @@ func workerEnvironment(env []string, node string, request coord.LaunchRequest, s
 	}
 	if request.SessionID != "" {
 		out = append(out, "TAU_COORD_SESSION="+request.SessionID)
+	}
+	if request.Name != "" {
+		out = append(out, "TAU_COORD_INSTANCE_NAME="+request.Name)
 	}
 	if sessionDir != "" {
 		out = append(out, "TAU_COORD_SESSION_DIR="+sessionDir)
@@ -445,6 +448,10 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 	launchRequest := os.Getenv("TAU_COORD_LAUNCH_REQUEST")
 	sessionID := os.Getenv("TAU_COORD_SESSION")
 	sessionDir := os.Getenv("TAU_COORD_SESSION_DIR")
+	name, err := coord.NormalizeInstanceName(os.Getenv("TAU_COORD_INSTANCE_NAME"))
+	if err != nil {
+		return fmt.Errorf("read worker name: %w", err)
+	}
 	if token == "" || instance == "" || node == "" || cmd.String("socket") == "" {
 		return errors.New("worker is an internal entry point; launch through the coordinator")
 	}
@@ -501,6 +508,6 @@ func runWorker(ctx context.Context, cmd *cli.Command) (err error) {
 		}
 	}
 	return server.NewWorker(runtime, reg, mgr).Run(ctx, cmd.String("socket"), coord.Instance{
-		ID: instance, NodeID: node, CWD: cwd, SessionID: sessionID, PID: os.Getpid(), State: coord.StateAwaitingUser, LaunchRequestID: launchRequest, BuildID: build,
+		ID: instance, Name: name, NodeID: node, CWD: cwd, SessionID: sessionID, PID: os.Getpid(), State: coord.StateAwaitingUser, LaunchRequestID: launchRequest, BuildID: build,
 	}, token)
 }

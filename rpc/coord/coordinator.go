@@ -46,6 +46,7 @@ type LaunchRequest struct {
 	Token           string
 	CWD             string
 	SessionID       string
+	Name            string
 	Ready           <-chan struct{}
 	// Lifetime, when set, must be inherited by the child and held open
 	// until process exit. The launcher must not unlock or close this copy.
@@ -126,6 +127,7 @@ type client struct {
 	watching        bool
 	instancePrompts bool
 	instanceNames   bool
+	instanceRename  bool
 	instanceBuild   bool
 	replacements    bool
 }
@@ -158,6 +160,7 @@ type worker struct {
 	instance         Instance
 	firstPrompt      string
 	sessionName      string
+	name             string
 	buildID          string
 	restart          bool
 	link             *Link
@@ -172,6 +175,7 @@ type pendingLaunch struct {
 	token      string
 	cwd        string
 	sessionID  string
+	name       string
 	requestID  string
 	ready      chan Instance
 	registered chan struct{}
@@ -383,6 +387,7 @@ func (co *coordinator) serveClient(link *Link, hello Frame) {
 		subs:            make(map[string]struct{}),
 		instancePrompts: slices.Contains(hello.Operations, OperationInstancePrompts),
 		instanceNames:   slices.Contains(hello.Operations, OperationInstanceNames),
+		instanceRename:  slices.Contains(hello.Operations, OperationInstanceRename),
 		instanceBuild:   slices.Contains(hello.Operations, OperationInstanceBuild),
 		replacements:    slices.Contains(hello.Operations, OperationInstanceReplacement),
 	}
@@ -391,7 +396,7 @@ func (co *coordinator) serveClient(link *Link, hello Frame) {
 	if co.receipts != nil {
 		launchVersion = 7
 	}
-	ops := []string{TypeListInstances, TypeWatchInstances, TypeUnwatchInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance, OperationSavedSessionLaunch}
+	ops := []string{TypeListInstances, TypeWatchInstances, TypeUnwatchInstances, TypeStartInstance, TypeAttach, TypeDetach, TypeCommand, TypeStopInstance, OperationSavedSessionLaunch, OperationInstanceRename}
 	if co.sessionDir != nil {
 		ops = append(ops, TypeSessionDirectory, OperationInstanceRestart)
 	}
@@ -520,7 +525,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 		}
 	}
 	record := *inst
-	record.FirstPrompt, record.SessionName, record.BuildID, record.Outdated = "", "", "", false
+	record.Name, record.FirstPrompt, record.SessionName, record.BuildID, record.Outdated = "", "", "", "", false
 	record.LaunchRequestID = requestID
 	record.LinkState = LinkConnected
 	if record.State == "" {
@@ -534,7 +539,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 		firstPrompt = cmp.Or(existing.firstPrompt, firstPrompt)
 		sessionName = cmp.Or(sessionName, existing.sessionName)
 	}
-	w := &worker{instance: record, firstPrompt: firstPrompt, sessionName: sessionName, buildID: buildID, restart: slices.Contains(hello.Operations, OperationInstanceRestart), link: link, routes: make(map[string]route), tokenHash: hash, epoch: epoch}
+	w := &worker{instance: record, name: inst.Name, firstPrompt: firstPrompt, sessionName: sessionName, buildID: buildID, restart: slices.Contains(hello.Operations, OperationInstanceRestart), link: link, routes: make(map[string]route), tokenHash: hash, epoch: epoch}
 	if existing != nil {
 		w.legacyRestarting, w.legacyChangeID = existing.legacyRestarting, existing.legacyChangeID
 	}
@@ -549,7 +554,7 @@ func (co *coordinator) register(link *Link, hello Frame) (*worker, *Error) {
 		w.lastPong = time.Now()
 	}
 	co.workers[record.ID] = w
-	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleWorker, Generation: co.generation, InstanceID: record.ID, Instance: &record, Operations: []string{TypeCommand, TypeRegister, TypeEvent, TypeResponse, OperationInstancePrompts, OperationInstanceNames, OperationInstanceBuild}, Limits: protocolLimits()})
+	send(link, Frame{Type: TypeWelcome, Version: Version, Role: RoleWorker, Generation: co.generation, InstanceID: record.ID, Instance: &record, Operations: []string{TypeCommand, TypeRegister, TypeEvent, TypeResponse, OperationInstancePrompts, OperationInstanceNames, OperationInstanceBuild, OperationInstanceRename}, Limits: protocolLimits()})
 	co.broadcast(Frame{Type: TypeInstanceUpdate, InstanceID: record.ID, SessionID: record.SessionID, Instance: &record})
 	co.announceReplacement(w)
 	if pl != nil {
@@ -1103,6 +1108,10 @@ func (co *coordinator) verifyLegacyRestartSave(ctx context.Context, project, id 
 }
 
 func (co *coordinator) startInstance(c *client, f Frame) {
+	if name, err := NormalizeInstanceName(f.Name); err != nil || name != f.Name {
+		replyError(c, f, CodeInvalidFrame, "invalid instance name")
+		return
+	}
 	if f.SessionID != "" {
 		id, err := uuid.Parse(f.SessionID)
 		if err != nil || id.String() != f.SessionID {
@@ -1248,7 +1257,7 @@ func (co *coordinator) runLaunch(c *client, f Frame, id string) {
 		co.mu.Unlock()
 		return
 	}
-	pl := &pendingLaunch{token: rand.Text(), cwd: cwd, sessionID: f.SessionID, requestID: f.RequestID, ready: make(chan Instance, 1), registered: make(chan struct{})}
+	pl := &pendingLaunch{token: rand.Text(), cwd: cwd, sessionID: f.SessionID, name: f.Name, requestID: f.RequestID, ready: make(chan Instance, 1), registered: make(chan struct{})}
 	co.launches[id] = pl
 	co.mu.Unlock()
 
@@ -1322,7 +1331,7 @@ func (co *coordinator) superviseLaunch(id string, pl *pendingLaunch) (Instance, 
 	defer cancel()
 	launched := make(chan error, 1)
 	co.wg.Go(func() {
-		err := co.launch(ctx, LaunchRequest{InstanceID: id, LaunchRequestID: pl.requestID, Token: pl.token, CWD: pl.cwd, SessionID: pl.sessionID, Ready: pl.registered, Lifetime: pl.lifetime})
+		err := co.launch(ctx, LaunchRequest{InstanceID: id, LaunchRequestID: pl.requestID, Token: pl.token, CWD: pl.cwd, SessionID: pl.sessionID, Name: pl.name, Ready: pl.registered, Lifetime: pl.lifetime})
 		if pl.lifetime != nil {
 			err = errors.Join(err, pl.lifetime.Close())
 		}
@@ -1472,6 +1481,7 @@ func (co *coordinator) handleWorker(w *worker, f Frame) {
 			w.firstPrompt = f.Instance.FirstPrompt
 		}
 		w.sessionName = f.Instance.SessionName
+		w.name = f.Instance.Name
 		w.instance.SessionID = f.Instance.SessionID
 		w.buildID = cmp.Or(w.buildID, f.Instance.BuildID)
 		if f.Instance.State != "" {
@@ -1506,8 +1516,8 @@ func (co *coordinator) broadcast(f Frame) {
 	if f.Type == TypeInstanceUpdate {
 		f.Generation = co.generation
 	}
-	var data [8][]byte
-	var errs [8]error
+	var data [16][]byte
+	var errs [16]error
 	for _, c := range co.clients {
 		_, attached := c.subs[f.InstanceID]
 		if (f.Type == TypeInstanceUpdate && !c.watching) || (f.Type != TypeInstanceUpdate && !attached) {
@@ -1523,6 +1533,9 @@ func (co *coordinator) broadcast(f Frame) {
 			}
 			if c.instanceNames {
 				key |= 4
+			}
+			if c.instanceRename {
+				key |= 8
 			}
 		}
 		if data[key] == nil && errs[key] == nil {
@@ -1545,6 +1558,9 @@ func (co *coordinator) instanceSummary(c *client, w *worker) Instance {
 	}
 	if c.instanceNames {
 		inst.SessionName = w.sessionName
+	}
+	if c.instanceRename {
+		inst.Name = w.name
 	}
 	if c.instanceBuild {
 		inst.Outdated = buildOutdated(co.launchBuild, w.buildID)

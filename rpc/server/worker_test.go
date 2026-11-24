@@ -143,7 +143,7 @@ func startWorkerInstance(t *testing.T, rt sdk.Runtime, reg commands.Registry, in
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames}}); err != nil {
+	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames, coord.OperationInstanceRename}}); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
@@ -505,6 +505,59 @@ func TestWorkerPublishesSessionName(t *testing.T) {
 	if state.Result.SessionName != "New name" {
 		t.Fatalf("get_state name = %q", state.Result.SessionName)
 	}
+}
+
+func TestWorkerPublishesInstanceName(t *testing.T) {
+	cwd, dir := t.TempDir(), t.TempDir()
+	storage, err := sessionpkg.NewStorageAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := sessionpkg.NewHeader(cwd, nil, nil)
+	writer, err := storage.Create(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(
+		writer.Append(sessionpkg.NewMessageEntry(nil, json.RawMessage(`{"role":"user","content":"Prompt"}`), nil)),
+		writer.Close(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := sdk.NewRuntime(sdk.RuntimeOptions{SessionsDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", Name: "Restarted", CWD: cwd, SessionID: header.ID})
+	if h.hello.Instance.Name != "" {
+		t.Fatalf("hello must work with older coordinators: %+v", h.hello.Instance)
+	}
+	waitName := func(want string) {
+		t.Helper()
+		for {
+			if f := h.next(t); f.Type == coord.TypeRegister && f.Instance != nil && f.Instance.Name == want {
+				return
+			}
+		}
+	}
+	waitName("Restarted")
+	h.send(t, "rename", `{"type":"set_instance_name","args":{"name":"  API   work "}}`)
+	waitName("API work")
+	h.send(t, "invalid", `{"type":"set_instance_name","args":{"name":"bad\u001bname"}}`)
+	for {
+		f := h.next(t)
+		if f.Type == coord.TypeRegister && f.Instance != nil && f.Instance.Name != "API work" {
+			t.Fatalf("invalid name was published: %+v", f.Instance)
+		}
+		if f.Type == coord.TypeResponse && f.ID == "invalid" {
+			if !strings.Contains(string(f.Result), "invalid characters") {
+				t.Fatalf("invalid rename result = %s", f.Result)
+			}
+			break
+		}
+	}
+	h.send(t, "clear", `{"type":"set_instance_name","args":{"name":""}}`)
+	waitName("")
 }
 
 func TestWorkerPublishesDerivedSessionName(t *testing.T) {

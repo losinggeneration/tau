@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/losinggeneration/rovel"
@@ -16,10 +17,12 @@ import (
 // DialogPickerItem is one entry in a DialogPicker's item list. Name
 // is the primary text shown left-aligned; Description is a short
 // summary shown to its right. Either field may be empty; the
-// layout adapts to whichever side has content.
+// layout adapts to whichever side has content. Detail adds a muted
+// second line; if any item has one, every row is two lines tall.
 type DialogPickerItem struct {
 	Name        string
 	Description string
+	Detail      string
 	Value       string
 }
 
@@ -308,7 +311,7 @@ func (d *DialogPicker) MinSize() geom.Size {
 		return geom.Size{W: w, H: h}
 	}
 	w := 80
-	h := d.Visible() + len(strings.Split(d.header, "\n")) + 3 // header + filter + separator + items + counter
+	h := d.Visible()*d.itemHeight() + len(strings.Split(d.header, "\n")) + 3 // header + filter + separator + items + counter
 	if h < 4 {
 		h = 4
 	}
@@ -416,25 +419,31 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 	}
 
 	// Rows 3..N+2: items. Viewport follows focus for long lists.
+	itemH := d.itemHeight()
+	slots := d.Visible()
+	if itemH > 1 {
+		// Keep the focused item on screen when tall rows exceed the viewport.
+		slots = max(1, min(slots, (r.H-headerH-3)/itemH))
+	}
 	start := 0
-	if len(d.items) > d.Visible() {
-		half := d.Visible() / 2
+	if len(d.items) > slots {
+		half := slots / 2
 		start = d.focused - half
 		if start < 0 {
 			start = 0
 		}
-		if start+d.Visible() > len(d.items) {
-			start = len(d.items) - d.Visible()
+		if start+slots > len(d.items) {
+			start = len(d.items) - slots
 		}
 	}
-	for i := 0; i < d.Visible(); i++ {
-		rowY := r.Y + headerH + 2 + i
+	for i := 0; i < slots; i++ {
+		rowY := r.Y + headerH + 2 + i*itemH
 		if rowY >= r.Y+r.H {
 			break
 		}
 		idx := start + i
 		if idx < 0 || idx >= len(d.items) {
-			dw.FillRect(geom.Rect{X: r.X, Y: rowY, W: r.W, H: 1}, surfSt)
+			dw.FillRect(geom.Rect{X: r.X, Y: rowY, W: r.W, H: min(itemH, r.Y+r.H-rowY)}, surfSt)
 			continue
 		}
 		item := d.items[idx]
@@ -444,7 +453,7 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 		} else {
 			rowSt = surfSt
 		}
-		dw.FillRect(geom.Rect{X: r.X, Y: rowY, W: r.W, H: 1}, rowSt)
+		dw.FillRect(geom.Rect{X: r.X, Y: rowY, W: r.W, H: min(itemH, r.Y+r.H-rowY)}, rowSt)
 		marker := "  "
 		if idx == d.focused {
 			marker = "→ "
@@ -472,10 +481,17 @@ func (d *DialogPicker) Paint(dw rovel.Drawer, ctx *rovel.Ctx) {
 			}
 			dw.DrawText(rovel.Point{X: metaX, Y: rowY}, text.Truncate(meta, r.X+r.W-metaX, false), descStyle)
 		}
+		if item.Detail != "" && rowY+1 < r.Y+r.H && r.W > 2 {
+			detailStyle := mutedSt
+			if idx == d.focused {
+				detailStyle = rowSt
+			}
+			dw.DrawText(rovel.Point{X: r.X + 2, Y: rowY + 1}, text.Truncate(item.Detail, r.W-2, true), detailStyle)
+		}
 	}
 
 	// Counter row at the bottom: "(focused+1)/total".
-	totalRows := headerH + 2 + d.Visible()
+	totalRows := headerH + 2 + slots*itemH
 	if r.H > totalRows {
 		counterY := r.Y + totalRows
 		dw.FillRect(geom.Rect{X: r.X, Y: counterY, W: r.W, H: 1}, surfSt)
@@ -665,6 +681,13 @@ func (d *DialogPicker) Reset() {
 	d.items = nil
 	d.focused = 0
 	d.recomputeItemWidths()
+}
+
+func (d *DialogPicker) itemHeight() int {
+	if slices.ContainsFunc(d.items, func(item DialogPickerItem) bool { return item.Detail != "" }) {
+		return 2
+	}
+	return 1
 }
 
 func (d *DialogPicker) recomputeItemWidths() {

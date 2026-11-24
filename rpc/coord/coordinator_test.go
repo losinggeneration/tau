@@ -536,6 +536,49 @@ func TestInstanceWatchSendsSessionNames(t *testing.T) {
 	}
 }
 
+func TestInstanceNamesRequireOperation(t *testing.T) {
+	h := startCoordinator(t, nil, launchTimeout)
+	legacy, _ := h.client()
+	named, welcome, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceRename}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := named.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if !slices.Contains(welcome.Operations, OperationInstanceRename) {
+		t.Fatalf("welcome operations = %v", welcome.Operations)
+	}
+	inst, w := h.start(legacy, "start")
+	request(t, legacy, Frame{Type: TypeWatchInstances, ID: "legacy"})
+	request(t, named, Frame{Type: TypeWatchInstances, ID: "watch"})
+	inst.Name = "API work"
+	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
+	for _, tc := range []struct {
+		link *Link
+		want string
+	}{{named, "API work"}, {legacy, ""}} {
+		if f := readFrame(t, tc.link); f.Type != TypeInstanceUpdate || f.Instance == nil || f.Instance.Name != tc.want {
+			t.Fatalf("watch update = %+v, want name %q", f, tc.want)
+		}
+		f := request(t, tc.link, Frame{Type: TypeListInstances, ID: "list"})
+		if len(f.Instances) != 1 || f.Instances[0].Name != tc.want {
+			t.Fatalf("list = %+v, want name %q", f.Instances, tc.want)
+		}
+	}
+}
+
+func TestStartInstanceRejectsInvalidName(t *testing.T) {
+	h := startCoordinator(t, nil, launchTimeout)
+	c, _ := h.client()
+	f := request(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: t.TempDir(), Name: "bad\x00name"})
+	if f.Error == nil || f.Error.Code != CodeInvalidFrame {
+		t.Fatalf("start reply = %+v", f)
+	}
+}
+
 func TestInstanceWatchCachesFirstPrompt(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	legacy, _ := h.client()

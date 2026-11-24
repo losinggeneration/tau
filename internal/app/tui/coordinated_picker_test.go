@@ -19,11 +19,13 @@ func TestInstancePickerShowsAndFiltersFirstPrompt(t *testing.T) {
 	}
 	items := instancePickerItems(instances, cwd, "worker-a", "")
 	require.Len(t, items, 4)
-	require.Equal(t, "Fix the picker", items[0].Name)
-	require.Equal(t, "working · current · worker-a · /project", items[0].Description)
-	require.Equal(t, "Review the tests", items[1].Name)
-	require.Equal(t, cwd, items[2].Name)
+	require.Equal(t, cwd, items[0].Name)
+	require.Equal(t, "worker-a | working · current", items[0].Description)
+	require.Equal(t, "Fix the picker", items[0].Detail)
+	require.Equal(t, "Review the tests", items[1].Detail)
+	require.Equal(t, "No messages yet", items[2].Detail)
 	require.Equal(t, NewInstanceChoice, items[3].Value)
+	require.Equal(t, cwd, items[3].Detail)
 
 	filtered := instancePickerItems(instances, cwd, "worker-a", "PICKER")
 	require.Len(t, filtered, 1)
@@ -37,9 +39,31 @@ func TestInstancePickerMarksOutdatedStatus(t *testing.T) {
 		{ID: "worker-c", CWD: "/c", State: coord.StateWorking},
 	}
 	items := instancePickerItems(instances, "/a", "worker-a", "")
-	require.Equal(t, "awaiting user ⟳ · current · worker-a", items[0].Description)
-	require.Equal(t, "needs input (2) ⟳ · worker-b", items[1].Description)
-	require.Equal(t, "working · worker-c", items[2].Description)
+	require.Equal(t, "worker-a | awaiting user ⟳ · current", items[0].Description)
+	require.Equal(t, "worker-b | needs input (2) ⟳", items[1].Description)
+	require.Equal(t, "worker-c | working", items[2].Description)
+}
+
+func TestInstancePickerShowsInstanceAndSessionNames(t *testing.T) {
+	instances := []coord.Instance{
+		{ID: "worker-a", Name: "API work", CWD: "/a", SessionName: "Auth fixes", FirstPrompt: "Fix auth", State: coord.StateWorking},
+		{ID: "worker-b", CWD: "/b", SessionName: "review-the-tests", FirstPrompt: "Review the tests", State: coord.StateWorking},
+	}
+	items := instancePickerItems(instances, "/a", "", "")
+	require.Equal(t, "API work | /a", items[0].Name)
+	require.Equal(t, "Auth fixes", items[0].Detail)
+	require.Equal(t, "/b", items[1].Name)
+	require.Equal(t, "Review the tests", items[1].Detail, "a derived slug should not replace the prompt")
+	for _, filter := range []string{"api work", "auth fixes"} {
+		filtered := instancePickerItems(instances, "/a", "", filter)
+		require.Len(t, filtered, 1, filter)
+		require.Equal(t, "worker-a", filtered[0].Value)
+	}
+}
+
+func TestInstanceNameItems(t *testing.T) {
+	require.Equal(t, "Clear name", instanceNameItems("  ")[0].Name)
+	require.Equal(t, "Save name", instanceNameItems("API")[0].Name)
 }
 
 func TestInstancePickerKeymap(t *testing.T) {
@@ -51,6 +75,7 @@ func TestInstancePickerKeymap(t *testing.T) {
 		{tauui.Keystroke{Key: tauui.KeyF1}, instancePickerRestart},
 		{tauui.Keystroke{Key: tauui.KeyF1, Mod: tauui.ModShift}, instancePickerRestartOutdated},
 		{tauui.Keystroke{Key: tauui.KeyF2}, instancePickerStop},
+		{tauui.Keystroke{Key: tauui.KeyF3}, instancePickerRename},
 		{tauui.Keystroke{Key: tauui.KeyEsc}, tauui.ActionQuit},
 	} {
 		act, ok := keymap.Resolve(tauui.KeyCtxGlobal, tc.ks)
@@ -71,6 +96,7 @@ func TestInstancePickerTerminalShortcuts(t *testing.T) {
 		{"Shift+F1", "\x1b[1;2P", instancePickerRestartOutdated},
 		{"Shift+F1 (legacy)", "\x1b[25~", instancePickerRestartOutdated},
 		{"F2", "\x1bOQ", instancePickerStop},
+		{"F3", "\x1bOR", instancePickerRename},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var decoder ansi.DecodeInput

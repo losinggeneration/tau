@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -67,6 +70,13 @@ const OperationInstanceRestart = "instance_restart"
 
 // OperationInstanceReplacement opts clients into instance_replacement frames.
 const OperationInstanceReplacement = "instance_replacement"
+
+// OperationInstanceRename opts clients into instance names and tells workers
+// the coordinator accepts them.
+const OperationInstanceRename = "instance_rename"
+
+// MaxInstanceNameBytes bounds a user-assigned instance name.
+const MaxInstanceNameBytes = 128
 
 // MaxInstancePromptBytes bounds a preview before JSON escaping.
 const MaxInstancePromptBytes = 256
@@ -209,6 +219,8 @@ type Frame struct {
 	// monotonic elapsed time, so their wall clock does not matter. An absent
 	// value means an older coordinator; use the local clock.
 	CoordinatorTimeUnixMS int64 `json:"coordinator_time_unix_ms,omitempty"`
+	// Name labels the worker launched by start_instance.
+	Name string `json:"name,omitempty"`
 }
 
 // Position identifies a point in one worker's event stream. Offset zero is
@@ -253,6 +265,7 @@ func (e *Error) Error() string {
 // Instance summarizes one registered worker.
 type Instance struct {
 	ID              string      `json:"instance_id"`
+	Name            string      `json:"name,omitempty"`
 	NodeID          string      `json:"node_id,omitempty"`
 	CWD             string      `json:"cwd,omitempty"`
 	SessionID       string      `json:"session_id,omitempty"`
@@ -388,6 +401,9 @@ func (f *Frame) validate() error {
 	if len(f.CWD) > maxTextBytes {
 		return fmt.Errorf("%w: cwd exceeds %d bytes", ErrInvalidFrame, maxTextBytes)
 	}
+	if len(f.Name) > MaxInstanceNameBytes {
+		return fmt.Errorf("%w: instance name exceeds %d bytes", ErrInvalidFrame, MaxInstanceNameBytes)
+	}
 	if f.CoordinatorTimeUnixMS < 0 {
 		return fmt.Errorf("%w: negative coordinator time", ErrInvalidFrame)
 	}
@@ -427,6 +443,9 @@ func (i *Instance) validate() error {
 			return fmt.Errorf("%w: instance identifier exceeds %d bytes", ErrInvalidFrame, maxIDBytes)
 		}
 	}
+	if len(i.Name) > MaxInstanceNameBytes {
+		return fmt.Errorf("%w: instance name exceeds %d bytes", ErrInvalidFrame, MaxInstanceNameBytes)
+	}
 	if len(i.FirstPrompt) > MaxInstancePromptBytes {
 		return fmt.Errorf("%w: instance prompt exceeds %d bytes", ErrInvalidFrame, MaxInstancePromptBytes)
 	}
@@ -440,6 +459,19 @@ func (i *Instance) validate() error {
 		return fmt.Errorf("%w: instance cwd exceeds %d bytes", ErrInvalidFrame, maxTextBytes)
 	}
 	return nil
+}
+
+// NormalizeInstanceName collapses whitespace and rejects names that can't be
+// displayed on one line or passed through a process environment.
+func NormalizeInstanceName(name string) (string, error) {
+	name = strings.Join(strings.Fields(name), " ")
+	if !utf8.ValidString(name) || strings.ContainsFunc(name, unicode.IsControl) {
+		return "", fmt.Errorf("%w: instance name contains invalid characters", ErrInvalidFrame)
+	}
+	if len(name) > MaxInstanceNameBytes {
+		return "", fmt.Errorf("%w: instance name exceeds %d bytes", ErrInvalidFrame, MaxInstanceNameBytes)
+	}
+	return name, nil
 }
 
 func isObject(raw json.RawMessage) bool {

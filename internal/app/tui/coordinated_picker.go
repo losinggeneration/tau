@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/losinggeneration/tau/agent/session"
 	"github.com/losinggeneration/tau/rpc/coord"
 	tauui "github.com/losinggeneration/tau/tui"
 )
@@ -20,12 +21,14 @@ const (
 	InstanceActionRestart         = "restart"
 	InstanceActionRestartOutdated = "restart-outdated"
 	InstanceActionStop            = "stop"
+	InstanceActionRename          = "rename"
 )
 
 const (
 	instancePickerRestart tauui.Action = iota + 300
 	instancePickerRestartOutdated
 	instancePickerStop
+	instancePickerRename
 )
 
 // InstancePickerState keeps the filter and focused row between picker runs.
@@ -116,7 +119,8 @@ func SelectInstance(ctx context.Context, instances []coord.Instance, updates <-c
 			if !handled || choice.Action == "" || job != nil {
 				return handled
 			}
-			if _, confirm := instanceManagementPrompt(choice.Action, choice.Targets); confirm {
+			_, confirm := instanceManagementPrompt(choice.Action, choice.Targets)
+			if confirm || choice.Action == InstanceActionRename {
 				selection = choice
 				root.app.Quit()
 				return true
@@ -158,7 +162,7 @@ func SelectInstance(ctx context.Context, instances []coord.Instance, updates <-c
 }
 
 func instancePickerHeader(notice string) string {
-	header := "Tau instances — Enter open · F1 restart · Shift+F1 restart outdated · F2 stop · Esc cancel"
+	header := "Tau instances — Enter open · F1 restart · Shift+F1 restart outdated · F2 stop · F3 rename · Esc cancel"
 	if notice != "" {
 		header += "\n" + sanitizeStatus(notice)
 	}
@@ -194,6 +198,8 @@ func instancePickerKey(ks tauui.Keystroke) (tauui.Action, bool) {
 		return instancePickerRestartOutdated, true
 	case ks.Key == tauui.KeyF2 && ks.Mod == 0:
 		return instancePickerStop, true
+	case ks.Key == tauui.KeyF3 && ks.Mod == 0:
+		return instancePickerRename, true
 	}
 	return tauui.ActionNone, false
 }
@@ -203,14 +209,17 @@ func instancePickerKey(ks tauui.Keystroke) (tauui.Action, bool) {
 // does nothing for the focused row.
 func instancePickerAction(act tauui.Action, instances []coord.Instance, focused string) (selection InstanceSelection, handled bool) {
 	switch act {
-	case instancePickerRestart, instancePickerStop:
+	case instancePickerRestart, instancePickerStop, instancePickerRename:
 		instance, ok := findPickerInstance(instances, focused)
 		if !ok {
 			return InstanceSelection{}, true
 		}
 		action := InstanceActionRestart
-		if act == instancePickerStop {
+		switch act {
+		case instancePickerStop:
 			action = InstanceActionStop
+		case instancePickerRename:
+			action = InstanceActionRename
 		}
 		return InstanceSelection{Action: action, Targets: []coord.Instance{instance}, Value: instance.ID}, true
 	case instancePickerRestartOutdated:
@@ -317,7 +326,8 @@ func instancePickerItems(instances []coord.Instance, cwd, current, filter string
 		if !pickerInstanceConnected(instance) {
 			continue
 		}
-		label := sanitizeStatus(instance.CWD)
+		name := sanitizeStatus(instance.Name)
+		directory := sanitizeStatus(instance.CWD)
 		state := sanitizeStatus(instance.StatusText())
 		if instance.Outdated {
 			state += " ⟳"
@@ -327,23 +337,65 @@ func instancePickerItems(instances []coord.Instance, cwd, current, filter string
 		}
 		id := instance.ID[:min(8, len(instance.ID))]
 		prompt := sanitizeStatus(instance.FirstPrompt)
-		if !strings.Contains(strings.ToLower(prompt+" "+label+" "+instance.ID+" "+instance.SessionID+" "+state), filter) {
+		sessionName := sanitizeStatus(instance.SessionName)
+		if !strings.Contains(strings.ToLower(strings.Join([]string{name, sessionName, prompt, directory, instance.ID, instance.SessionID, state}, " ")), filter) {
 			continue
 		}
-		detail := state + " · " + id
-		if prompt != "" {
-			if label != "" {
-				// Keep long paths from squeezing the prompt out of the row.
-				detail += " · " + tauui.Truncate(shortenHome(label), 24, true)
-			}
-			label = prompt
+		title := shortenHome(directory)
+		if name != "" {
+			title = name + " | " + title
 		}
-		items = append(items, tauui.DialogPickerItem{Name: label, Description: detail, Value: instance.ID})
+		items = append(items, tauui.DialogPickerItem{
+			Name:        title,
+			Description: id + " | " + state,
+			Detail:      instanceSessionText(instance, sessionName, prompt),
+			Value:       instance.ID,
+		})
 	}
 	if strings.Contains(strings.ToLower("start new instance "+cwd), filter) {
-		items = append(items, tauui.DialogPickerItem{Name: "Start a new instance", Description: sanitizeStatus(cwd), Value: NewInstanceChoice})
+		items = append(items, tauui.DialogPickerItem{Name: "Start a new instance", Detail: sanitizeStatus(cwd), Value: NewInstanceChoice})
 	}
 	return items
+}
+
+// instanceSessionText prefers a chosen session name over the first prompt. A
+// name derived from the prompt is only a slug, so the prompt reads better.
+func instanceSessionText(instance coord.Instance, sessionName, prompt string) string {
+	firstLine, _, _ := strings.Cut(strings.TrimSpace(instance.FirstPrompt), "\n")
+	switch {
+	case sessionName != "" && session.SlugFromName(strings.Join(strings.Fields(firstLine), " ")) != sessionName:
+		return sessionName
+	case prompt != "":
+		return prompt
+	case sessionName != "":
+		return sessionName
+	}
+	return "No messages yet"
+}
+
+// PromptInstanceName edits a name in the picker's input. An empty result clears
+// the name; ok is false when the user cancels.
+func PromptInstanceName(ctx context.Context, instance coord.Instance) (name string, ok bool, err error) {
+	root, err := runTerminalSelector(ctx, terminalSelector{
+		header: "Name this instance — Enter save · Esc cancel\n" + sanitizeStatus(instance.CWD),
+		title:  "tau — name instance",
+		filter: instance.Name,
+		items:  instanceNameItems,
+	})
+	if err != nil {
+		return "", false, err
+	}
+	if root.selected == "" {
+		return "", false, nil
+	}
+	return strings.TrimSpace(root.picker.Filter()), true, nil
+}
+
+func instanceNameItems(input string) []tauui.DialogPickerItem {
+	if strings.TrimSpace(input) == "" {
+		return []tauui.DialogPickerItem{{Name: "Clear name", Value: "save"}}
+	}
+	return []tauui.DialogPickerItem{{Name: "Save name", Value: "save"}}
 }
 
 // ConfirmInstanceStop requires an explicit choice before stopping shared work.

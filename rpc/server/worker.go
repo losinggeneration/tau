@@ -249,6 +249,27 @@ func (w *Worker) Run(ctx context.Context, path string, instance coord.Instance, 
 				return s.sendResult(cmd.ID, map[string]any{"ok": true})
 			}
 			switch cmd.Type {
+			case "set_instance_name":
+				var args struct {
+					Name string `json:"name"`
+				}
+				if err := json.Unmarshal(cmd.Args, &args); err != nil {
+					if err := s.sendError(cmd.ID, coord.CodeInvalidFrame, "invalid instance name arguments"); err != nil {
+						return err
+					}
+					continue
+				}
+				name, nameErr := coord.NormalizeInstanceName(args.Name)
+				if nameErr != nil {
+					if err := s.sendError(cmd.ID, coord.CodeInvalidFrame, nameErr.Error()); err != nil {
+						return err
+					}
+					continue
+				}
+				output.setInstanceName(name)
+				if err := s.sendResult(cmd.ID, map[string]string{"name": name}); err != nil {
+					return err
+				}
 			case "interrupt", "abort":
 				// SDK prompt admission can also run a slash command inline.
 				// Resolving dialogs before cancelling the handler reports them
@@ -333,6 +354,7 @@ type workerWriter struct {
 	link              *coord.Link
 	instancePrompts   bool
 	instanceNames     bool
+	instanceRename    bool
 	instanceBuild     bool
 	instance          coord.Instance
 	run               string
@@ -348,7 +370,7 @@ func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Lin
 	w.mu.Lock()
 	inst, pos := w.instance, w.journal.position
 	hello := inst
-	hello.FirstPrompt, hello.SessionName, hello.BuildID = "", "", ""
+	hello.Name, hello.FirstPrompt, hello.SessionName, hello.BuildID = "", "", "", ""
 	w.mu.Unlock()
 	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -365,10 +387,11 @@ func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Lin
 	w.instancePrompts = slices.Contains(welcome.Operations, coord.OperationInstancePrompts)
 	w.instanceNames = slices.Contains(welcome.Operations, coord.OperationInstanceNames)
 	w.instanceBuild = slices.Contains(welcome.Operations, coord.OperationInstanceBuild)
+	w.instanceRename = slices.Contains(welcome.Operations, coord.OperationInstanceRename)
 	// A hello must also work with coordinators that predate previews.
 	// Changes made during the handshake were journaled but could not be
 	// forwarded. Publish the latest summary before forwarding new events.
-	if w.instance != inst || (w.instancePrompts && inst.FirstPrompt != "") || (w.instanceNames && inst.SessionName != "") || (w.instanceBuild && inst.BuildID != "") {
+	if w.instance != inst || (w.instanceRename && inst.Name != "") || (w.instancePrompts && inst.FirstPrompt != "") || (w.instanceNames && inst.SessionName != "") || (w.instanceBuild && inst.BuildID != "") {
 		if err := w.sendSummaryLocked(); err != nil {
 			w.disconnect(err)
 		}
@@ -682,7 +705,23 @@ func (w *workerWriter) sendSummaryLocked() error {
 	if !w.instanceBuild {
 		inst.BuildID = ""
 	}
+	if !w.instanceRename {
+		inst.Name = ""
+	}
 	return w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &inst})
+}
+
+// setInstanceName publishes name now, or on the next dial if the link is down.
+func (w *workerWriter) setInstanceName(name string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.instance.Name = name
+	if w.link == nil {
+		return
+	}
+	if err := w.sendSummaryLocked(); err != nil {
+		w.disconnect(err)
+	}
 }
 
 func instancePromptPreview(prompt string) string {

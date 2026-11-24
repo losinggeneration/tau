@@ -221,7 +221,7 @@ func dialCoordinated(ctx context.Context, path string, eventBuffer int, opts ...
 		Version:    coord.Version,
 		Role:       coord.RoleClient,
 		ClientID:   clientID,
-		Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames, coord.OperationInstanceBuild, coord.OperationInstanceReplacement},
+		Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames, coord.OperationInstanceBuild, coord.OperationInstanceReplacement, coord.OperationInstanceRename},
 	})
 	if err != nil {
 		return nil, err
@@ -428,13 +428,19 @@ func (c *CoordinatedClient) StartInstance(ctx context.Context, cwd string) (*coo
 // *OutcomeUnknownError. A new UUIDv4 intent is rejected on a recoverable
 // coordinator. Other mutations do not deduplicate.
 func (c *CoordinatedClient) StartInstanceWithRequestID(ctx context.Context, cwd, requestID string) (*coord.Instance, error) {
-	return c.startInstance(ctx, cwd, "", requestID)
+	return c.startInstance(ctx, cwd, "", "", requestID)
 }
 
 // StartSavedSession returns the connected worker for the saved session in cwd,
 // or launches one if it has no worker. If a worker is starting or reconnecting,
 // it waits for the worker within ctx. It does not attach to the returned worker.
 func (c *CoordinatedClient) StartSavedSession(ctx context.Context, cwd, sessionID string) (*coord.Instance, error) {
+	return c.StartNamedSavedSession(ctx, cwd, sessionID, "")
+}
+
+// StartNamedSavedSession is StartSavedSession for a worker labeled name. An
+// already running worker keeps its own name.
+func (c *CoordinatedClient) StartNamedSavedSession(ctx context.Context, cwd, sessionID, name string) (*coord.Instance, error) {
 	if sessionID == "" {
 		return nil, errors.New("saved session ID required")
 	}
@@ -442,7 +448,7 @@ func (c *CoordinatedClient) StartSavedSession(ctx context.Context, cwd, sessionI
 		return nil, errors.New("coordinator does not support launching saved sessions; restart it with the current Tau version")
 	}
 	for {
-		inst, err := c.startInstance(ctx, cwd, sessionID, "")
+		inst, err := c.startInstance(ctx, cwd, sessionID, name, "")
 		// Busy guarantees that this request didn't start a worker. Don't
 		// retry a launch whose outcome is unknown.
 		if e, ok := errors.AsType[*coord.Error](err); !ok || e.Code != coord.CodeBusy || errors.Is(err, ErrOutcomeUnknown) {
@@ -458,13 +464,17 @@ func (c *CoordinatedClient) StartSavedSession(ctx context.Context, cwd, sessionI
 	}
 }
 
-func (c *CoordinatedClient) startInstance(ctx context.Context, cwd, sessionID, requestID string) (*coord.Instance, error) {
+func (c *CoordinatedClient) startInstance(ctx context.Context, cwd, sessionID, name, requestID string) (*coord.Instance, error) {
+	// Older coordinators reject unknown frame fields.
+	if !slices.Contains(c.welcome.Operations, coord.OperationInstanceRename) {
+		name = ""
+	}
 	if requestID == "" {
 		requestID = c.NewStartRequestID()
 	} else if !coord.ValidLaunchRequestID(requestID) {
 		return nil, ErrInvalidRequestID
 	}
-	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeStartInstance, CWD: cwd, SessionID: sessionID, RequestID: requestID})
+	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeStartInstance, CWD: cwd, SessionID: sessionID, Name: name, RequestID: requestID})
 	if err != nil {
 		return nil, err
 	}
@@ -535,6 +545,28 @@ func (c *CoordinatedClient) CommandWithRequestID(ctx context.Context, instanceID
 		return nil, err
 	}
 	return commandResponse(cmdID, reply.Result)
+}
+
+// RenameInstance sets the instance's name. An empty name clears it.
+func (c *CoordinatedClient) RenameInstance(ctx context.Context, instanceID, name string) error {
+	if !slices.Contains(c.welcome.Operations, coord.OperationInstanceRename) {
+		return errors.New("coordinator does not support instance names; restart it with the current Tau version")
+	}
+	name, err := coord.NormalizeInstanceName(name)
+	if err != nil {
+		return err
+	}
+	response, err := c.Command(ctx, instanceID, Command{Type: "set_instance_name", Args: map[string]string{"name": name}})
+	if err != nil {
+		return err
+	}
+	if !response.OK {
+		if response.Error != nil {
+			return &coord.Error{Code: response.Error.Code, Message: response.Error.Message}
+		}
+		return errors.New("worker rename failed without error details")
+	}
+	return nil
 }
 
 // StopInstance asks instanceID to shut down. It sends a fresh request ID;

@@ -194,6 +194,40 @@ func TestDialogPicker_ShownReportsMinSize(t *testing.T) {
 // TestDialogPicker_ItemsClampFocus verifies that a shorter items
 // list clamps the focused index into range, so a stale focus
 // position doesn't point past the end.
+func TestDialogPicker_DetailRowsKeepFocusVisible(t *testing.T) {
+	p := NewDialogPicker()
+	p.SetHeader("title")
+	p.SetVisible(20)
+	items := make([]DialogPickerItem, 6)
+	for i := range items {
+		items[i] = DialogPickerItem{Name: "name-" + string(rune('a'+i)), Description: "meta", Detail: "detail-" + string(rune('a'+i))}
+	}
+	p.SetItems(items)
+	p.SetFocused(5)
+	p.SetShown(true)
+	if got := p.MinSize().H; got != 44 {
+		t.Fatalf("MinSize height = %d, want two rows per visible item", got)
+	}
+	p.Layout(geom.Rect{W: 30, H: 10})
+	buf := render.NewBuffer(30, 10)
+	painter := render.NewPainter(buf, geom.Rect{W: 30, H: 10}, style.Style{})
+	p.Paint(rovel.NewDrawer(rovel.NewPainter(painter, style.Style{})), &rovel.Ctx{Theme: rovel.DefaultTheme()})
+	var rows []string
+	for y := range 10 {
+		var row strings.Builder
+		for x := range 30 {
+			row.WriteRune(buf.At(x, y).R)
+		}
+		rows = append(rows, row.String())
+	}
+	screen := strings.Join(rows, "\n")
+	for _, want := range []string{"→ name-f", "detail-f", "(6/6)"} {
+		if !strings.Contains(screen, want) {
+			t.Fatalf("screen missing %q:\n%s", want, screen)
+		}
+	}
+}
+
 func TestDialogPicker_ItemsClampFocus(t *testing.T) {
 	p := NewDialogPicker()
 	p.SetItems([]DialogPickerItem{

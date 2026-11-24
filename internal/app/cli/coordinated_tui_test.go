@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -397,7 +398,7 @@ func TestRestartTUIInstancePreservesUntouchedSession(t *testing.T) {
 					return
 				}
 				assert.NoError(t, server.NewWorker(rt, nil, nil).Run(ctx, path, coord.Instance{
-					ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: req.SessionID, PID: os.Getpid(),
+					ID: req.InstanceID, Name: req.Name, NodeID: "node", CWD: req.CWD, SessionID: req.SessionID, PID: os.Getpid(),
 				}, req.Token))
 			})
 			return nil
@@ -418,6 +419,8 @@ func TestRestartTUIInstancePreservesUntouchedSession(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, c.Close()) })
 	original, err := c.StartInstance(op, cwd)
 	require.NoError(t, err)
+	require.NoError(t, c.RenameInstance(op, original.ID, "API work"))
+	original.Name = "API work"
 	_, err = storage.ResolveHeader(original.SessionID)
 	require.Error(t, err, "untouched session should not be on disk yet")
 	require.ErrorContains(t, c.StopInstanceForRestart(op, original.ID, "wrong-session"), "switched sessions")
@@ -457,6 +460,12 @@ func TestRestartTUIInstancePreservesUntouchedSession(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, current, replacement.ID)
 	require.Equal(t, original.SessionID, replacement.SessionID)
+	require.Eventually(t, func() bool {
+		instances, err := c.ListInstances(op)
+		return err == nil && slices.ContainsFunc(instances, func(inst coord.Instance) bool {
+			return inst.ID == current && inst.Name == "API work"
+		})
+	}, time.Second, 5*time.Millisecond, "restart should keep the instance name")
 	header, err := storage.ResolveHeader(original.SessionID)
 	require.NoError(t, err)
 	require.Equal(t, original.SessionID, header.ID)
