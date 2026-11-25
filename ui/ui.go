@@ -12,7 +12,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -451,14 +450,7 @@ func (u *JSONEventUI) Confirm(ctx context.Context, title, message string) (bool,
 
 	select {
 	case resp := <-respCh:
-		if resp.Cancelled {
-			return false, nil
-		}
-		if resp.Confirmed != nil {
-			return *resp.Confirmed, nil
-		}
-		// Backwards-compat: legacy clients send "true"/"false" in Value.
-		return resp.Value == "true" || resp.Value == "yes", nil
+		return confirmResult(resp)
 	case <-ctx.Done():
 		return false, ctx.Err()
 	}
@@ -490,26 +482,7 @@ func (u *JSONEventUI) Select(ctx context.Context, title string, options []string
 
 	select {
 	case resp := <-respCh:
-		if resp.Cancelled {
-			return -1, nil
-		}
-		// Typed Value carries the selected option label; look up its index.
-		if resp.Value != "" {
-			for i, opt := range options {
-				if opt == resp.Value {
-					return i, nil
-				}
-			}
-		}
-		// Backwards-compat: legacy clients send a numeric index in Value.
-		var idx int
-		if n, err := fmt.Sscanf(resp.Value, "%d", &idx); err == nil && n == 1 {
-			if idx >= 0 && idx < len(options) {
-				return idx, nil
-			}
-			return -1, fmt.Errorf("select index out of range: %d", idx)
-		}
-		return -1, fmt.Errorf("invalid select response: %q", resp.Value)
+		return selectResult(resp, options)
 	case <-ctx.Done():
 		return -1, ctx.Err()
 	}
@@ -640,11 +613,7 @@ func (u *JSONEventUI) runScanner() {
 		if msg.ID == "" {
 			continue
 		}
-		// Tolerate legacy clients that omit `type` but send {"id":...,"value":...}.
-		// The scanner accepts both the typed `ui_response` envelope and the
-		// bare id+value pair (when the `type` field is missing we treat the
-		// line as a response, matching the documented wire format).
-		if msg.Type != "" && msg.Type != "ui_response" {
+		if msg.Type != "ui_response" {
 			continue
 		}
 
@@ -760,56 +729,35 @@ func (r SharedRequest) validate(resp UIResponse) error {
 	}
 	switch r.Method {
 	case UIMethodConfirm:
-		switch resp.Value {
-		case "true", "yes", "false", "no":
-			return nil
-		}
 		if resp.Confirmed == nil {
 			return fmt.Errorf("%w: confirm requires confirmed or cancelled", ErrInvalidResponse)
 		}
 	case UIMethodSelect:
-		if slices.Contains(r.Options, resp.Value) && resp.Value != "" {
-			return nil
-		}
-		if index, err := strconv.Atoi(resp.Value); err != nil || index < 0 || index >= len(r.Options) {
-			return fmt.Errorf("%w: select requires an option or an in-range index", ErrInvalidResponse)
+		if resp.Value == "" || !slices.Contains(r.Options, resp.Value) {
+			return fmt.Errorf("%w: select requires one of the options", ErrInvalidResponse)
 		}
 	}
 	return nil
 }
 
-func confirmResult(resp UIResponse) bool {
-	if resp.Cancelled {
-		return false
+func confirmResult(resp UIResponse) (bool, error) {
+	switch {
+	case resp.Cancelled:
+		return false, nil
+	case resp.Confirmed == nil:
+		return false, fmt.Errorf("%w: confirm requires confirmed or cancelled", ErrInvalidResponse)
 	}
-	if resp.Confirmed != nil {
-		return *resp.Confirmed
-	}
-	// Backwards-compat: legacy clients send "true"/"false" in Value.
-	return resp.Value == "true" || resp.Value == "yes"
+	return *resp.Confirmed, nil
 }
 
 func selectResult(resp UIResponse, options []string) (int, error) {
 	if resp.Cancelled {
 		return -1, nil
 	}
-	// Typed Value carries the selected option label; look up its index.
-	if resp.Value != "" {
-		for i, opt := range options {
-			if opt == resp.Value {
-				return i, nil
-			}
-		}
+	if i := slices.Index(options, resp.Value); resp.Value != "" && i >= 0 {
+		return i, nil
 	}
-	// Backwards-compat: legacy clients send a numeric index in Value.
-	var idx int
-	if n, err := fmt.Sscanf(resp.Value, "%d", &idx); err == nil && n == 1 {
-		if idx >= 0 && idx < len(options) {
-			return idx, nil
-		}
-		return -1, fmt.Errorf("select index out of range: %d", idx)
-	}
-	return -1, fmt.Errorf("invalid select response: %q", resp.Value)
+	return -1, fmt.Errorf("%w: select requires one of the options, got %q", ErrInvalidResponse, resp.Value)
 }
 
 func inputResult(resp UIResponse) (string, error) {
@@ -990,7 +938,7 @@ func (u *RPCUI) Confirm(ctx context.Context, title, message string) (bool, error
 		if err != nil {
 			return false, err
 		}
-		return confirmResult(resp), nil
+		return confirmResult(resp)
 	}
 	id := fmt.Sprintf("ui-%d", time.Now().UnixNano())
 	respCh := make(chan UIResponse, 1)
@@ -1016,7 +964,7 @@ func (u *RPCUI) Confirm(ctx context.Context, title, message string) (bool, error
 
 	select {
 	case resp := <-respCh:
-		return confirmResult(resp), nil
+		return confirmResult(resp)
 	case <-ctx.Done():
 		return false, ctx.Err()
 	}
@@ -1192,10 +1140,7 @@ func (u *RPCUI) runScanner() {
 		if msg.ID == "" {
 			continue
 		}
-		// Tolerate both the typed `ui_response` envelope and bare id+value
-		// pairs from legacy clients (when `type` is empty the line is
-		// treated as a response).
-		if msg.Type != "" && msg.Type != "ui_response" {
+		if msg.Type != "ui_response" {
 			continue
 		}
 
@@ -1219,15 +1164,6 @@ func (u *RPCUI) Close() error {
 	defer u.mu.Unlock()
 	u.abandonLocked(sharedReply{outcome: OutcomeAborted, err: ErrUIClosed})
 	return nil
-}
-
-// DispatchResponse delivers a UI response that was received from the command stream.
-// It dispatches to the pending channel without reading from a separate Reader.
-//
-// The default `Method` is `UIMethodInput` (the legacy value-channel shape);
-// callers that have the original method should call DispatchResponseTyped.
-func (u *RPCUI) DispatchResponse(id, value string) {
-	u.DispatchResponseTyped(UIResponse{ID: id, Method: UIMethodInput, Value: value})
 }
 
 // DispatchResponseTyped delivers a typed UIResponse (with discriminator and
@@ -1261,22 +1197,8 @@ func (u *RPCUI) CancelPending() {
 	}
 }
 
-// WaitForResponse waits for a response for the given ID and returns the
-// value payload as a string (legacy convenience shim). It is used by RPC
-// handlers whose typed response semantics are encoded in the `Value` field.
-// Prefer WaitForResponseTyped when you need the full UIResponse.
-//
-// The response is delivered via DispatchResponse or DispatchResponseTyped.
-func (u *RPCUI) WaitForResponse(id string, timeout time.Duration) (string, error) {
-	resp, err := u.WaitForResponseTyped(id, timeout)
-	if err != nil {
-		return "", err
-	}
-	return resp.Value, nil
-}
-
 // WaitForResponseTyped waits for a typed UIResponse for the given ID.
-// The response is delivered via DispatchResponse or DispatchResponseTyped.
+// The response is delivered via DispatchResponseTyped.
 func (u *RPCUI) WaitForResponseTyped(id string, timeout time.Duration) (UIResponse, error) {
 	respCh := make(chan UIResponse, 1)
 

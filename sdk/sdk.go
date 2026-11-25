@@ -4870,13 +4870,6 @@ func usagePayload(usage ai.Usage) map[string]any {
 		"cacheRead":   usage.CacheRead,
 		"cacheWrite":  usage.CacheWrite,
 		"totalTokens": usage.TotalTokens,
-		// Legacy snake_case aliases are kept for JSON/event clients that still
-		// read the older SDK shape.
-		"input_tokens":       usage.Input,
-		"output_tokens":      usage.Output,
-		"cache_read_tokens":  usage.CacheRead,
-		"cache_write_tokens": usage.CacheWrite,
-		"total_tokens":       usage.TotalTokens,
 	}
 	if usage.Cost.Input > 0 || usage.Cost.Output > 0 || usage.Cost.CacheRead > 0 || usage.Cost.CacheWrite > 0 || usage.Cost.Total > 0 {
 		payload["cost"] = map[string]any{
@@ -4886,7 +4879,6 @@ func usagePayload(usage ai.Usage) map[string]any {
 			"cacheWrite": usage.Cost.CacheWrite,
 			"total":      usage.Cost.Total,
 		}
-		payload["cost_usd"] = usage.Cost.Total
 	}
 	return payload
 }

@@ -101,7 +101,6 @@ func NewCoordinatedBridge(addr, socket, token string, store *TokenStore) (*Coord
 		CheckOrigin:      sameOrigin,
 	}
 	mux := http.NewServeMux()
-	registerCoordinatedWebApp(mux)
 	mux.HandleFunc("/rpc", b.serveRPC)
 	b.server = &http.Server{
 		Handler:           localOnly(mux),
@@ -413,7 +412,6 @@ func (b *CoordinatedBridge) guard(token string) func() bool {
 // defeats DNS rebinding against the loopback listener.
 func localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Referrer-Policy", "no-referrer")
 		host, _, err := net.SplitHostPort(r.Host)
 		if err != nil {
 			host = r.Host
@@ -436,9 +434,8 @@ func loopbackHost(host string) bool {
 }
 
 // sameOrigin admits native clients that send no Origin header, and browsers
-// only when exactly one Origin names the canonical loopback origin of the
-// page this bridge serves: same scheme, host and port, with no path or
-// other decoration. Opaque ("null"), empty and repeated origins fail.
+// only when exactly one Origin names the bridge's own canonical loopback
+// origin: same scheme, host and port, with no path or other decoration. Opaque ("null"), empty and repeated origins fail.
 func sameOrigin(r *http.Request) bool {
 	origins := r.Header.Values("Origin")
 	if len(origins) == 0 {

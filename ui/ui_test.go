@@ -327,7 +327,7 @@ func TestJSONEventUI_ResponseCorrelation(t *testing.T) {
 	}
 
 	// Write the response
-	w.Write([]byte(`{"type":"ui_response","id":"` + confirmID + `","value":"true"}` + "\n"))
+	w.Write([]byte(`{"type":"ui_response","id":"` + confirmID + `","confirmed":true}` + "\n"))
 	w.Close()
 
 	// Wait for confirm to complete
@@ -826,51 +826,6 @@ func TestRPCUI_DispatchTypedSelectByLabel(t *testing.T) {
 	}
 }
 
-func TestRPCUI_LegacyValueStringBackwardsCompat(t *testing.T) {
-	// Legacy clients send "true"/"false" for confirm and numeric indices
-	// for select. RPCUI must still understand those.
-	var buf bytes.Buffer
-	u := NewRPCUI()
-	u.Writer = &buf
-
-	done := make(chan struct{})
-	var got bool
-
-	go func() {
-		got, _ = u.Confirm(context.Background(), "OK?", "")
-		close(done)
-	}()
-
-	deadline := time.Now().Add(200 * time.Millisecond)
-	var id string
-	for time.Now().Before(deadline) {
-		u.mu.Lock()
-		for k := range u.pending {
-			id = k
-		}
-		u.mu.Unlock()
-		if id != "" {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if id == "" {
-		t.Fatal("no pending ID registered")
-	}
-
-	// Legacy path: id + "true" via DispatchResponse (string shim).
-	u.DispatchResponse(id, "true")
-
-	select {
-	case <-done:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("Confirm did not return")
-	}
-	if !got {
-		t.Errorf("legacy Confirm returned false; expected true")
-	}
-}
-
 // A pending ui_confirm/ui_select/ui_input shows up as an outstanding request
 // until the client replies — the workspace surfaces this as "needs_input".
 func TestRPCUI_PendingRequestsTracksWaitingResponses(t *testing.T) {
@@ -1200,61 +1155,5 @@ func TestJSONEventUI_ScannerDispatchesTypedResponse(t *testing.T) {
 	}
 	if got != "answer" {
 		t.Errorf("Input = %q; want %q", got, "answer")
-	}
-}
-
-func TestJSONEventUI_ScannerAcceptsLegacyBareIDValue(t *testing.T) {
-	// Legacy clients may send {"id":"...","value":"..."} without `type`.
-	// The scanner must still dispatch it.
-	var buf bytes.Buffer
-	pr, pw := io.Pipe()
-
-	u := &JSONEventUI{
-		Writer:  &buf,
-		Reader:  pr,
-		pending: make(map[string]chan<- UIResponse),
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	u.ReadResponse(ctx)
-
-	done := make(chan struct{})
-	var got bool
-
-	go func() {
-		got, _ = u.Confirm(context.Background(), "Title", "")
-		close(done)
-	}()
-
-	deadline := time.Now().Add(200 * time.Millisecond)
-	var id string
-	for time.Now().Before(deadline) {
-		u.mu.Lock()
-		for k := range u.pending {
-			id = k
-		}
-		u.mu.Unlock()
-		if id != "" {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if id == "" {
-		t.Fatal("no pending ID registered")
-	}
-
-	legacy := `{"id":"` + id + `","value":"true"}` + "\n"
-	if _, err := pw.Write([]byte(legacy)); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	select {
-	case <-done:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Confirm did not return")
-	}
-	if !got {
-		t.Errorf("legacy Confirm returned false; expected true")
 	}
 }

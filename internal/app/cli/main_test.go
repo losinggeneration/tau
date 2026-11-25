@@ -842,7 +842,7 @@ func TestProcessEventWith_UsageAcceptsIntegerTokenCounts(t *testing.T) {
 	stderr := captureStderr(t, func() {
 		var mu sync.Mutex
 		processEventWith(&sdk.Event{Type: "usage", Payload: map[string]any{
-			"this_call": map[string]any{"input_tokens": 120, "output_tokens": 30},
+			"this_call": map[string]any{"input": 120, "output": 30},
 		}}, &mu, nil)
 	})
 	if !strings.Contains(stderr, "[tokens: in=120 out=30]") {

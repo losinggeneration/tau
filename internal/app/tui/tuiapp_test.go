@@ -831,7 +831,7 @@ func TestUsageEventRefreshesFooterStatsFromSessionState(t *testing.T) {
 	fs.usedPct = 42
 	fs.mu.Unlock()
 
-	a.handleEvent(sdk.Event{Type: "usage", Payload: map[string]any{"this_call": map[string]any{"input_tokens": 999, "output_tokens": 999}}})
+	a.handleEvent(sdk.Event{Type: "usage", Payload: map[string]any{"this_call": map[string]any{"input": 999, "output": 999}}})
 
 	if got := a.footer.data.totalTokens; got != 42 {
 		t.Fatalf("footer total tokens = %d, want session Stats total 42", got)

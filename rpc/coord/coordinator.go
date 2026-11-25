@@ -317,7 +317,6 @@ func (co *coordinator) serve(conn net.Conn) {
 	}
 	hello, err := decodeFrame(line)
 	if err != nil {
-		rejectLegacy(link, line)
 		return
 	}
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
@@ -349,23 +348,6 @@ func checkHello(f Frame) *Error {
 
 func reject(link *Link, e *Error) {
 	send(link, Frame{Type: TypeResponse, Version: Version, Error: e})
-}
-
-// rejectLegacy queues a compatible error for a legacy RPC command so its
-// client fails with guidance instead of a silent disconnect. The caller's
-// deferred Close flushes it.
-func rejectLegacy(link *Link, line []byte) {
-	reply, err := legacyRejection(line)
-	if err != nil {
-		logf("%v", err)
-		return
-	}
-	if reply == nil {
-		return
-	}
-	if err := link.enqueue(reply); err != nil {
-		logf("reply to legacy client: %v", err)
-	}
 }
 
 func (co *coordinator) serveClient(link *Link, hello Frame) {

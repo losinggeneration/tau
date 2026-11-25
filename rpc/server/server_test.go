@@ -370,7 +370,7 @@ func TestRPCCommandUIRegistersBeforePublishing(t *testing.T) {
 
 // Without a coordinated worker, ui_response keeps its direct reply shape;
 // shared snapshots are coordinated-only.
-func TestLegacyUIResponseKeepsReplyShape(t *testing.T) {
+func TestStandaloneUIResponseKeepsReplyShape(t *testing.T) {
 	var out bytes.Buffer
 	s := newServer(nil, nil, nil)
 	s.writer = &out
@@ -386,7 +386,7 @@ func TestLegacyUIResponseKeepsReplyShape(t *testing.T) {
 		t.Fatalf("responses: %q", lines)
 	}
 	if lines[0] != `{"type":"response","id":"reply","ok":true,"result":{"ok":true}}` {
-		t.Fatalf("legacy ui_response reply = %s", lines[0])
+		t.Fatalf("standalone ui_response reply = %s", lines[0])
 	}
 	var list Response
 	if err := json.Unmarshal([]byte(lines[1]), &list); err != nil {

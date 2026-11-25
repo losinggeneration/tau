@@ -942,10 +942,8 @@ func (s *Server) handleCompact(ctx context.Context, cmd *Command) error {
 
 // handleUIResponse processes client reply to a ui_* event.
 //
-// The args payload may carry either a typed `UIResponse` (with `method`,
-// `confirmed`, `cancelled`) or a legacy `{id, value}` pair. We unmarshal
-// straight into UIResponse and dispatch via DispatchResponseTyped so the
-// receiving goroutine sees the full discriminator.
+// The args payload is a UIResponse: `value` for select and input,
+// `confirmed` for confirm, or `cancelled`.
 func (s *Server) handleUIResponse(ctx context.Context, cmd *Command) error {
 	var resp ui.UIResponse
 	if err := json.Unmarshal(cmd.Args, &resp); err != nil {

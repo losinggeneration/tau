@@ -4357,8 +4357,8 @@ func processEventWith(event *sdk.Event, mu *sync.Mutex, p *eventPrinter) {
 	case "usage":
 		if p, ok := event.Payload.(map[string]any); ok {
 			if call, ok := p["this_call"].(map[string]any); ok {
-				inputTokens := eventUsageTokenCount(call["input_tokens"])
-				outputTokens := eventUsageTokenCount(call["output_tokens"])
+				inputTokens := eventUsageTokenCount(call["input"])
+				outputTokens := eventUsageTokenCount(call["output"])
 				fmt.Fprintf(os.Stderr, "\n[tokens: in=%d out=%d]\n", inputTokens, outputTokens)
 			}
 		}

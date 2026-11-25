@@ -1422,21 +1422,15 @@ func TestEventSessionFollowsWorkerSwitch(t *testing.T) {
 	}
 }
 
-func TestLegacyFirstFrameGetsCompatibleRejection(t *testing.T) {
+func TestInvalidFirstFrameClosesSilently(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	h.client()
-	tests := map[string]struct {
-		line   string
-		wantID string
-	}{
-		"get_state":   {`{"id":"cmd-1","type":"get_state"}`, "cmd-1"},
-		"with args":   {`{"id":"p-1","type":"prompt","args":{"text":"hi"}}`, "p-1"},
-		"no id":       {`{"type":"get_state"}`, ""},
-		"not json":    {`hello`, ""},
-		"coord frame": {`{"id":"x","type":"command","admin":true}`, ""},
-		"long id":     {`{"id":"` + strings.Repeat("x", maxIDBytes+1) + `","type":"get_state"}`, ""},
-	}
-	for name, tc := range tests {
+	for name, line := range map[string]string{
+		"rpc command": `{"id":"cmd-1","type":"get_state"}`,
+		"no id":       `{"type":"get_state"}`,
+		"not json":    `hello`,
+		"coord frame": `{"id":"x","type":"command","admin":true}`,
+	} {
 		t.Run(name, func(t *testing.T) {
 			conn, err := net.Dial("unix", h.path)
 			if err != nil {
@@ -1446,38 +1440,15 @@ func TestLegacyFirstFrameGetsCompatibleRejection(t *testing.T) {
 			if err := conn.SetDeadline(time.Now().Add(testTimeout)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := conn.Write([]byte(tc.line + "\n")); err != nil {
+			if _, err := conn.Write([]byte(line + "\n")); err != nil {
 				t.Fatal(err)
 			}
 			data, err := io.ReadAll(conn)
 			if err != nil {
 				t.Fatalf("read reply: %v", err)
 			}
-			if tc.wantID == "" {
-				if len(data) != 0 {
-					t.Fatalf("non-legacy frame got reply %s", data)
-				}
-				return
-			}
-			lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-			if len(lines) != 1 || !strings.Contains(lines[0], `"ok":false`) {
-				t.Fatalf("legacy reply = %q", data)
-			}
-			var resp struct {
-				Type  string `json:"type"`
-				ID    string `json:"id"`
-				OK    bool   `json:"ok"`
-				Error *struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
-				t.Fatal(err)
-			}
-			if resp.Type != "response" || resp.ID != tc.wantID || resp.OK || resp.Error == nil ||
-				resp.Error.Code == "" || !strings.Contains(resp.Error.Message, "has been removed") {
-				t.Fatalf("legacy reply = %+v (error %+v)", resp, resp.Error)
+			if len(data) != 0 {
+				t.Fatalf("invalid first frame got reply %s", data)
 			}
 		})
 	}

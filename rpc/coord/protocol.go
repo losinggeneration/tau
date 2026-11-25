@@ -142,8 +142,6 @@ const (
 	// outside the receipt window although it was never recorded. Nothing was
 	// started; a new ID from a corrected clock may be used.
 	CodeClockSkew = "clock_skew"
-	// CodeLegacyProtocol answers a legacy RPC command sent in place of hello.
-	CodeLegacyProtocol = "unsupported_protocol"
 )
 
 const (
@@ -353,38 +351,6 @@ func isFrameType(t string) bool {
 	}
 	return false
 }
-
-// legacyRejection answers a first line that is a connection-owned RPC
-// command rather than a hello, in that protocol's response shape. It returns
-// nil for anything else so the strict handshake stays silent.
-func legacyRejection(line []byte) ([]byte, error) {
-	var cmd struct {
-		ID   string `json:"id"`
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(line, &cmd) != nil || cmd.ID == "" || cmd.Type == "" || len(cmd.ID) > maxIDBytes || len(cmd.Type) > maxIDBytes || isFrameType(cmd.Type) {
-		return nil, nil
-	}
-	data, err := json.Marshal(legacyResponse{
-		Type:  TypeResponse,
-		ID:    cmd.ID,
-		Error: &Error{Code: CodeLegacyProtocol, Message: legacyGuidance},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("encode legacy rejection: %w", err)
-	}
-	return append(data, '\n'), nil
-}
-
-type legacyResponse struct {
-	Type  string `json:"type"`
-	ID    string `json:"id"`
-	OK    bool   `json:"ok"`
-	Error *Error `json:"error"`
-}
-
-const legacyGuidance = "this socket serves coordinated protocol v1 and requires a hello handshake; " +
-	"the old connection-owned RPC protocol has been removed"
 
 func (f *Frame) validate() error {
 	if !isFrameType(f.Type) {

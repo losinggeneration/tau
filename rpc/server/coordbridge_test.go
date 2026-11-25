@@ -542,17 +542,20 @@ func TestCoordinatedBridgeRechecksDeviceAfterDial(t *testing.T) {
 	}
 }
 
-func TestCoordinatedBridgePageForbidsReferrer(t *testing.T) {
+func TestCoordinatedBridgeServesOnlyRPC(t *testing.T) {
 	h := startRelay(t)
-	resp, err := http.Get("http://" + h.bridge.Addr() + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := resp.Body.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK || resp.Header.Get("Referrer-Policy") != "no-referrer" {
-		t.Fatalf("page status %d referrer policy %q", resp.StatusCode, resp.Header.Get("Referrer-Policy"))
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	for _, path := range []string{"/", "/app.js", "/manifest.webmanifest", "/sw.js"} {
+		resp, err := client.Get("http://" + h.bridge.Addr() + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s status %d, want 404", path, resp.StatusCode)
+		}
 	}
 }
 

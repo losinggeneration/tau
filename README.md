@@ -42,8 +42,8 @@ better off with pi itself.
   plugins over gRPC, and MCP servers
 - A coordinator daemon (`tau daemon`) that runs agents as separate processes,
   so closing a client doesn't stop a running agent
-- Clients for the daemon: the terminal UI, a browser client, and a Go client
-  library. Remote access goes over SSH with per-device tokens
+- Clients for the daemon: the terminal UI and a Go client library. Remote
+  access goes over SSH with per-device tokens
 - An embeddable SDK for driving tau from Go code
 - Built-in tools: read, write, edit, bash, grep, find, ls
 
