@@ -143,7 +143,7 @@ func refuseNonRegular(path string) error {
 }
 
 // removeStaleSocket removes a socket nothing is listening on. A live
-// listener, such as a daemon that predates the lock, is left untouched.
+// listener that doesn't hold the lock is left untouched.
 func removeStaleSocket(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {

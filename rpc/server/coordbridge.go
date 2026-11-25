@@ -242,7 +242,7 @@ func (b *CoordinatedBridge) relay(conn *websocket.Conn, link *coord.Link, welcom
 			return
 		}
 		welcome.Operations = slices.DeleteFunc(welcome.Operations, func(op string) bool {
-			return op == coord.TypeSessionDirectory || op == coord.TypeLocateSession || op == coord.OperationSavedSessionLaunch || op == coord.OperationInstanceRestart
+			return op == coord.TypeSessionDirectory || op == coord.TypeLocateSession || op == coord.OperationSavedSessionLaunch
 		})
 		if err := sock.send(welcome); err != nil {
 			return

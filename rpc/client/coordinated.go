@@ -357,7 +357,7 @@ func (c *CoordinatedClient) Err() error {
 // The lookup is only available on the local daemon socket.
 func (c *CoordinatedClient) SessionDirectory(ctx context.Context, cwd string) (string, error) {
 	if !slices.Contains(c.welcome.Operations, coord.TypeSessionDirectory) {
-		return "", errors.New("coordinator does not support looking up saved sessions; restart it with the current Tau version")
+		return "", errors.New("this connection does not support looking up saved sessions")
 	}
 	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeSessionDirectory, CWD: cwd})
 	return reply.CWD, err
@@ -372,7 +372,7 @@ func (c *CoordinatedClient) CanLocateSession() bool {
 // unique prefix. hint is the client's directory and may be empty.
 func (c *CoordinatedClient) LocateSession(ctx context.Context, ref, hint string) (id, project string, err error) {
 	if !c.CanLocateSession() {
-		return "", "", errors.New("coordinator does not support locating sessions; restart it with the current Tau version")
+		return "", "", errors.New("this connection does not support locating sessions")
 	}
 	reply, err := c.request(ctx, coord.Frame{Type: coord.TypeLocateSession, SessionID: ref, CWD: hint})
 	if err != nil {
@@ -418,15 +418,13 @@ func (c *CoordinatedClient) StartInstance(ctx context.Context, cwd string) (*coo
 	return c.StartInstanceWithRequestID(ctx, cwd, "")
 }
 
-// StartInstanceWithRequestID is StartInstance under the caller's request ID,
-// which should come from c.NewStartRequestID.
-// An empty ID uses the UUID version advertised at handshake. The started
-// instance reports it as LaunchRequestID. A recoverable coordinator records
-// the ID before spawning. Reusing it can return the matching live worker,
-// regardless of cwd, but cannot launch a replacement for a recorded intent.
-// An expired ID or a recorded ID with no live match reports
-// *OutcomeUnknownError. A new UUIDv4 intent is rejected on a recoverable
-// coordinator. Other mutations do not deduplicate.
+// StartInstanceWithRequestID is StartInstance under the caller's UUIDv7
+// request ID, which should come from c.NewStartRequestID; empty generates
+// one. The started instance reports it as LaunchRequestID. A recoverable
+// coordinator records the ID before spawning. Reusing it can return the
+// matching live worker, regardless of cwd, but cannot launch a replacement
+// for a recorded intent. An expired ID or a recorded ID with no live match
+// reports *OutcomeUnknownError. Other mutations do not deduplicate.
 func (c *CoordinatedClient) StartInstanceWithRequestID(ctx context.Context, cwd, requestID string) (*coord.Instance, error) {
 	return c.startInstance(ctx, cwd, "", "", requestID)
 }
@@ -445,7 +443,7 @@ func (c *CoordinatedClient) StartNamedSavedSession(ctx context.Context, cwd, ses
 		return nil, errors.New("saved session ID required")
 	}
 	if !slices.Contains(c.welcome.Operations, coord.OperationSavedSessionLaunch) {
-		return nil, errors.New("coordinator does not support launching saved sessions; restart it with the current Tau version")
+		return nil, errors.New("this connection does not support launching saved sessions")
 	}
 	for {
 		inst, err := c.startInstance(ctx, cwd, sessionID, name, "")
@@ -465,10 +463,6 @@ func (c *CoordinatedClient) StartNamedSavedSession(ctx context.Context, cwd, ses
 }
 
 func (c *CoordinatedClient) startInstance(ctx context.Context, cwd, sessionID, name, requestID string) (*coord.Instance, error) {
-	// Older coordinators reject unknown frame fields.
-	if !slices.Contains(c.welcome.Operations, coord.OperationInstanceRename) {
-		name = ""
-	}
 	if requestID == "" {
 		requestID = c.NewStartRequestID()
 	} else if !coord.ValidLaunchRequestID(requestID) {
@@ -487,17 +481,11 @@ func (c *CoordinatedClient) startInstance(ctx context.Context, cwd, sessionID, n
 	return reply.Instance, nil
 }
 
-// NewStartRequestID makes a launch ID using the format and clock advertised
-// in Welcome. Persist it before sending if you may need to reconcile a lost reply.
+// NewStartRequestID makes a UUIDv7 launch ID from the coordinator clock
+// advertised in Welcome. Persist it before sending if you may need to
+// reconcile a lost reply.
 func (c *CoordinatedClient) NewStartRequestID() string {
-	if c.welcome.LaunchRequestVersion != 7 {
-		return NewRequestID()
-	}
-	ms := c.welcome.CoordinatorTimeUnixMS
-	if ms == 0 {
-		return NewLaunchRequestID()
-	}
-	ms += time.Since(c.welcomed).Milliseconds()
+	ms := c.welcome.CoordinatorTimeUnixMS + time.Since(c.welcomed).Milliseconds()
 	id := uuid.New()
 	for i := 5; i >= 0; i-- {
 		id[i] = byte(ms)
@@ -549,9 +537,6 @@ func (c *CoordinatedClient) CommandWithRequestID(ctx context.Context, instanceID
 
 // RenameInstance sets the instance's name. An empty name clears it.
 func (c *CoordinatedClient) RenameInstance(ctx context.Context, instanceID, name string) error {
-	if !slices.Contains(c.welcome.Operations, coord.OperationInstanceRename) {
-		return errors.New("coordinator does not support instance names; restart it with the current Tau version")
-	}
 	name, err := coord.NormalizeInstanceName(name)
 	if err != nil {
 		return err
@@ -581,14 +566,15 @@ func (c *CoordinatedClient) StopInstanceWithRequestID(ctx context.Context, insta
 	return c.stopInstance(ctx, instanceID, "", requestID)
 }
 
-// StopInstanceForRestart gracefully stops the worker after it saves sessionID
-// or the coordinator verifies an existing save for an older worker.
+// StopInstanceForRestart gracefully stops the worker after it saves sessionID,
+// so StartSavedSession can resume it. Restarts need the saved-session launch,
+// which the WebSocket bridge does not relay.
 func (c *CoordinatedClient) StopInstanceForRestart(ctx context.Context, instanceID, sessionID string) error {
 	if sessionID == "" {
 		return errors.New("restart requires a session ID")
 	}
-	if !slices.Contains(c.welcome.Operations, coord.OperationInstanceRestart) {
-		return errors.New("coordinator does not support session-preserving restart")
+	if !slices.Contains(c.welcome.Operations, coord.OperationSavedSessionLaunch) {
+		return errors.New("this connection does not support session-preserving restart")
 	}
 	return c.stopInstance(ctx, instanceID, sessionID, "")
 }

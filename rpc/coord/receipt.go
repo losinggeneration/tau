@@ -35,7 +35,6 @@ const (
 
 var (
 	errExpiredLaunchIntent = errors.New("launch intent predates the current receipt window")
-	errLegacyLaunchIntent  = errors.New("new recoverable launches require a UUIDv7 request_id")
 	errFutureLaunchIntent  = errors.New("launch intent is too far in the future and was not recorded; check the system clocks")
 	errStaleLaunchIntent   = errors.New("launch intent is older than the receipt window and was never recorded; check the system clocks")
 	errReceiptLimit        = errors.New("launch receipt limit reached; retry after receipts expire")
@@ -90,13 +89,15 @@ func openReceiptStore(dir string) (*receiptStore, error) {
 }
 
 func isReceipt(entry os.DirEntry) bool {
-	return entry.Type().IsRegular() && strings.HasSuffix(entry.Name(), ".json")
+	name := entry.Name()
+	return entry.Type().IsRegular() && strings.HasPrefix(name, receiptPrefix) && strings.HasSuffix(name, ".json")
 }
 
-func (s *receiptStore) path(key string) string { return filepath.Join(s.dir, key+".json") }
+// receiptPrefix keeps receipt files apart from the cutoff file.
+const receiptPrefix = "r-"
 
-func receiptTime(key string) time.Time {
-	return launchTime(strings.TrimPrefix(strings.TrimPrefix(key, "r-"), "i-"))
+func (s *receiptStore) path(key string) string {
+	return filepath.Join(s.dir, receiptPrefix+key+".json")
 }
 
 func (s *receiptStore) check(key string, now time.Time) error {
@@ -106,33 +107,21 @@ func (s *receiptStore) check(key string, now time.Time) error {
 }
 
 func (s *receiptStore) checkLocked(key string, now time.Time) error {
-	issued := receiptTime(key)
+	issued := launchTime(key)
 	if _, err := os.Stat(s.path(key)); !errors.Is(err, os.ErrNotExist) {
 		if err != nil {
 			return fmt.Errorf("check launch receipt: %w", err)
 		}
 		return os.ErrExist
 	}
-	if legacy, ok := strings.CutPrefix(key, "r-"); ok {
-		if issued.IsZero() {
-			// Unprefixed UUIDv4 receipts predate the separate key namespaces.
-			if _, err := os.Stat(s.path(legacy)); !errors.Is(err, os.ErrNotExist) {
-				if err != nil {
-					return fmt.Errorf("check legacy launch receipt: %w", err)
-				}
-				return os.ErrExist
-			}
-			return errLegacyLaunchIntent
-		}
-		// Pruning raises the durable cutoff to every removed intent before
-		// deleting it, so only intents at or before the cutoff can have been
-		// recorded and forgotten. A later one with no receipt never was.
-		if !issued.After(s.cutoff) {
-			return errExpiredLaunchIntent
-		}
-		if !issued.After(now.Add(-launchReceiptTTL)) {
-			return errStaleLaunchIntent
-		}
+	// Pruning raises the durable cutoff to every removed intent before
+	// deleting it, so only intents at or before the cutoff can have been
+	// recorded and forgotten. A later one with no receipt never was.
+	if !issued.After(s.cutoff) {
+		return errExpiredLaunchIntent
+	}
+	if !issued.After(now.Add(-launchReceiptTTL)) {
+		return errStaleLaunchIntent
 	}
 	if issued.After(now.Add(launchClockSkew)) {
 		return errFutureLaunchIntent
@@ -209,8 +198,6 @@ func (s *receiptStore) saveCutoff(cutoff time.Time) error {
 }
 
 // prune returns the keys for which it both proved exit and removed a receipt.
-// Old UUIDv4 receipts can be kept for a surviving worker, but can never create
-// a new intent, so they need no time-based tombstone.
 func (s *receiptStore) prune(now time.Time) (map[string]struct{}, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -224,8 +211,8 @@ func (s *receiptStore) prune(now time.Time) (map[string]struct{}, error) {
 		if !isReceipt(entry) {
 			continue
 		}
-		key := strings.TrimSuffix(entry.Name(), ".json")
-		issued := receiptTime(key)
+		key := strings.TrimSuffix(strings.TrimPrefix(entry.Name(), receiptPrefix), ".json")
+		issued := launchTime(key)
 		if issued.After(cutoff) && issued.After(s.cutoff) {
 			continue
 		}
@@ -236,7 +223,7 @@ func (s *receiptStore) prune(now time.Time) (map[string]struct{}, error) {
 		if !exited {
 			continue
 		}
-		if !strings.HasPrefix(key, "i-") && issued.After(s.cutoff) {
+		if issued.After(s.cutoff) {
 			if err := s.saveCutoff(issued); err != nil {
 				return removed, err
 			}

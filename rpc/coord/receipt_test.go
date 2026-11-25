@@ -19,7 +19,7 @@ func TestLaunchReceiptPruningCannotMakeAnOldIntentNew(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	key := receiptKey("", launchIDAt(now.Add(time.Second)))
+	key := launchIDAt(now.Add(time.Second))
 	life, err := store.create(key, launchReceipt{})
 	if err != nil {
 		t.Fatal(err)
@@ -57,14 +57,14 @@ func TestLaunchReceiptPruningCannotMakeAnOldIntentNew(t *testing.T) {
 		t.Fatalf("pruned intent is eligible again: %v", err)
 	}
 	// A transient clock jump while pruning must not block unrelated fresh IDs.
-	fresh := receiptKey("", launchIDAt(now.Add(2*time.Second)))
+	fresh := launchIDAt(now.Add(2 * time.Second))
 	if err := store.check(fresh, now); err != nil {
 		t.Fatalf("fresh intent rejected after clock correction: %v", err)
 	}
 }
 
 func TestNewReceiptStoreRejectsIntentsFromBeforeItExisted(t *testing.T) {
-	key := receiptKey("", launchIDAt(time.Now().Add(-time.Minute)))
+	key := launchIDAt(time.Now().Add(-time.Minute))
 	dir := filepath.Join(t.TempDir(), "receipts")
 	for range 2 {
 		store, err := openReceiptStore(dir)
@@ -101,13 +101,13 @@ func TestLaunchReceiptClockRefusalsOnlyCoverUnrecordedIntents(t *testing.T) {
 		{"stale after cutoff", now.Add(-2 * launchReceiptTTL), errStaleLaunchIntent},
 		{"future", now.Add(launchClockSkew + time.Minute), errFutureLaunchIntent},
 	} {
-		if err := store.check(receiptKey("", launchIDAt(tc.issued)), now); !errors.Is(err, tc.want) {
+		if err := store.check(launchIDAt(tc.issued), now); !errors.Is(err, tc.want) {
 			t.Errorf("%s: got %v, want %v", tc.name, err, tc.want)
 		}
 	}
 
 	// A recorded intent never reports a clock refusal, before or after pruning.
-	key := receiptKey("", launchIDAt(now))
+	key := launchIDAt(now)
 	life, err := store.create(key, launchReceipt{})
 	if err != nil {
 		t.Fatal(err)

@@ -28,7 +28,7 @@ func fakeCoordinator(t *testing.T, eventBuffer int, opts ...CoordinatedOption) (
 	if len(opts) > 0 {
 		assign = func(hello coord.Frame) string { return hello.ClientID }
 	}
-	c, srv, hello, err := dialFake(t, eventBuffer, assign, 0, opts...)
+	c, srv, hello, err := dialFake(t, eventBuffer, assign, opts...)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -37,7 +37,7 @@ func fakeCoordinator(t *testing.T, eventBuffer int, opts ...CoordinatedOption) (
 
 // dialFake is fakeCoordinator with the welcome's client ID chosen by assign
 // and the dial error returned.
-func dialFake(t *testing.T, eventBuffer int, assign func(hello coord.Frame) string, launchVersion int, opts ...CoordinatedOption) (*CoordinatedClient, *coord.Link, coord.Frame, error) {
+func dialFake(t *testing.T, eventBuffer int, assign func(hello coord.Frame) string, opts ...CoordinatedOption) (*CoordinatedClient, *coord.Link, coord.Frame, error) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "c.sock")
 	ln, err := net.Listen("unix", path)
@@ -65,7 +65,7 @@ func dialFake(t *testing.T, eventBuffer int, assign func(hello coord.Frame) stri
 		link := coord.NewLink(conn)
 		hello, err := link.Read()
 		if err == nil {
-			err = link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, Generation: "gen-1", ClientID: assign(hello), LaunchRequestVersion: launchVersion})
+			err = link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, Generation: "gen-1", ClientID: assign(hello), CoordinatorTimeUnixMS: time.Now().UnixMilli()})
 		}
 		ready <- accepted{link: link, hello: hello, err: err}
 	}()
@@ -145,7 +145,7 @@ func TestCoordinatedWebSocketClient(t *testing.T) {
 				t.Error(err)
 			}
 		}()
-		if err := ws.WriteJSON(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, ClientID: "bridge-assigned", Generation: "generation", LaunchRequestVersion: 7, CoordinatorTimeUnixMS: serverMS}); err != nil {
+		if err := ws.WriteJSON(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Role: coord.RoleClient, ClientID: "bridge-assigned", Generation: "generation", CoordinatorTimeUnixMS: serverMS}); err != nil {
 			t.Error(err)
 			return
 		}
@@ -508,7 +508,7 @@ func fakeWorker(ctx context.Context, path string, req coord.LaunchRequest, comma
 	link, _, err := coord.Dial(ctx, path, coord.Frame{
 		Role:     coord.RoleWorker,
 		Token:    req.Token,
-		Instance: &coord.Instance{ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: cmp.Or(req.SessionID, "sess-"+req.InstanceID)},
+		Instance: &coord.Instance{ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: cmp.Or(req.SessionID, "sess-"+req.InstanceID), LaunchRequestID: req.LaunchRequestID},
 	})
 	if err != nil {
 		return
@@ -758,32 +758,12 @@ func TestCoordinatedClientStableClientID(t *testing.T) {
 }
 
 func TestCoordinatedClientRejectsReassignedClientID(t *testing.T) {
-	_, _, hello, err := dialFake(t, coordinatedEventBuffer, func(coord.Frame) string { return "other" }, 0, WithClientID("client-a"))
+	_, _, hello, err := dialFake(t, coordinatedEventBuffer, func(coord.Frame) string { return "other" }, WithClientID("client-a"))
 	if hello.ClientID != "client-a" {
 		t.Fatalf("hello client id = %q", hello.ClientID)
 	}
 	if !errors.Is(err, ErrInvalidClientID) {
 		t.Fatalf("dial error = %v, want ErrInvalidClientID", err)
-	}
-}
-
-func TestCoordinatedClientUsesAdvertisedLaunchIDVersion(t *testing.T) {
-	c, srv, _, err := dialFake(t, coordinatedEventBuffer, func(coord.Frame) string { return "assigned" }, 7)
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := c.StartInstance(t.Context(), "/project")
-		done <- err
-	}()
-	f := readFrame(t, srv)
-	if f.Type != coord.TypeStartInstance || !coord.ValidLaunchRequestID(f.RequestID) || coord.ValidRequestID(f.RequestID) {
-		t.Fatalf("expected UUIDv7 start: %+v", f)
-	}
-	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: f.ID, Instance: &coord.Instance{ID: "inst", LaunchRequestID: f.RequestID}})
-	if err := <-done; err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -824,7 +804,7 @@ func TestCoordinatedClientRequestIDs(t *testing.T) {
 		done <- err
 	}()
 	f = readFrame(t, srv)
-	if f.Type != coord.TypeStartInstance || !coord.ValidRequestID(f.RequestID) {
+	if f.Type != coord.TypeStartInstance || !coord.ValidLaunchRequestID(f.RequestID) {
 		t.Fatalf("start frame = %+v", f)
 	}
 	sendFrames(t, srv, coord.Frame{Type: coord.TypeResponse, ID: f.ID, RequestID: f.RequestID, Instance: &coord.Instance{ID: "inst-b", LaunchRequestID: f.RequestID}})
@@ -832,6 +812,9 @@ func TestCoordinatedClientRequestIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := c.StartInstanceWithRequestID(ctx, "/project", supplied); !errors.Is(err, ErrInvalidRequestID) {
+		t.Errorf("start with UUIDv4 request id: error = %v", err)
+	}
 	invalid := []string{"not-a-uuid", strings.ToUpper(supplied), "00000000-0000-1000-8000-000000000000"}
 	for _, id := range invalid {
 		if _, err := c.CommandWithRequestID(ctx, "inst-a", id, Command{Type: "prompt"}); !errors.Is(err, ErrInvalidRequestID) {
@@ -1328,12 +1311,15 @@ func TestStartSavedSessionWaitsForBusyOwner(t *testing.T) {
 	}
 }
 
-func TestSavedSessionOperationsRequireCoordinatorSupport(t *testing.T) {
+func TestSavedSessionOperationsRequireAdvertisedSupport(t *testing.T) {
 	c, _, _ := fakeCoordinator(t, 16)
-	if _, err := c.StartSavedSession(t.Context(), "/work", uuid.NewString()); err == nil || !strings.Contains(err.Error(), "restart") {
-		t.Fatalf("old coordinator launch: %v", err)
+	if _, err := c.StartSavedSession(t.Context(), "/work", uuid.NewString()); err == nil || !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("unadvertised launch: %v", err)
 	}
-	if _, err := c.SessionDirectory(t.Context(), "/work"); err == nil || !strings.Contains(err.Error(), "restart") {
-		t.Fatalf("old coordinator lookup: %v", err)
+	if _, err := c.SessionDirectory(t.Context(), "/work"); err == nil || !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("unadvertised lookup: %v", err)
+	}
+	if err := c.StopInstanceForRestart(t.Context(), "inst", uuid.NewString()); err == nil || !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("unadvertised restart: %v", err)
 	}
 }

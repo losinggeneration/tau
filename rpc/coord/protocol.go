@@ -53,26 +53,19 @@ const (
 // OperationSavedSessionLaunch advertises that start_instance honors session_id.
 const OperationSavedSessionLaunch = "start_saved_session"
 
-// OperationInstancePrompts opts clients into prompt previews and tells workers
-// the coordinator accepts prompt previews in registrations.
+// OperationInstancePrompts opts clients into prompt previews.
 const OperationInstancePrompts = "instance_prompts"
 
-// OperationInstanceNames opts clients into session names and tells workers
-// the coordinator accepts them.
+// OperationInstanceNames opts clients into session names.
 const OperationInstanceNames = "instance_names"
 
-// OperationInstanceBuild opts local clients into the outdated indicator and
-// allows workers to report their build identity in registrations.
+// OperationInstanceBuild opts local clients into the outdated indicator.
 const OperationInstanceBuild = "instance_build"
-
-// OperationInstanceRestart advertises session-preserving shutdown support.
-const OperationInstanceRestart = "instance_restart"
 
 // OperationInstanceReplacement opts clients into instance_replacement frames.
 const OperationInstanceReplacement = "instance_replacement"
 
-// OperationInstanceRename opts clients into instance names and tells workers
-// the coordinator accepts them.
+// OperationInstanceRename opts clients into instance names.
 const OperationInstanceRename = "instance_rename"
 
 // MaxInstanceNameBytes bounds a user-assigned instance name.
@@ -163,10 +156,9 @@ func ValidRequestID(id string) bool {
 	return err == nil && parsed.Version() == 4 && parsed.Variant() == uuid.RFC4122 && parsed.String() == id
 }
 
-// ValidLaunchRequestID reports whether id is a canonical UUIDv7 or a legacy
-// UUIDv4. Only UUIDv7 can reserve a new intent on a recoverable coordinator.
+// ValidLaunchRequestID reports whether id is a canonical UUIDv7.
 func ValidLaunchRequestID(id string) bool {
-	return ValidRequestID(id) || !launchTime(id).IsZero()
+	return !launchTime(id).IsZero()
 }
 
 func launchTime(id string) time.Time {
@@ -209,13 +201,9 @@ type Frame struct {
 	Instances  []Instance      `json:"instances,omitempty"`
 	Operations []string        `json:"operations,omitempty"`
 	Limits     *Limits         `json:"limits,omitempty"`
-	// LaunchRequestVersion advertises the preferred UUID version for new starts.
-	// An absent value means UUIDv4.
-	LaunchRequestVersion int `json:"launch_request_version,omitempty"`
 	// CoordinatorTimeUnixMS is the coordinator's wall clock when it sent a
 	// client welcome. Clients derive UUIDv7 launch IDs from it plus their own
-	// monotonic elapsed time, so their wall clock does not matter. An absent
-	// value means an older coordinator; use the local clock.
+	// monotonic elapsed time, so their wall clock does not matter.
 	CoordinatorTimeUnixMS int64 `json:"coordinator_time_unix_ms,omitempty"`
 	// Name labels the worker launched by start_instance.
 	Name string `json:"name,omitempty"`

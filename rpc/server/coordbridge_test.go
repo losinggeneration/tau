@@ -78,7 +78,7 @@ func startRelayWith(t *testing.T, configure func(*relayHarness)) *relayHarness {
 			Role:  coord.RoleWorker,
 			Token: req.Token,
 			Instance: &coord.Instance{
-				ID: req.InstanceID, NodeID: "node", SessionID: "session-" + req.InstanceID, CWD: req.CWD,
+				ID: req.InstanceID, NodeID: "node", SessionID: "session-" + req.InstanceID, CWD: req.CWD, LaunchRequestID: req.LaunchRequestID,
 			},
 		})
 		if err != nil {
@@ -288,7 +288,7 @@ func TestCoordinatedBridgeClientsShareCoordinator(t *testing.T) {
 
 	// Credentials and worker identity a browser smuggles in are dropped.
 	start, err := json.Marshal(map[string]any{
-		"type": "start_instance", "id": "start", "cwd": h.cwd,
+		"type": "start_instance", "id": "start", "request_id": uuid.Must(uuid.NewV7()).String(), "cwd": h.cwd,
 		"role": "worker", "token": device.Token, "client_id": "spoof",
 		"instance": map[string]any{"instance_id": "forged", "node_id": "evil"},
 	})
@@ -341,7 +341,7 @@ func TestCoordinatedBridgeRelaysRequestCorrelationWithoutTrust(t *testing.T) {
 	welcomeA, _ := relayRead(t, a)
 	relayRead(t, b)
 
-	launchID := uuid.NewString()
+	launchID := uuid.Must(uuid.NewV7()).String()
 	relaySend(t, a, `{"type":"start_instance","id":"start","request_id":"`+launchID+`","client_id":"spoof","cwd":"`+h.cwd+`"}`)
 	started := relayResponse(t, a, "start")
 	instance, _ := started["instance_id"].(string)
@@ -574,7 +574,7 @@ func TestCoordinatedBridgeRevocationCutsBothDirections(t *testing.T) {
 	relayRead(t, subscriber)
 	relayRead(t, sender)
 
-	relaySend(t, subscriber, `{"type":"start_instance","id":"start","cwd":"`+h.cwd+`"}`)
+	relaySend(t, subscriber, `{"type":"start_instance","id":"start","request_id":"`+uuid.Must(uuid.NewV7()).String()+`","cwd":"`+h.cwd+`"}`)
 	instance, _ := relayResponse(t, subscriber, "start")["instance_id"].(string)
 	w := h.worker(t)
 	relaySend(t, subscriber, `{"type":"attach","id":"attach","instance_id":"`+instance+`"}`)

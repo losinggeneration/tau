@@ -22,7 +22,6 @@ type receiptStore struct{ mu sync.RWMutex }
 var (
 	errNoReceipts          = errors.New("worker launch receipts require Unix file locks")
 	errExpiredLaunchIntent = errNoReceipts
-	errLegacyLaunchIntent  = errNoReceipts
 	errFutureLaunchIntent  = errNoReceipts
 	errStaleLaunchIntent   = errNoReceipts
 	errReceiptLimit        = errNoReceipts

@@ -398,7 +398,7 @@ func TestRestartTUIInstancePreservesUntouchedSession(t *testing.T) {
 					return
 				}
 				assert.NoError(t, server.NewWorker(rt, nil, nil).Run(ctx, path, coord.Instance{
-					ID: req.InstanceID, Name: req.Name, NodeID: "node", CWD: req.CWD, SessionID: req.SessionID, PID: os.Getpid(),
+					ID: req.InstanceID, Name: req.Name, NodeID: "node", CWD: req.CWD, SessionID: req.SessionID, PID: os.Getpid(), LaunchRequestID: req.LaunchRequestID,
 				}, req.Token))
 			})
 			return nil

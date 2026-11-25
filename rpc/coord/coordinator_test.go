@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -64,17 +63,10 @@ func startCoordinator(t *testing.T, launch func(*harness) LaunchFunc, timeout ti
 
 // spawnWorker models a detached worker: it dials back with the launch token.
 func (h *harness) spawnWorker() LaunchFunc {
-	return h.spawnWorkerWithPID(42)
-}
-
-func (h *harness) spawnWorkerWithPID(pid int) LaunchFunc {
-	return h.spawnWorkerWithOperations(pid)
-}
-
-func (h *harness) spawnWorkerWithOperations(pid int, operations ...string) LaunchFunc {
+	const pid = 42
 	return func(_ context.Context, req LaunchRequest) error {
 		go func() {
-			hello := Frame{Role: RoleWorker, Token: req.Token, Operations: operations, Instance: &Instance{
+			hello := Frame{Role: RoleWorker, Token: req.Token, Instance: &Instance{
 				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: cmp.Or(req.SessionID, "session-"+req.InstanceID), PID: pid,
 				LaunchRequestID: req.LaunchRequestID,
 			}}
@@ -189,9 +181,13 @@ func wantError(t *testing.T, f Frame, id, code string) {
 	}
 }
 
+func newLaunchID() string {
+	return uuid.Must(uuid.NewV7()).String()
+}
+
 func (h *harness) start(c *Link, id string) (Instance, *fakeWorker) {
 	h.t.Helper()
-	mustSend(h.t, c, Frame{Type: TypeStartInstance, ID: id, CWD: h.cwd})
+	mustSend(h.t, c, Frame{Type: TypeStartInstance, ID: id, RequestID: newLaunchID(), CWD: h.cwd})
 	w := h.nextWorker()
 	resp := readFrame(h.t, c)
 	if resp.Type != TypeResponse || resp.ID != id || resp.Error != nil || resp.Instance == nil {
@@ -260,7 +256,7 @@ func TestWorkerTokenIsSingleUseAndBoundToInstance(t *testing.T) {
 	}
 	h := startCoordinator(t, record, 200*time.Millisecond)
 	c, _ := h.client()
-	mustSend(t, c, Frame{Type: TypeStartInstance, ID: "s1", CWD: h.cwd})
+	mustSend(t, c, Frame{Type: TypeStartInstance, ID: "s1", RequestID: newLaunchID(), CWD: h.cwd})
 	var req LaunchRequest
 	deadline := time.Now().Add(testTimeout)
 	for {
@@ -305,7 +301,7 @@ func TestLaunchErrorClearsPendingAndRedactsToken(t *testing.T) {
 	h := startCoordinator(t, failing, launchTimeout)
 	c, _ := h.client()
 	for range 2 {
-		resp := request(t, c, Frame{Type: TypeStartInstance, ID: "same", CWD: h.cwd})
+		resp := request(t, c, Frame{Type: TypeStartInstance, ID: "same", RequestID: newLaunchID(), CWD: h.cwd})
 		wantError(t, resp, "same", CodeLaunchFailed)
 		if !strings.Contains(resp.Error.Message, "[redacted]") || !strings.Contains(resp.Error.Message, "spawn failed") {
 			t.Fatalf("launch error message = %q", resp.Error.Message)
@@ -320,8 +316,8 @@ func TestLaunchErrorClearsPendingAndRedactsToken(t *testing.T) {
 func TestStartRejectsRelativeCWD(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	c, _ := h.client()
-	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "1", CWD: "project"}), "1", CodeInvalidFrame)
-	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "2"}), "2", CodeInvalidFrame)
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "1", RequestID: newLaunchID(), CWD: "project"}), "1", CodeInvalidFrame)
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "2", RequestID: newLaunchID()}), "2", CodeInvalidFrame)
 }
 
 func TestCommandTargetValidation(t *testing.T) {
@@ -497,7 +493,7 @@ func TestWatchInstancesOnlyDeliversSummaries(t *testing.T) {
 
 func TestInstanceWatchSendsSessionNames(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
-	legacy, _ := h.client()
+	plain, _ := h.client()
 	watcher, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceNames}})
 	if err != nil {
 		t.Fatal(err)
@@ -507,15 +503,15 @@ func TestInstanceWatchSendsSessionNames(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	inst, w := h.start(legacy, "start")
-	request(t, legacy, Frame{Type: TypeWatchInstances, ID: "legacy"})
+	inst, w := h.start(plain, "start")
+	request(t, plain, Frame{Type: TypeWatchInstances, ID: "plain"})
 	request(t, watcher, Frame{Type: TypeWatchInstances, ID: "watch"})
 	inst.SessionName = "Auth worktree"
 	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
 	for _, tc := range []struct {
 		link *Link
 		want string
-	}{{watcher, "Auth worktree"}, {legacy, ""}} {
+	}{{watcher, "Auth worktree"}, {plain, ""}} {
 		f := readFrame(t, tc.link)
 		if f.Type != TypeInstanceUpdate || f.Instance == nil || f.Instance.SessionName != tc.want {
 			t.Fatalf("watch update = %+v, want name %q", f, tc.want)
@@ -538,8 +534,8 @@ func TestInstanceWatchSendsSessionNames(t *testing.T) {
 
 func TestInstanceNamesRequireOperation(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
-	legacy, _ := h.client()
-	named, welcome, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceRename}})
+	plain, _ := h.client()
+	named, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceRename}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,18 +544,15 @@ func TestInstanceNamesRequireOperation(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if !slices.Contains(welcome.Operations, OperationInstanceRename) {
-		t.Fatalf("welcome operations = %v", welcome.Operations)
-	}
-	inst, w := h.start(legacy, "start")
-	request(t, legacy, Frame{Type: TypeWatchInstances, ID: "legacy"})
+	inst, w := h.start(plain, "start")
+	request(t, plain, Frame{Type: TypeWatchInstances, ID: "plain"})
 	request(t, named, Frame{Type: TypeWatchInstances, ID: "watch"})
 	inst.Name = "API work"
 	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
 	for _, tc := range []struct {
 		link *Link
 		want string
-	}{{named, "API work"}, {legacy, ""}} {
+	}{{named, "API work"}, {plain, ""}} {
 		if f := readFrame(t, tc.link); f.Type != TypeInstanceUpdate || f.Instance == nil || f.Instance.Name != tc.want {
 			t.Fatalf("watch update = %+v, want name %q", f, tc.want)
 		}
@@ -573,7 +566,7 @@ func TestInstanceNamesRequireOperation(t *testing.T) {
 func TestStartInstanceRejectsInvalidName(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
 	c, _ := h.client()
-	f := request(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: t.TempDir(), Name: "bad\x00name"})
+	f := request(t, c, Frame{Type: TypeStartInstance, ID: "start", RequestID: newLaunchID(), CWD: t.TempDir(), Name: "bad\x00name"})
 	if f.Error == nil || f.Error.Code != CodeInvalidFrame {
 		t.Fatalf("start reply = %+v", f)
 	}
@@ -581,7 +574,7 @@ func TestStartInstanceRejectsInvalidName(t *testing.T) {
 
 func TestInstanceWatchCachesFirstPrompt(t *testing.T) {
 	h := startCoordinator(t, nil, launchTimeout)
-	legacy, _ := h.client()
+	plain, _ := h.client()
 	watcher, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstancePrompts}})
 	if err != nil {
 		t.Fatal(err)
@@ -591,15 +584,15 @@ func TestInstanceWatchCachesFirstPrompt(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	inst, w := h.start(legacy, "start")
-	request(t, legacy, Frame{Type: TypeWatchInstances, ID: "legacy"})
+	inst, w := h.start(plain, "start")
+	request(t, plain, Frame{Type: TypeWatchInstances, ID: "plain"})
 	request(t, watcher, Frame{Type: TypeWatchInstances, ID: "watch"})
 	inst.FirstPrompt = "Fix the picker"
 	mustSend(t, w.link, Frame{Type: TypeRegister, Instance: &inst})
 	for _, tc := range []struct {
 		link *Link
 		want string
-	}{{watcher, "Fix the picker"}, {legacy, ""}} {
+	}{{watcher, "Fix the picker"}, {plain, ""}} {
 		f := readFrame(t, tc.link)
 		if f.Type != TypeInstanceUpdate || f.Instance == nil || f.Instance.FirstPrompt != tc.want {
 			t.Fatalf("watch update = %+v, want prompt %q", f, tc.want)
@@ -635,7 +628,7 @@ func TestOutdatedIndicatorTracksLaunchBuild(t *testing.T) {
 	var build atomic.Value
 	build.Store("build-a")
 	h := startCoordinator(t, nil, launchTimeout, WithWorkerBuild(func() string { return build.Load().(string) }))
-	legacy, _ := h.client()
+	plain, _ := h.client()
 	watcher, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceBuild}})
 	if err != nil {
 		t.Fatal(err)
@@ -645,7 +638,7 @@ func TestOutdatedIndicatorTracksLaunchBuild(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	inst, w := h.start(legacy, "start")
+	inst, w := h.start(plain, "start")
 	request(t, watcher, Frame{Type: TypeWatchInstances, ID: "watch"})
 	for _, buildID := range []string{"", "build-a"} {
 		inst.BuildID = buildID
@@ -663,149 +656,13 @@ func TestOutdatedIndicatorTracksLaunchBuild(t *testing.T) {
 	if len(list.Instances) != 1 || !list.Instances[0].Outdated || list.Instances[0].BuildID != "" {
 		t.Fatalf("outdated list = %+v", list.Instances)
 	}
-	if list := request(t, legacy, Frame{Type: TypeListInstances, ID: "legacy"}); len(list.Instances) != 1 || list.Instances[0].Outdated || list.Instances[0].BuildID != "" {
-		t.Fatalf("legacy list = %+v", list.Instances)
-	}
-}
-
-func TestOutdatedIndicatorForLegacyLocalWorker(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("requires Linux Unix peer credentials and procfs")
-	}
-	if _, err := os.Stat("/proc/self/exe"); err != nil {
-		t.Skipf("cannot inspect process executable: %v", err)
-	}
-	installed := filepath.Join(t.TempDir(), "tau")
-	if err := os.Symlink("/proc/self/exe", installed); err != nil {
-		t.Fatal(err)
-	}
-	// The test process is the Unix peer, simulating a worker built before
-	// build reporting existed. Its executable will not change on update.
-	launchBuild := func() string { return ExecutableBuildID(installed) }
-	h := startCoordinator(t, func(h *harness) LaunchFunc { return h.spawnWorkerWithPID(os.Getpid()) }, launchTimeout, WithWorkerBuild(launchBuild))
-	h.client() // wait for the coordinator to accept connections
-	c, _, err := Dial(t.Context(), h.path, Frame{Role: RoleClient, Operations: []string{OperationInstanceBuild}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := c.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	h.start(c, "start")
-	if f := request(t, c, Frame{Type: TypeWatchInstances, ID: "before"}); len(f.Instances) != 1 || f.Instances[0].Outdated {
-		t.Fatalf("current legacy worker marked outdated: %+v", f.Instances)
-	}
-	newExe := installed + ".next"
-	if err := os.WriteFile(newExe, []byte("updated"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(newExe, installed); err != nil {
-		t.Fatal(err)
-	}
-	mustSend(t, c, Frame{Type: TypeListInstances, ID: "after"})
-	f := readFrame(t, c)
-	if f.Type != TypeInstanceUpdate || f.Instance == nil || !f.Instance.Outdated {
-		t.Fatalf("legacy worker must be marked outdated after update, got %s: %+v %+v", f.Type, f.Instance, f.Instances)
-	}
-	if f := readFrame(t, c); f.ID != "after" || len(f.Instances) != 1 || !f.Instances[0].Outdated {
-		t.Fatalf("legacy worker not marked outdated in list: %+v", f.Instances)
-	}
-}
-
-func TestLegacyRestartRequiresSavedSession(t *testing.T) {
-	dir := t.TempDir()
-	h := startCoordinator(t, nil, launchTimeout, WithSessionDirectory(func(context.Context, string) (string, error) { return dir, nil }))
-	c, _ := h.client()
-	inst, w := h.start(c, "start")
-	storage, err := sessionpkg.NewStorageAt(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	header := sessionpkg.NewHeader(inst.CWD, nil, nil)
-	inst.SessionID = header.ID
-	mustSend(t, w.link, Frame{Type: TypeRegister, ID: "bind", Instance: &inst})
-	if f := w.next(t); f.ID != "bind" || f.Error != nil {
-		t.Fatalf("register saved session: %+v", f)
-	}
-	stop := Frame{Type: TypeStopInstance, ID: "restart", InstanceID: inst.ID, SessionID: header.ID}
-	if f := request(t, c, stop); f.Error == nil || !strings.Contains(f.Error.Message, "no resumable save") {
-		t.Errorf("unsaved legacy session should be left running: %+v (%v)", f, f.Error)
-	}
-	invalid := header
-	invalid.Type = sessionpkg.EntryTypeMessage
-	invalidSave, err := storage.Create(invalid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := invalidSave.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if f := request(t, c, stop); f.Error == nil || f.Error.Code != CodeUnavailable {
-		t.Fatalf("invalid saved header should leave the worker running: %+v (%v)", f, f.Error)
-	}
-	if err := os.Remove(invalidSave.Path()); err != nil {
-		t.Fatal(err)
-	}
-	writer, err := storage.Create(header)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := writer.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	// A lost caller does not cancel a switch already queued at an old worker.
-	other, _ := h.client()
-	switchSession := Frame{Type: TypeCommand, ID: "switch", InstanceID: inst.ID, Command: json.RawMessage(`{"type":"fork"}`)}
-	mustSend(t, other, switchSession)
-	pendingSwitch := w.next(t)
-	if err := other.Close(); err != nil {
-		t.Fatal(err)
-	}
-	wantError(t, request(t, c, stop), "restart", CodeBusy)
-	mustSend(t, w.link, Frame{Type: TypeResponse, ID: pendingSwitch.ID, Result: json.RawMessage(`{"ok":false}`)})
-	mustSend(t, w.link, Frame{Type: TypeRegister, ID: "ready", Instance: &inst})
-	if f := w.next(t); f.ID != "ready" || f.Error != nil {
-		t.Fatalf("worker ready: %+v", f)
-	}
-	mustSend(t, c, stop)
-	type routed struct {
-		f   Frame
-		err error
-	}
-	worker, caller := make(chan Frame, 1), make(chan routed, 1)
-	go func() { worker <- <-w.frames }()
-	go func() { f, err := c.Read(); caller <- routed{f, err} }()
-	select {
-	case r := <-caller:
-		t.Fatalf("saved legacy worker refused restart: %v / %v", r.f.Error, r.err)
-	case f := <-worker:
-		if string(f.Command) != `{"type":"shutdown"}` || f.SessionID != header.ID {
-			t.Fatalf("not a legacy graceful shutdown: %+v", f)
-		}
-		other, _ := h.client()
-		wantError(t, request(t, other, switchSession), "switch", CodeBusy)
-		mustSend(t, w.link, Frame{Type: TypeResponse, ID: f.ID, Result: json.RawMessage(`{"ok":true}`)})
-	case <-time.After(testTimeout):
-		t.Fatal("restart neither routed nor rejected")
-	}
-	select {
-	case r := <-caller:
-		if r.err != nil || r.f.ID != stop.ID || r.f.Error != nil {
-			t.Fatalf("shutdown response: %+v / %v", r.f, r.err)
-		}
-	case <-time.After(testTimeout):
-		t.Fatal("shutdown response was not forwarded")
+	if list := request(t, plain, Frame{Type: TypeListInstances, ID: "plain"}); len(list.Instances) != 1 || list.Instances[0].Outdated || list.Instances[0].BuildID != "" {
+		t.Fatalf("plain list = %+v", list.Instances)
 	}
 }
 
 func TestRestartAnnouncesReplacementToAttachedClients(t *testing.T) {
-	h := startCoordinator(t, func(h *harness) LaunchFunc {
-		return h.spawnWorkerWithOperations(42, OperationInstanceRestart)
-	}, launchTimeout)
+	h := startCoordinator(t, nil, launchTimeout)
 	restarter, _ := h.client()
 	inst, w := h.start(restarter, "start")
 	inst.SessionID = uuid.NewString()
@@ -820,8 +677,8 @@ func TestRestartAnnouncesReplacementToAttachedClients(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = viewer.Close() })
-	older, _ := h.client()
-	for _, c := range []*Link{viewer, older} {
+	plain, _ := h.client()
+	for _, c := range []*Link{viewer, plain} {
 		if f := request(t, c, Frame{Type: TypeAttach, ID: "attach", InstanceID: inst.ID}); f.Error != nil {
 			t.Fatalf("attach: %v", f.Error)
 		}
@@ -829,6 +686,9 @@ func TestRestartAnnouncesReplacementToAttachedClients(t *testing.T) {
 
 	mustSend(t, restarter, Frame{Type: TypeStopInstance, ID: "stop", InstanceID: inst.ID, SessionID: inst.SessionID})
 	shutdown := w.next(t)
+	if want := `{"args":{"expected_session_id":"` + inst.SessionID + `"},"type":"shutdown"}`; string(shutdown.Command) != want {
+		t.Fatalf("restart shutdown = %s, want %s", shutdown.Command, want)
+	}
 	mustSend(t, w.link, Frame{Type: TypeResponse, ID: shutdown.ID, Result: json.RawMessage(`{"ok":true}`)})
 	if f := readFrame(t, restarter); f.ID != "stop" || f.Error != nil {
 		t.Fatalf("stop reply: %+v", f)
@@ -842,11 +702,11 @@ func TestRestartAnnouncesReplacementToAttachedClients(t *testing.T) {
 	if f := readFrame(t, viewer); f.Type != TypeEvent || f.Error == nil || f.Error.Code != CodeWorkerLinkLost {
 		t.Fatalf("link loss = %+v", f)
 	}
-	if f := readFrame(t, older); f.Type != TypeEvent || f.Error == nil {
-		t.Fatalf("older client link loss = %+v", f)
+	if f := readFrame(t, plain); f.Type != TypeEvent || f.Error == nil {
+		t.Fatalf("plain client link loss = %+v", f)
 	}
 
-	mustSend(t, restarter, Frame{Type: TypeStartInstance, ID: "restart", CWD: h.cwd, SessionID: inst.SessionID})
+	mustSend(t, restarter, Frame{Type: TypeStartInstance, ID: "restart", RequestID: newLaunchID(), CWD: h.cwd, SessionID: inst.SessionID})
 	next := h.nextWorker()
 	if f := readFrame(t, restarter); f.Error != nil || f.Instance == nil {
 		t.Fatalf("restart start: %+v", f)
@@ -855,8 +715,8 @@ func TestRestartAnnouncesReplacementToAttachedClients(t *testing.T) {
 	if f.Type != TypeInstanceReplacement || f.InstanceID != inst.ID || f.Instance == nil || f.Instance.ID != next.req.InstanceID {
 		t.Fatalf("replacement = %+v", f)
 	}
-	if f := request(t, older, Frame{Type: TypeListInstances, ID: "list"}); f.ID != "list" {
-		t.Fatalf("older client received %+v", f)
+	if f := request(t, plain, Frame{Type: TypeListInstances, ID: "list"}); f.ID != "list" {
+		t.Fatalf("plain client received %+v", f)
 	}
 }
 
@@ -955,9 +815,9 @@ func TestCommandCorrelationCarriesIdentityWithoutAuthority(t *testing.T) {
 			t.Fatalf("invalid request ID echoed: %+v", resp)
 		}
 	}
-	mustSend(t, a, Frame{Type: TypeCommand, ID: "legacy", InstanceID: inst.ID, Command: cmd})
+	mustSend(t, a, Frame{Type: TypeCommand, ID: "uncorrelated", InstanceID: inst.ID, Command: cmd})
 	if f := w.next(t); f.ClientID != aWelcome.ClientID || f.RequestID != "" {
-		t.Fatalf("legacy command routed as %+v", f)
+		t.Fatalf("uncorrelated command routed as %+v", f)
 	}
 }
 
@@ -975,7 +835,7 @@ func TestLaunchRequestIDIsRetainedByCoordinator(t *testing.T) {
 	}
 	h := startCoordinator(t, launch, launchTimeout)
 	c, _ := h.client()
-	requestID := uuid.NewString()
+	requestID := newLaunchID()
 	mustSend(t, c, Frame{Type: TypeStartInstance, ID: "start", RequestID: requestID, CWD: h.cwd})
 	w := h.nextWorker()
 	resp := readFrame(t, c)
@@ -1003,10 +863,8 @@ func TestLaunchRequestIDIsRetainedByCoordinator(t *testing.T) {
 		t.Fatalf("listed instances = %+v", list.Instances)
 	}
 
-	legacy, _ := h.start(c, "legacy")
-	if legacy.LaunchRequestID != "" {
-		t.Fatalf("start without request ID retained %q", legacy.LaunchRequestID)
-	}
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "missing", CWD: h.cwd}), "missing", CodeInvalidFrame)
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "v4", RequestID: uuid.NewString(), CWD: h.cwd}), "v4", CodeInvalidFrame)
 	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "bad", RequestID: "bad", CWD: h.cwd}), "bad", CodeInvalidFrame)
 }
 
@@ -1021,7 +879,7 @@ func TestLostLaunchReplyLeavesRetainedRequestIDObservable(t *testing.T) {
 	}
 	h := startCoordinator(t, launch, launchTimeout)
 	c, _ := h.client()
-	requestID := uuid.NewString()
+	requestID := newLaunchID()
 	mustSend(t, c, Frame{Type: TypeStartInstance, ID: "start", RequestID: requestID, CWD: h.cwd})
 	w := h.nextWorker()
 	// The accepted launch's reply is never read: the connection drops.
@@ -1125,7 +983,7 @@ func TestLaunchCanceledAfterStartupTimeout(t *testing.T) {
 	}
 	h := startCoordinator(t, launch, 10*time.Millisecond)
 	c, _ := h.client()
-	response := request(t, c, Frame{Type: TypeStartInstance, ID: "failed", CWD: h.cwd})
+	response := request(t, c, Frame{Type: TypeStartInstance, ID: "failed", RequestID: newLaunchID(), CWD: h.cwd})
 	wantError(t, response, "failed", CodeLaunchFailed)
 }
 
@@ -1135,7 +993,7 @@ func TestStartupTimeoutRevokesTokenBeforeCancelingLaunch(t *testing.T) {
 		return func(ctx context.Context, req LaunchRequest) error {
 			<-ctx.Done()
 			hello := Frame{Role: RoleWorker, Token: req.Token, Instance: &Instance{
-				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: "late",
+				ID: req.InstanceID, NodeID: "node", CWD: req.CWD, SessionID: "late", LaunchRequestID: req.LaunchRequestID,
 			}}
 			link, _, err := Dial(context.Background(), h.path, hello)
 			if err == nil {
@@ -1147,7 +1005,7 @@ func TestStartupTimeoutRevokesTokenBeforeCancelingLaunch(t *testing.T) {
 	}
 	h := startCoordinator(t, launch, 50*time.Millisecond)
 	c, _ := h.client()
-	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "slow", CWD: h.cwd}), "slow", CodeLaunchFailed)
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "slow", RequestID: newLaunchID(), CWD: h.cwd}), "slow", CodeLaunchFailed)
 	select {
 	case err := <-late:
 		var protoErr *Error
@@ -1212,7 +1070,7 @@ func TestProjectValidationDoesNotBlockCoordinator(t *testing.T) {
 	c, _ := h.client()
 	other, _ := h.client()
 	for i := range maxLaunches {
-		mustSend(t, c, Frame{Type: TypeStartInstance, ID: fmt.Sprint(i), CWD: h.cwd})
+		mustSend(t, c, Frame{Type: TypeStartInstance, ID: fmt.Sprint(i), RequestID: newLaunchID(), CWD: h.cwd})
 		select {
 		case <-entered:
 		case <-time.After(testTimeout):
@@ -1222,7 +1080,7 @@ func TestProjectValidationDoesNotBlockCoordinator(t *testing.T) {
 	if list := request(t, other, Frame{Type: TypeListInstances, ID: "l"}); list.ID != "l" || list.Error != nil {
 		t.Fatalf("list during validation = %+v", list)
 	}
-	wantError(t, request(t, other, Frame{Type: TypeStartInstance, ID: "over", CWD: h.cwd}), "over", CodeLimitExceeded)
+	wantError(t, request(t, other, Frame{Type: TypeStartInstance, ID: "over", RequestID: newLaunchID(), CWD: h.cwd}), "over", CodeLimitExceeded)
 }
 
 func TestProjectValidationFailureReleasesSlot(t *testing.T) {
@@ -1230,7 +1088,7 @@ func TestProjectValidationFailureReleasesSlot(t *testing.T) {
 	c, _ := h.client()
 	missing := filepath.Join(h.cwd, "missing")
 	for i := range maxLaunches + 1 {
-		wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: fmt.Sprint(i), CWD: missing}), fmt.Sprint(i), CodeInvalidFrame)
+		wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: fmt.Sprint(i), RequestID: newLaunchID(), CWD: missing}), fmt.Sprint(i), CodeInvalidFrame)
 	}
 	h.start(c, "ok")
 }
@@ -1342,10 +1200,10 @@ func TestWorkerQueueOverflowReportsLostLink(t *testing.T) {
 	c := &client{link: clientLink, pending: make(map[string]pendingRef), subs: map[string]struct{}{w.instance.ID: {}}}
 	co := &coordinator{clients: map[string]*client{"client": c}, workers: map[string]*worker{w.instance.ID: w}}
 	for i := range maxQueuedFrames - 1 {
-		co.forward(c, Frame{ID: fmt.Sprintf("request-%d", i), InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`), "get_state")
+		co.forward(c, Frame{ID: fmt.Sprintf("request-%d", i), InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`))
 	}
 	mustSend(t, workerLink, Frame{Type: TypeResponse})
-	co.forward(c, Frame{ID: "overflow", InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`), "get_state")
+	co.forward(c, Frame{ID: "overflow", InstanceID: w.instance.ID}, json.RawMessage(`{"type":"get_state"}`))
 	wantError(t, readFrame(t, clientReader), "overflow", CodeUnavailable)
 	if err := workerLink.Err(); !errors.Is(err, ErrSlowConsumer) {
 		t.Fatalf("worker link error = %v, want overflow", err)
@@ -1519,9 +1377,6 @@ func TestRecoveredLaunchDoesNotSpawnAgain(t *testing.T) {
 		return nil, nil, Frame{}
 	}
 	stop, first, welcome := start()
-	if welcome.LaunchRequestVersion != 7 {
-		t.Fatalf("recoverable coordinator advertised launch ID version %d", welcome.LaunchRequestVersion)
-	}
 	if skew := time.Since(time.UnixMilli(welcome.CoordinatorTimeUnixMS)); skew < 0 || skew > testTimeout {
 		t.Fatalf("welcome coordinator time is %v from now", skew)
 	}
@@ -1608,14 +1463,14 @@ func TestLauncherExistErrorIsNotAReceiptCollision(t *testing.T) {
 		return func(context.Context, LaunchRequest) error { return fmt.Errorf("create worker log: %w", os.ErrExist) }
 	}, launchTimeout)
 	c, _ := h.client()
-	got := request(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd, RequestID: uuid.NewString()})
+	got := request(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd, RequestID: newLaunchID()})
 	wantError(t, got, "start", CodeLaunchFailed)
 }
 
 func TestEmbeddedRunRemovesAnEpochWorkerOnDisconnect(t *testing.T) {
 	h := startCoordinator(t, func(h *harness) LaunchFunc {
 		return func(ctx context.Context, r LaunchRequest) error {
-			inst := Instance{ID: r.InstanceID, CWD: r.CWD, NodeID: "node", SessionID: "session", PID: 42}
+			inst := Instance{ID: r.InstanceID, LaunchRequestID: r.LaunchRequestID, CWD: r.CWD, NodeID: "node", SessionID: "session", PID: 42}
 			dialCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), testTimeout)
 			defer cancel()
 			link, welcome, err := Dial(dialCtx, h.path, Frame{
@@ -1631,7 +1486,7 @@ func TestEmbeddedRunRemovesAnEpochWorkerOnDisconnect(t *testing.T) {
 	c, _ := h.client()
 	request(t, c, Frame{Type: TypeWatchInstances, ID: "watch"})
 	for range 2 {
-		mustSend(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd})
+		mustSend(t, c, Frame{Type: TypeStartInstance, ID: "start", RequestID: newLaunchID(), CWD: h.cwd})
 		w := h.nextWorker()
 		readFrame(t, c) // instance update comes before readiness
 		if f := readFrame(t, c); f.Error != nil || f.Instance == nil || f.Instance.ID != w.req.InstanceID {
@@ -1667,9 +1522,9 @@ func TestStartSavedSessionBindsWorkerRegistration(t *testing.T) {
 		}
 	}, launchTimeout)
 	c, _ := h.client()
-	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "bad", CWD: h.cwd, SessionID: "/tmp/file"}), "bad", CodeInvalidFrame)
+	wantError(t, request(t, c, Frame{Type: TypeStartInstance, ID: "bad", RequestID: newLaunchID(), CWD: h.cwd, SessionID: "/tmp/file"}), "bad", CodeInvalidFrame)
 	id := uuid.NewString()
-	resp := request(t, c, Frame{Type: TypeStartInstance, ID: "resume", CWD: h.cwd, SessionID: id})
+	resp := request(t, c, Frame{Type: TypeStartInstance, ID: "resume", RequestID: newLaunchID(), CWD: h.cwd, SessionID: id})
 	if resp.Error != nil || resp.Instance == nil || resp.Instance.SessionID != id {
 		t.Fatalf("start saved session: %+v", resp)
 	}
@@ -1696,20 +1551,22 @@ func TestSavedSessionLaunchReservesOwner(t *testing.T) {
 	a, _ := h.client()
 	b, _ := h.client()
 	id := uuid.NewString()
-	launch := Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd, SessionID: id}
-	mustSend(t, a, launch)
+	launch := func() Frame {
+		return Frame{Type: TypeStartInstance, ID: "start", RequestID: newLaunchID(), CWD: h.cwd, SessionID: id}
+	}
+	mustSend(t, a, launch())
 	select {
 	case <-started:
 	case <-time.After(testTimeout):
 		t.Fatal("first launch did not reach the launcher")
 	}
-	wantError(t, request(t, b, launch), "start", CodeBusy)
+	wantError(t, request(t, b, launch()), "start", CodeBusy)
 	close(allow)
 	first := readFrame(t, a)
 	if first.Instance == nil || first.Instance.SessionID != id {
 		t.Fatalf("first launch lost its reservation: %+v", first)
 	}
-	if got := request(t, b, launch); got.Error != nil || got.Instance == nil || got.Instance.ID != first.Instance.ID {
+	if got := request(t, b, launch()); got.Error != nil || got.Instance == nil || got.Instance.ID != first.Instance.ID {
 		t.Fatalf("second resume did not return the first worker: %+v", got)
 	}
 	if len(started) != 0 {
@@ -1732,7 +1589,7 @@ func TestLocateSessionPrefersRunningWorker(t *testing.T) {
 	if got := request(t, c, Frame{Type: TypeLocateSession, ID: "saved", SessionID: saved[:8], CWD: "/client/only"}); got.Error != nil || got.SessionID != saved || got.CWD != "/saved/project" {
 		t.Fatalf("saved lookup: %+v", got)
 	}
-	resp := request(t, c, Frame{Type: TypeStartInstance, ID: "start", CWD: h.cwd, SessionID: uuid.NewString()})
+	resp := request(t, c, Frame{Type: TypeStartInstance, ID: "start", RequestID: newLaunchID(), CWD: h.cwd, SessionID: uuid.NewString()})
 	if resp.Error != nil {
 		t.Fatalf("start: %+v", resp)
 	}

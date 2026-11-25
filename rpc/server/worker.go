@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -359,10 +358,6 @@ type workerWriter struct {
 	bound             *eventSession
 	mu                sync.Mutex
 	link              *coord.Link
-	instancePrompts   bool
-	instanceNames     bool
-	instanceRename    bool
-	instanceBuild     bool
 	instance          coord.Instance
 	run               string
 	runDetail         coord.StateDetail
@@ -376,14 +371,12 @@ type workerWriter struct {
 func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Link, error) {
 	w.mu.Lock()
 	inst, pos := w.instance, w.journal.position
-	hello := inst
-	hello.Name, hello.FirstPrompt, hello.SessionName, hello.BuildID = "", "", "", ""
 	w.mu.Unlock()
 	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	link, welcome, err := coord.Dial(probe, path, coord.Frame{
+	hello := inst
+	link, _, err := coord.Dial(probe, path, coord.Frame{
 		Role: coord.RoleWorker, Instance: &hello, Token: token, Position: &pos,
-		Operations: []string{coord.OperationInstanceRestart},
 	})
 	if err != nil {
 		return nil, err
@@ -391,14 +384,9 @@ func (w *workerWriter) dial(ctx context.Context, path, token string) (*coord.Lin
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.link = link
-	w.instancePrompts = slices.Contains(welcome.Operations, coord.OperationInstancePrompts)
-	w.instanceNames = slices.Contains(welcome.Operations, coord.OperationInstanceNames)
-	w.instanceBuild = slices.Contains(welcome.Operations, coord.OperationInstanceBuild)
-	w.instanceRename = slices.Contains(welcome.Operations, coord.OperationInstanceRename)
-	// A hello must also work with coordinators that predate previews.
 	// Changes made during the handshake were journaled but could not be
 	// forwarded. Publish the latest summary before forwarding new events.
-	if w.instance != inst || (w.instanceRename && inst.Name != "") || (w.instancePrompts && inst.FirstPrompt != "") || (w.instanceNames && inst.SessionName != "") || (w.instanceBuild && inst.BuildID != "") {
+	if w.instance != inst {
 		if err := w.sendSummaryLocked(); err != nil {
 			w.disconnect(err)
 		}
@@ -604,9 +592,6 @@ func (w *workerWriter) publishSummaryLocked(kind string, data []byte) error {
 				if w.server != nil && w.instance.FirstPrompt != "" {
 					w.refreshSessionNameLocked()
 				}
-				if !w.instancePrompts && !w.instanceNames {
-					return nil
-				}
 			}
 		}
 	case "agent_start":
@@ -703,18 +688,6 @@ func (w *workerWriter) syncStateLocked() {
 
 func (w *workerWriter) sendSummaryLocked() error {
 	inst := w.instance
-	if !w.instancePrompts {
-		inst.FirstPrompt = ""
-	}
-	if !w.instanceNames {
-		inst.SessionName = ""
-	}
-	if !w.instanceBuild {
-		inst.BuildID = ""
-	}
-	if !w.instanceRename {
-		inst.Name = ""
-	}
 	return w.link.Send(coord.Frame{Type: coord.TypeRegister, Instance: &inst})
 }
 

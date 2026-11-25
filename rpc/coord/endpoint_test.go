@@ -72,14 +72,14 @@ func TestListenArbitratesSingleOwner(t *testing.T) {
 
 func TestListenLeavesUnlockedLiveListener(t *testing.T) {
 	path := filepath.Join(socketDir(t), "c.sock")
-	legacy, err := net.Listen("unix", path)
+	unlocked, err := net.Listen("unix", path)
 	if err != nil {
-		t.Fatalf("legacy listen: %v", err)
+		t.Fatalf("unlocked listen: %v", err)
 	}
-	defer legacy.Close()
+	defer unlocked.Close()
 	go func() {
 		for {
-			conn, err := legacy.Accept()
+			conn, err := unlocked.Accept()
 			if err != nil {
 				return
 			}

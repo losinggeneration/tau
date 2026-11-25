@@ -627,8 +627,8 @@ func startTUIInstanceManagement(ctx context.Context, socket string, choice tui.I
 	var result instanceManagementResult
 	go func() {
 		defer close(done)
-		// A legacy save check can stall requests on its connection. Keep it
-		// off the picker's link as well as off the UI loop.
+		// Stops and relaunches can stall requests on their connection. Keep
+		// them off the picker's link as well as off the UI loop.
 		c, err := findInteractiveCoordinator(ctx, socket)
 		if err != nil {
 			result.notice = err.Error()

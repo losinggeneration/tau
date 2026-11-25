@@ -143,7 +143,7 @@ func startWorkerInstance(t *testing.T, rt sdk.Runtime, reg commands.Registry, in
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: []string{coord.OperationInstancePrompts, coord.OperationInstanceNames, coord.OperationInstanceRename}}); err != nil {
+	if err := h.link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version}); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
@@ -438,9 +438,8 @@ func TestWorkerRegistersSavedSessionPreview(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", CWD: cwd, SessionID: header.ID})
-	f := h.next(t)
-	if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.SessionID != header.ID || f.Instance.FirstPrompt != "Original prompt" {
-		t.Fatalf("saved session registration = %+v", f)
+	if inst := h.hello.Instance; inst == nil || inst.SessionID != header.ID || inst.FirstPrompt != "Original prompt" {
+		t.Fatalf("saved session hello = %+v", inst)
 	}
 }
 
@@ -467,13 +466,10 @@ func TestWorkerPublishesSessionName(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", CWD: cwd, SessionID: header.ID})
-	if h.hello.Instance.SessionName != "" {
-		t.Fatalf("hello must work with older coordinators: %+v", h.hello.Instance)
+	if h.hello.Instance.SessionName != "Saved name" {
+		t.Fatalf("saved name hello = %+v", h.hello.Instance)
 	}
-	f := h.next(t)
-	if f.Type != coord.TypeRegister || f.Instance == nil || f.Instance.SessionName != "Saved name" {
-		t.Fatalf("saved name registration = %+v", f)
-	}
+	var f coord.Frame
 	h.send(t, "rename", `{"type":"set_session_name","args":{"name":"New name"}}`)
 	for {
 		f = h.next(t)
@@ -529,8 +525,8 @@ func TestWorkerPublishesInstanceName(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := startWorkerInstance(t, rt, nil, coord.Instance{ID: "instance", Name: "Restarted", CWD: cwd, SessionID: header.ID})
-	if h.hello.Instance.Name != "" {
-		t.Fatalf("hello must work with older coordinators: %+v", h.hello.Instance)
+	if h.hello.Instance.Name != "Restarted" {
+		t.Fatalf("instance name hello = %+v", h.hello.Instance)
 	}
 	waitName := func(want string) {
 		t.Helper()
@@ -540,7 +536,6 @@ func TestWorkerPublishesInstanceName(t *testing.T) {
 			}
 		}
 	}
-	waitName("Restarted")
 	h.send(t, "rename", `{"type":"set_instance_name","args":{"name":"  API   work "}}`)
 	waitName("API work")
 	h.send(t, "invalid", `{"type":"set_instance_name","args":{"name":"bad\u001bname"}}`)
@@ -1434,7 +1429,7 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 			t.Error("worker still running after cancellation")
 		}
 	})
-	accept := func(ops ...string) (*coord.Link, coord.Frame) {
+	accept := func() (*coord.Link, coord.Frame) {
 		t.Helper()
 		if err := listener.SetDeadline(time.Now().Add(time.Second)); err != nil {
 			t.Fatal(err)
@@ -1456,7 +1451,7 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version, Operations: ops}); err != nil {
+		if err := link.Send(coord.Frame{Type: coord.TypeWelcome, Version: coord.Version}); err != nil {
 			t.Fatal(err)
 		}
 		return link, hello
@@ -1478,8 +1473,6 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	read(first, coord.TypeResponse)
-	// Start with a coordinator that doesn't understand previews, then verify
-	// the worker can supply its cached prompt after a coordinator upgrade.
 	observe := <-rt.sess.observerReady
 	observe(sdk.Event{Type: "message_end", SessionID: "session", Payload: map[string]any{"role": "user", "content": "Keep this prompt"}})
 	read(first, coord.TypeEvent)
@@ -1494,18 +1487,16 @@ func TestWorkerRedialsWithPendingInputAndSameEpoch(t *testing.T) {
 	if event.Position == nil || !strings.Contains(string(event.Event), `"type":"ui_input"`) {
 		t.Fatalf("missing input event: %+v", event)
 	}
-	if f := read(first, coord.TypeRegister); f.Instance == nil || f.Instance.FirstPrompt != "" || f.Instance.PendingInputs != 1 {
-		t.Fatalf("legacy registration = %+v", f)
+	if f := read(first, coord.TypeRegister); f.Instance == nil || f.Instance.FirstPrompt != "Keep this prompt" || f.Instance.PendingInputs != 1 {
+		t.Fatalf("pending input registration = %+v", f)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	second, rejoined := accept(coord.OperationInstancePrompts)
-	if rejoined.Instance.ID != original.Instance.ID || rejoined.Instance.SessionID != original.Instance.SessionID || rejoined.Instance.PendingInputs != 1 {
-		t.Fatalf("lost session or input: %+v", rejoined.Instance)
-	}
-	if f := read(second, coord.TypeRegister); f.Instance == nil || f.Instance.FirstPrompt != "Keep this prompt" {
-		t.Fatalf("rejoin did not republish preview: %+v", f)
+	second, rejoined := accept()
+	if rejoined.Instance.ID != original.Instance.ID || rejoined.Instance.SessionID != original.Instance.SessionID || rejoined.Instance.PendingInputs != 1 ||
+		rejoined.Instance.FirstPrompt != "Keep this prompt" {
+		t.Fatalf("lost session, input, or preview: %+v", rejoined.Instance)
 	}
 	if err := second.Send(coord.Frame{Type: coord.TypeCommand, ID: "snapshot", InstanceID: "instance", Command: json.RawMessage(`{"type":"get_snapshot"}`)}); err != nil {
 		t.Fatal(err)
